@@ -1,0 +1,15 @@
+{
+  "id": "agy-acp",
+  "name": "Antigravity ACP",
+  "requirements": {
+    "paseo": ">=0.15.0"
+  },
+  "description": "Connect Antigravity ACP to Paseo with native sessions and rich tool timelines",
+  "translations": {
+    "zh-CN": {
+      "name": "Antigravity ACP",
+      "description": "通过原生 ACP 将 Antigravity 接入 Paseo，支持会话恢复与工具时间线"
+    }
+  },
+  "build": [["npm", "ci", "--omit=dev", "--ignore-scripts"]]
+}

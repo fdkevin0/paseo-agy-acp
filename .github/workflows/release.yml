@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish to npm and GitHub Releases
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Validate release tag and check npm registry
+        id: meta
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          if [[ "$GITHUB_REF_TYPE" != tag || "$GITHUB_REF_NAME" != "v${VERSION}" ]]; then
+            echo "::error::Run this workflow on the existing v${VERSION} tag."
+            exit 1
+          fi
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::This workflow publishes stable versions only (vX.Y.Z)."
+            exit 1
+          fi
+          STATUS=$(curl --silent --show-error --max-time 30 \
+            --output /dev/null --write-out '%{http_code}' \
+            "https://registry.npmjs.org/${NAME}/${VERSION}")
+          case "$STATUS" in
+            200) PUBLISHED=true ;;
+            404) PUBLISHED=false ;;
+            *) echo "::error::npm registry returned HTTP ${STATUS}"; exit 1 ;;
+          esac
+          echo "published=${PUBLISHED}" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        if: steps.meta.outputs.published == 'false'
+        run: npm ci --ignore-scripts
+
+      - name: Typecheck, test, and verify package
+        if: steps.meta.outputs.published == 'false'
+        run: |
+          npm run format:check
+          npm run check
+          npm test
+          npm pack --dry-run
+
+      - name: Prepare npm manifest
+        if: steps.meta.outputs.published == 'false'
+        run: |
+          node --input-type=module - <<'JS'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          const manifest = JSON.parse(readFileSync('paseo-plugin.json', 'utf8'));
+          delete manifest.build;
+          writeFileSync('paseo-plugin.json', JSON.stringify(manifest, null, 2) + '\n');
+          JS
+          npm pack --dry-run --ignore-scripts
+
+      - name: Update npm for trusted publishing
+        if: steps.meta.outputs.published == 'false'
+        run: npm install --global npm@^11.5.1
+
+      - name: Publish to npm
+        if: steps.meta.outputs.published == 'false'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
+
+      - name: Ensure GitHub Release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "GitHub Release ${GITHUB_REF_NAME} already exists."
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag \
+              --title "$GITHUB_REF_NAME" --generate-notes
+          fi

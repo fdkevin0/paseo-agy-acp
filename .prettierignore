@@ -1,0 +1,4 @@
+node_modules/
+.pi/
+npm-shrinkwrap.json
+package-lock.json
