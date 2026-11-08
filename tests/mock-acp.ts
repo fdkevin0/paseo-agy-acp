@@ -40,6 +40,8 @@ const canceled = new Set<string>()
 const cancels = new Map<string, () => void>()
 if (process.env.AGY_TEST_PID_LOG)
   appendFileSync(process.env.AGY_TEST_PID_LOG, `${process.pid}\n`)
+if (process.argv.includes('--dangerously-skip-permissions'))
+  log('flag:--dangerously-skip-permissions')
 const stream = ndJsonStream(
   Writable.toWeb(process.stdout),
   Readable.toWeb(process.stdin),
@@ -155,6 +157,7 @@ new AgentSideConnection((client) => {
         _meta?.antigravity as { systemPrompt?: { append?: string } }
       )?.systemPrompt?.append
       if (append) log(`load:${append}`)
+      else if (process.env.AGY_TEST_LOG_LOAD) log('load')
       sendCommands(sessionId)
       await client.sessionUpdate({
         sessionId,

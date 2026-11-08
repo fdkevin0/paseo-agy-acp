@@ -52,6 +52,39 @@ interface SessionOptions {
   emit: (event: ProviderEvent) => void
 }
 
+const SKIP_PERMISSIONS_FLAG = '--dangerously-skip-permissions'
+
+function effectiveLaunch(
+  launch: ProviderLaunch | undefined,
+  skipPermissions?: boolean,
+): ProviderLaunch | undefined {
+  if (!skipPermissions) return launch
+  const args = launch?.args ?? ['acp']
+  return args.includes(SKIP_PERMISSIONS_FLAG)
+    ? launch
+    : {
+        command: launch?.command ?? 'agy',
+        args: [...args, SKIP_PERMISSIONS_FLAG],
+        env: launch?.env ?? {},
+      }
+}
+
+function sessionParams(cwd: string, config?: ProviderSessionConfig) {
+  return {
+    cwd,
+    mcpServers: config ? mcpServers(config) : [],
+    ...(config?.systemPrompt?.trim()
+      ? {
+          _meta: {
+            antigravity: {
+              systemPrompt: { append: config.systemPrompt },
+            },
+          },
+        }
+      : {}),
+  }
+}
+
 function launchScope(launch: ProviderLaunch | undefined, cwd: string) {
   return [launch?.command ?? 'agy', ...(launch?.args ?? ['acp'])].map(
     (part) => {
@@ -83,9 +116,11 @@ export class SessionManager {
 
   async start(id: string, cwd: string, config?: ProviderSessionConfig) {
     if (this.closed) throw new Error('Provider connection is closed')
+    const skipPermissions = config?.mode === FULL_ACCESS_MODE_ID
+    const launch = effectiveLaunch(this.options.launch, skipPermissions)
     const warmKey = JSON.stringify([
-      launchScope(this.options.launch, cwd),
-      dataDirectory(this.options.launch, config?.env, cwd),
+      launchScope(launch, cwd),
+      dataDirectory(launch, config?.env, cwd),
       Object.entries(config?.env ?? {}).sort(([a], [b]) => a.localeCompare(b)),
     ])
     const hasCwd = await stat(cwd).then(
@@ -93,7 +128,7 @@ export class SessionManager {
       () => false,
     )
     if (this.closed) throw new Error('Provider connection is closed')
-    const warm = hasCwd ? this.warm.get(warmKey) : undefined
+    const warm = hasCwd && !skipPermissions ? this.warm.get(warmKey) : undefined
     if (warm) {
       clearTimeout(warm.timer)
       this.warm.delete(warmKey)
@@ -114,6 +149,7 @@ export class SessionManager {
           runtime.transport.closed ||
           this.warm.has(warmKey) ||
           agentId ||
+          skipPermissions ||
           config?.systemPrompt?.trim()
         )
           return false
@@ -164,19 +200,7 @@ export class SessionManager {
             typeof data.sessionId !== 'string')
         )
           throw new Error('Invalid agy persistence handle')
-        const params = {
-          cwd: input.config.cwd,
-          mcpServers: mcpServers(input.config),
-          ...(input.config.systemPrompt?.trim()
-            ? {
-                _meta: {
-                  antigravity: {
-                    systemPrompt: { append: input.config.systemPrompt },
-                  },
-                },
-              }
-            : {}),
-        }
+        const params = sessionParams(input.config.cwd, input.config)
         session.state.persisted = Boolean(input.persistence)
         session.state.replay = input.history === 'replay'
         if (input.persistence) {
@@ -333,6 +357,7 @@ async function createSession(
     opened: false,
     persisted: false,
     closing: false,
+    skipPermissions: config?.mode === FULL_ACCESS_MODE_ID,
     turnSteps: 1,
     afterToolResult: false,
     turnHadContextUsage: false,
@@ -580,23 +605,29 @@ async function createSession(
         error: { message: error.message },
       })
   }
-  const transport = warm
+  let currentTransport = warm
     ? (warm.transport.bind(client, onExit), warm.transport)
-    : connectAcp(launch, cwd, config?.env ?? {}, client, onExit)
+    : connectAcp(
+        effectiveLaunch(launch, state.skipPermissions),
+        cwd,
+        config?.env ?? {},
+        client,
+        onExit,
+      )
   if (!warm) {
-    transports.add(transport)
-    void transport.exited
-      .then(() => transport.close())
+    transports.add(currentTransport)
+    void currentTransport.exited
+      .then(() => currentTransport.close())
       .then(
-        () => transports.delete(transport),
+        () => transports.delete(currentTransport),
         () => undefined,
       )
   }
   try {
-    const initialized = warm
+    let currentInitialized = warm
       ? warm.initialized
-      : await transport.request(
-          transport.rpc.initialize({
+      : await currentTransport.request(
+          currentTransport.rpc.initialize({
             protocolVersion: 1,
             clientInfo: { name: 'paseo-agy-acp', version: '0.1.0' },
             clientCapabilities: {
@@ -610,8 +641,12 @@ async function createSession(
       cwd,
       config,
       state,
-      initialized,
-      transport,
+      get initialized() {
+        return currentInitialized
+      },
+      get transport() {
+        return currentTransport
+      },
       timeline,
       permissions,
       cancelPermissions,
@@ -623,6 +658,88 @@ async function createSession(
       flush() {
         state.opening = false
         for (const item of buffered.splice(0)) update(item)
+      },
+      async relaunch(skipPermissions: boolean) {
+        if (
+          state.skipPermissions === skipPermissions ||
+          !currentInitialized.agentCapabilities?.loadSession
+        )
+          return
+        const prev = configState(state.metadata)
+        const old = currentTransport
+        old.bind(
+          {
+            sessionUpdate: async () => {},
+            requestPermission: async () => ({
+              outcome: { outcome: 'cancelled' },
+            }),
+          },
+          () => {},
+        )
+        await old.close().catch(() => undefined)
+        const next = connectAcp(
+          effectiveLaunch(launch, skipPermissions),
+          cwd,
+          config?.env ?? {},
+          client,
+          onExit,
+        )
+        currentTransport = next
+        transports.add(next)
+        void next.exited
+          .then(() => next.close())
+          .then(
+            () => transports.delete(next),
+            () => undefined,
+          )
+        currentInitialized = await next.request(
+          next.rpc.initialize({
+            protocolVersion: 1,
+            clientInfo: { name: 'paseo-agy-acp', version: '0.1.0' },
+            clientCapabilities: {
+              fs: { readTextFile: false, writeTextFile: false },
+              terminal: false,
+            },
+          }),
+        )
+        state.skipPermissions = skipPermissions
+        state.loading = true
+        state.replay = false
+        try {
+          state.metadata = {
+            ...(await next.request(
+              next.rpc.loadSession({
+                ...sessionParams(cwd, config),
+                sessionId: state.nativeId,
+              }),
+            )),
+            sessionId: state.nativeId,
+            models: next.models,
+            fullAccess: skipPermissions,
+          }
+          await drain()
+        } finally {
+          state.loading = false
+          state.replay = true
+        }
+        for (const [k, v] of [
+          ['model', prev.model],
+          ['thought_level', prev.thinkingOption],
+        ] as const) {
+          const opt = state.metadata.configOptions?.find(
+            (o) => o.id === k || o.category === k,
+          )
+          if (v && opt && opt.currentValue !== v) {
+            const res = await next.request(
+              next.rpc.setSessionConfigOption({
+                sessionId: state.nativeId,
+                configId: opt.id,
+                value: v,
+              }),
+            )
+            state.metadata.configOptions = res.configOptions
+          }
+        }
       },
       close(reuseUnbound = false): Promise<void> {
         if (closing) return closing
@@ -641,9 +758,11 @@ async function createSession(
             state.prompts.size === 0 &&
             sessionIdPattern.test(state.nativeId)
           const closedNatively = disposable
-            ? await transport
+            ? await currentTransport
                 .request(
-                  transport.rpc.closeSession({ sessionId: state.nativeId }),
+                  currentTransport.rpc.closeSession({
+                    sessionId: state.nativeId,
+                  }),
                 )
                 .then(
                   () => true,
@@ -655,7 +774,11 @@ async function createSession(
             ((reuseUnbound && !state.nativeId) ||
               (disposable && closedNatively)) &&
             !state.failed &&
-            parkWarm({ transport, initialized })
+            !state.skipPermissions &&
+            parkWarm({
+              transport: currentTransport,
+              initialized: currentInitialized,
+            })
           ) {
             if (disposable)
               await removeSessionArtifacts(dir, state.nativeId).catch(
@@ -663,7 +786,7 @@ async function createSession(
               )
             return
           }
-          const stopped = await transport.close().then(
+          const stopped = await currentTransport.close().then(
             () => true,
             () => false,
           )
@@ -676,7 +799,7 @@ async function createSession(
       },
     }
   } catch (error) {
-    await transport.close()
+    await currentTransport.close()
     throw error
   }
 }
@@ -703,11 +826,12 @@ async function configureSession(
           ? current.mode
           : current.thinkingOption
     if (value === selected) continue
-    const option = session.state.metadata.configOptions?.find(
-      (o) => o.id === key || o.category === key,
-    )
     if (key === 'mode' && value === FULL_ACCESS_MODE_ID) {
+      await session.relaunch(true)
       session.state.metadata.fullAccess = true
+      const option = session.state.metadata.configOptions?.find(
+        (o) => o.id === key || o.category === key,
+      )
       const nativeModes = configState({
         ...session.state.metadata,
         fullAccess: false,
@@ -740,7 +864,13 @@ async function configureSession(
       }
       continue
     }
-    if (key === 'mode') session.state.metadata.fullAccess = false
+    if (key === 'mode') {
+      await session.relaunch(false)
+      session.state.metadata.fullAccess = false
+    }
+    const option = session.state.metadata.configOptions?.find(
+      (o) => o.id === key || o.category === key,
+    )
     if (option) {
       if (option.currentValue === value) continue
       const result = await session.transport.request(

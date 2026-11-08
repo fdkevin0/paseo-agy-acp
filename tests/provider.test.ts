@@ -875,10 +875,14 @@ test('forwards systemPrompt via _meta.antigravity.systemPrompt.append on new and
   }
 })
 
-test('full-access mode sets accept-edits natively, auto-approves allow_once without prompting, and restores prompts when switched back', async () => {
+test('full-access mode launches with --dangerously-skip-permissions, auto-approves permissions, and relaunches when toggled', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-full-access-'))
   const log = join(home, 'calls')
-  const h = await harness({ HOME: home, AGY_TEST_LOG: log })
+  const h = await harness({
+    HOME: home,
+    AGY_TEST_LOG: log,
+    AGY_TEST_LOG_LOAD: '1',
+  })
   try {
     await h.provider.send({
       type: 'session.open',
@@ -927,7 +931,7 @@ test('full-access mode sets accept-edits natively, auto-approves allow_once with
     )
     assert.equal(
       await readFile(log, 'utf8'),
-      'new\nconfigure:mode=accept-edits\n',
+      'flag:--dangerously-skip-permissions\nnew\nconfigure:mode=accept-edits\n',
     )
 
     h.events.length = 0
@@ -964,9 +968,28 @@ test('full-access mode sets accept-edits natively, auto-approves allow_once with
     const afterDefault = h.events.findLast((e) => e.type === 'session.config')
     assert.ok(afterDefault?.type === 'session.config')
     assert.equal(afterDefault.config.mode, 'default')
+    assert.ok(!h.events.some((e) => e.type === 'timeline.item'))
     assert.equal(
       await readFile(log, 'utf8'),
-      'new\nconfigure:mode=accept-edits\nconfigure:mode=default\n',
+      'flag:--dangerously-skip-permissions\nnew\nconfigure:mode=accept-edits\nload\n',
+    )
+
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.configure',
+      requestId: 'cfg-full',
+      sessionId: 's',
+      changes: { mode: 'full-access' },
+    })
+    await h.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'cfg-full',
+    )
+    const afterFull = h.events.findLast((e) => e.type === 'session.config')
+    assert.ok(afterFull?.type === 'session.config')
+    assert.equal(afterFull.config.mode, 'full-access')
+    assert.equal(
+      await readFile(log, 'utf8'),
+      'flag:--dangerously-skip-permissions\nnew\nconfigure:mode=accept-edits\nload\nflag:--dangerously-skip-permissions\nload\nconfigure:mode=accept-edits\n',
     )
   } finally {
     await h.provider.close()
