@@ -18,10 +18,10 @@ Supports text, images, attachment context, native commands, permission decisions
 
 The Composer context popover shows context occupancy and subscription quota. Usage Source `agy`, also available through `paseo usage ls --json`, reports Gemini and Claude/GPT 5-hour and weekly quotas, reset times and the subscription tier when known. It calls agy's `/usage` command without starting a model turn. Account labels come from local login logs; token contents are not read by the plugin or exposed in usage reports.
 
-Temporary discovery sessions and new sessions closed before their first prompt are cleaned up where possible. Imported and prompted conversations are retained. Explicitly closing a session releases its local runtime.
+Temporary discovery sessions and new sessions closed before their first prompt are cleaned up where possible. Imported and prompted conversations are retained. Closing imported or prompted sessions stops their local runtime. Healthy runtimes from temporary sessions or session listing may be reused across sessions sharing a compatible launch, data directory and environment; the idle pool has a size limit and expires unused processes.
 
 ## Known limits
 
 Context occupancy is an estimate when native measurements are unavailable. Current agy print mode rejects custom ACP directory flags; quota queries with those flags return an error instead of querying another account. Subagent timelines depend on native logs and do not provide independent session control.
 
-Steering, rewind, archive operations, structured output, custom system prompts, recursive child discovery and Artifacts panels are unsupported. Automatic idle runtime cleanup is disabled because ACP cannot confirm that background work has stopped.
+Steering, rewind, archive operations, structured output, custom system prompts, recursive child discovery and Artifacts panels are unsupported. Automatic idle cleanup of open sessions is disabled because ACP cannot confirm that background work has stopped. This does not prevent expiry of parked discovery runtimes.

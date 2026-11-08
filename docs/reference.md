@@ -22,7 +22,7 @@ Provider status runs the executable with `--version`, with a five-second timeout
 
 ### Temporary session cleanup
 
-Catalog discovery opens an unprompted native session, reads its configuration, and calls `session/close`. New sessions closed before their first prompt use the same cleanup. When `session/close` succeeds on a healthy runtime and no warm process is already parked for that data directory and environment, the plugin removes the closed session's artifacts immediately and keeps the initialized ACP process warm for the next session; otherwise it stops the process first. Imported and prompted conversations are retained.
+Catalog discovery opens an unprompted native session, reads its configuration, and calls `session/close`. New sessions closed before their first prompt use the same cleanup. When `session/close` succeeds on a healthy runtime eligible for the warm pool, the plugin removes the closed session's artifacts immediately and keeps the initialized ACP process warm for the next session; otherwise it stops the process first. Imported and prompted conversations are retained.
 
 Only the closed session's validated UUID is eligible for deletion:
 
@@ -38,7 +38,7 @@ Cleanup refuses symlink targets and does not traverse symlink directories. Nativ
 
 Model, mode and thinking controls derive from native `configOptions`. Legacy model metadata constrains effort variants to each model's supported choices; fixed-effort models hide the thinking selector. Opening a session changes configuration only when a requested value differs from native state. Effective configuration is published before `session.ready`.
 
-The provider waits up to one second for the initial `available_commands_update` before readiness so draft and live composers can query native commands, and caches the latest command list per `(cwd, env)` across the connection to seed subsequent sessions immediately before `session.ready`. An empty list also resolves the wait; close or failure releases it. If the deadline expires, readiness proceeds without an initial list. Changed command lists from later updates are forwarded.
+The provider waits up to one second for the current native session's initial `available_commands_update` before readiness so draft and live composers can query fresh commands. Command lists are not cached across sessions, even when a warm process is reused. An empty list also resolves the wait; close or failure releases it. If the deadline expires, readiness proceeds without an initial list. Changed command lists from later updates are forwarded; duplicate lists within a session are suppressed. Catalog probes wait up to 100 ms for commands before closing their temporary session.
 
 The connection negotiates these capabilities with Paseo and validates incoming operations against the negotiated set: `prompt.message`, `prompt.command`, `prompt.image`, `session.configure`, `session.list`, `session.persistence`, `session.can_stop_runtime`, `permission`, and `session.subsession`.
 
@@ -78,9 +78,13 @@ Tool results do not become assistant bubbles. This read-only projection depends 
 
 ## Permissions and runtime lifecycle
 
-Permission events include the native title, input, detail card and available actions. An action must match both the supplied ID and allow/deny intent; no match cancels the request. Malformed fields are rejected with a canceled outcome before any approval is queued. Interrupt, close and runtime failure resolve outstanding permissions as canceled. `clearPendingPermissions` does the same before handling a new prompt; it does not permit a second concurrent turn.
+Permission events include the native title, input, detail card and available actions. An action must match both the supplied ID and allow/deny intent; no match cancels the request. Malformed fields, mismatched native session IDs, and requests during close or after runtime failure receive a canceled outcome before any approval is queued. Notifications are also checked against the current native ID, including buffered notifications flushed after opening. Interrupt, close and runtime failure resolve outstanding permissions as canceled. `clearPendingPermissions` does the same before handling a new prompt; it does not permit a second concurrent turn.
 
-Control RPCs time out after 30 seconds. Prompt generation remains open until completion, interruption or process failure. Shutdown ends stdin, then escalates process termination with a bounded wait. Explicit close releases the process and all Brain polling while preserving imported and prompted conversations. Automatic idle cleanup is vetoed because native background tasks cannot be safely queried.
+Control RPCs time out after 30 seconds. Prompt generation remains open until completion, interruption or process failure. Shutdown ends stdin, then escalates process termination with a bounded wait. Explicit close stops Brain polling and preserves imported and prompted conversations; their processes are stopped. Healthy temporary sessions can return their process to the warm pool after native close succeeds. Successful session listing can also return a process without creating a native session. Failed operations without a known native session are stopped.
+
+The warm pool belongs to one provider connection, whose launch command and environment are fixed. Reuse additionally requires the same resolved launch paths, session environment and native data directory (so relative launch or directory arguments stay scoped to their working directory). At most four idle processes are retained, with oldest-first eviction and a 60-second idle expiry timer that does not keep the host alive. Environments containing a nonempty `PASEO_AGENT_ID` are not parked. A duplicate idle scope is stopped instead of replacing its parked process. Open sessions are not subject to this pool's limits: Paseo's automatic idle cleanup is vetoed because native background tasks cannot be safely queried.
+
+Protocol disconnection terminates the child even if the process is still alive. Parked runtimes cancel permissions and ignore notifications; a checked-out runtime binds the new session's handlers. Provider connection shutdown terminates both active and parked processes and waits for shutdown to finish.
 
 Steering, rewind, archive operations, structured output and custom system prompts are unsupported.
 
@@ -118,7 +122,7 @@ Successful catalog discovery and session opening remember `_meta.antigravity.tie
 
 ### Query execution
 
-Fetching runs the launch executable with `-p /usage --output-format json` and a 15-second timeout. The `acp` subcommand and transport flags are removed; explicit directory arguments, the remembered working directory and launch/session environment overrides are preserved. No directory flags are added for default accounts. Current agy print mode rejects ACP directory flags, so such launches return a command error instead of querying a different account.
+Fetching runs the launch executable with `-p /usage --output-format json` and a 15-second timeout. The `acp` subcommand and transport flags are removed; explicit directory arguments, the remembered working directory and launch/session environment overrides are preserved. If the remembered workspace no longer exists, execution falls back to the host home directory only when the resolved account directory stays identical and the executable is not a relative path. Cwd-dependent directory flags produce a diagnostic instead of silently switching accounts. Other launch arguments remain unchanged. No directory flags are added for default accounts. Current agy print mode rejects ACP directory flags, so such launches return a command error instead of querying a different account.
 
 The CLI may contact its quota service but does not start a model turn. The plugin does not modify login credentials.
 

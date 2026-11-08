@@ -1,6 +1,7 @@
 /** Subscription quota obtained through agy's local /usage command, without a model turn. */
 import { open, readdir, stat } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, isAbsolute } from 'node:path'
+import { homedir } from 'node:os'
 import { z } from 'zod'
 import { execCommand } from '@getpaseo/plugin/server'
 import type { ProviderLaunch } from '@getpaseo/plugin/server/provider'
@@ -214,13 +215,35 @@ export class AgyUsageSource {
       throw new Error('Antigravity login store no longer exists')
     if (known && loggedIn) known.hadLogin = true
     try {
+      let cwd = known?.cwd
+      if (
+        cwd &&
+        !(await stat(cwd).then(
+          (s) => s.isDirectory(),
+          () => false,
+        ))
+      ) {
+        cwd = homedir()
+        const launch = {
+          command: command ?? 'agy',
+          args: args ?? [],
+          env: known!.env,
+        }
+        if (
+          dataDirectory(launch, {}, cwd) !== dataDir ||
+          (!isAbsolute(launch.command) && /[/\\]/.test(launch.command))
+        )
+          throw new Error(
+            'Remembered workspace is missing and the usage launch depends on it',
+          )
+      }
       const { stdout } = await execCommand(
         command ?? 'agy',
         [...usageArgs(args ?? []), '-p', '/usage', '--output-format', 'json'],
         {
           timeout: 15_000,
           env: known ? { ...process.env, ...known.env } : process.env,
-          cwd: known?.cwd,
+          cwd,
         },
       )
       const windows = parseUsage(stdout).flatMap((group) =>

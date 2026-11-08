@@ -1,8 +1,9 @@
 import { AgentSideConnection, ndJsonStream } from '@agentclientprotocol/sdk'
+import { randomUUID } from 'node:crypto'
 import { appendFileSync } from 'node:fs'
 import { WritableStream } from 'node:stream/web'
 import { Readable, Writable } from 'node:stream'
-const nativeId = '11111111-1111-4111-8111-111111111111'
+let nativeId = ''
 function log(method: string) {
   if (process.env.AGY_TEST_LOG)
     appendFileSync(process.env.AGY_TEST_LOG, method + '\n')
@@ -23,7 +24,10 @@ const configOptions = [
     options: ['low', 'high'].map((value) => ({ name: value, value })),
   },
 ]
-let cancel: (() => void) | undefined
+const canceled = new Set<string>()
+const cancels = new Map<string, () => void>()
+if (process.env.AGY_TEST_PID_LOG)
+  appendFileSync(process.env.AGY_TEST_PID_LOG, `${process.pid}\n`)
 const stream = ndJsonStream(
   Writable.toWeb(process.stdout),
   Readable.toWeb(process.stdin),
@@ -62,14 +66,36 @@ stream.writable = new WritableStream({
 })
 new AgentSideConnection((client) => {
   let sessions = 0
+  async function staleEvents(sessionId: string) {
+    for (const update of [
+      {
+        sessionUpdate: 'agent_message_chunk' as const,
+        content: { type: 'text' as const, text: 'stale' },
+      },
+      {
+        sessionUpdate: 'available_commands_update' as const,
+        availableCommands: [{ name: 'stale', description: 'stale' }],
+      },
+      { sessionUpdate: 'usage_update' as const, used: 999, size: 1000 },
+      { sessionUpdate: 'config_option_update' as const, configOptions: [] },
+    ])
+      await client.sessionUpdate({ sessionId, update })
+    const result = await client.requestPermission({
+      sessionId,
+      toolCall: { toolCallId: 'stale', title: 'stale' },
+      options: [{ optionId: 'yes', name: 'Allow', kind: 'allow_once' }],
+    })
+    log(`stale-permission:${result.outcome.outcome}`)
+  }
   function sendCommands(sessionId: string) {
     if (process.env.AGY_TEST_NO_COMMANDS) return
     const extra =
       process.env.AGY_TEST_WARM_COMMANDS && sessions > 1
         ? [{ name: 'plan', description: 'Plan task' }]
         : []
-    setTimeout(() => {
-      void client.sessionUpdate({
+    setTimeout(async () => {
+      if (process.env.AGY_TEST_STALE_EVENTS) await staleEvents(randomUUID())
+      await client.sessionUpdate({
         sessionId,
         update: {
           sessionUpdate: 'available_commands_update',
@@ -95,13 +121,17 @@ new AgentSideConnection((client) => {
       return {}
     },
     async newSession() {
+      const previousId = nativeId || randomUUID()
+      nativeId = randomUUID()
       sessions += 1
       log('new')
+      if (process.env.AGY_TEST_STALE_EVENTS) await staleEvents(previousId)
       sendCommands(nativeId)
       return { sessionId: nativeId, configOptions }
     },
-    async closeSession() {
+    async closeSession({ sessionId }) {
       log('close')
+      if (process.env.AGY_TEST_STALE_EVENTS) await staleEvents(sessionId)
       if (process.env.AGY_TEST_CLOSE_ERROR) throw new Error('close failed')
       return {}
     },
@@ -133,12 +163,12 @@ new AgentSideConnection((client) => {
       })
       return { configOptions }
     },
-    async listSessions() {
+    async listSessions({ cwd }) {
       return {
         sessions: [
           {
             sessionId: 'native-test',
-            cwd: process.cwd(),
+            cwd: cwd ?? process.cwd(),
             title: 'Test session',
           },
         ],
@@ -148,8 +178,9 @@ new AgentSideConnection((client) => {
       log('configure')
       return { configOptions }
     },
-    async cancel() {
-      cancel?.()
+    async cancel({ sessionId }) {
+      canceled.add(sessionId)
+      cancels.get(sessionId)?.()
     },
     async prompt({ sessionId, prompt }) {
       const text = prompt.map((c) => (c.type === 'text' ? c.text : '')).join('')
@@ -170,13 +201,23 @@ new AgentSideConnection((client) => {
           rawInput: { CommandLine: 'echo unfinished' },
         },
       })
+      if (text === 'disconnect') {
+        setInterval(() => {}, 1000)
+        process.stdout.end()
+        await new Promise(() => {})
+      }
       if (text === 'crash') {
         process.exit(7)
       }
       if (text === 'wait') {
+        if (process.env.AGY_TEST_CANCEL_DELAY)
+          await new Promise((resolve) => setTimeout(resolve, 100))
         await new Promise<void>((resolve) => {
-          cancel = resolve
+          if (canceled.has(sessionId)) resolve()
+          else cancels.set(sessionId, resolve)
         })
+        cancels.delete(sessionId)
+        canceled.delete(sessionId)
         return { stopReason: 'cancelled' as const }
       }
       const permission = await client.requestPermission({

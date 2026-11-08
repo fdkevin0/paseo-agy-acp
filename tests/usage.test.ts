@@ -240,3 +240,49 @@ test('default usage launch adds no ACP directory flags and keeps the session HOM
     await rm(home, { recursive: true, force: true })
   }
 })
+
+test('deleted workspaces fall back only when quota account paths are cwd independent', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-deleted-worktree-'))
+  const workspace = join(root, 'worktree')
+  const fixture = join(root, 'quota.json')
+  const argsLog = join(root, 'args.json')
+  try {
+    await mkdir(workspace)
+    await writeFile(fixture, envelope(groups))
+    for (const args of [
+      [],
+      ['--gemini-dir', root],
+      ['--gemini-dir', '.gemini'],
+    ]) {
+      const usage = new AgyUsageSource()
+      const dir = usage.remember(
+        {
+          command: process.execPath,
+          args: [
+            fileURLToPath(new URL('./mock-usage.ts', import.meta.url)),
+            'acp',
+            ...args,
+          ],
+          env: {
+            HOME: root,
+            AGY_USAGE_FIXTURE: fixture,
+            AGY_USAGE_ARGS: argsLog,
+          },
+        },
+        {},
+        workspace,
+      )
+      await rm(workspace, { recursive: true, force: true })
+      const [account] = (await usage.discover({ kind: 'global' })).filter(
+        (a) => a.key === hashAccountKey(dir),
+      )
+      const report = await usage.fetch(account.input)
+      if (args.includes('.gemini')) {
+        assert.ok(report.status === 'error')
+        assert.match(report.error, /workspace is missing/)
+      } else assert.equal(report.status, 'available')
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

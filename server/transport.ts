@@ -34,18 +34,16 @@ export function connectAcp(
   const exited = new Promise<void>((resolve) =>
     child.once('close', () => resolve()),
   )
-  child.on('error', (error) => {
-    if (!stopping) {
-      stopping = true
-      activeOnExit(error)
-    }
-  })
-  child.once('exit', (code) => {
-    if (!stopping) {
-      stopping = true
-      activeOnExit(new Error(`agy exited (${code}): ${stderr}`))
-    }
-  })
+  function fail(error: Error) {
+    if (stopping) return
+    // A broken protocol stream need not mean the child process has exited.
+    void close().catch(() => undefined)
+    activeOnExit(error)
+  }
+  child.on('error', fail)
+  child.once('exit', (code) =>
+    fail(new Error(`agy exited (${code}): ${stderr}`)),
+  )
   const tierSchema = z.object({
     id: z.string().optional(),
     name: z.string().optional(),
@@ -98,12 +96,7 @@ export function connectAcp(
     }),
     { readable, writable },
   )
-  void rpc.closed.then(() => {
-    if (!stopping) {
-      stopping = true
-      activeOnExit(new Error('ACP connection closed'))
-    }
-  })
+  void rpc.closed.then(() => fail(new Error('ACP connection closed')))
   let closing: Promise<void> | undefined
   function close(): Promise<void> {
     if (closing) return closing
@@ -149,6 +142,7 @@ export function connectAcp(
   }
   return {
     rpc,
+    exited,
     close,
     request,
     bind(nextClient: Client, nextOnExit: (error: Error) => void) {

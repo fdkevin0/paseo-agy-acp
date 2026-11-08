@@ -10,6 +10,7 @@ import {
   type ProviderEvent,
 } from '@getpaseo/plugin/server/provider'
 import { AgyUsageSource } from '../server/usage.ts'
+import { record } from '../server/mapping.ts'
 import { dataDirectory } from '../server/preflight.ts'
 import { createProvider } from '../server/provider.ts'
 
@@ -145,7 +146,13 @@ test('open, permission, tool merge, duplicate prompt, cancel and runtime crash',
         input: { type: 'message', content: [{ type: 'text', text: 'wait' }] },
       },
     })
-    await h.wait((e) => e.type === 'session.turn' && e.state === 'started')
+    await h.wait(
+      (e) =>
+        e.type === 'timeline.item' &&
+        e.item.type === 'tool_call' &&
+        e.item.callId === 'unfinished' &&
+        e.item.status === 'running',
+    )
     await h.provider.send({
       type: 'session.interrupt',
       requestId: 'stop',
@@ -508,17 +515,11 @@ test('delayed commands precede readiness on both new and restored sessions; tier
   }
 })
 
-test('disposable sessions park warm runtimes, clean artifacts, and seed cached commands', async () => {
+test('disposable sessions reuse runtimes and wait for fresh commands before readiness', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-warm-'))
-  const id = '11111111-1111-4111-8111-111111111111'
   const dir = dataDirectory(undefined, { HOME: home })
-  const db = join(dir, 'conversations', `${id}.db`)
-  const brain = join(dir, 'brain', id)
   const h = await harness({ HOME: home, AGY_TEST_WARM_COMMANDS: '1' })
   try {
-    await mkdir(join(dir, 'conversations'), { recursive: true })
-    await mkdir(brain, { recursive: true })
-    await writeFile(db, 'fixture')
     await h.provider.send({
       type: 'session.open',
       requestId: 'open-1',
@@ -527,6 +528,14 @@ test('disposable sessions park warm runtimes, clean artifacts, and seed cached c
       history: 'skip',
     })
     await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's1')
+    const first = h.events.find((e) => e.type === 'session.opened')
+    assert.ok(first?.type === 'session.opened')
+    const id = String(record(first.persistence?.data).sessionId)
+    const db = join(dir, 'conversations', `${id}.db`)
+    const brain = join(dir, 'brain', id)
+    await mkdir(join(dir, 'conversations'), { recursive: true })
+    await mkdir(brain, { recursive: true })
+    await writeFile(db, 'fixture')
     await h.provider.send({
       type: 'session.close',
       requestId: 'close-1',
@@ -545,25 +554,19 @@ test('disposable sessions park warm runtimes, clean artifacts, and seed cached c
       history: 'skip',
     })
     await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's2')
-    const seeded = h.events.find(
-      (e) => e.type === 'session.commands' && e.sessionId === 's2',
-    )
-    assert.ok(seeded?.type === 'session.commands')
+    const commands = h.events.filter((e) => e.type === 'session.commands')
+    assert.equal(commands.length, 1)
     assert.deepEqual(
-      seeded.commands.map((c) => c.name),
-      ['compact'],
-    )
-    const updated = await h.wait(
-      (e) =>
-        e.type === 'session.commands' &&
-        e.sessionId === 's2' &&
-        e.commands.length === 2,
-    )
-    assert.ok(updated.type === 'session.commands')
-    assert.deepEqual(
-      updated.commands.map((c) => c.name),
+      commands[0].commands.map((c) => c.name),
       ['compact', 'plan'],
     )
+    assert.ok(
+      h.events.indexOf(commands[0]) <
+        h.events.findIndex((e) => e.type === 'session.ready'),
+    )
+    const second = h.events.find((e) => e.type === 'session.opened')
+    assert.ok(second?.type === 'session.opened')
+    assert.notEqual(record(second.persistence?.data).sessionId, id)
   } finally {
     await h.provider.close()
     await rm(home, { recursive: true, force: true })
@@ -592,10 +595,6 @@ test('close removes only new unprompted session artifacts and retains imported s
   const log = join(home, 'calls')
   const id = '11111111-1111-4111-8111-111111111111'
   const dir = dataDirectory(undefined, { HOME: home })
-  const files = ['.db', '.db-wal', '.db-shm'].map((ext) =>
-    join(dir, 'conversations', id + ext),
-  )
-  const brain = join(dir, 'brain', id)
   const h = await harness({
     HOME: home,
     AGY_TEST_LOG: log,
@@ -604,11 +603,6 @@ test('close removes only new unprompted session artifacts and retains imported s
   try {
     for (const restored of [false, true]) {
       h.events.length = 0
-      await mkdir(join(dir, 'conversations'), { recursive: true })
-      await mkdir(brain, { recursive: true })
-      for (const file of files) await writeFile(file, 'fixture')
-      const shared = join(dir, 'conversations', 'summary.db')
-      await writeFile(shared, 'keep')
       await h.provider.send({
         type: 'session.open',
         requestId: 'open',
@@ -620,6 +614,19 @@ test('close removes only new unprompted session artifacts and retains imported s
           : {}),
       })
       await h.wait((e) => e.type === 'session.ready')
+      const opened = h.events.find((e) => e.type === 'session.opened')
+      assert.ok(opened?.type === 'session.opened')
+      const nativeId = String(record(opened.persistence?.data).sessionId)
+      const files = ['.db', '.db-wal', '.db-shm'].map((ext) =>
+        join(dir, 'conversations', nativeId + ext),
+      )
+      const brain = join(dir, 'brain', nativeId)
+      await mkdir(join(dir, 'conversations'), { recursive: true })
+      await mkdir(brain, { recursive: true })
+      for (const file of files) await writeFile(file, 'fixture')
+      const shared = join(dir, 'conversations', 'summary.db')
+      await writeFile(shared, 'keep')
+
       await h.provider.send({
         type: 'session.close',
         requestId: 'close',
@@ -707,5 +714,125 @@ test('failed probes cannot replace remembered usage launches with missing worksp
   } finally {
     await h.provider.close()
     await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('stale buffered/live notifications and permissions cannot cross native sessions or close', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-stale-'))
+  const log = join(home, 'calls')
+  const h = await harness({
+    HOME: home,
+    AGY_TEST_LOG: log,
+    AGY_TEST_STALE_EVENTS: '1',
+  })
+  try {
+    for (const id of ['one', 'two']) {
+      await h.provider.send({
+        type: 'session.open',
+        requestId: id,
+        sessionId: id,
+        config: h.config,
+        history: 'replay',
+      })
+      await h.wait((e) => e.type === 'session.ready' && e.sessionId === id)
+      await h.provider.send({
+        type: 'session.close',
+        requestId: `close-${id}`,
+        sessionId: id,
+      })
+      await h.wait((e) => e.type === 'session.closed' && e.sessionId === id)
+    }
+    assert.ok(
+      !h.events.some(
+        (e) =>
+          e.type === 'session.permission' ||
+          e.type === 'timeline.item' ||
+          e.type === 'session.usage',
+      ),
+    )
+    const commands = h.events.filter((e) => e.type === 'session.commands')
+    assert.equal(commands.length, 2)
+    assert.ok(
+      commands.every(
+        (e) => e.commands.length === 1 && e.commands[0].name === 'compact',
+      ),
+    )
+    assert.ok(
+      h.events
+        .filter((e) => e.type === 'session.config')
+        .every((e) => e.config.model === 'test'),
+    )
+    assert.equal(
+      (await readFile(log, 'utf8'))
+        .split('\n')
+        .filter((s) => s === 'stale-permission:cancelled').length,
+      6,
+    )
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('session listing returns its healthy process for the next open', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-list-warm-'))
+  const log = join(home, 'pids')
+  const h = await harness({ HOME: home, AGY_TEST_PID_LOG: log })
+  try {
+    await h.provider.send({
+      type: 'sessions',
+      requestId: 'list',
+      cwd: h.config.cwd,
+    })
+    await h.wait((e) => e.type === 'sessions')
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      config: h.config,
+      history: 'skip',
+    })
+    await h.wait((e) => e.type === 'session.ready')
+    assert.equal((await readFile(log, 'utf8')).trim().split('\n').length, 1)
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('cancel is sticky when it arrives before the mock installs its prompt resolver', async () => {
+  const h = await harness({ AGY_TEST_CANCEL_DELAY: '1' })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      config: h.config,
+      history: 'skip',
+    })
+    await h.wait((e) => e.type === 'session.ready')
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'wait',
+        delivery: 'auto',
+        input: { type: 'message', content: [{ type: 'text', text: 'wait' }] },
+      },
+    })
+    await h.wait(
+      (e) =>
+        e.type === 'timeline.item' &&
+        e.item.type === 'tool_call' &&
+        e.item.callId === 'unfinished',
+    )
+    await h.provider.send({
+      type: 'session.interrupt',
+      requestId: 'cancel',
+      sessionId: 's',
+    })
+    await h.wait((e) => e.type === 'session.turn' && e.state === 'canceled')
+  } finally {
+    await h.provider.close()
   }
 })

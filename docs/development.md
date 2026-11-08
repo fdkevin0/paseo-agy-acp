@@ -15,10 +15,10 @@ Paseo compiles the TypeScript plugin; no separate build output is required. Git/
 ## Request and session flow
 
 1. `index.server.ts` registers provider `agy` and a shared subscription usage source. The provider negotiates capabilities and creates a session manager for each connection.
-2. Catalog discovery opens a disposable ACP session. Normal opens create or load a native session, apply requested configuration and collect initial commands before publishing readiness.
-3. Prompts go to agy over stdio. Native notifications become timeline snapshots, permissions, configuration and usage events; agy owns tool execution.
+2. Catalog discovery opens a disposable ACP session; session listing needs no native session. Normal opens create or load a native session, apply requested configuration and wait for that session's live commands before publishing readiness. A compatible warm process can avoid repeated initialization; command lists are never seeded from previous sessions.
+3. Prompts go to agy over stdio. Notifications and permission requests must match the current native session and are ignored or canceled during shutdown. Valid notifications become timeline snapshots, permissions, configuration and usage events; agy owns tool execution.
 4. Permission responses resolve the matching native request. Child conversation IDs start read-only Brain transcript tracking. Pending notifications are drained before the turn ends.
-5. Close cancels pending approvals, stops Brain polling and shuts down the process. New unprompted sessions and catalog probes remove only their own temporary artifacts; imported and prompted conversations remain resumable.
+5. Close cancels pending approvals and stops Brain polling. New unprompted sessions and catalog probes close natively and remove only their own temporary artifacts; their healthy process may be parked, as may a successful session-listing process. The pool is scoped by resolved launch paths, environment and data directory, holds at most four idle processes, and expires them after 60 seconds. Agent-specific environments are not parked. Other closes stop the process while preserving imported and prompted conversations. Protocol failure also terminates the child; connection shutdown waits for all owned transports.
 6. Subscription queries independently invoke agy's local `/usage` command using observed account and tier metadata. They do not start a model turn.
 
 ## Source layout
@@ -53,7 +53,7 @@ npm pack --dry-run --ignore-scripts
 
 Tests run with Node's native TypeScript support and temporary files; they require no login or model quota. Workflow tests require Bash and stub `curl`, `gh` and `npm`, so they neither contact registries nor publish artifacts.
 
-Coverage includes tool terminalization, PascalCase arguments, FIFO Brain results, history suppression, permissions, attachment mapping, delayed commands, catalog concurrency and cleanup containment. Usage tests cover context normalization, native-measurement precedence, account discovery, quota mapping and error handling. Workflow tests exercise tag/version validation, registry failures, manifest preparation and GitHub Release recovery.
+Coverage includes tool terminalization, PascalCase arguments, FIFO Brain results, history suppression, permissions, attachment mapping, fresh commands before readiness on warm reuse, stale notification/permission rejection, cancellation races, warm-pool bounds and expiry, cwd/environment isolation, protocol disconnect shutdown, session-listing reuse, catalog concurrency and cleanup containment. Usage tests cover context normalization, native-measurement precedence, account discovery, quota mapping, deleted-workspace fallback and error handling. Workflow tests exercise tag/version validation, registry failures, manifest preparation and GitHub Release recovery.
 
 ### Live Paseo smoke checks
 
