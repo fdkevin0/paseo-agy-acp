@@ -333,6 +333,8 @@ export type StepUsage = {
   inputTokens: number
   outputTokens: number
   cachedReadTokens: number
+  /** Only present when agy records a step-level cache write counter. */
+  cachedWriteTokens?: number
 }
 
 /** Combine ACP turn token counters with per-step context occupancy from transcript_full.jsonl when available. */
@@ -354,14 +356,17 @@ export function promptUsage(
     : (options?.lastStep?.cachedReadTokens ?? 0)
   const cacheWrite = nonnegative(raw.cachedWriteTokens)
     ? raw.cachedWriteTokens
-    : 0
+    : (options?.lastStep?.cachedWriteTokens ?? 0)
   const output = nonnegative(raw.outputTokens)
     ? raw.outputTokens
     : (options?.lastStep?.outputTokens ?? 0)
-  const used = options?.lastStep
-    ? options.lastStep.inputTokens +
-      options.lastStep.cachedReadTokens +
-      options.lastStep.outputTokens
+  const step = options?.lastStep
+  // Each source is summed on its own: per-step counters never mix with cumulative turn counters.
+  const used = step
+    ? step.inputTokens +
+      step.cachedReadTokens +
+      (step.cachedWriteTokens ?? 0) +
+      step.outputTokens
     : input + cacheRead + cacheWrite + output ||
       (nonnegative(raw.totalTokens) ? raw.totalTokens : 0)
   return {

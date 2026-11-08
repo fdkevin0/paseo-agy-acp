@@ -16,6 +16,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import {
   BrainTranscriptProjector,
   hasActiveBackgroundWork,
+  readLastStepIndex,
   settleBrainTurn,
   watchBrain,
   type BrainWatchHandle,
@@ -93,8 +94,7 @@ async function fixture() {
   async function subagent(
     parentId: string,
     childId: string,
-    state:
-      'SUBAGENT_STATE_ALIVE' | 'SUBAGENT_STATE_KILLED' = 'SUBAGENT_STATE_ALIVE',
+    state = 'SUBAGENT_STATE_ALIVE',
     spawnStepIndex = 3,
     spawnCallId = 'invoke',
   ) {
@@ -178,6 +178,11 @@ async function fixture() {
     deliver,
     close: () => rm(root, { recursive: true, force: true }),
   }
+}
+/** settleBrainTurn's poll timer is unref'd; hold the event loop open while awaiting it. */
+function alive<T>(promise: Promise<T>): Promise<T> {
+  const keepAlive = setInterval(() => {}, 1000)
+  return promise.finally(() => clearInterval(keepAlive))
 }
 async function until(predicate: () => boolean) {
   for (let i = 0; i < 100; i++) {
@@ -294,7 +299,6 @@ test('parent waits for the terminal child report, then its own response, without
     await until(() => settled)
     assert.deepEqual(await running, {
       status: 'completed',
-      wokeUp: true,
       lastStepUsage: {
         inputTokens: 100,
         outputTokens: 20,
@@ -345,7 +349,6 @@ test('nested child completion uses delivered reports and sending to parent never
     ])
     assert.deepEqual(await settleBrainTurn(f.root, parent, 'p', () => {}), {
       status: 'completed',
-      wokeUp: true,
       lastStepUsage: undefined,
     })
   } finally {
@@ -458,7 +461,8 @@ test('watching retains split UTF-8 records, resets on replacement and truncation
       ],
     )
     const countBeforeCancel = events.length
-    stop.cancel()
+    // cancel() drains rows already written, then ignores everything after it resolves.
+    await stop.cancel()
     await appendFile(
       f.path(child),
       encode([
@@ -667,7 +671,6 @@ test('a child can report to its parent and a sibling before completing', async (
     ])
     assert.deepEqual(await settleBrainTurn(f.root, parent, 'p', () => {}), {
       status: 'completed',
-      wokeUp: true,
       lastStepUsage: undefined,
     })
   } finally {
@@ -704,7 +707,6 @@ test('silent terminal descendants settle and conditional schedules are released 
     await f.put(grandchild, [message(0, child, 'work'), done(1)])
     assert.deepEqual(await settleBrainTurn(f.root, parent, 'p', () => {}), {
       status: 'completed',
-      wokeUp: false,
       lastStepUsage: undefined,
     })
     const projector = new BrainTranscriptProjector(child)
@@ -772,7 +774,6 @@ test('retrying an owned child waits for inbox read instead of accepting old DONE
       await until(() => settled)
       assert.deepEqual(await running, {
         status: 'completed',
-        wokeUp: false,
         lastStepUsage: undefined,
       })
     } finally {
@@ -891,11 +892,10 @@ test('batched SYSTEM_MESSAGE with multiple task completions resolves all tasks a
       parent,
       'p',
       (item) => items.push(item),
-      { minStepIndex: -1, foregroundMaxStepIndex: 4 },
+      { minStepIndex: -1 },
     )
     assert.deepEqual(result, {
       status: 'completed',
-      wokeUp: true,
       lastStepUsage: undefined,
     })
     const completedTools = items.filter(
@@ -959,7 +959,6 @@ test('literal [Message] inside a subagent report body does not over-count consum
     await until(() => settled)
     assert.deepEqual(await running, {
       status: 'completed',
-      wokeUp: true,
       lastStepUsage: undefined,
     })
   } finally {
@@ -969,7 +968,7 @@ test('literal [Message] inside a subagent report body does not over-count consum
   }
 })
 
-test('foregroundMaxStepIndex and shouldEmitPreWakeupTool suppress completed foreground tools while emitting post-wakeup items and identical OK replies', async () => {
+test('shouldEmitPreWakeupTool suppresses completed foreground tools while emitting post-wakeup items and identical OK replies', async () => {
   const f = await fixture()
   try {
     const taskId = `${parent}/task-4`
@@ -1048,12 +1047,10 @@ test('foregroundMaxStepIndex and shouldEmitPreWakeupTool suppress completed fore
       (item) => items.push(item),
       {
         minStepIndex: 0,
-        foregroundMaxStepIndex: 5,
         shouldEmitPreWakeupTool: (item) => item.callId === 'bg-cmd',
       },
     )
     assert.equal(result.status, 'completed')
-    assert.equal(result.wokeUp, true)
     assert.equal(
       items.some((i) => i.type === 'tool_call' && i.callId === 'fg-edit'),
       false,
@@ -1151,6 +1148,206 @@ test('hasActiveBackgroundWork preserves Turn 1 background tasks in Turn 2 and ig
       true,
       'Turn 1 background task must remain active across Turn 2 USER_INPUT',
     )
+  } finally {
+    await f.close()
+  }
+})
+
+test('a RUNNING progress row without a task id keeps its call pending for the final row', () => {
+  const projector = new BrainTranscriptProjector('p')
+  const items = [
+    { step_index: 1, type: 'USER_INPUT', content: 'two tools' },
+    {
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        { id: 'first', name: 'run_command', args: { CommandLine: 'a' } },
+        { id: 'second', name: 'run_command', args: { CommandLine: 'b' } },
+      ],
+    },
+    { step_index: 3, type: 'GENERIC', status: 'RUNNING', content: 'working' },
+    { step_index: 3, type: 'GENERIC', status: 'DONE', content: 'first out' },
+    { step_index: 4, type: 'GENERIC', status: 'DONE', content: 'second out' },
+  ].flatMap((row) => projector.project(row))
+  assert.deepEqual(
+    items.flatMap((i) =>
+      i.type === 'tool_call' && i.status === 'completed'
+        ? [[i.callId, i.detail.type === 'shell' ? i.detail.output : '']]
+        : [],
+    ),
+    [
+      ['first', 'first out'],
+      ['second', 'second out'],
+    ],
+  )
+  assert.equal(projector.hasPending(), false)
+  assert.equal(projector.hasBackground(), false)
+})
+
+test('settlement emits the final row of a step that first reported progress', async () => {
+  const f = await fixture()
+  try {
+    await f.put(parent, [
+      { step_index: 1, type: 'USER_INPUT', content: 'run' },
+      {
+        step_index: 2,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ id: 'cmd', name: 'run_command', args: {} }],
+      },
+      { step_index: 3, type: 'GENERIC', status: 'RUNNING', content: 'busy' },
+      { step_index: 3, type: 'GENERIC', status: 'DONE', content: 'ok' },
+      done(4),
+    ])
+    const items: ProviderTimelineItem[] = []
+    const result = await settleBrainTurn(f.root, parent, 'p', (item) =>
+      items.push(item),
+    )
+    assert.equal(result.status, 'completed')
+    assert.deepEqual(
+      items.map((i) => (i.type === 'tool_call' ? i.status : i.type)),
+      ['completed'],
+    )
+  } finally {
+    await f.close()
+  }
+})
+
+test('settlement waits for a late USER_INPUT flush within the grace period', async () => {
+  const f = await fixture()
+  try {
+    await f.put(parent, [{ step_index: 0, type: 'USER_INPUT', content: 'old' }])
+    let settled = false
+    const running = alive(
+      settleBrainTurn(f.root, parent, 'p', () => {}, {
+        minStepIndex: 0,
+        pollIntervalMs: 5,
+        transcriptGraceMs: 2000,
+      }),
+    ).then((result) => {
+      settled = true
+      return result
+    })
+    await delay(40)
+    assert.equal(settled, false, 'must not give up before the row is flushed')
+    await appendFile(
+      f.path(parent),
+      encode([
+        { step_index: 1, type: 'USER_INPUT', content: 'new' },
+        {
+          step_index: 2,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: 'hi',
+          input_tokens: 10,
+          cache_read_tokens: 5,
+          output_tokens: 2,
+        },
+      ]),
+    )
+    assert.deepEqual(await running, {
+      status: 'completed',
+      lastStepUsage: { inputTokens: 10, cachedReadTokens: 5, outputTokens: 2 },
+    })
+  } finally {
+    await f.close()
+  }
+})
+
+test('settlement without grace completes immediately when no turn row exists', async () => {
+  const f = await fixture()
+  try {
+    await f.put(parent, [{ step_index: 0, type: 'USER_INPUT', content: 'old' }])
+    const startedAt = Date.now()
+    assert.deepEqual(
+      await settleBrainTurn(f.root, parent, 'p', () => {}, { minStepIndex: 0 }),
+      { status: 'completed' },
+    )
+    assert.ok(Date.now() - startedAt < 500)
+  } finally {
+    await f.close()
+  }
+})
+
+test('settlement stops waiting on an idle transcript without a final response', async () => {
+  const f = await fixture()
+  try {
+    await f.put(parent, [
+      { step_index: 1, type: 'USER_INPUT', content: 'run' },
+      { step_index: 2, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+    ])
+    const items: ProviderTimelineItem[] = []
+    const result = await alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+        pollIntervalMs: 5,
+        stallTimeoutMs: 50,
+      }),
+    )
+    assert.equal(result.status, 'completed')
+    assert.deepEqual(
+      items.map((i) => (i.type === 'error' ? i.id : i.type)),
+      ['p:step:2:stalled'],
+    )
+  } finally {
+    await f.close()
+  }
+})
+
+test('pending approvals and background tasks suspend the stall timeout', async () => {
+  const f = await fixture()
+  const abort = new AbortController()
+  try {
+    await f.put(parent, [
+      { step_index: 1, type: 'USER_INPUT', content: 'run' },
+      { step_index: 2, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+    ])
+    let settled = false
+    const running = alive(
+      settleBrainTurn(f.root, parent, 'p', () => {}, {
+        signal: abort.signal,
+        pollIntervalMs: 5,
+        stallTimeoutMs: 20,
+        isWaitingOnUser: () => true,
+      }),
+    ).then((result) => {
+      settled = true
+      return result
+    })
+    await delay(100)
+    assert.equal(settled, false, 'a pending approval is not a stall')
+    abort.abort()
+    assert.equal((await running).status, 'canceled')
+  } finally {
+    await f.close()
+  }
+})
+
+test('unknown subagent states do not count as active background work', async () => {
+  const f = await fixture()
+  try {
+    await f.subagent(parent, child, 'SUBAGENT_STATE_FINISHED')
+    await f.put(child, [message(0, parent, 'work')])
+    await f.put(parent, [...invoke(child)])
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
+  } finally {
+    await f.close()
+  }
+})
+
+test('readLastStepIndex reads the tail past large rows and torn writes', async () => {
+  const f = await fixture()
+  try {
+    assert.equal(await readLastStepIndex(f.root, parent), -1)
+    const big = 'x'.repeat(200 * 1024)
+    await f.put(parent, [
+      { step_index: 0, type: 'USER_INPUT', content: 'a' },
+      done(1),
+      { step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', content: big },
+    ])
+    assert.equal(await readLastStepIndex(f.root, parent), 2)
+    await appendFile(f.path(parent), '{"step_index": 3, "type": "PLAN')
+    assert.equal(await readLastStepIndex(f.root, parent), 2)
   } finally {
     await f.close()
   }

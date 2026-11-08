@@ -145,6 +145,35 @@ test('usage rejects invalid context, ignores foreign currency, and computes last
     30,
   )
   assert.equal(promptUsage(usage).contextWindowUsedTokens, 189)
+  assert.equal(
+    promptUsage(usage, {
+      lastStep: {
+        inputTokens: 40,
+        cachedReadTokens: 20,
+        cachedWriteTokens: 5,
+        outputTokens: 9,
+      },
+    }).contextWindowUsedTokens,
+    74,
+    'a step-level cache write counts, the cumulative ACP one never does',
+  )
+  assert.deepEqual(
+    promptUsage(null, {
+      lastStep: {
+        inputTokens: 7,
+        cachedReadTokens: 3,
+        cachedWriteTokens: 2,
+        outputTokens: 1,
+      },
+    }),
+    {
+      inputTokens: 7,
+      outputTokens: 1,
+      cachedInputTokens: 3,
+      contextWindowUsedTokens: 13,
+      contextWindowMaxTokens: 256_000,
+    },
+  )
   assert.deepEqual(promptUsage(null), {})
   assert.equal(contextWindowForModel('gemini'), 256_000)
 })

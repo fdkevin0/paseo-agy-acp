@@ -279,6 +279,7 @@ async function createSession(
     closing: false,
     skipPermissions: config?.mode === FULL_ACCESS_MODE_ID,
     turnHadContextUsage: false,
+    turnHadModelOutput: false,
     turnToolCallIds: [] as string[],
     opening: true,
     loading: true,
@@ -446,6 +447,13 @@ async function createSession(
         !state.turnToolCallIds.includes(u.toolCallId)
       )
         state.turnToolCallIds.push(u.toolCallId)
+      if (
+        state.turn &&
+        (u.sessionUpdate === 'agent_message_chunk' ||
+          u.sessionUpdate === 'agent_thought_chunk' ||
+          u.sessionUpdate === 'tool_call')
+      )
+        state.turnHadModelOutput = true
       const item = timeline.update(u)
       if (item) emitItem(item)
     }
@@ -604,6 +612,8 @@ async function createSession(
             )
             emitItem(item)
           }
+        // A child opened by the last replayed tool must read its history before a historical kill cancels it.
+        await Promise.all([...children.values()].map((child) => child.ready))
         await syncKilledChildren(subagents)
       },
       flush() {
@@ -637,6 +647,9 @@ async function createSession(
             await currentTransport.request(
               currentTransport.rpc.cancel({ sessionId: state.nativeId }),
             )
+          } catch (error) {
+            // A concurrent close already stops the runtime; its closed stream is not an interrupt failure.
+            if (!state.closing) throw error
           } finally {
             if (needsRelaunch) await this.relaunch(state.skipPermissions, true)
           }
@@ -910,6 +923,7 @@ async function promptSession(
   session.state.turn = turnId
   session.state.turnAbort = turnAbort
   session.state.turnHadContextUsage = false
+  session.state.turnHadModelOutput = false
   session.state.turnToolCallIds = []
   session.state.prompts.add(p.clientMessageId)
   session.timeline.boundary()
@@ -967,6 +981,9 @@ async function promptSession(
             (item.detail.type === 'sub_agent' &&
               item.detail.childSessionId !== undefined &&
               !session.hasChild(item.detail.childSessionId)),
+          // A model turn always writes USER_INPUT; give agy a moment to flush it. Native commands may write none.
+          transcriptGraceMs: session.state.turnHadModelOutput ? 2000 : 0,
+          isWaitingOnUser: () => session.permissions.size > 0,
         },
       )
       await session.syncKilledChildren()

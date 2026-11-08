@@ -15,19 +15,22 @@ import type { ProviderLaunch } from '@getpaseo/plugin/server/provider'
 
 const execFileAsync = promisify(execFile)
 
-async function ownedProcessGroups(pid: number): Promise<Set<number>> {
+async function listProcesses(): Promise<number[][]> {
+  const options = { encoding: 'utf8' as const, timeout: 1000 }
+  // procps/BSD accept -A; BusyBox lists every process by default and rejects -A.
   const { stdout } = await execFileAsync(
     'ps',
     ['-A', '-o', 'pid=,ppid=,pgid='],
-    {
-      encoding: 'utf8',
-      timeout: 1000,
-    },
-  )
-  const processes = stdout
-    .trim()
+    options,
+  ).catch(() => execFileAsync('ps', ['-o', 'pid,ppid,pgid'], options))
+  return stdout
     .split('\n')
     .map((line) => line.trim().split(/\s+/).map(Number))
+    .filter((row) => row.length === 3 && row.every(Number.isInteger))
+}
+
+async function ownedProcessGroups(pid: number): Promise<Set<number>> {
+  const processes = await listProcesses()
   const owned = new Set([pid])
   let previousSize = 0
   while (previousSize !== owned.size) {
@@ -45,8 +48,8 @@ async function ownedProcessGroups(pid: number): Promise<Set<number>> {
 function killGroup(group: number) {
   try {
     process.kill(-group, 'SIGKILL')
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+  } catch {
+    /* Already gone (ESRCH) or no longer ours (EPERM); shutdown stays best-effort. */
   }
 }
 
@@ -150,33 +153,26 @@ export function connectAcp(
     stopping = true
     closing = (async () => {
       const groups = new Set<number>()
-      let inspectionError: unknown
+      // Best effort: without a usable `ps`, still stop agy's own process group.
       const collectGroups = async () => {
         if (process.platform === 'win32' || !child.pid) return
         groups.add(child.pid)
-        for (const group of await ownedProcessGroups(child.pid))
-          groups.add(group)
+        const owned = await ownedProcessGroups(child.pid).catch(
+          () => new Set<number>(),
+        )
+        for (const group of owned) groups.add(group)
       }
-      if (process.platform !== 'win32' && child.pid) {
-        try {
-          await collectGroups()
-        } catch (error) {
-          inspectionError = error
-        }
-      }
+      await collectGroups()
       child.stdin.end()
       const stop = async () => {
         if (process.platform === 'win32') await terminateProcess(child)
         else {
-          await collectGroups().catch(() => undefined)
+          await collectGroups()
           for (const group of groups) killGroup(group)
         }
       }
-      let stopError: unknown
       const timer = setTimeout(() => {
-        void stop().catch((error) => {
-          stopError = error
-        })
+        void stop().catch(() => undefined)
       }, 500)
       const force = setTimeout(() => child.kill('SIGKILL'), 2000)
       let deadline: NodeJS.Timeout | undefined
@@ -198,8 +194,6 @@ export function connectAcp(
         if (process.platform !== 'win32')
           for (const group of groups) killGroup(group)
       }
-      if (inspectionError) throw inspectionError
-      if (stopError) throw stopError
     })()
     return closing
   }

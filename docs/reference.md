@@ -68,18 +68,20 @@ Child `conversationId` values are validated and translated to provider-scoped ch
 
 An ACP prompt response can precede native background work and Reactive Wakeup responses. The plugin anchors each prompt to its new `USER_INPUT` and splits stream ownership by phase: while the foreground `session/prompt` RPC is running (`foregroundIdleReached === false`), ACP owns text, thought and tool streaming while Brain only enriches completed foreground tools (such as omitted `invoke_subagent` child IDs and `manage_subagents` cancellations). Once the initial foreground `PLANNER_RESPONSE` completes (`foregroundIdleReached === true`) and a subsequent Reactive Wakeup `SYSTEM_MESSAGE` arrives (`wokeUp === true`), Brain takes over full projection for the remainder of the turn until all structured subagent states (`subagents/*.json`), inbox messages (`messages/read.json`), and background tasks settle.
 
-Subagent lifecycle is tracked directly from `.system_generated/subagents/*.json` (`SUBAGENT_STATE_ALIVE`, `SUBAGENT_STATE_KILLED`) and `.system_generated/messages/read.json` across the session and its owned descendants, without creating recursive UI cards. An outstanding child's terminal failure fails the waiting turn rather than leaving it running. Only a restart notice from the native `system` sender clears tracked background tasks; quoted notice text in child reports does not.
+When the ACP turn streamed model output, the plugin waits up to 2 seconds for agy to flush the turn's `USER_INPUT` row; native commands that write no transcript row complete immediately. Background tasks, live subagents, tools of a woken turn and pending approvals may keep a turn open indefinitely (interrupt stops them). Any other wait ends after 120 seconds without transcript or inbox activity: the turn completes with an error item instead of hanging on an unrecognized final row.
 
-| Transcript row     | Projection                                                                              |
-| ------------------ | --------------------------------------------------------------------------------------- |
-| `USER_INPUT`       | User message.                                                                           |
-| `PLANNER_RESPONSE` | Thoughts, assistant text and initially running tool cards.                              |
-| `GENERIC`          | Match pending tools in FIFO order; retain background tasks until their results arrive.  |
-| `SYSTEM_MESSAGE`   | Match background results and child notifications; preserve subsequent wakeup responses. |
-| `CHECKPOINT`       | Ignore metadata.                                                                        |
-| `ERROR_MESSAGE`    | Error item.                                                                             |
+Subagent lifecycle is tracked directly from `.system_generated/subagents/*.json` (only `SUBAGENT_STATE_ALIVE` counts as active; `SUBAGENT_STATE_KILLED` cancels the watcher; other states are inactive) and `.system_generated/messages/read.json` across the session and its owned descendants, without creating recursive UI cards. An outstanding child's terminal failure fails the waiting turn rather than leaving it running. Only a restart notice from the native `system` sender clears tracked background tasks; quoted notice text in child reports does not.
 
-Tool results do not become assistant bubbles. Child watchers emit completed or failed turn events, and successful native `manage_subagents` cancellation stops the affected watchers and emits canceled events. New native child turns restart lifecycle tracking. History replay reads a child's existing transcript before applying historical cancellation. Independent child control, recursive card discovery and Artifacts panels are unsupported.
+| Transcript row     | Projection                                                                                                                                       |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `USER_INPUT`       | User message.                                                                                                                                    |
+| `PLANNER_RESPONSE` | Thoughts, assistant text and initially running tool cards.                                                                                       |
+| `GENERIC`          | Match pending tools in FIFO order; retain background tasks until their results arrive; a `RUNNING` row without a task id keeps the tool pending. |
+| `SYSTEM_MESSAGE`   | Match background results and child notifications; preserve subsequent wakeup responses.                                                          |
+| `CHECKPOINT`       | Ignore metadata.                                                                                                                                 |
+| `ERROR_MESSAGE`    | Error item.                                                                                                                                      |
+
+Tool results do not become assistant bubbles. Child watchers emit completed or failed turn events, and successful native `manage_subagents` cancellation stops the affected watchers and emits canceled events. New native child turns restart lifecycle tracking. Cancellation (historical or live) first drains the child rows already written, so the child timeline is complete before its canceled turn. Independent child control, recursive card discovery and Artifacts panels are unsupported.
 
 ## Permissions and runtime lifecycle
 
@@ -87,7 +89,7 @@ Permission events include the native title, input, detail card and available act
 
 Interrupt always sends `session/cancel` to stop foreground generation. When no background tasks, unread inbox wakeups, or active subagents exist, `session/cancel` completes in place without restarting the ACP process. When background work or subagents are active, interrupt also stops the session's ACP process and its descendant process groups, then reloads the same native session with its model, thinking level, mode and launch configuration preserved, because agy 1.5.3 leaves background tasks alive after `session/cancel`. Conversation history is retained; a reload failure requires reopening the session.
 
-Control RPCs time out after 30 seconds. Prompt generation remains open until completion, interruption or process failure. On Unix, shutdown snapshots the ACP process's descendant process groups before ending stdin and refreshes the snapshot before sending `SIGTERM`/`SIGKILL` so process groups spawned during the graceful shutdown window are also terminated. Explicit close stops Brain polling and terminates the session's ACP process while preserving imported and prompted conversations. Paseo's automatic idle cleanup is vetoed via `session.can_stop_runtime: false` so active sessions are not stopped externally while background work may be running.
+Control RPCs time out after 30 seconds. Prompt generation remains open until completion, interruption or process failure. On Unix, shutdown snapshots the ACP process's descendant process groups before ending stdin and refreshes the snapshot before sending `SIGTERM`/`SIGKILL` so process groups spawned during the graceful shutdown window are also terminated. The snapshot uses `ps` (procps/BSD, with a BusyBox fallback); where `ps` is unavailable, shutdown still terminates agy's own process group and never fails because of it. Explicit close stops Brain polling and terminates the session's ACP process while preserving imported and prompted conversations. Paseo's automatic idle cleanup is vetoed via `session.can_stop_runtime: false` so active sessions are not stopped externally while background work may be running.
 
 Protocol disconnection terminates the child even if the process is still alive. Provider connection shutdown terminates all active transports and waits for shutdown to finish.
 
@@ -100,8 +102,10 @@ Paseo's context meter needs both `contextWindowUsedTokens` and a positive `conte
 agy prompt responses report cumulative token counters across internal model steps, whereas `transcript_full.jsonl` records exact per-step `input_tokens`, `cache_read_tokens` and `output_tokens` on each `PLANNER_RESPONSE`. When no valid `usage_update` notification arrives during a turn, the plugin computes context window occupancy from the final `PLANNER_RESPONSE` step in `transcript_full.jsonl`:
 
 ```text
-usedTokens = lastStep.inputTokens + lastStep.cachedReadTokens + lastStep.outputTokens
+usedTokens = lastStep.inputTokens + lastStep.cachedReadTokens + lastStep.cachedWriteTokens + lastStep.outputTokens
 ```
+
+`cachedWriteTokens` is taken from the step's `cache_write_tokens` when agy records it and is otherwise zero; agy 1.5.3 records only the first three counters. Per-step and cumulative ACP counters are never mixed in one sum.
 
 When no step-level counters are available in `transcript_full.jsonl`, it falls back to `inputTokens + cachedReadTokens + cachedWriteTokens + outputTokens` (or `totalTokens` if zero) from the ACP prompt response. Invalid counters are treated as zero.
 

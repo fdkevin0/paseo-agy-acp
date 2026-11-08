@@ -1,4 +1,4 @@
-import { open, readdir, readFile, realpath } from 'node:fs/promises'
+import { open, readdir, readFile, realpath, stat } from 'node:fs/promises'
 import { join, sep } from 'node:path'
 import {
   Timeline,
@@ -22,10 +22,13 @@ type PendingTool = {
 
 export type SubagentRecord = {
   conversationId: string
-  state: 'SUBAGENT_STATE_ALIVE' | 'SUBAGENT_STATE_KILLED'
+  /** Native lifecycle state; only SUBAGENT_STATE_ALIVE counts as active work. */
+  state: string
   spawnStepIndex: number
   spawnCallId?: string
 }
+
+const SUBAGENT_ALIVE = 'SUBAGENT_STATE_ALIVE'
 
 export type BrainMessageRecord = {
   id: string
@@ -78,24 +81,19 @@ function stepErrorMessage(
 
 function extractStepUsage(row: Record<string, unknown>): StepUsage | undefined {
   if (row.type !== 'PLANNER_RESPONSE') return undefined
-  const input =
-    typeof row.input_tokens === 'number' && Number.isFinite(row.input_tokens)
-      ? row.input_tokens
+  const count = (value: unknown) =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0
+      ? value
       : undefined
-  const output =
-    typeof row.output_tokens === 'number' && Number.isFinite(row.output_tokens)
-      ? row.output_tokens
-      : undefined
-  const cacheRead =
-    typeof row.cache_read_tokens === 'number' &&
-    Number.isFinite(row.cache_read_tokens)
-      ? row.cache_read_tokens
-      : 0
+  const input = count(row.input_tokens)
+  const output = count(row.output_tokens)
   if (input === undefined && output === undefined) return undefined
+  const cacheWrite = count(row.cache_write_tokens)
   return {
     inputTokens: input ?? 0,
     outputTokens: output ?? 0,
-    cachedReadTokens: cacheRead,
+    cachedReadTokens: count(row.cache_read_tokens) ?? 0,
+    ...(cacheWrite !== undefined ? { cachedWriteTokens: cacheWrite } : {}),
   }
 }
 
@@ -111,6 +109,24 @@ function countRowMessages(row: Record<string, unknown>): number {
       /(?:^|\n)(?:\d+\.\s+)?\[Message\]\s+(?:timestamp=\S+\s+)?sender=(?!user\b)\S+/g,
     )?.length ?? 0
   )
+}
+
+type CachedJson = { mtimeMs: number; size: number; value: unknown }
+const jsonCache = new Map<string, CachedJson>()
+const JSON_CACHE_LIMIT = 4096
+
+/** Parse a write-once Brain message file, re-reading it only when its mtime or size changes. */
+async function readJsonCached(path: string): Promise<unknown> {
+  const info = await stat(path)
+  const hit = jsonCache.get(path)
+  if (hit && hit.mtimeMs === info.mtimeMs && hit.size === info.size)
+    return hit.value
+  const value: unknown = JSON.parse(await readFile(path, 'utf8'))
+  jsonCache.delete(path)
+  jsonCache.set(path, { mtimeMs: info.mtimeMs, size: info.size, value })
+  if (jsonCache.size > JSON_CACHE_LIMIT)
+    jsonCache.delete(jsonCache.keys().next().value!)
+  return value
 }
 
 async function resolveBrainPath(
@@ -167,7 +183,7 @@ export async function readInboxState(
   for (const name of entries) {
     if (!name.endsWith('.json') || name === 'read.json') continue
     try {
-      const raw = record(JSON.parse(await readFile(join(dir, name), 'utf8')))
+      const raw = record(await readJsonCached(join(dir, name)))
       const id =
         typeof raw.id === 'string' && raw.id ? raw.id : name.slice(0, -5)
       const sender = typeof raw.sender === 'string' ? raw.sender : ''
@@ -258,10 +274,11 @@ export async function readSubagents(
               ? raw.conversationId
               : name.slice(0, -5)
           if (!sessionIdPattern.test(conversationId)) return undefined
+          // A missing state means the descriptor predates lifecycle tracking; unknown states are not active.
           const state =
-            raw.state === 'SUBAGENT_STATE_KILLED'
-              ? 'SUBAGENT_STATE_KILLED'
-              : 'SUBAGENT_STATE_ALIVE'
+            typeof raw.state === 'string' && raw.state
+              ? raw.state
+              : SUBAGENT_ALIVE
           let spawnStepIndex =
             typeof raw.spawnStepIndex === 'number' &&
             Number.isInteger(raw.spawnStepIndex)
@@ -458,18 +475,22 @@ export class BrainTranscriptProjector {
           },
         ]
       case 'GENERIC': {
-        const pending = this.pending.shift()
+        const pending = this.pending[0]
         if (!pending) return []
+        if (row.status === 'RUNNING') {
+          const taskId = text.match(backgroundTaskPattern)?.[1]
+          // A progress row without a task id leaves the call pending for its final row.
+          if (!taskId) return []
+          this.pending.shift()
+          if (pending.args.IsDaemon !== true)
+            this.background.set(taskId, pending)
+          return []
+        }
+        this.pending.shift()
         const subagent =
           this.callSubagents.get(pending.callId) ??
           this.stepSubagents.get(stepIndex) ??
           this.stepSubagents.get(pending.stepIndex)
-        if (row.status === 'RUNNING') {
-          const taskId = text.match(backgroundTaskPattern)?.[1]
-          if (taskId && pending.args.IsDaemon !== true)
-            this.background.set(taskId, pending)
-          return []
-        }
         const rawOutput =
           pending.name === 'invoke_subagent' &&
           subagent &&
@@ -605,17 +626,42 @@ export async function readTranscriptRows(
   }
 }
 
+/** Step index of the newest transcript row; reads only the file tail since rows are appended in step order. */
 export async function readLastStepIndex(
   root: string,
   nativeId: string,
 ): Promise<number> {
-  const rows = await readTranscriptRows(root, nativeId)
-  let max = -1
-  for (const row of rows) {
-    const step = Number(row.step_index)
-    if (Number.isInteger(step) && step > max) max = step
+  if (!sessionIdPattern.test(nativeId)) return -1
+  let file
+  try {
+    file = await open(await resolveTranscriptPath(root, nativeId), 'r')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return -1
+    throw error
   }
-  return max
+  try {
+    const { size } = await file.stat()
+    for (let window = 64 * 1024; ; window *= 4) {
+      const length = Math.min(size, window)
+      const buffer = Buffer.alloc(length)
+      const { bytesRead } = await file.read(buffer, 0, length, size - length)
+      const lines = buffer.subarray(0, bytesRead).toString('utf8').split('\n')
+      // The first line may be cut by the window unless it starts the file.
+      const complete = length < size ? lines.slice(1) : lines
+      for (let i = complete.length - 1; i >= 0; i--) {
+        if (!complete[i].trim()) continue
+        try {
+          const step = Number(record(JSON.parse(complete[i])).step_index)
+          if (Number.isInteger(step)) return step
+        } catch {
+          /* A torn trailing write; look at the previous record. */
+        }
+      }
+      if (length >= size) return -1
+    }
+  } finally {
+    await file.close()
+  }
 }
 
 function activeChildIdsForTurn(
@@ -627,7 +673,7 @@ function activeChildIdsForTurn(
   const ids = new Set<string>()
   for (const sub of subagents) {
     if (
-      sub.state === 'SUBAGENT_STATE_ALIVE' &&
+      sub.state === SUBAGENT_ALIVE &&
       (sub.spawnStepIndex > minStepIndex || touched.has(sub.conversationId))
     ) {
       ids.add(sub.conversationId)
@@ -812,6 +858,23 @@ async function settleChildren(
   }
 }
 
+function pause(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve) => {
+    // An abort during the previous poll has already fired; do not wait for it again.
+    if (signal?.aborted) return resolve()
+    const onAbort = () => {
+      clearTimeout(timer)
+      resolve()
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    timer.unref()
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
 /** Follow background tasks and post-RPC Reactive Wakeup steps in transcript_full.jsonl until the turn settles. */
 export async function settleBrainTurn(
   root: string,
@@ -821,51 +884,72 @@ export async function settleBrainTurn(
   {
     signal,
     minStepIndex = -1,
-    foregroundMaxStepIndex,
     pollIntervalMs = 200,
     acpToolCallIds = [],
     shouldEmitPreWakeupTool,
+    transcriptGraceMs = 0,
+    stallTimeoutMs = 120_000,
+    isWaitingOnUser,
   }: {
     signal?: AbortSignal
     minStepIndex?: number
-    foregroundMaxStepIndex?: number
     pollIntervalMs?: number
     acpToolCallIds?: readonly string[]
     shouldEmitPreWakeupTool?: (
       item: Extract<ProviderTimelineItem, { type: 'tool_call' }>,
     ) => boolean
+    /** How long to wait for agy to flush this turn's USER_INPUT row before treating the turn as transcript-less. */
+    transcriptGraceMs?: number
+    /** Give up when nothing tracked is running and the transcript stays idle without a final response. */
+    stallTimeoutMs?: number
+    /** Pending approvals legitimately block agy; they suspend the stall timeout. */
+    isWaitingOnUser?: () => boolean
   } = {},
 ): Promise<{
   status: 'completed' | 'canceled' | 'failed'
-  wokeUp: boolean
   error?: string
   lastStepUsage?: StepUsage
 }> {
-  if (!sessionIdPattern.test(nativeId))
-    return { status: 'completed', wokeUp: false }
+  if (!sessionIdPattern.test(nativeId)) return { status: 'completed' }
   const node = new BrainNode(nativeId, sessionId)
+  const startedAt = Date.now()
+  let lastActivity = startedAt
+  let fingerprint = ''
   let initial = true
+  let preamble: Record<string, unknown>[] = []
   let seenPlannerResponse = false
   let foregroundIdleReached = false
   let wokeUp = false
-  let emittedStep = -1
+  let lastStepIndex = -1
+  // Steps at or below this index were already emitted before a transcript reset.
+  let replayedThrough = -1
   let lastStepUsage: StepUsage | undefined
+  const withinGrace = () => Date.now() - startedAt < transcriptGraceMs
   while (true) {
     if (signal?.aborted) {
       if (signal.reason instanceof Error && signal.reason.name !== 'AbortError')
         throw signal.reason
-      return { status: 'canceled', wokeUp, lastStepUsage }
+      return { status: 'canceled', lastStepUsage }
     }
     const { inbox, subagents } = await node.pollMetadata(root)
+    const nextFingerprint = `${inbox.messages.length}:${inbox.readIds.size}:${subagents
+      .map((s) => `${s.conversationId}=${s.state}`)
+      .join(',')}`
+    if (nextFingerprint !== fingerprint) {
+      fingerprint = nextFingerprint
+      lastActivity = Date.now()
+    }
     let rows: Record<string, unknown>[]
     try {
       const result = await node.reader.read(root, nativeId)
       rows = result.rows
       if (result.reset) {
         initial = true
+        preamble = []
         seenPlannerResponse = false
         foregroundIdleReached = false
         wokeUp = false
+        replayedThrough = lastStepIndex
         node.reset(inbox, subagents)
       }
     } catch (error) {
@@ -874,28 +958,39 @@ export async function settleBrainTurn(
         !wokeUp &&
         inbox.unconsumedHighPriority.length === 0 &&
         subagents.length === 0
-      )
-        return { status: 'completed', wokeUp: false }
+      ) {
+        if (!withinGrace()) return { status: 'completed' }
+        await pause(pollIntervalMs, signal)
+        continue
+      }
       throw error
     }
+    if (rows.length) lastActivity = Date.now()
     let slice = rows
     if (initial) {
+      // Keep rows already consumed by the cursor until this turn's USER_INPUT is visible.
+      preamble.push(...rows)
       let start = -1
-      for (let i = rows.length - 1; i >= 0; i--) {
+      for (let i = preamble.length - 1; i >= 0; i--) {
         if (
-          rows[i].type === 'USER_INPUT' &&
-          Number(rows[i].step_index) > minStepIndex
+          preamble[i].type === 'USER_INPUT' &&
+          Number(preamble[i].step_index) > minStepIndex
         ) {
           start = i
           break
         }
       }
-      if (start < 0) return { status: 'completed', wokeUp: false }
+      if (start < 0) {
+        if (!withinGrace()) return { status: 'completed' }
+        await pause(pollIntervalMs, signal)
+        continue
+      }
       initial = false
-      for (const row of rows.slice(0, start))
+      for (const row of preamble.slice(0, start))
         node.consumedMessages += countRowMessages(row)
       node.projector.bindToolCallIds(acpToolCallIds)
-      slice = rows.slice(start)
+      slice = preamble.slice(start)
+      preamble = []
     }
     for (const row of slice) {
       const stepIndex = Number(row.step_index)
@@ -903,16 +998,15 @@ export async function settleBrainTurn(
       if (
         row.type === 'SYSTEM_MESSAGE' &&
         !restartNoticePattern.test(String(row.content ?? '')) &&
-        foregroundIdleReached &&
-        (foregroundMaxStepIndex === undefined ||
-          stepIndex > foregroundMaxStepIndex)
+        foregroundIdleReached
       )
         wokeUp = true
       const items = node.projector.project(row)
       const usage = extractStepUsage(row)
       if (usage) lastStepUsage = usage
-      if (stepIndex > emittedStep) {
-        emittedStep = stepIndex
+      if (Number.isInteger(stepIndex) && stepIndex > lastStepIndex)
+        lastStepIndex = stepIndex
+      if (stepIndex > replayedThrough) {
         const timestamp =
           typeof row.created_at === 'string' ? row.created_at : undefined
         for (const item of items) {
@@ -939,7 +1033,6 @@ export async function settleBrainTurn(
     if (node.lastStep?.type === 'ERROR_MESSAGE') {
       return {
         status: 'failed',
-        wokeUp,
         error: stepErrorMessage(node.lastStep, 'Turn failed'),
         lastStepUsage,
       }
@@ -953,7 +1046,6 @@ export async function settleBrainTurn(
     if (childStatus.error)
       return {
         status: 'failed',
-        wokeUp,
         error: childStatus.error,
         lastStepUsage,
       }
@@ -966,25 +1058,31 @@ export async function settleBrainTurn(
         )
           continue
       }
-      return { status: 'completed', wokeUp, lastStepUsage }
+      return { status: 'completed', lastStepUsage }
     }
-    await new Promise<void>((resolve) => {
-      const onAbort = () => {
-        clearTimeout(timer)
-        resolve()
-      }
-      const timer = setTimeout(() => {
-        signal?.removeEventListener('abort', onAbort)
-        resolve()
-      }, pollIntervalMs)
-      timer.unref()
-      signal?.addEventListener('abort', onAbort, { once: true })
-    })
+    // Background tasks, live children and tools of a woken turn may legitimately run for a long time;
+    // anything else idle (e.g. an unrecognized final row) is a stall.
+    const tracking =
+      node.projector.hasBackground() ||
+      (wokeUp && node.projector.hasPending()) ||
+      activeChildIds.length > 0 ||
+      isWaitingOnUser?.() === true
+    if (tracking) lastActivity = Date.now()
+    else if (Date.now() - lastActivity >= stallTimeoutMs) {
+      onItem({
+        type: 'error',
+        id: `${sessionId}:step:${lastStepIndex}:stalled`,
+        message: `Stopped waiting for agy: transcript_full.jsonl was idle for ${Math.round(stallTimeoutMs / 1000)}s without a final response.`,
+      })
+      return { status: 'completed', lastStepUsage }
+    }
+    await pause(pollIntervalMs, signal)
   }
 }
 
 export type BrainWatchHandle = (() => void) & {
-  cancel: () => void
+  /** Drain rows written so far, then end the active child turn as canceled. */
+  cancel: () => Promise<void>
   isRunning: () => boolean
   ready: Promise<void>
 }
@@ -1004,7 +1102,8 @@ export function watchBrain(
   const timeline = new Timeline(sessionId)
   const node = new BrainNode(nativeId, sessionId)
   let stopped = false
-  let busy = false
+  let inflight: Promise<void> | undefined
+  let cancelling: Promise<void> | undefined
   let warned = false
   let running = true
   let turnSeq = 1
@@ -1025,9 +1124,15 @@ export function watchBrain(
       ...(state === 'failed' && error ? { error: { message: error } } : {}),
     })
   }
-  async function poll() {
-    if (stopped || busy) return
-    busy = true
+  /** One poll at a time; concurrent callers share the pass in flight. */
+  function poll(): Promise<void> {
+    if (stopped) return Promise.resolve()
+    inflight ??= pollOnce().finally(() => {
+      inflight = undefined
+    })
+    return inflight
+  }
+  async function pollOnce() {
     try {
       const { inbox, subagents } = await node.pollMetadata(root)
       const { rows, reset } = await node.reader.read(root, nativeId)
@@ -1110,8 +1215,6 @@ export function watchBrain(
           },
         })
       }
-    } finally {
-      busy = false
     }
   }
   const timer = setInterval(() => {
@@ -1130,9 +1233,16 @@ export function watchBrain(
         return running && !stopped
       },
       cancel() {
-        finishTurn('canceled')
-        stopped = true
+        if (stopped) return Promise.resolve()
         clearInterval(timer)
+        // Read what the child wrote before it was killed so its timeline is complete.
+        cancelling ??= (async () => {
+          await inflight?.catch(() => undefined)
+          await poll().catch(() => undefined)
+          finishTurn('canceled')
+          stopped = true
+        })()
+        return cancelling
       },
     },
   )

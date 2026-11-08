@@ -93,3 +93,53 @@ for (const shutdown of ['graceful', 'stubborn']) {
     },
   )
 }
+
+test(
+  'transport shutdown without a usable ps still stops agy and resolves',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-transport-nops-'))
+    const path = process.env.PATH
+    const transport = connectAcp(
+      {
+        command: process.execPath,
+        args: [fileURLToPath(new URL('./transport-acp.ts', import.meta.url))],
+        env: { HOME: home, PATH: path ?? '', AGY_SHUTDOWN: 'stubborn' },
+      },
+      home,
+      {},
+      {
+        sessionUpdate: async () => {},
+        requestPermission: async () => ({
+          outcome: { outcome: 'cancelled' },
+        }),
+      },
+      () => {},
+    )
+    let commandPid: number | undefined
+    try {
+      await transport.rpc.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {},
+      })
+      await transport.rpc.newSession({ cwd: home, mcpServers: [] })
+      commandPid = Number(await readFile(join(home, 'command.pid'), 'utf8'))
+      // Simulate slim images without procps: `ps` cannot be found.
+      process.env.PATH = join(home, 'no-such-bin')
+      await transport.close()
+      process.env.PATH = path
+      await transport.exited
+    } finally {
+      process.env.PATH = path
+      await transport.close()
+      if (commandPid) {
+        try {
+          process.kill(-commandPid, 'SIGKILL')
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+        }
+      }
+      await rm(home, { recursive: true, force: true })
+    }
+  },
+)
