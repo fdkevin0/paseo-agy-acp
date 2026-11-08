@@ -1587,3 +1587,108 @@ test('a rewrite observed mid-O_TRUNC does not end an anchored turn', async () =>
     await f.close()
   }
 })
+
+const stoppedNotice = (step: number) =>
+  message(
+    step,
+    'system',
+    '[Notice] All your subagents and background tasks have been stopped',
+  )
+const toolCall = (step: number, id: string): Row => ({
+  step_index: step,
+  type: 'PLANNER_RESPONSE',
+  status: 'DONE',
+  tool_calls: [{ id, name: 'run_command', args: {} }],
+})
+
+test('stopped calls never linger: restart notices and new responses drop them', () => {
+  for (const interruption of [[stoppedNotice(2)], []]) {
+    const projector = new BrainTranscriptProjector('c')
+    const items = [
+      message(0, parent, 'work'),
+      toolCall(1, 'stopped'),
+      ...interruption,
+      message(3, parent, 'continue'),
+      toolCall(4, 'fresh'),
+      { step_index: 5, type: 'GENERIC', status: 'DONE', content: 'out' },
+    ].flatMap((row) => projector.project(row))
+    assert.deepEqual(
+      items.flatMap((i) =>
+        i.type === 'tool_call' && i.status === 'completed' ? [i.callId] : [],
+      ),
+      ['fresh'],
+      'the result belongs to the current response',
+    )
+    assert.equal(projector.hasPending(), false)
+  }
+})
+
+test('a child woken after an interrupted tool call completes its new turn', async () => {
+  const f = await fixture()
+  const events: ProviderEvent[] = []
+  let handle: BrainWatchHandle | undefined
+  try {
+    // Child transcripts have no USER_INPUT: a wakeup is a SYSTEM_MESSAGE.
+    await f.put(child, [
+      message(0, parent, 'work'),
+      toolCall(1, 'stopped'),
+      stoppedNotice(2),
+      message(3, parent, 'continue'),
+      toolCall(4, 'fresh'),
+      { step_index: 5, type: 'GENERIC', status: 'DONE', content: 'out' },
+      done(6, 'Finished'),
+    ])
+    handle = watchBrain(f.root, child, 'c', (event) => events.push(event), 5)
+    await until(() =>
+      events.some((e) => e.type === 'session.turn' && e.state === 'completed'),
+    )
+  } finally {
+    handle?.()
+    await f.close()
+  }
+})
+
+test('resuming after a drained cancel neither repeats nor skips child rows', async () => {
+  const f = await fixture()
+  const first: ProviderEvent[] = []
+  const second: ProviderEvent[] = []
+  let resumed: BrainWatchHandle | undefined
+  try {
+    await f.put(child, [message(0, parent, 'work')])
+    const old = watchBrain(f.root, child, 'c', (e) => first.push(e), 5)
+    await old.ready
+    // Written before the cancel request but not yet polled.
+    await appendFile(f.path(child), encode([done(1, 'Before cancel')]))
+    const canceling = old.cancel()
+    assert.equal(old.isStopping(), true, 'canceling already counts as stopping')
+    await canceling
+    resumed = watchBrain(
+      f.root,
+      child,
+      'c',
+      (e) => second.push(e),
+      5,
+      () => true,
+      old.resumePoint(),
+    )
+    await resumed.ready
+    await appendFile(
+      f.path(child),
+      encode([message(2, parent, 'again'), done(3, 'After resume')]),
+    )
+    await until(() =>
+      second.some((e) => e.type === 'session.turn' && e.state === 'completed'),
+    )
+    const replies = (events: ProviderEvent[]) =>
+      events.flatMap((e) =>
+        e.type === 'timeline.item' && e.item.type === 'assistant_message'
+          ? [e.item.text]
+          : [],
+      )
+    assert.deepEqual(replies(first), ['Before cancel'])
+    assert.deepEqual(replies(second), ['After resume'])
+  } finally {
+    resumed?.()
+    await f.close()
+  }
+})

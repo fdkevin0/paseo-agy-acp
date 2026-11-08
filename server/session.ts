@@ -294,6 +294,7 @@ async function createSession(
   const buffered: SessionNotification[] = []
   const children = new Map<string, BrainWatchHandle>()
   const killedChildren = new Set<string>()
+  const resuming = new Set<string>()
   let notificationLane = Promise.resolve()
   let usage: ProviderUsage = {}
   let commandsReceived = false
@@ -375,6 +376,32 @@ async function createSession(
       ),
     )
   }
+  /** A child stopped by interruption (not killed) can be woken by a message. */
+  function isResumable(childId: string) {
+    return (
+      !killedChildren.has(childId) &&
+      children.get(childId)?.isStopping() === true
+    )
+  }
+  /** Resume watching the same child session once its previous watcher has drained. */
+  function resumeChild(
+    nativeId: string,
+    childId: string,
+    existing: BrainWatchHandle,
+  ) {
+    if (resuming.has(childId)) return
+    resuming.add(childId)
+    void existing.cancel().then(() => {
+      resuming.delete(childId)
+      if (
+        state.closing ||
+        killedChildren.has(childId) ||
+        children.get(childId) !== existing
+      )
+        return
+      watchChild(nativeId, childId, existing.resumePoint())
+    })
+  }
   /** Brain-projected items are not yet known to the ACP timeline. */
   function emitItem(item: ProviderTimelineItem, timestamp?: string) {
     timeline.track(item)
@@ -392,13 +419,12 @@ async function createSession(
         const childId = `${id}:child:${nativeId}`
         const existing = children.get(childId)
         if (
-          existing?.isStopped() &&
-          !killedChildren.has(childId) &&
+          existing &&
+          isResumable(childId) &&
           !state.loading &&
-          /\bsend_message\b/.test(item.name)
+          item.name.includes('send_message')
         ) {
-          // A message wakes a child stopped by interruption; resume watching the same child session.
-          watchChild(nativeId, childId, existing.resumePoint())
+          resumeChild(nativeId, childId, existing)
         } else if (!existing) {
           emit({
             type: 'session.opened',
@@ -419,7 +445,7 @@ async function createSession(
     if (
       item.type === 'tool_call' &&
       item.status === 'completed' &&
-      /\bmanage_subagents\b/.test(item.name)
+      item.name.includes('manage_subagents')
     ) {
       void syncKilledChildren()
     }
@@ -630,6 +656,9 @@ async function createSession(
       emitItem,
       hasChild(nativeId: string) {
         return children.has(`${id}:child:${nativeId}`)
+      },
+      isChildResumable(nativeId: string) {
+        return isResumable(`${id}:child:${nativeId}`)
       },
       syncKilledChildren,
       drain,
@@ -994,7 +1023,9 @@ async function promptSession(
             session.timeline.isRunning(item.id) ||
             (item.detail.type === 'sub_agent' &&
               item.detail.childSessionId !== undefined &&
-              !session.hasChild(item.detail.childSessionId)),
+              // Unknown children open, interrupted ones resume.
+              (!session.hasChild(item.detail.childSessionId) ||
+                session.isChildResumable(item.detail.childSessionId))),
           // A model turn always writes USER_INPUT; give agy a moment to flush it. Native commands may write none.
           transcriptGraceMs: session.state.turnHadModelOutput ? 2000 : 0,
           isWaitingOnUser: () => session.permissions.size > 0,

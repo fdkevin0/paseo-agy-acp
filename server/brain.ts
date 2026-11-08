@@ -470,6 +470,8 @@ export class BrainTranscriptProjector {
         return text ? [{ type: 'user_message', id, text }] : []
       case 'SYSTEM_MESSAGE': {
         if (restartNoticePattern.test(text)) {
+          // Stopped calls never log a result; child transcripts have no USER_INPUT to reset them.
+          this.pending = []
           this.background.clear()
           this.touchedSubagents.clear()
           return []
@@ -563,6 +565,9 @@ export class BrainTranscriptProjector {
         ]
       }
       case 'PLANNER_RESPONSE': {
+        // A new model response means calls of the previous one without a GENERIC row were stopped;
+        // keeping them would misattribute this response's results in FIFO order.
+        this.pending = []
         const items: ProviderTimelineItem[] = []
         if (typeof row.thinking === 'string' && row.thinking)
           items.push({
@@ -637,10 +642,17 @@ class TranscriptReader {
     return bytesRead === probe.length && buffer.equals(probe)
   }
 
-  private async probe(file: FileHandle, position: number, length: number) {
-    const buffer = Buffer.alloc(length)
-    const { bytesRead } = await file.read(buffer, 0, length, position)
-    return buffer.subarray(0, bytesRead)
+  /** Keep the probes equal to bytes actually parsed, so a rewrite racing this read is still noticed. */
+  private remember(chunk: Buffer) {
+    if (this.head.length < REWRITE_PROBE_BYTES)
+      this.head = Buffer.concat([
+        this.head,
+        chunk.subarray(0, REWRITE_PROBE_BYTES - this.head.length),
+      ])
+    this.tail =
+      chunk.length >= REWRITE_PROBE_BYTES
+        ? Buffer.from(chunk.subarray(chunk.length - REWRITE_PROBE_BYTES))
+        : Buffer.concat([this.tail, chunk]).subarray(-REWRITE_PROBE_BYTES)
   }
 
   async read(root: string, nativeId: string) {
@@ -662,7 +674,6 @@ class TranscriptReader {
         this.head = Buffer.alloc(0)
         this.tail = Buffer.alloc(0)
       }
-      const start = this.offset
       while (this.offset < stat.size) {
         const buffer = Buffer.alloc(
           Math.min(stat.size - this.offset, 1024 * 1024),
@@ -675,6 +686,7 @@ class TranscriptReader {
         )
         if (!bytesRead) break
         this.offset += bytesRead
+        this.remember(buffer.subarray(0, bytesRead))
         // Preserve bytes until a complete line is available, including split UTF-8 characters.
         this.remainder += buffer.subarray(0, bytesRead).toString('latin1')
         const lines = this.remainder.split('\n')
@@ -690,16 +702,6 @@ class TranscriptReader {
           )
           if (!isUnloggedStep(row)) rows.push(row)
         }
-      }
-      if (this.offset !== start) {
-        if (this.head.length < REWRITE_PROBE_BYTES)
-          this.head = await this.probe(
-            file,
-            0,
-            Math.min(this.offset, REWRITE_PROBE_BYTES),
-          )
-        const length = Math.min(this.offset, REWRITE_PROBE_BYTES)
-        this.tail = await this.probe(file, this.offset - length, length)
       }
       return { rows, reset }
     } finally {
@@ -1187,6 +1189,8 @@ export type BrainWatchHandle = (() => void) & {
   isRunning: () => boolean
   /** Stopped or canceled: no further rows are read. */
   isStopped: () => boolean
+  /** Stopped, or canceling and draining its last rows. */
+  isStopping: () => boolean
   /** Where a replacement watcher for the same child session should resume. */
   resumePoint: () => { afterStep: number; turnSeq: number }
   ready: Promise<void>
@@ -1350,6 +1354,9 @@ export function watchBrain(
       },
       isStopped() {
         return stopped
+      },
+      isStopping() {
+        return stopped || cancelling !== undefined
       },
       resumePoint() {
         return { afterStep: lastStepIndex, turnSeq }
