@@ -10,7 +10,7 @@
 
 - Paseo **0.15.0 或更高版本**，且已启用插件功能。
 - daemon 主机已安装 Node.js **22.18 或更高版本** 及 npm。
-- daemon 主机已安装并完成登录的 Antigravity CLI (`agy`) **1.4.12 或更高版本**。使用本插件前，请先在终端运行 `agy` 完成账号登录。
+- daemon 主机已安装并完成登录的 Antigravity CLI (`agy`) **1.5.3 或更高版本**。使用本插件前，请先在终端运行 `agy` 完成账号登录。
 
 ## 安装
 
@@ -87,7 +87,7 @@ paseo usage ls --json
 | 订阅配额 | Gemini 与 Claude/GPT 模型组的 5 小时及每周配额窗口。                                                                         |
 | 子 Agent | 原生子会话链接与只读 Brain 日志时间线卡片。                                                                                  |
 
-暂不支持运行中追加指令（steering）、回退（rewind）、归档操作、结构化输出、Artifacts 面板以及递归子会话发现。子会话卡片不提供独立的会话控制。当 `agy` 未提供原生上下文通知时，上下文占用为估算值；当前 `agy` 的 print 模式不接受用于配额查询的自定义 ACP 目录参数。详见[参考文档](docs/reference.md)。
+暂不支持运行中追加指令（steering）、回退（rewind）、归档操作、结构化输出、Artifacts 面板以及递归子会话发现。子会话卡片不提供独立的会话控制。当 `agy` 未提供原生 `usage_update` 上下文通知时，上下文占用基于 `transcript_full.jsonl` 的单步 Token 计数计算（缺失时回退至回合计数）；当前 `agy` 的 print 模式不接受用于配额查询的自定义 ACP 目录参数。详见[参考文档](docs/reference.md)。
 
 ## 更多信息
 

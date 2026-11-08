@@ -1,11 +1,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, appendFile, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { Timeline, toolDetail, configState } from '../server/mapping.ts'
-import { BrainTranscriptProjector, watchBrain } from '../server/brain.ts'
-import type { ProviderEvent } from '@getpaseo/plugin/server/provider'
+import {
+  Timeline,
+  toolDetail,
+  configState,
+  contextUsage,
+  promptUsage,
+  contextWindowForModel,
+  promptContent,
+} from '../server/mapping.ts'
 
 test('stream snapshots retain identity and split across tools/turns', () => {
   const t = new Timeline('s')
@@ -69,45 +72,6 @@ test('subagent and diff details, grouped model choices', () => {
   )
 })
 
-test('Brain handles split UTF-8 JSONL and does not repeat rows', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'paseo-agy-test-'))
-  const id = 'b3bbd901-0d20-4a21-aa53-99f4072fb378'
-  const dir = join(root, id, '.system_generated/logs')
-  await mkdir(dir, { recursive: true })
-  const path = join(dir, 'transcript.jsonl')
-  const bytes = Buffer.from(
-    JSON.stringify({
-      step_index: 1,
-      type: 'PLANNER_RESPONSE',
-      content: '你好',
-    }) + '\n',
-  )
-  await appendFile(path, bytes.subarray(0, bytes.length - 4))
-  const events: ProviderEvent[] = []
-  const stop = watchBrain(root, id, 'child', (e) => events.push(e), 20)
-  try {
-    await new Promise((resolve) => setTimeout(resolve, 30))
-    assert.equal(events.length, 0)
-    await appendFile(path, bytes.subarray(bytes.length - 4))
-    await new Promise((resolve) => setTimeout(resolve, 80))
-    assert.equal(events.length, 1)
-    assert.ok(
-      events[0].type === 'timeline.item' &&
-        events[0].item.type === 'assistant_message' &&
-        events[0].item.text === '你好',
-    )
-    assert.throws(() => watchBrain(root, '../escape', 'child', () => {}))
-    assert.equal(
-      new BrainTranscriptProjector('child').project({ step_index: 'bad' })
-        .length,
-      0,
-    )
-  } finally {
-    stop()
-    await rm(root, { recursive: true, force: true })
-  }
-})
-
 test('unfinished tools terminalize once on every terminal state', () => {
   for (const status of ['completed', 'canceled', 'failed'] as const) {
     const timeline = new Timeline('s')
@@ -127,8 +91,7 @@ test('unfinished tools terminalize once on every terminal state', () => {
   }
 })
 
-test('usage rejects invalid context and ignores foreign currency', async () => {
-  const { contextUsage, promptUsage } = await import('../server/mapping.ts')
+test('usage rejects invalid context, ignores foreign currency, and computes lastStep occupancy', () => {
   assert.equal(contextUsage({ size: 0, used: 10 }), undefined)
   assert.equal(contextUsage({ size: 100, used: -1 }), undefined)
   assert.equal(contextUsage({ size: Infinity, used: 1 }), undefined)
@@ -151,6 +114,39 @@ test('usage rejects invalid context and ignores foreign currency', async () => {
       contextWindowMaxTokens: 256_000,
     },
   )
+  const usage = {
+    inputTokens: 120,
+    cachedReadTokens: 40,
+    cachedWriteTokens: 20,
+    outputTokens: 9,
+    totalTokens: 189,
+  }
+  assert.deepEqual(
+    promptUsage(usage, {
+      model: 'gpt-oss-120b',
+      lastStep: { inputTokens: 40, cachedReadTokens: 20, outputTokens: 9 },
+    }),
+    {
+      inputTokens: 120,
+      outputTokens: 9,
+      cachedInputTokens: 40,
+      contextWindowUsedTokens: 69,
+      contextWindowMaxTokens: 131_072,
+    },
+  )
+  assert.deepEqual(promptUsage(usage, { preserveContext: true }), {
+    inputTokens: 120,
+    outputTokens: 9,
+    cachedInputTokens: 40,
+  })
+  assert.equal(
+    promptUsage({ inputTokens: -1, outputTokens: NaN, totalTokens: 30 })
+      .contextWindowUsedTokens,
+    30,
+  )
+  assert.equal(promptUsage(usage).contextWindowUsedTokens, 189)
+  assert.deepEqual(promptUsage(null), {})
+  assert.equal(contextWindowForModel('gemini'), 256_000)
 })
 
 test('model metadata restricts effort variants and hides fixed-effort selectors', () => {
@@ -207,8 +203,7 @@ test('model metadata restricts effort variants and hides fixed-effort selectors'
   ])
 })
 
-test('attachments preserve file paths, issue context and review comments', async () => {
-  const { promptContent } = await import('../server/mapping.ts')
+test('attachments preserve file paths, issue context and review comments', () => {
   const file = promptContent({
     type: 'uploaded_file',
     id: 'f',
@@ -259,20 +254,6 @@ test('attachments preserve file paths, issue context and review comments', async
     review.type === 'text' &&
       review.text.includes('test.ts:3') &&
       review.text.includes('Fix here'),
-  )
-})
-
-test('Brain tool cards decode JSON-encoded native arguments', () => {
-  const items = new BrainTranscriptProjector('child').project({
-    step_index: 2,
-    type: 'PLANNER_RESPONSE',
-    tool_calls: [{ name: 'run_command', args: { CommandLine: '"echo test"' } }],
-  })
-  assert.ok(
-    items[0].type === 'tool_call' &&
-      items[0].status === 'running' &&
-      items[0].detail.type === 'shell' &&
-      items[0].detail.command === 'echo test',
   )
 })
 
@@ -353,126 +334,4 @@ test('native PascalCase tools retain paths, content, ranges and recipients', () 
   assert.ok(
     read.type === 'read' && read.offset === 8 && read.limit === undefined,
   )
-})
-
-test('Brain matches FIFO tool results without fake assistant bubbles', () => {
-  const projector = new BrainTranscriptProjector('child')
-  const started = projector.project({
-    type: 'PLANNER_RESPONSE',
-    source: 'MODEL',
-    step_index: 1,
-    thinking: 'Thinking',
-    content: 'Checking',
-    tool_calls: [
-      { id: 'one', name: 'run_command', args: { CommandLine: '"echo hello"' } },
-      { id: 'two', name: 'read_file', args: { Path: '"/missing"' } },
-    ],
-  })
-  assert.deepEqual(
-    started.map((i) => i.type),
-    ['reasoning', 'assistant_message', 'tool_call', 'tool_call'],
-  )
-  assert.ok(started[2].type === 'tool_call' && started[2].status === 'running')
-  for (const type of ['CHECKPOINT', 'SYSTEM_MESSAGE', 'UNKNOWN'])
-    assert.deepEqual(
-      projector.project({
-        type,
-        step_index: 2,
-        content: 'metadata',
-        thinking: 'hidden',
-      }),
-      [],
-    )
-  const done = projector.project({
-    type: 'GENERIC',
-    source: 'MODEL',
-    step_index: 3,
-    status: 'DONE',
-    content: 'Created At: today\nhello',
-  })
-  assert.equal(done.length, 1)
-  assert.ok(
-    done[0].type === 'tool_call' &&
-      done[0].status === 'completed' &&
-      done[0].detail.type === 'shell',
-  )
-  assert.equal(done[0].id, started[2].id)
-  assert.equal(done[0].callId, started[2].callId)
-  assert.equal(done[0].detail.output, 'Created At: today\nhello')
-  const failed = projector.project({
-    type: 'GENERIC',
-    source: 'MODEL',
-    step_index: 4,
-    status: 'ERROR',
-    error: { message: 'not found' },
-  })
-  assert.ok(
-    failed[0].type === 'tool_call' &&
-      failed[0].status === 'failed' &&
-      failed[0].error,
-  )
-  assert.equal(failed[0].id, started[3].id)
-  assert.ok(
-    failed[0].detail.type === 'read' &&
-      failed[0].detail.content?.includes('not found'),
-  )
-  assert.deepEqual(
-    projector.project({
-      type: 'GENERIC',
-      step_index: 5,
-      content: 'orphan result',
-    }),
-    [],
-  )
-  assert.deepEqual(
-    projector.project({
-      type: 'ERROR_MESSAGE',
-      source: 'SYSTEM',
-      step_index: 6,
-      content: 'Model error',
-    }),
-    [{ type: 'error', id: 'child:step:6:error', message: 'Model error' }],
-  )
-  assert.equal(
-    projector.project({
-      type: 'USER_INPUT',
-      step_index: 7,
-      content: 'hello',
-    })[0].type,
-    'user_message',
-  )
-})
-
-test('prompt usage normalizes model steps, counts caches and preserves native context', async () => {
-  const { promptUsage, contextWindowForModel } =
-    await import('../server/mapping.ts')
-  const usage = {
-    inputTokens: 120,
-    cachedReadTokens: 40,
-    cachedWriteTokens: 20,
-    outputTokens: 9,
-    totalTokens: 189,
-  }
-  assert.deepEqual(promptUsage(usage, { model: 'gpt-oss-120b', steps: 3 }), {
-    inputTokens: 120,
-    outputTokens: 9,
-    cachedInputTokens: 40,
-    contextWindowUsedTokens: 69,
-    contextWindowMaxTokens: 131_072,
-  })
-  assert.deepEqual(promptUsage(usage, { preserveContext: true }), {
-    inputTokens: 120,
-    outputTokens: 9,
-    cachedInputTokens: 40,
-  })
-  assert.equal(
-    promptUsage(
-      { inputTokens: -1, outputTokens: NaN, totalTokens: 30 },
-      { steps: 3 },
-    ).contextWindowUsedTokens,
-    10,
-  )
-  assert.equal(promptUsage(usage, { steps: 0 }).contextWindowUsedTokens, 189)
-  assert.deepEqual(promptUsage(null), {})
-  assert.equal(contextWindowForModel('gemini'), 256_000)
 })

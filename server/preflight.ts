@@ -34,19 +34,19 @@ export async function providerStatus(
     if (!version)
       return {
         available: false,
-        diagnostic: 'Could not determine agy version; requires >=1.4.12.',
+        diagnostic: 'Could not determine agy version; requires >=1.5.3.',
       }
     const [major, minor, patch] = version.slice(1).map(Number)
     if (
       major > 1 ||
-      (major === 1 && (minor > 4 || (minor === 4 && patch >= 12)))
+      (major === 1 && (minor > 5 || (minor === 5 && patch >= 3)))
     ) {
       statusCache.set(key, Date.now())
       return { available: true }
     }
     return {
       available: false,
-      diagnostic: `agy ${version[0]} is too old; requires >=1.4.12. Run agy update.`,
+      diagnostic: `agy ${version[0]} is too old; requires >=1.5.3. Run agy update.`,
     }
   } catch (error) {
     return {

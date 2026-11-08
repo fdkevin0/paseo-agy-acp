@@ -10,7 +10,7 @@ The plugin ID is `agy-acp`; its provider is `agy`, displayed as **Antigravity (A
 
 - Paseo **0.15.0 or later**, with plugins enabled.
 - Node.js **22.18 or later** and npm on the daemon host.
-- Antigravity CLI (`agy`) **1.4.12 or later**, already authenticated on that host. Run `agy` in a terminal to sign in before using the plugin.
+- Antigravity CLI (`agy`) **1.5.3 or later**, already authenticated on that host. Run `agy` in a terminal to sign in before using the plugin.
 
 ## Install
 
@@ -87,7 +87,7 @@ Existing agents keep their original provider; they are not migrated. Remove the 
 | Subscription  | Gemini and Claude/GPT 5-hour and weekly quota windows.                                                                                 |
 | Subagents     | Native child links and read-only Brain transcript cards.                                                                               |
 
-Steering, rewind, archive operations, structured output, Artifacts panels and recursive child discovery are unsupported. Child cards do not provide independent session control. Context occupancy is estimated when agy supplies no native measurement; current agy print mode rejects custom ACP directory flags for quota queries. See [reference limitations](docs/reference.md) for details.
+Steering, rewind, archive operations, structured output, Artifacts panels and recursive child discovery are unsupported. Child cards do not provide independent session control. When agy supplies no native `usage_update` notification, context occupancy is computed from per-step token counters in `transcript_full.jsonl` (falling back to prompt counters); current agy print mode rejects custom ACP directory flags for quota queries. See [reference limitations](docs/reference.md) for details.
 
 ## More information
 

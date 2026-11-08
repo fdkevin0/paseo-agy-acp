@@ -163,7 +163,6 @@ async function listSessions(
   emit: (event: ProviderEvent) => void,
 ) {
   const session = await manager.start(randomUUID(), input.cwd ?? homedir())
-  let listed = false
   try {
     const results = []
     let cursor: string | undefined
@@ -196,14 +195,13 @@ async function listSessions(
         throw new Error('Repeated ACP session list cursor')
       if (cursor) cursors.add(cursor)
     } while (cursor && results.length < (input.limit ?? 100))
-    listed = true
     emit({
       type: 'sessions',
       requestId: input.requestId,
       sessions: results.slice(0, input.limit ?? 100),
     })
   } finally {
-    await session.close(listed)
+    await session.close()
   }
   return
 }
