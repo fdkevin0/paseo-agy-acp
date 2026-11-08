@@ -73,6 +73,12 @@ test('email discovery uses recent logs, the latest match and bounded tails', asy
       'applyAuthResult: email=first@example.test\nOAuth: authenticated successfully as latest@example.test\n',
     )
     assert.equal(await readLoggedEmail(dir), 'latest@example.test')
+    await utimes(join(dir, 'log/cli-new.log'), 2, 2)
+    await writeFile(
+      join(dir, 'log/acp-server-1234.log'),
+      'applyAuthResult: email=acp@example.test, token=omitted\n',
+    )
+    assert.equal(await readLoggedEmail(dir), 'acp@example.test')
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -109,7 +115,9 @@ test('usage discovers account scopes and maps windows, tier and failures through
     await writeFile(join(dir, 'antigravity-oauth-token'), '')
     assert.deepEqual(await usage.discover(scope), [])
     await writeFile(join(dir, 'antigravity-oauth-token'), 'fixture-token')
-    assert.equal((await usage.discover(scope))[0].key, hashAccountKey(dir))
+    const [beforeRemember] = await usage.discover(scope)
+    assert.equal(beforeRemember.key, hashAccountKey(dir))
+    assert.deepEqual(beforeRemember.input, { dataDir: dir })
     await writeFile(
       join(dir, 'cli.log'),
       'applyAuthResult: email=example@example.test\n',
@@ -118,6 +126,11 @@ test('usage discovers account scopes and maps windows, tier and failures through
     usage.tiers.set(dir, 'Google AI Ultra')
     assert.deepEqual(await usage.discover({ ...scope, provider: 'codex' }), [])
     const [account] = await usage.discover(scope)
+    assert.deepEqual(account.input, beforeRemember.input)
+    assert.equal(
+      (await usage.discover({ ...scope, provider: 'antigravity' }))[0]?.key,
+      account.key,
+    )
     assert.equal(account.label, 'example@example.test')
     assert.equal(account.harness, 'Antigravity')
     assert.equal(

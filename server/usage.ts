@@ -69,7 +69,7 @@ export async function readLoggedEmail(
   let names: string[] = []
   try {
     names = (await readdir(join(dataDir, 'log'))).filter((name) =>
-      /^cli-.*\.log$/.test(name),
+      /^(?:cli|acp-server)-.*\.log$/.test(name),
     )
   } catch {
     /* Logs are optional. */
@@ -169,7 +169,12 @@ export class AgyUsageSource {
   }
 
   async discover(scope: UsageScope): Promise<UsageAccount[]> {
-    if (scope.kind === 'session' && scope.provider !== 'agy') return []
+    if (
+      scope.kind === 'session' &&
+      scope.provider !== 'agy' &&
+      scope.provider !== 'antigravity'
+    )
+      return []
     let dirs: string[]
     if (scope.kind === 'global')
       dirs = [...this.launches.keys(), dataDirectory()]
@@ -199,8 +204,6 @@ export class AgyUsageSource {
         harness: 'Antigravity',
         input: {
           dataDir: dir,
-          command: known?.launch?.command ?? 'agy',
-          args: usageArgs(known?.launch?.args ?? []),
         },
       })
     }
@@ -210,6 +213,8 @@ export class AgyUsageSource {
   async fetch(rawInput: unknown): Promise<UsageReport> {
     const { dataDir, command, args } = usageInputSchema.parse(rawInput)
     const known = this.launches.get(dataDir)
+    const cmd = command ?? known?.launch?.command ?? 'agy'
+    const rawArgs = args ?? known?.launch?.args ?? []
     const loggedIn = await hasLogin(dataDir)
     if (!loggedIn && (!known || known.hadLogin))
       throw new Error('Antigravity login store no longer exists')
@@ -225,8 +230,8 @@ export class AgyUsageSource {
       ) {
         cwd = homedir()
         const launch = {
-          command: command ?? 'agy',
-          args: args ?? [],
+          command: cmd,
+          args: rawArgs,
           env: known!.env,
         }
         if (
@@ -238,8 +243,8 @@ export class AgyUsageSource {
           )
       }
       const { stdout } = await execCommand(
-        command ?? 'agy',
-        [...usageArgs(args ?? []), '-p', '/usage', '--output-format', 'json'],
+        cmd,
+        [...usageArgs(rawArgs), '-p', '/usage', '--output-format', 'json'],
         {
           timeout: 15_000,
           env: known ? { ...process.env, ...known.env } : process.env,
