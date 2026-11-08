@@ -1,45 +1,118 @@
 # Development and releases
 
-## Layout
+Start with the [installation guide](../README.md#install) to use the plugin. For configuration, protocol behavior and operational limits, see the [reference](reference.md).
 
-- `index.server.ts`: Paseo contribution entry.
-- `server/provider.ts`: registration, capability negotiation and cached discovery.
-- `server/session.ts`: session manager, notifications, turn lifecycle and permission handling.
-- `server/permissions.ts`: permission request validation before pending work is created.
-- `server/transport.ts`: ACP stdio process and control deadlines.
-- `server/mapping.ts`: timeline, configuration, attachment and usage mapping.
-- `server/brain.ts`: child transcript projection and tailing.
-- `server/preflight.ts`: version check, cache identity and scoped probe cleanup.
-- `tests/`: fixture ACP server and regression tests.
+## Development setup
 
-## Local checks
+From a clone, install the locked development dependencies:
 
 ```sh
 npm ci --ignore-scripts
-npm run format
-npm run check
-npm test
-npm pack --dry-run
 ```
 
-Tests require no login or model quota. They cover tool terminalization, history suppression, permission decisions, concurrent catalog discovery, cleanup containment, attachment mapping, usage and malformed input. Brain fixtures cover FIFO tool results, native PascalCase arguments and ignored metadata rows. Discovery tests also cover failed native close requests. Test Brain polling uses a short interval instead of waiting a second per assertion.
+Paseo compiles the TypeScript plugin; no separate build output is required. Git/local plugin preparation installs production dependencies only, so rerun the command above if preparation removed development tools.
 
-For integration, install the directory on a test daemon and require `running` from `paseo plugin ls`. After editing, reload `agy-acp`. `paseo plugin logs agy-acp` supplies initialization diagnostics. Local build preparation installs production dependencies; rerun `npm ci --ignore-scripts` if development tools were removed.
+## Request and session flow
 
-A real smoke test should open a plan-mode agent, request a text-only reply without tools, close it, then import/reopen the native session and verify history. Permission and tool tests should use a disposable working directory. Mobile/desktop layout acceptance is a separate manual check of Paseo's native cards.
+1. `index.server.ts` registers provider `agy` and a shared subscription usage source. The provider negotiates capabilities and creates a session manager for each connection.
+2. Catalog discovery opens a disposable ACP session. Normal opens create or load a native session, apply requested configuration and collect initial commands before publishing readiness.
+3. Prompts go to agy over stdio. Native notifications become timeline snapshots, permissions, configuration and usage events; agy owns tool execution.
+4. Permission responses resolve the matching native request. Child conversation IDs start read-only Brain transcript tracking. Pending notifications are drained before the turn ends.
+5. Close cancels pending approvals, stops Brain polling and shuts down the process. New unprompted sessions and catalog probes remove only their own temporary artifacts; imported and prompted conversations remain resumable.
+6. Subscription queries independently invoke agy's local `/usage` command using observed account and tier metadata. They do not start a model turn.
 
-## Packaging
+## Source layout
 
-Paseo host libraries remain development dependencies. ACP SDK is a runtime dependency. `npm-shrinkwrap.json` locks both Git preparation and the npm installation tree; keep it synchronized with package metadata using `npm install --package-lock-only --ignore-scripts` after dependency changes. npm automatically includes the shrinkwrap in the published package.
+| File                                       | Responsibility                                                             |
+| ------------------------------------------ | -------------------------------------------------------------------------- |
+| `index.server.ts`                          | Register the provider and shared usage source.                             |
+| `server/provider.ts`                       | Provider contract, capability negotiation and cached catalog discovery.    |
+| `server/session.ts`                        | Session manager, notifications, prompts, commands and lifecycle.           |
+| `server/permissions.ts`                    | Validate permission requests before queuing approvals.                     |
+| `server/transport.ts`                      | ACP stdio process, metadata capture and control deadlines.                 |
+| `server/mapping.ts`                        | Timeline, configuration, attachment and context usage mapping.             |
+| `server/brain.ts`                          | Child transcript projection and bounded tailing.                           |
+| `server/preflight.ts`                      | Version checks, cache identity, data directories and scoped cleanup.       |
+| `server/usage.ts`                          | Account discovery, bounded login-log reads and subscription quota windows. |
+| `tests/mock-acp.ts`, `tests/mock-usage.ts` | Offline CLI substitutes.                                                   |
+| `tests/*.test.ts`                          | Mapping, permissions, lifecycle, discovery and quota regression tests.     |
+| `tests/workflows.test.ts`                  | Execute release workflow scripts against local command substitutes.        |
+| `.github/workflows/`                       | CI checks and tagged npm/GitHub releases.                                  |
 
-The Git manifest runs `npm ci --omit=dev --ignore-scripts`. Do not ship a second dependency installation step inside the npm artifact: the release workflow removes the Git-only `build` field from its checked-out manifest immediately before packing/publishing. This affects only the release runner, not the Git source. If publishing manually, perform that change in a disposable checkout first.
+## Verification
 
-Inspect `npm pack --dry-run` for the manifest, SVG, English/Chinese overviews, license, docs, server entry, runtime source and shrinkwrap. Tests, caches and local transcripts must not be included. Overviews describe behavior without installation commands.
+### Offline checks
 
-## CI and release
+```sh
+npm run format
+npm run format:check
+npm run check
+npm test
+npm pack --dry-run --ignore-scripts
+```
 
-CI installs the locked tree, checks formatting/types, runs tests and checks the package on Node 22.18 and 24. It runs for pull requests and pushes to `main`.
+Tests run with Node's native TypeScript support and temporary files; they require no login or model quota. Workflow tests require Bash and stub `curl`, `gh` and `npm`, so they neither contact registries nor publish artifacts.
 
-The release workflow publishes only a tag matching the stable package version, such as `v0.1.0`. It verifies the same checks, publishes a public npm package with provenance, and creates a GitHub Release. Configure npm trusted publishing for `fdkevin0/paseo-agy-acp` and `.github/workflows/release.yml`, or supply a scoped `NPM_TOKEN` secret if needed. Repository creation, registry ownership, credentials and the first publish are external setup; adding this workflow does not perform a release.
+Coverage includes tool terminalization, PascalCase arguments, FIFO Brain results, history suppression, permissions, attachment mapping, delayed commands, catalog concurrency and cleanup containment. Usage tests cover context normalization, native-measurement precedence, account discovery, quota mapping and error handling. Workflow tests exercise tag/version validation, registry failures, manifest preparation and GitHub Release recovery.
 
-Before a release, update `package.json` and the shrinkwrap, inspect the tarball, validate with a real agy/Paseo session, and push the reviewed version commit and tag. Re-running an existing version skips npm publication and can finish the GitHub Release step. Do not overwrite a published version.
+### Live Paseo smoke checks
+
+Use an authenticated agy installation and a test daemon:
+
+```sh
+paseo plugin install .
+paseo plugin ls
+paseo plugin reload agy-acp
+paseo provider models agy --json
+paseo usage ls --json --refresh
+paseo plugin logs agy-acp
+```
+
+Require `running` with no plugin error, a model catalog and an `available` agy quota report. The tier appears after successful native catalog discovery or session opening; a cached model list alone may not populate it. Draft commands should be available before the first prompt, and closing an unprompted draft session should leave no new session artifacts.
+
+For a full conversation smoke test, use a disposable working directory, open a plan-mode agent, request a text-only reply, then close and import/reopen the native session to verify history. Exercise permission approval, denial, cancellation and rich tool cards separately. Model prompts consume account quota. Desktop/mobile UI acceptance is a manual check; offline tests do not verify layout or service access.
+
+## Packaging, CI, and releases
+
+### Dependency locks and package contents
+
+Keep Paseo host libraries and type-only dependencies in `devDependencies`; the ACP SDK is a runtime dependency. `npm-shrinkwrap.json` locks Git preparation and the installed npm dependency tree. After dependency or version changes, synchronize it with `npm install --package-lock-only --ignore-scripts` and review the diff. npm automatically includes the shrinkwrap in published packages.
+
+The source manifest's `build` runs `npm ci --omit=dev --ignore-scripts` for Git/local installations. npm already installs production dependencies, so the release workflow removes only `build` from `paseo-plugin.json` before packing and publishing. It preserves the other manifest fields and changes only the release runner's checkout. Manual npm packaging must perform the same preparation in a disposable checkout.
+
+Inspect `npm pack --dry-run --ignore-scripts` for the manifest, icon, both overviews, README, license, linked docs, server entry, all imported runtime files and shrinkwrap. Tests, workflow fixtures, local transcripts, caches and credentials must stay outside the tarball. Also inspect an actual tarball before a release. Follow Paseo's [plugin publishing guide](https://paseo.sh/docs/plugins/publishing) when preparing a registry submission.
+
+### CI and tag validation
+
+`ci.yml` checks pull requests, pushes to `main` and manual runs on Node 22.18 and 24. It installs the locked dependencies, checks formatting and types, runs the offline suite and verifies package contents.
+
+`release.yml` runs for version-tag pushes or manual dispatch on an existing tag. It rejects branch dispatches, mismatched tags and non-stable versions before contacting npm. The tag must equal `v` plus `package.json`'s stable `X.Y.Z` version. Only a registry HTTP 404 means the version is absent; HTTP 200 marks it as already published. Authentication failures, server errors and timeouts stop the workflow.
+
+For an unpublished version, the job installs dependencies, verifies formatting/types/tests, prepares the npm manifest and checks the package before publishing publicly with provenance. Existing versions skip npm preparation/publication and proceed to GitHub Release recovery. Ordinary branch pushes do not trigger this release workflow.
+
+### Trusted Publishing and release procedure
+
+Configure npm [Trusted Publishing](https://docs.npmjs.com/trusted-publishers/) for owner `fdkevin0`, repository `paseo-agy-acp` and workflow filename `release.yml`. The publish job grants `id-token: write` and installs npm >=11.5.1. An optional `NPM_TOKEN` repository secret is passed as `NODE_AUTH_TOKEN` for token-based authentication. Repository ownership, npm package permissions and publisher setup must be configured before releasing.
+
+1. Bump the stable package version and synchronize the shrinkwrap.
+2. Run offline checks, inspect the prepared tarball and complete live smoke checks.
+3. Commit with a Conventional Commit message and review the final source and package contents.
+4. Push the reviewed version commit and matching `vX.Y.Z` tag when ready to publish. Never move a published tag or overwrite a published npm version.
+5. Verify the exact published package on a test daemon before submitting it to Paseo's registry.
+
+### Release recovery
+
+If npm publication succeeds but GitHub Release creation fails, rerun the tagged workflow or dispatch it with `gh workflow run release.yml --ref vX.Y.Z`. It detects the published npm version and skips republishing. An existing GitHub Release is left alone; a missing one is created with `gh release create --verify-tag`, so recovery cannot silently create a tag at the wrong commit. A failed create command fails the job.
+
+Resolve registry or authentication errors before retrying. If a published artifact is wrong, publish a corrected new version instead of changing the old tag or package.
+
+## Documentation conventions
+
+Use progressive disclosure:
+
+- Keep the README focused on installation, the first successful run, capabilities and essential limitations.
+- Put launch settings and protocol/operational details in the reference; keep implementation, testing and release instructions here.
+- Keep listing overviews factual and user-facing, with purpose, operation, requirements, data flow and limits. They must not contain plugin-add or npm-install command examples.
+- Maintain `README.zh-CN.md` and `OVERVIEW.zh-CN.md` as complete translations of `README.md` and `OVERVIEW.md`; keep the rest of the project documentation in English.
+- Link to deeper explanations instead of duplicating them, and include every linked user document in the package's `files` list.
+- Use sample identities and paths; never commit account logs, local credentials or personal workstation paths.

@@ -1,37 +1,39 @@
 # paseo-agy-acp
 
-An Antigravity ACP provider for [Paseo](https://paseo.sh). Use native agy sessions, permission prompts, model controls and rich tool timelines from Paseo desktop or mobile clients.
+English · [简体中文](README.zh-CN.md)
 
-- Plugin ID: `agy-acp`
-- Provider ID: `agy`
-- Display name: **Antigravity (ACP)**
+Use Antigravity in [Paseo](https://paseo.sh) through the native `agy` Agent Client Protocol. Open and resume conversations, approve tools, select models and track usage from Paseo desktop or mobile clients.
+
+The plugin ID is `agy-acp`; its provider is `agy`, displayed as **Antigravity (ACP)**.
 
 ## Prerequisites
 
 - Paseo **0.15.0 or later**, with plugins enabled.
 - Node.js **22.18 or later** and npm on the daemon host.
-- Antigravity CLI (`agy`) **1.4.12 or later**, authenticated on that host. The plugin probes `agy --version`; it does not perform login.
+- Antigravity CLI (`agy`) **1.4.12 or later**, already authenticated on that host. Run `agy` in a terminal to sign in before using the plugin.
 
 ## Install
 
-From a local checkout:
-
-```sh
-npm ci --ignore-scripts
-npm run check
-npm test
-paseo plugin install /absolute/path/to/paseo-agy-acp
-paseo plugin ls
-```
-
-Once the repository or package has been published, install from GitHub or npm:
+From GitHub:
 
 ```sh
 paseo plugin install git:fdkevin0/paseo-agy-acp
+```
+
+From npm:
+
+```sh
 paseo plugin install npm:@fdkevin0/paseo-agy-acp
 ```
 
-These are distribution addresses, not a claim that a release is already available. Git installation runs the manifest's locked production dependency preparation. For a remote daemon, add `--host <endpoint>`; the source path and agy executable must exist on that host.
+From a local clone:
+
+```sh
+git clone https://github.com/fdkevin0/paseo-agy-acp.git
+paseo plugin install ./paseo-agy-acp
+```
+
+See [development setup](docs/development.md#development-setup) for dependencies and local checks. For a remote daemon, add `--host <endpoint>`; local source paths and the agy executable must exist on that host.
 
 ## Usage
 
@@ -39,9 +41,26 @@ These are distribution addresses, not a claim that a release is already availabl
 paseo run --provider agy "Explain this repository"
 ```
 
-In Paseo, create an agent and choose **Antigravity (ACP)**. The model, mode, thinking selector and slash commands come from the native CLI. Use Paseo's session import to open an existing agy conversation. Initial native slash commands are collected before the session becomes ready, including in the draft composer.
+In Paseo, create an agent and select **Antigravity (ACP)**. Choose from the models, modes, thinking options and slash commands supplied by agy. Use session import to resume an existing native conversation.
 
-The built-in `antigravity` provider remains available alongside `agy`. To hide it after validating this plugin, merge this fragment into the daemon's `~/.paseo/config.json` and reload the configuration:
+View context occupancy and subscription quota in the Composer context popover, or check account quota from the CLI:
+
+```sh
+paseo usage ls --json
+```
+
+Manage the plugin:
+
+| Command                        | Purpose                                     |
+| ------------------------------ | ------------------------------------------- |
+| `paseo plugin ls`              | Check that `agy-acp` is running.            |
+| `paseo plugin reload agy-acp`  | Reload after changing a local installation. |
+| `paseo plugin disable agy-acp` | Disable the plugin.                         |
+| `paseo plugin remove agy-acp`  | Remove its plugin configuration.            |
+
+### Coexist with the built-in provider
+
+The built-in `antigravity` provider can remain enabled alongside `agy`. To hide it, merge this fragment into the daemon's `~/.paseo/config.json` and reload the configuration:
 
 ```json
 {
@@ -53,49 +72,28 @@ The built-in `antigravity` provider remains available alongside `agy`. To hide i
 }
 ```
 
-Existing agents keep their original provider. This plugin does not migrate them. Re-enable the built-in provider by removing that override or setting it to `true`.
+Existing agents keep their original provider; they are not migrated. Remove the override or set it to `true` to re-enable the built-in provider.
 
 ## Capabilities
 
-| Capability    | Behavior                                                             |
-| ------------- | -------------------------------------------------------------------- |
-| Sessions      | Create, list, import and restore through native ACP persistence      |
-| Prompts       | Text, images, commands and readable attachment context               |
-| Configuration | Native models, modes and per-model thinking choices                  |
-| Permissions   | Native options with tool arguments/details; no implicit bypass       |
-| Timeline      | Streaming responses, reasoning, plans and rich tool cards            |
-| Usage         | Token counters, context occupancy and USD costs when supplied by agy |
-| Subscription  | Gemini and Claude/GPT 5-hour and weekly quota windows                |
-| Subagents     | Native child links and read-only Brain transcript cards              |
+| Capability    | Behavior                                                   |
+| ------------- | ---------------------------------------------------------- |
+| Sessions      | Create, list, import and restore native conversations.     |
+| Prompts       | Text, images, slash commands and attachment context.       |
+| Configuration | Native models, modes and per-model thinking choices.       |
+| Permissions   | Native approval options with tool arguments and details.   |
+| Timeline      | Streaming responses, reasoning, plans and rich tool cards. |
+| Context       | Token counters, context occupancy and reported USD costs.  |
+| Subscription  | Gemini and Claude/GPT 5-hour and weekly quota windows.     |
+| Subagents     | Native child links and read-only Brain transcript cards.   |
 
-Steering, rewind, archive/unarchive, structured output and custom system prompts are not implemented. Artifacts panels and recursive child discovery are not implemented. Child transcript cards are a projection of native logs, not an independently controllable ACP session.
+Steering, rewind, archive operations, structured output, custom system prompts, Artifacts panels and recursive child discovery are unsupported. Child cards do not provide independent session control. Context occupancy is estimated when agy supplies no native measurement; current agy print mode rejects custom ACP directory flags for quota queries. See [reference limitations](docs/reference.md) for details.
 
-## Context and subscription usage
+## More information
 
-Paseo's Composer context popover shows context occupancy and subscription quota. When agy supplies no context notification, occupancy is estimated from uncached input plus cache reads/writes divided by the observed model steps, then output tokens are added. The fallback capacity is 131,072 tokens for GPT-OSS and 256,000 for other models; native context reports take precedence.
-
-```sh
-paseo usage ls --json
-```
-
-Usage source `agy` runs the local `agy -p /usage --output-format json` command to report **Gemini Models** and **Claude and GPT models** quota windows, reset times and the observed subscription tier. This command does not start a model turn. Account labels come from local login logs; credentials remain in agy's login store. Launch environment overrides are retained; custom ACP directory flags require support from agy print mode. The plan label becomes available after catalog discovery or a session opens.
-
-## Verification
-
-```sh
-npm run check
-npm test
-npm run format:check
-npm pack --dry-run
-```
-
-Tests use a local ACP fixture and temporary files, without calling a model or consuming quota. Changes to the local plugin require `paseo plugin reload agy-acp`; verify `running` using `paseo plugin ls`. Disable it with `paseo plugin disable agy-acp`.
-
-## Documentation
-
-- [Reference](docs/reference.md): launch configuration, tool mappings, permissions and data flow.
-- [Development](docs/development.md): tests, troubleshooting, packaging and release setup.
-- [Plugin overview](OVERVIEW.md) · [简体中文](OVERVIEW.zh-CN.md)
+- [Reference](docs/reference.md): launch settings, tool mappings, persistence, permissions, context and quota behavior.
+- [Development](docs/development.md): request flow, source layout, verification, packaging and releases.
+- [Plugin listing overview](OVERVIEW.md) · [简体中文](OVERVIEW.zh-CN.md)
 
 ## License
 
