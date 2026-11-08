@@ -15,6 +15,7 @@ import { AgyUsageSource } from '../server/usage.ts'
 async function run(
   scenario: string,
   verify: (events: ProviderEvent[]) => void,
+  afterClose?: (events: ProviderEvent[]) => void,
 ) {
   const home = await mkdtemp(join(tmpdir(), 'agy-compat-'))
   const provider = await createProvider(new AgyUsageSource()).connect({
@@ -92,6 +93,7 @@ async function run(
     verify(events)
   } finally {
     await provider.close()
+    afterClose?.(events)
     await rm(home, { recursive: true, force: true })
   }
 }
@@ -197,6 +199,44 @@ test('replaying a historical kill preserves the child timeline before cancellati
 
 for (const scenario of ['kill', 'kill-all'])
   test(`native Run manage_subagents ${scenario} cancels registered children`, async () => {
+    const childId = 's:child:22222222-2222-4222-8222-222222222222'
+    await run(
+      scenario,
+      (events) => {
+        assert.equal(
+          events.filter(
+            (event) =>
+              event.type === 'session.opened' && event.sessionId === childId,
+          ).length,
+          1,
+          'a killed child is never reopened by later settlement',
+        )
+        const canceled = events.findIndex(
+          (event) =>
+            event.type === 'session.turn' &&
+            event.sessionId === childId &&
+            event.state === 'canceled',
+        )
+        const parentDone = events.findIndex(
+          (event) =>
+            event.type === 'session.turn' &&
+            event.sessionId === 's' &&
+            event.state === 'completed',
+        )
+        assert.ok(
+          canceled >= 0 && canceled < parentDone,
+          'the child is canceled before the parent turn completes',
+        )
+      },
+      (events) =>
+        assert.ok(
+          events.some(
+            (event) =>
+              event.type === 'session.closed' && event.sessionId === childId,
+          ),
+          'closing the parent closes the killed child session',
+        ),
+    )
     await run(scenario, (events) => {
       assert.ok(
         events.some(

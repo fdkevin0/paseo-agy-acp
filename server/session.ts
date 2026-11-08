@@ -293,6 +293,7 @@ async function createSession(
   }
   const buffered: SessionNotification[] = []
   const children = new Map<string, BrainWatchHandle>()
+  const killedChildren = new Set<string>()
   let notificationLane = Promise.resolve()
   let usage: ProviderUsage = {}
   let commandsReceived = false
@@ -345,12 +346,16 @@ async function createSession(
     const list =
       subagents ??
       (await readSubagents(brainRoot, state.nativeId).catch(() => []))
+    const cancels: Promise<void>[] = []
     for (const sub of list)
       if (sub.state === 'SUBAGENT_STATE_KILLED') {
         const childId = `${id}:child:${sub.conversationId}`
-        children.get(childId)?.cancel()
-        children.delete(childId)
+        killedChildren.add(childId)
+        // Keep the entry: the child session stays open (closed with its parent) and is never reopened.
+        const child = children.get(childId)
+        if (child) cancels.push(child.cancel())
       }
+    await Promise.all(cancels)
   }
   function emitItem(item: ProviderTimelineItem, timestamp?: string) {
     timeline.track(item)
@@ -362,7 +367,27 @@ async function createSession(
       const nativeId = item.detail.childSessionId
       if (nativeId && sessionIdPattern.test(nativeId)) {
         const childId = `${id}:child:${nativeId}`
-        if (!children.has(childId)) {
+        const existing = children.get(childId)
+        if (
+          existing?.isStopped() &&
+          !killedChildren.has(childId) &&
+          !state.loading &&
+          /\bsend_message\b/.test(item.name)
+        ) {
+          // A message wakes a child stopped by interruption; resume watching the same child session.
+          children.set(
+            childId,
+            watchBrain(
+              brainRoot,
+              nativeId,
+              childId,
+              emit,
+              1000,
+              () => Boolean(state.turn),
+              existing.resumePoint(),
+            ),
+          )
+        } else if (!existing) {
           emit({
             type: 'session.opened',
             sessionId: childId,
@@ -624,25 +649,21 @@ async function createSession(
         if (state.interrupting) return state.interrupting
         state.turnAbort?.abort()
         cancelPermissions()
-        const hadRunningWatchedChildren = [...children.values()].some((child) =>
+        // Children stay registered when canceled so they are neither reopened nor left unclosed.
+        const runningChildren = [...children.values()].filter((child) =>
           child.isRunning(),
         )
-        for (const [childId, child] of children)
-          if (child.isRunning()) {
-            child.cancel()
-            children.delete(childId)
-          }
+        const canceling = runningChildren.map((child) => child.cancel())
         // Native session/cancel leaves background tasks alive; stop their owner when background work is active.
         state.interrupting = (async () => {
+          await Promise.all(canceling)
           const needsRelaunch =
-            hadRunningWatchedChildren ||
+            runningChildren.length > 0 ||
             (await hasActiveBackgroundWork(brainRoot, state.nativeId).catch(
               () => true,
             ))
-          if (needsRelaunch) {
-            for (const child of children.values()) child.cancel()
-            children.clear()
-          }
+          if (needsRelaunch)
+            await Promise.all([...children.values()].map((c) => c.cancel()))
           try {
             await currentTransport.request(
               currentTransport.rpc.cancel({ sessionId: state.nativeId }),

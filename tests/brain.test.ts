@@ -1153,63 +1153,102 @@ test('hasActiveBackgroundWork preserves Turn 1 background tasks in Turn 2 and ig
   }
 })
 
-test('a RUNNING progress row without a task id keeps its call pending for the final row', () => {
+test('GENERIC rows consume one call each and map native terminal statuses', () => {
   const projector = new BrainTranscriptProjector('p')
+  const call = (id: string) => ({ id, name: 'run_command', args: {} })
   const items = [
-    { step_index: 1, type: 'USER_INPUT', content: 'two tools' },
+    { step_index: 1, type: 'USER_INPUT', content: 'tools' },
     {
       step_index: 2,
       type: 'PLANNER_RESPONSE',
       status: 'DONE',
       tool_calls: [
-        { id: 'first', name: 'run_command', args: { CommandLine: 'a' } },
-        { id: 'second', name: 'run_command', args: { CommandLine: 'b' } },
-      ],
+        'running',
+        'waiting',
+        'canceled',
+        'interrupted',
+        'failed',
+      ].map(call),
     },
-    { step_index: 3, type: 'GENERIC', status: 'RUNNING', content: 'working' },
-    { step_index: 3, type: 'GENERIC', status: 'DONE', content: 'first out' },
-    { step_index: 4, type: 'GENERIC', status: 'DONE', content: 'second out' },
+    // agy logs a step once; RUNNING/WAITING rows are never followed by a final row.
+    { step_index: 3, type: 'GENERIC', status: 'RUNNING', content: 'busy' },
+    { step_index: 4, type: 'GENERIC', status: 'WAITING', content: 'approve?' },
+    { step_index: 5, type: 'GENERIC', status: 'CANCELED', content: 'stop' },
+    { step_index: 6, type: 'GENERIC', status: 'INTERRUPTED', content: 'cut' },
+    { step_index: 7, type: 'GENERIC', status: 'ERROR', content: 'boom' },
   ].flatMap((row) => projector.project(row))
   assert.deepEqual(
     items.flatMap((i) =>
-      i.type === 'tool_call' && i.status === 'completed'
-        ? [[i.callId, i.detail.type === 'shell' ? i.detail.output : '']]
+      i.type === 'tool_call' && i.status !== 'running'
+        ? [`${i.callId}:${i.status}`]
         : [],
     ),
-    [
-      ['first', 'first out'],
-      ['second', 'second out'],
-    ],
+    ['canceled:canceled', 'interrupted:canceled', 'failed:failed'],
   )
-  assert.equal(projector.hasPending(), false)
+  assert.equal(projector.hasPending(), false, 'no call is left to misattribute')
   assert.equal(projector.hasBackground(), false)
 })
 
-test('settlement emits the final row of a step that first reported progress', async () => {
+test('an in-place O_TRUNC rewrite re-delivers changed steps once and drops unlogged rows', async () => {
   const f = await fixture()
+  const abort = new AbortController()
   try {
+    const plan = {
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ id: 'cmd', name: 'run_command', args: {} }],
+    }
     await f.put(parent, [
       { step_index: 1, type: 'USER_INPUT', content: 'run' },
-      {
-        step_index: 2,
-        type: 'PLANNER_RESPONSE',
-        status: 'DONE',
-        tool_calls: [{ id: 'cmd', name: 'run_command', args: {} }],
-      },
+      plan,
       { step_index: 3, type: 'GENERIC', status: 'RUNNING', content: 'busy' },
-      { step_index: 3, type: 'GENERIC', status: 'DONE', content: 'ok' },
-      done(4),
     ])
     const items: ProviderTimelineItem[] = []
-    const result = await settleBrainTurn(f.root, parent, 'p', (item) =>
-      items.push(item),
-    )
-    assert.equal(result.status, 'completed')
+    let settled = false
+    const running = alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+        signal: abort.signal,
+        pollIntervalMs: 5,
+        shouldEmitPreWakeupTool: () => true,
+      }),
+    ).then((result) => {
+      settled = true
+      return result
+    })
+    await delay(40)
+    assert.equal(settled, false)
+    // Same inode, larger file: only content probes can notice the rewrite.
+    const rewritten = encode([
+      { step_index: 1, type: 'USER_INPUT', content: 'run' },
+      plan,
+      {
+        step_index: 3,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'finished ok',
+      },
+      { step_index: 4, type: 'PLANNER_RESPONSE', status: 'GENERATING' },
+    ])
+    const handle = await (
+      await import('node:fs/promises')
+    ).open(f.path(parent), 'r+')
+    await handle.truncate(0)
+    await handle.write(rewritten, 0)
+    await handle.close()
+    await delay(40)
+    assert.equal(settled, false, 'a GENERATING row is superseded, not final')
+    await appendFile(f.path(parent), encode([done(4, 'All done')]))
+    assert.equal((await running).status, 'completed')
     assert.deepEqual(
-      items.map((i) => (i.type === 'tool_call' ? i.status : i.type)),
-      ['completed'],
+      items.map((i) =>
+        i.type === 'tool_call' ? `${i.callId}:${i.status}` : i.type,
+      ),
+      ['cmd:completed'],
+      'the rewritten DONE step is delivered once; unchanged steps are not repeated',
     )
   } finally {
+    abort.abort()
     await f.close()
   }
 })
@@ -1270,6 +1309,35 @@ test('settlement without grace completes immediately when no turn row exists', a
   }
 })
 
+test('a missing transcript never throws and only waits when the session directory exists', async () => {
+  const f = await fixture()
+  try {
+    let startedAt = Date.now()
+    assert.deepEqual(
+      await settleBrainTurn(f.root, parent, 'p', () => {}, {
+        transcriptGraceMs: 2000,
+      }),
+      { status: 'completed' },
+    )
+    assert.ok(Date.now() - startedAt < 500, 'no Brain directory: no grace')
+    // Earlier subagents and no transcript used to throw ENOENT.
+    await f.subagent(parent, child)
+    startedAt = Date.now()
+    assert.deepEqual(
+      await alive(
+        settleBrainTurn(f.root, parent, 'p', () => {}, {
+          pollIntervalMs: 5,
+          transcriptGraceMs: 100,
+        }),
+      ),
+      { status: 'completed' },
+    )
+    assert.ok(Date.now() - startedAt >= 100, 'directory exists: grace applies')
+  } finally {
+    await f.close()
+  }
+})
+
 test('settlement stops waiting on an idle transcript without a final response', async () => {
   const f = await fixture()
   try {
@@ -1288,6 +1356,38 @@ test('settlement stops waiting on an idle transcript without a final response', 
     assert.deepEqual(
       items.map((i) => (i.type === 'error' ? i.id : i.type)),
       ['p:step:2:stalled'],
+    )
+  } finally {
+    await f.close()
+  }
+})
+
+test('a settled ALIVE child does not suspend the parent stall timeout', async () => {
+  const f = await fixture()
+  try {
+    // agy keeps finished subagents ALIVE until an explicit kill.
+    await f.subagent(parent, child)
+    await f.deliver(parent, child, 'Report', true, 'report')
+    await f.put(child, [
+      message(0, parent, 'work'),
+      ...report(parent, 'Report'),
+    ])
+    await f.put(parent, [
+      ...invoke(child),
+      message(5, child, 'Report'),
+      { step_index: 6, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+    ])
+    const items: ProviderTimelineItem[] = []
+    const result = await alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+        minStepIndex: -1,
+        pollIntervalMs: 5,
+        stallTimeoutMs: 50,
+      }),
+    )
+    assert.equal(result.status, 'completed')
+    assert.ok(
+      items.some((i) => i.type === 'error' && i.id.endsWith(':stalled')),
     )
   } finally {
     await f.close()
@@ -1349,6 +1449,115 @@ test('readLastStepIndex reads the tail past large rows and torn writes', async (
     await appendFile(f.path(parent), '{"step_index": 3, "type": "PLAN')
     assert.equal(await readLastStepIndex(f.root, parent), 2)
   } finally {
+    await f.close()
+  }
+})
+
+test('a resumed child watcher skips its history and continues turn IDs', async () => {
+  const f = await fixture()
+  const events: ProviderEvent[] = []
+  let handle: BrainWatchHandle | undefined
+  try {
+    await f.put(child, [message(0, parent, 'work'), done(1, 'First reply')])
+    handle = watchBrain(
+      f.root,
+      child,
+      'c',
+      (event) => events.push(event),
+      5,
+      () => true,
+      { afterStep: 1, turnSeq: 3 },
+    )
+    await handle.ready
+    assert.equal(
+      events.length,
+      0,
+      'history up to the resume point is not replayed',
+    )
+    await appendFile(
+      f.path(child),
+      encode([message(2, parent, 'more'), done(3, 'Second reply')]),
+    )
+    await until(() =>
+      events.some((e) => e.type === 'session.turn' && e.state === 'completed'),
+    )
+    assert.deepEqual(
+      events.flatMap((e) =>
+        e.type === 'session.turn'
+          ? [`${e.turnId}:${e.state}`]
+          : e.type === 'timeline.item' && e.item.type === 'assistant_message'
+            ? [e.item.text]
+            : [],
+      ),
+      ['c:turn:4:started', 'Second reply', 'c:turn:4:completed'],
+    )
+    assert.equal(handle.isStopped(), false)
+    await handle.cancel()
+    assert.equal(handle.isStopped(), true)
+  } finally {
+    handle?.()
+    await f.close()
+  }
+})
+
+test('a child watcher does not restart turns when its transcript is rewritten in place', async () => {
+  const f = await fixture()
+  const events: ProviderEvent[] = []
+  let handle: BrainWatchHandle | undefined
+  try {
+    const rows = [message(0, parent, 'work'), done(1, 'Reply')]
+    await f.put(child, rows)
+    handle = watchBrain(f.root, child, 'c', (event) => events.push(event), 5)
+    await until(() =>
+      events.some((e) => e.type === 'session.turn' && e.state === 'completed'),
+    )
+    const before = events.length
+    const fs = await import('node:fs/promises')
+    const file = await fs.open(f.path(child), 'r+')
+    await file.truncate(0)
+    await file.write(
+      encode([...rows, { step_index: 2, type: 'CHECKPOINT' }]),
+      0,
+    )
+    await file.close()
+    await delay(50)
+    assert.equal(events.length, before, 'unchanged steps are not new activity')
+  } finally {
+    handle?.()
+    await f.close()
+  }
+})
+
+test('a rewrite observed mid-O_TRUNC does not end an anchored turn', async () => {
+  const f = await fixture()
+  const abort = new AbortController()
+  try {
+    const rows = [
+      { step_index: 1, type: 'USER_INPUT', content: 'run' },
+      { step_index: 2, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+    ]
+    await f.put(parent, rows)
+    let settled = false
+    const running = alive(
+      settleBrainTurn(f.root, parent, 'p', () => {}, {
+        signal: abort.signal,
+        pollIntervalMs: 5,
+      }),
+    ).then((result) => {
+      settled = true
+      return result
+    })
+    await delay(30)
+    const fs = await import('node:fs/promises')
+    const file = await fs.open(f.path(parent), 'r+')
+    await file.truncate(0)
+    await delay(30)
+    assert.equal(settled, false, 'an empty file mid-rewrite is not "no turn"')
+    await file.write(encode([...rows, done(3, 'ok')]), 0)
+    await file.close()
+    assert.equal((await running).status, 'completed')
+  } finally {
+    abort.abort()
     await f.close()
   }
 })
