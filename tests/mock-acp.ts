@@ -61,8 +61,13 @@ stream.writable = new WritableStream({
   },
 })
 new AgentSideConnection((client) => {
+  let sessions = 0
   function sendCommands(sessionId: string) {
     if (process.env.AGY_TEST_NO_COMMANDS) return
+    const extra =
+      process.env.AGY_TEST_WARM_COMMANDS && sessions > 1
+        ? [{ name: 'plan', description: 'Plan task' }]
+        : []
     setTimeout(() => {
       void client.sessionUpdate({
         sessionId,
@@ -70,6 +75,7 @@ new AgentSideConnection((client) => {
           sessionUpdate: 'available_commands_update',
           availableCommands: [
             { name: 'compact', description: 'Compact context' },
+            ...extra,
           ],
         },
       })
@@ -89,6 +95,7 @@ new AgentSideConnection((client) => {
       return {}
     },
     async newSession() {
+      sessions += 1
       log('new')
       sendCommands(nativeId)
       return { sessionId: nativeId, configOptions }

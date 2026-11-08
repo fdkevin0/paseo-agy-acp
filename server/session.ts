@@ -1,6 +1,7 @@
 import type { AgyUsageSource } from './usage.ts'
 import { z } from 'zod'
 import { randomUUID } from 'node:crypto'
+import { stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import type {
   RequestPermissionRequest,
@@ -37,6 +38,17 @@ import {
 type Open = Extract<ProviderInput, { type: 'session.open' }>
 type Prompt = Extract<ProviderInput, { type: 'session.prompt' }>
 type Session = Awaited<ReturnType<typeof createSession>>
+type CommandItem = {
+  name: string
+  description: string
+  argumentHint?: string
+}
+type WarmRuntime = {
+  transport: ReturnType<typeof connectAcp>
+  initialized: Awaited<
+    ReturnType<ReturnType<typeof connectAcp>['rpc']['initialize']>
+  >
+}
 interface SessionOptions {
   usage: AgyUsageSource
   launch?: ProviderLaunch
@@ -44,20 +56,70 @@ interface SessionOptions {
   emit: (event: ProviderEvent) => void
 }
 
+function scopeKey(
+  cwd: string,
+  env: Readonly<Record<string, string>> = {},
+): string {
+  return JSON.stringify([
+    cwd,
+    Object.entries(env).sort(([a], [b]) => a.localeCompare(b)),
+  ])
+}
+
 /** Own native runtimes, session identities and their cancellation across a provider connection. */
 export class SessionManager {
   private sessions = new Map<string, Session>()
   private opening = new Set<string>()
   private transports = new Set<ReturnType<typeof connectAcp>>()
+  private commands = new Map<string, CommandItem[]>()
+  private warm = new Map<string, WarmRuntime>()
   private closed = false
   private options: SessionOptions
   constructor(options: SessionOptions) {
     this.options = options
   }
 
-  start(id: string, cwd: string, config?: ProviderSessionConfig) {
+  async start(id: string, cwd: string, config?: ProviderSessionConfig) {
     if (this.closed) throw new Error('Provider connection is closed')
-    return createSession(id, cwd, config, this.options, this.transports)
+    const cmdKey = scopeKey(cwd, config?.env)
+    const warmKey = scopeKey(
+      dataDirectory(this.options.launch, config?.env, cwd),
+      config?.env,
+    )
+    const hasCwd = await stat(cwd).then(
+      (s) => s.isDirectory(),
+      () => false,
+    )
+    const warm = hasCwd ? this.warm.get(warmKey) : undefined
+    if (warm) this.warm.delete(warmKey)
+    return createSession(
+      id,
+      cwd,
+      config,
+      this.options,
+      this.transports,
+      cmdKey,
+      this.commands,
+      warm && !warm.transport.closed ? warm : undefined,
+      (runtime) => {
+        if (this.closed || runtime.transport.closed || this.warm.has(warmKey))
+          return false
+        runtime.transport.bind(
+          {
+            sessionUpdate: async () => {},
+            requestPermission: async () => ({
+              outcome: { outcome: 'cancelled' },
+            }),
+          },
+          () => {
+            this.transports.delete(runtime.transport)
+            if (this.warm.get(warmKey) === runtime) this.warm.delete(warmKey)
+          },
+        )
+        this.warm.set(warmKey, runtime)
+        return true
+      },
+    )
   }
   async open(input: Open) {
     const { emit, capabilities } = this.options
@@ -116,6 +178,7 @@ export class SessionManager {
           this.options.usage.tiers.set(dir, session.transport.tier.name)
         await session.drain()
         if (this.closed) throw new Error('Provider connection is closed')
+        session.state.opened = true
         emit({
           type: 'session.opened',
           sessionId: input.sessionId,
@@ -129,6 +192,7 @@ export class SessionManager {
           },
         })
         session.flush()
+        session.seedCommands()
         await configureSession(session, input.config)
         await session.drain()
         session.state.loading = false
@@ -209,6 +273,7 @@ export class SessionManager {
   }
   async close() {
     this.closed = true
+    this.warm.clear()
     await Promise.all([...this.sessions.values()].map((s) => s.close()))
     await Promise.all([...this.transports].map((t) => t.close()))
     this.sessions.clear()
@@ -221,6 +286,10 @@ async function createSession(
   config: ProviderSessionConfig | undefined,
   options: SessionOptions,
   transports: Set<ReturnType<typeof connectAcp>>,
+  key: string,
+  commands: Map<string, CommandItem[]>,
+  warm: WarmRuntime | undefined,
+  parkWarm: (runtime: WarmRuntime) => boolean,
 ) {
   const { launch, capabilities, emit } = options
   const permissions = new Map<
@@ -233,6 +302,7 @@ async function createSession(
   const timeline = new Timeline(id)
   const state = {
     nativeId: '',
+    opened: false,
     persisted: false,
     closing: false,
     turnSteps: 1,
@@ -251,6 +321,7 @@ async function createSession(
   let notificationLane = Promise.resolve()
   let usage: ProviderUsage = {}
   let commandsReceived = false
+  let emittedCommands: CommandItem[] | undefined
   let commandWaiter: (() => void) | null = null
   let closing: Promise<void> | undefined
   function resolveCommands() {
@@ -324,15 +395,23 @@ async function createSession(
         state.metadata.modes.currentModeId = u.currentModeId
       publishConfig()
     } else if (u.sessionUpdate === 'available_commands_update') {
-      emit({
-        type: 'session.commands',
-        sessionId: id,
-        commands: u.availableCommands.map((c) => ({
-          name: c.name,
-          description: c.description,
-          argumentHint: c.input?.hint,
-        })),
-      })
+      const next = u.availableCommands.map((c) => ({
+        name: c.name,
+        description: c.description,
+        argumentHint: c.input?.hint,
+      }))
+      commands.set(key, next)
+      if (
+        state.opened &&
+        JSON.stringify(next) !== JSON.stringify(emittedCommands)
+      ) {
+        emittedCommands = next
+        emit({
+          type: 'session.commands',
+          sessionId: id,
+          commands: next,
+        })
+      }
       commandsReceived = true
       resolveCommands()
     } else if (u.sessionUpdate === 'usage_update') {
@@ -404,73 +483,73 @@ async function createSession(
     }
     permissions.clear()
   }
-  const transport = connectAcp(
-    launch,
-    cwd,
-    config?.env ?? {},
-    {
-      sessionUpdate: (notification) => {
-        notificationLane = notificationLane.then(() => update(notification))
-        return notificationLane
-      },
-      requestPermission: (request) => {
-        const parsed = RequestPermissionRequestSchema.safeParse(request)
-        if (!parsed.success)
-          return Promise.resolve({ outcome: { outcome: 'cancelled' as const } })
-        const input = z
-          .record(z.string(), z.json())
-          .safeParse(record(request.toolCall?.rawInput))
-        if (!input.success)
-          return Promise.resolve({ outcome: { outcome: 'cancelled' as const } })
-        return new Promise((resolve) => {
-          const permissionId = randomUUID()
-          permissions.set(permissionId, { request, resolve })
-          emit({
-            type: 'session.permission',
-            sessionId: id,
-            request: {
-              id: permissionId,
-              name: request.toolCall.title ?? 'Tool',
-              kind: 'tool',
-              title: request.toolCall.title ?? undefined,
-              input: input.data,
-              detail: toolDetail(request.toolCall),
-              actions: request.options.map((o) => ({
-                id: o.optionId,
-                label: o.name,
-                behavior: o.kind.startsWith('allow') ? 'allow' : 'deny',
-              })),
-            },
-          })
-        })
-      },
+  const client = {
+    sessionUpdate: (notification: SessionNotification) => {
+      notificationLane = notificationLane.then(() => update(notification))
+      return notificationLane
     },
-    (error) => {
-      if (state.failed) return
-      state.failed = true
-      resolveCommands()
-      cancelPermissions()
-      terminalize('failed', error.message)
-      if (!state.opening)
+    requestPermission: (request: RequestPermissionRequest) => {
+      const parsed = RequestPermissionRequestSchema.safeParse(request)
+      if (!parsed.success)
+        return Promise.resolve({ outcome: { outcome: 'cancelled' as const } })
+      const input = z
+        .record(z.string(), z.json())
+        .safeParse(record(request.toolCall?.rawInput))
+      if (!input.success)
+        return Promise.resolve({ outcome: { outcome: 'cancelled' as const } })
+      return new Promise<RequestPermissionResponse>((resolve) => {
+        const permissionId = randomUUID()
+        permissions.set(permissionId, { request, resolve })
         emit({
-          type: 'session.runtime_failed',
+          type: 'session.permission',
           sessionId: id,
-          error: { message: error.message },
+          request: {
+            id: permissionId,
+            name: request.toolCall.title ?? 'Tool',
+            kind: 'tool',
+            title: request.toolCall.title ?? undefined,
+            input: input.data,
+            detail: toolDetail(request.toolCall),
+            actions: request.options.map((o) => ({
+              id: o.optionId,
+              label: o.name,
+              behavior: o.kind.startsWith('allow') ? 'allow' : 'deny',
+            })),
+          },
         })
+      })
     },
-  )
+  }
+  const onExit = (error: Error) => {
+    if (state.failed) return
+    state.failed = true
+    resolveCommands()
+    cancelPermissions()
+    terminalize('failed', error.message)
+    if (!state.opening && state.opened)
+      emit({
+        type: 'session.runtime_failed',
+        sessionId: id,
+        error: { message: error.message },
+      })
+  }
+  const transport = warm
+    ? (warm.transport.bind(client, onExit), warm.transport)
+    : connectAcp(launch, cwd, config?.env ?? {}, client, onExit)
   transports.add(transport)
   try {
-    const initialized = await transport.request(
-      transport.rpc.initialize({
-        protocolVersion: 1,
-        clientInfo: { name: 'paseo-agy-acp', version: '0.1.0' },
-        clientCapabilities: {
-          fs: { readTextFile: false, writeTextFile: false },
-          terminal: false,
-        },
-      }),
-    )
+    const initialized = warm
+      ? warm.initialized
+      : await transport.request(
+          transport.rpc.initialize({
+            protocolVersion: 1,
+            clientInfo: { name: 'paseo-agy-acp', version: '0.1.0' },
+            clientCapabilities: {
+              fs: { readTextFile: false, writeTextFile: false },
+              terminal: false,
+            },
+          }),
+        )
     return {
       id,
       cwd,
@@ -486,6 +565,17 @@ async function createSession(
       terminalize,
       drain,
       waitForCommands,
+      seedCommands() {
+        const cached = commands.get(key)
+        if (!cached || commandsReceived) return
+        emittedCommands = cached
+        commandsReceived = true
+        emit({
+          type: 'session.commands',
+          sessionId: id,
+          commands: cached,
+        })
+      },
       flush() {
         state.opening = false
         for (const item of buffered.splice(0)) update(item)
@@ -506,19 +596,37 @@ async function createSession(
             !state.persisted &&
             state.prompts.size === 0 &&
             sessionIdPattern.test(state.nativeId)
-          if (disposable)
-            await transport
-              .request(
-                transport.rpc.closeSession({ sessionId: state.nativeId }),
-              )
-              .catch(() => undefined)
-          await transport.close()
+          const closedNatively = disposable
+            ? await transport
+                .request(
+                  transport.rpc.closeSession({ sessionId: state.nativeId }),
+                )
+                .then(
+                  () => true,
+                  () => false,
+                )
+            : false
+          const dir = dataDirectory(launch, config?.env, cwd)
+          if (
+            disposable &&
+            closedNatively &&
+            !state.failed &&
+            parkWarm({ transport, initialized })
+          ) {
+            await removeSessionArtifacts(dir, state.nativeId).catch(
+              () => undefined,
+            )
+            return
+          }
+          const stopped = await transport.close().then(
+            () => true,
+            () => false,
+          )
           transports.delete(transport)
-          if (disposable)
-            await removeSessionArtifacts(
-              dataDirectory(launch, config?.env, cwd),
-              state.nativeId,
-            ).catch(() => undefined)
+          if (disposable && stopped)
+            await removeSessionArtifacts(dir, state.nativeId).catch(
+              () => undefined,
+            )
         })()
         return closing
       },

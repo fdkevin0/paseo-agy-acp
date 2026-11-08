@@ -10,10 +10,15 @@ import type {
 } from '@getpaseo/plugin/server/provider'
 import { sessionIdPattern } from './mapping.ts'
 
+const statusCache = new Map<string, number>()
+
 /** Verify that the configured executable supports the required ACP version. */
 export async function providerStatus(
   launch?: ProviderLaunch,
 ): Promise<ProviderStatus> {
+  const key = catalogCacheKey(launch)
+  const cached = statusCache.get(key)
+  if (cached && Date.now() - cached < 60_000) return { available: true }
   try {
     const { stdout, stderr } = await execCommand(
       launch?.command ?? 'agy',
@@ -35,8 +40,10 @@ export async function providerStatus(
     if (
       major > 1 ||
       (major === 1 && (minor > 4 || (minor === 4 && patch >= 12)))
-    )
+    ) {
+      statusCache.set(key, Date.now())
       return { available: true }
+    }
     return {
       available: false,
       diagnostic: `agy ${version[0]} is too old; requires >=1.4.12. Run agy update.`,

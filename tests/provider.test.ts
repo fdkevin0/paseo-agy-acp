@@ -492,14 +492,77 @@ test('delayed commands precede readiness on both new and restored sessions; tier
       const commands = h.events.find((e) => e.type === 'session.commands')
       assert.ok(commands?.type === 'session.commands')
       assert.equal(commands.commands[0].name, 'compact')
-      assert.ok(
+      assert.equal(
         h.events.indexOf(commands) <
           h.events.findIndex((e) => e.type === 'session.ready'),
+        true,
       )
     }
     assert.equal(
       h.usage.tiers.get(dataDirectory(undefined, { HOME: home })),
       'Google AI Ultra',
+    )
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('disposable sessions park warm runtimes, clean artifacts, and seed cached commands', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-warm-'))
+  const id = '11111111-1111-4111-8111-111111111111'
+  const dir = dataDirectory(undefined, { HOME: home })
+  const db = join(dir, 'conversations', `${id}.db`)
+  const brain = join(dir, 'brain', id)
+  const h = await harness({ HOME: home, AGY_TEST_WARM_COMMANDS: '1' })
+  try {
+    await mkdir(join(dir, 'conversations'), { recursive: true })
+    await mkdir(brain, { recursive: true })
+    await writeFile(db, 'fixture')
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-1',
+      sessionId: 's1',
+      config: h.config,
+      history: 'skip',
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's1')
+    await h.provider.send({
+      type: 'session.close',
+      requestId: 'close-1',
+      sessionId: 's1',
+    })
+    await h.wait((e) => e.type === 'session.closed' && e.sessionId === 's1')
+    await assert.rejects(stat(db), { code: 'ENOENT' })
+    await assert.rejects(stat(brain), { code: 'ENOENT' })
+
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-2',
+      sessionId: 's2',
+      config: h.config,
+      history: 'skip',
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's2')
+    const seeded = h.events.find(
+      (e) => e.type === 'session.commands' && e.sessionId === 's2',
+    )
+    assert.ok(seeded?.type === 'session.commands')
+    assert.deepEqual(
+      seeded.commands.map((c) => c.name),
+      ['compact'],
+    )
+    const updated = await h.wait(
+      (e) =>
+        e.type === 'session.commands' &&
+        e.sessionId === 's2' &&
+        e.commands.length === 2,
+    )
+    assert.ok(updated.type === 'session.commands')
+    assert.deepEqual(
+      updated.commands.map((c) => c.name),
+      ['compact', 'plan'],
     )
   } finally {
     await h.provider.close()

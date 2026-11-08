@@ -25,6 +25,8 @@ export function connectAcp(
     { cwd, env: { ...(launch?.env ?? process.env), ...env }, stdio: 'pipe' },
   )
   let stopping = false
+  let activeClient = client
+  let activeOnExit = onExit
   let stderr = ''
   child.stderr.on('data', (chunk) => {
     stderr = (stderr + chunk).slice(-4096)
@@ -33,10 +35,16 @@ export function connectAcp(
     child.once('close', () => resolve()),
   )
   child.on('error', (error) => {
-    if (!stopping) onExit(error)
+    if (!stopping) {
+      stopping = true
+      activeOnExit(error)
+    }
   })
   child.once('exit', (code) => {
-    if (!stopping) onExit(new Error(`agy exited (${code}): ${stderr}`))
+    if (!stopping) {
+      stopping = true
+      activeOnExit(new Error(`agy exited (${code}): ${stderr}`))
+    }
   })
   const tierSchema = z.object({
     id: z.string().optional(),
@@ -83,9 +91,18 @@ export function connectAcp(
       },
     }),
   )
-  const rpc = new ClientSideConnection(() => client, { readable, writable })
+  const rpc = new ClientSideConnection(
+    () => ({
+      sessionUpdate: (params) => activeClient.sessionUpdate(params),
+      requestPermission: (params) => activeClient.requestPermission(params),
+    }),
+    { readable, writable },
+  )
   void rpc.closed.then(() => {
-    if (!stopping) onExit(new Error('ACP connection closed'))
+    if (!stopping) {
+      stopping = true
+      activeOnExit(new Error('ACP connection closed'))
+    }
   })
   let closing: Promise<void> | undefined
   function close(): Promise<void> {
@@ -121,7 +138,7 @@ export function connectAcp(
         operation,
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
-            void close().catch(onExit)
+            void close().catch(activeOnExit)
             reject(new Error('ACP request timed out'))
           }, 30_000)
         }),
@@ -134,6 +151,13 @@ export function connectAcp(
     rpc,
     close,
     request,
+    bind(nextClient: Client, nextOnExit: (error: Error) => void) {
+      activeClient = nextClient
+      activeOnExit = nextOnExit
+    },
+    get closed() {
+      return stopping
+    },
     get tier() {
       return tier
     },

@@ -18,19 +18,19 @@ The resolved native directory is used for temporary artifact cleanup, Brain trac
 
 ### Availability and catalog discovery
 
-Provider status runs the executable with `--version`, with a five-second timeout, and requires a parseable version of at least 1.4.12. Catalog identity hashes the command, arguments and sorted environment using SHA-256; environment values are not included in plain-text cache keys. Within a connection, concurrent catalog requests for the same working directory share a promise. Failed probes may be retried and do not replace remembered usage launches.
+Provider status runs the executable with `--version`, with a five-second timeout, requires a parseable version of at least 1.4.12, and caches successful checks for 60 seconds per launch key. Catalog identity hashes the command, arguments and sorted environment using SHA-256; environment values are not included in plain-text cache keys. Within a connection, concurrent catalog requests for the same working directory share a promise. Failed probes may be retried and do not replace remembered usage launches.
 
 ### Temporary session cleanup
 
-Catalog discovery opens an unprompted native session, reads its configuration, calls `session/close`, then stops the process. New sessions closed before their first prompt use the same cleanup. Imported and prompted conversations are retained.
+Catalog discovery opens an unprompted native session, reads its configuration, and calls `session/close`. New sessions closed before their first prompt use the same cleanup. When `session/close` succeeds on a healthy runtime and no warm process is already parked for that data directory and environment, the plugin removes the closed session's artifacts immediately and keeps the initialized ACP process warm for the next session; otherwise it stops the process first. Imported and prompted conversations are retained.
 
 Only the closed session's validated UUID is eligible for deletion:
 
-| Artifact under the native data directory      | Cleanup                                                  |
-| --------------------------------------------- | -------------------------------------------------------- |
-| `conversations/<id>.db`, `.db-wal`, `.db-shm` | Remove after the process stops.                          |
-| `brain/<id>/`                                 | Remove that session's directory after the process stops. |
-| Shared summary databases and other sessions   | Retain.                                                  |
+| Artifact under the native data directory      | Cleanup                                                      |
+| --------------------------------------------- | ------------------------------------------------------------ |
+| `conversations/<id>.db`, `.db-wal`, `.db-shm` | Remove after `session/close` or after the process stops.     |
+| `brain/<id>/`                                 | Remove that session's directory after close or process stop. |
+| Shared summary databases and other sessions   | Retain.                                                      |
 
 Cleanup refuses symlink targets and does not traverse symlink directories. Native close and filesystem cleanup are best-effort; errors do not discard an already-discovered catalog and may leave temporary artifacts.
 
@@ -38,7 +38,7 @@ Cleanup refuses symlink targets and does not traverse symlink directories. Nativ
 
 Model, mode and thinking controls derive from native `configOptions`. Legacy model metadata constrains effort variants to each model's supported choices; fixed-effort models hide the thinking selector. Opening a session changes configuration only when a requested value differs from native state. Effective configuration is published before `session.ready`.
 
-The provider waits up to one second for the initial `available_commands_update` before readiness so draft and live composers can query native commands. An empty list also resolves the wait; close or failure releases it. If the deadline expires, readiness proceeds without an initial list. Later updates are forwarded, but Paseo may have already cached the draft command list.
+The provider waits up to one second for the initial `available_commands_update` before readiness so draft and live composers can query native commands, and caches the latest command list per `(cwd, env)` across the connection to seed subsequent sessions immediately before `session.ready`. An empty list also resolves the wait; close or failure releases it. If the deadline expires, readiness proceeds without an initial list. Changed command lists from later updates are forwarded.
 
 The connection negotiates these capabilities with Paseo and validates incoming operations against the negotiated set: `prompt.message`, `prompt.command`, `prompt.image`, `session.configure`, `session.list`, `session.persistence`, `session.can_stop_runtime`, `permission`, and `session.subsession`.
 

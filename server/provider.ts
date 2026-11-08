@@ -13,12 +13,7 @@ import type {
   ProviderEvent,
   ProviderInput,
 } from '@getpaseo/plugin/server/provider'
-import {
-  providerStatus,
-  catalogCacheKey,
-  dataDirectory,
-  removeSessionArtifacts,
-} from './preflight.ts'
+import { providerStatus, catalogCacheKey } from './preflight.ts'
 import { configState } from './mapping.ts'
 import { AgyUsageSource } from './usage.ts'
 import { SessionManager } from './session.ts'
@@ -135,15 +130,16 @@ async function probeCatalog(
   usage: AgyUsageSource,
 ): Promise<ProviderCatalog> {
   const session = await manager.start(randomUUID(), cwd)
-  let nativeId: string | undefined
   try {
     const response = await session.transport.request(
       session.transport.rpc.newSession({ cwd, mcpServers: [] }),
     )
-    nativeId = response.sessionId
+    session.state.nativeId = response.sessionId
     const dir = usage.remember(launch, {}, cwd)
     if (session.transport.tier?.name)
       usage.tiers.set(dir, session.transport.tier.name)
+    session.flush()
+    await session.waitForCommands(100)
     const config = configState({
       ...response,
       models: session.transport.models,
@@ -157,21 +153,7 @@ async function probeCatalog(
       defaultThinkingOption: config.thinkingOption,
     }
   } finally {
-    if (nativeId) {
-      await session.transport
-        .request(session.transport.rpc.closeSession({ sessionId: nativeId }))
-        .catch(() => undefined)
-    }
-    // Never remove files until the process has actually stopped.
-    const stopped = await session.close().then(
-      () => true,
-      () => false,
-    )
-    if (nativeId && stopped)
-      await removeSessionArtifacts(
-        dataDirectory(launch, {}, cwd),
-        nativeId,
-      ).catch(() => undefined)
+    await session.close()
   }
 }
 
