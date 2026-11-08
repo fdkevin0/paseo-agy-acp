@@ -11,11 +11,28 @@ import type {
 } from '@agentclientprotocol/sdk'
 import type {
   ProviderConfigState,
+  ProviderMode,
   ProviderTimelineItem,
   ProviderToolCallDetail,
   ProviderContent,
   ProviderUsage,
 } from '@getpaseo/plugin/server/provider'
+
+export const FULL_ACCESS_MODE_ID = 'full-access'
+
+const modeVisuals: Record<
+  string,
+  Pick<ProviderMode, 'icon' | 'colorTier' | 'isUnattended'>
+> = {
+  default: { icon: 'Shield', colorTier: 'safe' },
+  'accept-edits': { icon: 'ShieldPlus', colorTier: 'moderate' },
+  plan: { icon: 'ShieldEllipsis', colorTier: 'planning' },
+  [FULL_ACCESS_MODE_ID]: {
+    icon: 'ShieldOff',
+    colorTier: 'dangerous',
+    isUnattended: true,
+  },
+}
 
 export const sessionIdPattern =
   /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i
@@ -169,6 +186,7 @@ export type SessionMetadata = Pick<
   'configOptions' | 'modes'
 > & {
   models?: z.infer<typeof nativeModelsSchema>
+  fullAccess?: boolean
 }
 
 /** Convert native catalog options to Paseo's model-specific composer controls. */
@@ -225,19 +243,36 @@ export function configState(response: SessionMetadata): ProviderConfigState {
   const modelId = model?.currentValue ?? response.models?.currentModelId
   const currentThinking =
     models.find((m) => m.id === modelId)?.thinkingOptions ?? thinkingOptions
-  return {
-    model: modelId,
-    mode: mode?.currentValue ?? response.modes?.currentModeId,
-    thinkingOption: currentThinking.some((o) => o.id === thinking?.currentValue)
-      ? thinking?.currentValue
-      : undefined,
-    models,
-    modes: mode
+  const nativeModes = (
+    mode
       ? choices(mode)
       : (response.modes?.availableModes.map((m) => ({
           id: m.id,
           label: m.name,
-        })) ?? []),
+          description: m.description ?? undefined,
+        })) ?? [])
+  )
+    .filter((m) => m.id !== FULL_ACCESS_MODE_ID)
+    .map((m) => ({ ...m, ...modeVisuals[m.id] }))
+  return {
+    model: modelId,
+    mode: response.fullAccess
+      ? FULL_ACCESS_MODE_ID
+      : (mode?.currentValue ?? response.modes?.currentModeId),
+    thinkingOption: currentThinking.some((o) => o.id === thinking?.currentValue)
+      ? thinking?.currentValue
+      : undefined,
+    models,
+    modes: [
+      ...nativeModes,
+      {
+        id: FULL_ACCESS_MODE_ID,
+        label: 'Full Access',
+        description:
+          'Approve file edits, commands and tool requests without asking.',
+        ...modeVisuals[FULL_ACCESS_MODE_ID],
+      },
+    ],
     thinkingOptions: currentThinking,
     settings: [],
   }

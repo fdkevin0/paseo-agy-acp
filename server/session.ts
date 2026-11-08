@@ -25,6 +25,7 @@ import { dataDirectory, removeSessionArtifacts } from './preflight.ts'
 import { connectAcp } from './transport.ts'
 import {
   configState,
+  FULL_ACCESS_MODE_ID,
   Timeline,
   record,
   toolDetail,
@@ -419,10 +420,13 @@ async function createSession(
     }
     if (u.sessionUpdate === 'config_option_update') {
       state.metadata.configOptions = u.configOptions
+      if (configState({ ...state.metadata, fullAccess: false }).mode === 'plan')
+        state.metadata.fullAccess = false
       publishConfig()
     } else if (u.sessionUpdate === 'current_mode_update') {
       if (state.metadata.modes)
         state.metadata.modes.currentModeId = u.currentModeId
+      if (u.currentModeId === 'plan') state.metadata.fullAccess = false
       publishConfig()
     } else if (u.sessionUpdate === 'available_commands_update') {
       const next = u.availableCommands.map((c) => ({
@@ -530,6 +534,16 @@ async function createSession(
         .safeParse(record(request.toolCall?.rawInput))
       if (!input.success)
         return Promise.resolve({ outcome: { outcome: 'cancelled' as const } })
+      if (state.metadata.fullAccess) {
+        const allow =
+          request.options.find((o) => o.kind === 'allow_once') ??
+          request.options.find((o) => o.kind.startsWith('allow'))
+        return Promise.resolve({
+          outcome: allow
+            ? { outcome: 'selected' as const, optionId: allow.optionId }
+            : { outcome: 'cancelled' as const },
+        })
+      }
       return new Promise<RequestPermissionResponse>((resolve) => {
         const permissionId = randomUUID()
         permissions.set(permissionId, { request, resolve })
@@ -692,6 +706,41 @@ async function configureSession(
     const option = session.state.metadata.configOptions?.find(
       (o) => o.id === key || o.category === key,
     )
+    if (key === 'mode' && value === FULL_ACCESS_MODE_ID) {
+      session.state.metadata.fullAccess = true
+      const nativeModes = configState({
+        ...session.state.metadata,
+        fullAccess: false,
+      }).modes.map((m) => m.id)
+      const target = ['accept-edits', 'default'].find((m) =>
+        nativeModes.includes(m),
+      )
+      if (!target) continue
+      if (option && option.currentValue !== target) {
+        const result = await session.transport.request(
+          session.transport.rpc.setSessionConfigOption({
+            sessionId: session.state.nativeId,
+            configId: option.id,
+            value: target,
+          }),
+        )
+        session.state.metadata.configOptions = result.configOptions
+      } else if (
+        !option &&
+        session.state.metadata.modes &&
+        session.state.metadata.modes.currentModeId !== target
+      ) {
+        await session.transport.request(
+          session.transport.rpc.setSessionMode({
+            sessionId: session.state.nativeId,
+            modeId: target,
+          }),
+        )
+        session.state.metadata.modes.currentModeId = target
+      }
+      continue
+    }
+    if (key === 'mode') session.state.metadata.fullAccess = false
     if (option) {
       if (option.currentValue === value) continue
       const result = await session.transport.request(

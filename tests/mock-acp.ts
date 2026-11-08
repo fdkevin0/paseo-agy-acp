@@ -23,6 +23,18 @@ const configOptions = [
     currentValue: 'low',
     options: ['low', 'high'].map((value) => ({ name: value, value })),
   },
+  {
+    id: 'mode',
+    name: 'Mode',
+    category: 'mode' as const,
+    type: 'select' as const,
+    currentValue: 'default',
+    options: [
+      { value: 'default', name: 'Default' },
+      { value: 'accept-edits', name: 'Accept edits' },
+      { value: 'plan', name: 'Plan' },
+    ],
+  },
 ]
 const canceled = new Set<string>()
 const cancels = new Map<string, () => void>()
@@ -181,9 +193,13 @@ new AgentSideConnection((client) => {
         ],
       }
     },
-    async setSessionConfigOption() {
-      log('configure')
-      return { configOptions }
+    async setSessionConfigOption({ configId, value }) {
+      log(`configure:${configId}=${value}`)
+      return {
+        configOptions: configOptions.map((o) =>
+          o.id === configId ? { ...o, currentValue: String(value) } : o,
+        ),
+      }
     },
     async cancel({ sessionId }) {
       canceled.add(sessionId)
@@ -235,6 +251,7 @@ new AgentSideConnection((client) => {
           rawInput: { CommandLine: 'echo test' },
         },
         options: [
+          { optionId: 'always', name: 'Always', kind: 'allow_always' },
           { optionId: 'yes', name: 'Allow', kind: 'allow_once' },
           { optionId: 'no', name: 'Deny', kind: 'reject_once' },
         ],
@@ -263,7 +280,13 @@ new AgentSideConnection((client) => {
         sessionId,
         update: {
           sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: permission.outcome.outcome },
+          content: {
+            type: 'text',
+            text:
+              permission.outcome.outcome === 'selected'
+                ? `selected:${permission.outcome.optionId}`
+                : permission.outcome.outcome,
+          },
         },
       })
       if (!process.env.AGY_TEST_NO_CONTEXT)

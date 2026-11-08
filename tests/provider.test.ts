@@ -874,3 +874,102 @@ test('forwards systemPrompt via _meta.antigravity.systemPrompt.append on new and
     await rm(home, { recursive: true, force: true })
   }
 })
+
+test('full-access mode sets accept-edits natively, auto-approves allow_once without prompting, and restores prompts when switched back', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-full-access-'))
+  const log = join(home, 'calls')
+  const h = await harness({ HOME: home, AGY_TEST_LOG: log })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      config: { ...h.config, mode: 'full-access' },
+      history: 'skip',
+    })
+    await h.wait((e) => e.type === 'session.ready')
+    const configEvent = h.events.findLast((e) => e.type === 'session.config')
+    assert.ok(configEvent?.type === 'session.config')
+    assert.equal(configEvent.config.mode, 'full-access')
+    assert.deepEqual(
+      configEvent.config.modes.map((m) => ({
+        id: m.id,
+        icon: m.icon,
+        colorTier: m.colorTier,
+        isUnattended: m.isUnattended,
+      })),
+      [
+        {
+          id: 'default',
+          icon: 'Shield',
+          colorTier: 'safe',
+          isUnattended: undefined,
+        },
+        {
+          id: 'accept-edits',
+          icon: 'ShieldPlus',
+          colorTier: 'moderate',
+          isUnattended: undefined,
+        },
+        {
+          id: 'plan',
+          icon: 'ShieldEllipsis',
+          colorTier: 'planning',
+          isUnattended: undefined,
+        },
+        {
+          id: 'full-access',
+          icon: 'ShieldOff',
+          colorTier: 'dangerous',
+          isUnattended: true,
+        },
+      ],
+    )
+    assert.equal(
+      await readFile(log, 'utf8'),
+      'new\nconfigure:mode=accept-edits\n',
+    )
+
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'p1',
+        delivery: 'auto',
+        input: { type: 'message', content: [{ type: 'text', text: 'hello' }] },
+      },
+    })
+    await h.wait((e) => e.type === 'session.turn' && e.state === 'completed')
+    assert.ok(!h.events.some((e) => e.type === 'session.permission'))
+    assert.ok(
+      h.events.some(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'assistant_message' &&
+          e.item.text === 'selected:yes',
+      ),
+    )
+
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.configure',
+      requestId: 'cfg-default',
+      sessionId: 's',
+      changes: { mode: 'default' },
+    })
+    await h.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'cfg-default',
+    )
+    const afterDefault = h.events.findLast((e) => e.type === 'session.config')
+    assert.ok(afterDefault?.type === 'session.config')
+    assert.equal(afterDefault.config.mode, 'default')
+    assert.equal(
+      await readFile(log, 'utf8'),
+      'new\nconfigure:mode=accept-edits\nconfigure:mode=default\n',
+    )
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})

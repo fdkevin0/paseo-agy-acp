@@ -194,6 +194,17 @@ test('model metadata restricts effort variants and hides fixed-effort selectors'
   assert.equal(state.models[1].contextWindowMaxTokens, 131072)
   assert.deepEqual(state.thinkingOptions, [])
   assert.equal(state.thinkingOption, undefined)
+  assert.deepEqual(state.modes, [
+    {
+      id: 'full-access',
+      label: 'Full Access',
+      description:
+        'Approve file edits, commands and tool requests without asking.',
+      icon: 'ShieldOff',
+      colorTier: 'dangerous',
+      isUnattended: true,
+    },
+  ])
 })
 
 test('attachments preserve file paths, issue context and review comments', async () => {
