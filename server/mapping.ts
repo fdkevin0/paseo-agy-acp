@@ -218,7 +218,7 @@ export function configState(response: SessionMetadata): ProviderConfigState {
       description:
         m.description ??
         available?.find((a) => a.modelId === m.id)?.description,
-      contextWindowMaxTokens: m.id.startsWith('gpt-oss') ? 131_072 : 256_000,
+      contextWindowMaxTokens: contextWindowForModel(m.id),
       thinkingOptions: efforts,
     }
   })
@@ -302,16 +302,41 @@ export function contextUsage(update: UsageUpdate): ProviderUsage | undefined {
   }
 }
 
-/** Map the prompt response's token counters without erasing streamed context usage. */
-export function promptUsage(usage?: Usage | null): ProviderUsage {
+/** Native model limits used when ACP does not report a context window size. */
+export function contextWindowForModel(modelId?: string): number {
+  return modelId?.startsWith('gpt-oss') ? 131_072 : 256_000
+}
+
+/** Estimate context occupancy from disjoint counters summed over native model steps. */
+export function promptUsage(
+  usage?: Usage | null,
+  options?: { model?: string; steps?: number; preserveContext?: boolean },
+): ProviderUsage {
   if (!usage) return {}
-  return Object.fromEntries(
-    Object.entries({
-      inputTokens: usage.inputTokens,
-      outputTokens: usage.outputTokens,
-      cachedInputTokens: usage.cachedReadTokens,
-    }).filter(([, value]) => nonnegative(value)),
-  )
+  const raw = record(usage)
+  const scale = Math.max(1, options?.steps ?? 1)
+  const input = nonnegative(raw.inputTokens) ? raw.inputTokens : 0
+  const cacheRead = nonnegative(raw.cachedReadTokens) ? raw.cachedReadTokens : 0
+  const cacheWrite = nonnegative(raw.cachedWriteTokens)
+    ? raw.cachedWriteTokens
+    : 0
+  const output = nonnegative(raw.outputTokens) ? raw.outputTokens : 0
+  // shortcut: aggregate counters estimate context; prefer native per-step usage when available.
+  const singleStepInput = Math.round((input + cacheRead + cacheWrite) / scale)
+  const used =
+    singleStepInput + output ||
+    (nonnegative(raw.totalTokens) ? Math.round(raw.totalTokens / scale) : 0)
+  return {
+    inputTokens: input,
+    outputTokens: output,
+    cachedInputTokens: cacheRead,
+    ...(!options?.preserveContext
+      ? {
+          contextWindowUsedTokens: used,
+          contextWindowMaxTokens: contextWindowForModel(options?.model),
+        }
+      : {}),
+  }
 }
 
 /** Assemble full snapshots and terminalize tools whose final native update is absent. */

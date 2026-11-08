@@ -1,3 +1,4 @@
+import { z } from 'zod'
 import { RequestPermissionRequestSchema } from './permissions.ts'
 import { TransformStream, WritableStream } from 'node:stream/web'
 import { nativeModelsSchema, record, type SessionMetadata } from './mapping.ts'
@@ -37,6 +38,11 @@ export function connectAcp(
   child.once('exit', (code) => {
     if (!stopping) onExit(new Error(`agy exited (${code}): ${stderr}`))
   })
+  const tierSchema = z.object({
+    id: z.string().optional(),
+    name: z.string().optional(),
+  })
+  let tier: z.infer<typeof tierSchema> | undefined
   let models: SessionMetadata['models']
   const stream = ndJsonStream(
     Writable.toWeb(child.stdin),
@@ -68,6 +74,10 @@ export function connectAcp(
             record(message.result).models,
           )
           if (result.success) models = result.data
+          const observedTier = tierSchema.safeParse(
+            record(record(record(message.result)._meta).antigravity).tier,
+          )
+          if (observedTier.success) tier = observedTier.data
         }
         controller.enqueue(message)
       },
@@ -124,6 +134,9 @@ export function connectAcp(
     rpc,
     close,
     request,
+    get tier() {
+      return tier
+    },
     get models() {
       return models
     },

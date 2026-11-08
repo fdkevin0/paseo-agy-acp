@@ -43,6 +43,11 @@ stream.writable = new WritableStream({
         result: {
           ...message.result,
           models: { availableModels: [{ modelId: 'test-low' }] },
+          _meta: {
+            antigravity: {
+              tier: { id: 'g1-ultra-tier', name: 'Google AI Ultra' },
+            },
+          },
         },
       }
     }
@@ -55,8 +60,22 @@ stream.writable = new WritableStream({
     return output.write(message)
   },
 })
-new AgentSideConnection(
-  (client) => ({
+new AgentSideConnection((client) => {
+  function sendCommands(sessionId: string) {
+    if (process.env.AGY_TEST_NO_COMMANDS) return
+    setTimeout(() => {
+      void client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: 'available_commands_update',
+          availableCommands: [
+            { name: 'compact', description: 'Compact context' },
+          ],
+        },
+      })
+    }, 20)
+  }
+  return {
     async initialize() {
       return {
         protocolVersion: 1,
@@ -71,6 +90,7 @@ new AgentSideConnection(
     },
     async newSession() {
       log('new')
+      sendCommands(nativeId)
       return { sessionId: nativeId, configOptions }
     },
     async closeSession() {
@@ -79,6 +99,7 @@ new AgentSideConnection(
       return {}
     },
     async loadSession({ sessionId }) {
+      sendCommands(sessionId)
       await client.sessionUpdate({
         sessionId,
         update: {
@@ -190,15 +211,16 @@ new AgentSideConnection(
           content: { type: 'text', text: permission.outcome.outcome },
         },
       })
-      void client.sessionUpdate({
-        sessionId,
-        update: {
-          sessionUpdate: 'usage_update',
-          used: 10,
-          size: 1000,
-          cost: { amount: 0.01, currency: 'USD' },
-        },
-      })
+      if (!process.env.AGY_TEST_NO_CONTEXT)
+        void client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'usage_update',
+            used: 10,
+            size: 1000,
+            cost: { amount: 0.01, currency: 'USD' },
+          },
+        })
       return {
         stopReason: 'end_turn' as const,
         usage: {
@@ -209,6 +231,5 @@ new AgentSideConnection(
         },
       }
     },
-  }),
-  stream,
-)
+  }
+}, stream)

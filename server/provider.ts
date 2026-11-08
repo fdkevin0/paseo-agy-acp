@@ -20,6 +20,7 @@ import {
   removeSessionArtifacts,
 } from './preflight.ts'
 import { configState } from './mapping.ts'
+import { AgyUsageSource } from './usage.ts'
 import { SessionManager } from './session.ts'
 const supported = [
   'prompt.message',
@@ -33,7 +34,9 @@ const supported = [
   'session.subsession',
 ] as const
 /** Register the direct ACP provider and own every runtime for its connection. */
-export function createProvider(): ProviderRegistration {
+export function createProvider(
+  usage = new AgyUsageSource(),
+): ProviderRegistration {
   return {
     id: 'agy',
     label: 'Antigravity (ACP)',
@@ -57,6 +60,7 @@ export function createProvider(): ProviderRegistration {
       }
       const manager = new SessionManager({
         launch: connection.launch,
+        usage,
         capabilities,
         emit,
       })
@@ -68,7 +72,7 @@ export function createProvider(): ProviderRegistration {
           const cwd = input.cwd ?? homedir()
           let catalog = catalogs.get(cwd)
           if (!catalog) {
-            catalog = probeCatalog(manager, connection.launch, cwd)
+            catalog = probeCatalog(manager, connection.launch, cwd, usage)
             catalogs.set(cwd, catalog)
             void catalog.catch(() => catalogs.delete(cwd))
           }
@@ -128,6 +132,7 @@ async function probeCatalog(
   manager: SessionManager,
   launch: ProviderLaunch | undefined,
   cwd: string,
+  usage: AgyUsageSource,
 ): Promise<ProviderCatalog> {
   const session = await manager.start(randomUUID(), cwd)
   let nativeId: string | undefined
@@ -136,6 +141,9 @@ async function probeCatalog(
       session.transport.rpc.newSession({ cwd, mcpServers: [] }),
     )
     nativeId = response.sessionId
+    const dir = usage.remember(launch, {}, cwd)
+    if (session.transport.tier?.name)
+      usage.tiers.set(dir, session.transport.tier.name)
     const config = configState({
       ...response,
       models: session.transport.models,

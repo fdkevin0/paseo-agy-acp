@@ -1,3 +1,4 @@
+import type { AgyUsageSource } from './usage.ts'
 import { z } from 'zod'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
@@ -19,7 +20,7 @@ import type {
 } from '@getpaseo/plugin/server/provider'
 import { RequestPermissionRequestSchema } from './permissions.ts'
 import { watchBrain } from './brain.ts'
-import { dataDirectory } from './preflight.ts'
+import { dataDirectory, removeSessionArtifacts } from './preflight.ts'
 import { connectAcp } from './transport.ts'
 import {
   configState,
@@ -37,6 +38,7 @@ type Open = Extract<ProviderInput, { type: 'session.open' }>
 type Prompt = Extract<ProviderInput, { type: 'session.prompt' }>
 type Session = Awaited<ReturnType<typeof createSession>>
 interface SessionOptions {
+  usage: AgyUsageSource
   launch?: ProviderLaunch
   capabilities: readonly string[]
   emit: (event: ProviderEvent) => void
@@ -83,6 +85,7 @@ export class SessionManager {
           cwd: input.config.cwd,
           mcpServers: mcpServers(input.config),
         }
+        session.state.persisted = Boolean(input.persistence)
         session.state.replay = input.history === 'replay'
         if (input.persistence) {
           if (!session.initialized.agentCapabilities?.loadSession)
@@ -104,6 +107,13 @@ export class SessionManager {
           session.state.nativeId = session.state.metadata.sessionId
         }
         session.state.metadata.models = session.transport.models
+        const dir = this.options.usage.remember(
+          this.options.launch,
+          input.config.env,
+          input.config.cwd,
+        )
+        if (session.transport.tier?.name)
+          this.options.usage.tiers.set(dir, session.transport.tier.name)
         await session.drain()
         if (this.closed) throw new Error('Provider connection is closed')
         emit({
@@ -123,6 +133,9 @@ export class SessionManager {
         await session.drain()
         session.state.loading = false
         session.state.replay = true
+        await session.waitForCommands()
+        if (this.closed || session.state.closing || session.state.failed)
+          throw new Error('Session closed before ready')
         emit({
           type: 'session.ready',
           sessionId: input.sessionId,
@@ -196,8 +209,8 @@ export class SessionManager {
   }
   async close() {
     this.closed = true
-    await Promise.all([...this.transports].map((t) => t.close()))
     await Promise.all([...this.sessions.values()].map((s) => s.close()))
+    await Promise.all([...this.transports].map((t) => t.close()))
     this.sessions.clear()
   }
 }
@@ -220,6 +233,11 @@ async function createSession(
   const timeline = new Timeline(id)
   const state = {
     nativeId: '',
+    persisted: false,
+    closing: false,
+    turnSteps: 1,
+    afterToolResult: false,
+    turnHadContextUsage: false,
     opening: true,
     loading: true,
     replay: true,
@@ -232,6 +250,28 @@ async function createSession(
   const children = new Map<string, () => void>()
   let notificationLane = Promise.resolve()
   let usage: ProviderUsage = {}
+  let commandsReceived = false
+  let commandWaiter: (() => void) | null = null
+  let closing: Promise<void> | undefined
+  function resolveCommands() {
+    commandWaiter?.()
+    commandWaiter = null
+  }
+  async function waitForCommands(timeoutMs = 1000) {
+    if (commandsReceived || state.failed || state.closing) return
+    let timer: NodeJS.Timeout | undefined
+    try {
+      await new Promise<void>((resolve) => {
+        commandWaiter = resolve
+        timer = setTimeout(resolve, timeoutMs)
+        timer.unref()
+      })
+      await drain()
+    } finally {
+      clearTimeout(timer)
+      commandWaiter = null
+    }
+  }
   async function drain() {
     // ACP dispatches notifications asynchronously relative to response resolution.
     await new Promise((resolve) => setTimeout(resolve, 0))
@@ -259,6 +299,23 @@ async function createSession(
       return
     }
     const u = notification.update
+    if (state.turn) {
+      if (
+        state.afterToolResult &&
+        (u.sessionUpdate === 'agent_message_chunk' ||
+          u.sessionUpdate === 'agent_thought_chunk' ||
+          u.sessionUpdate === 'tool_call')
+      ) {
+        state.turnSteps += 1
+        state.afterToolResult = false
+      }
+      if (
+        (u.sessionUpdate === 'tool_call' ||
+          u.sessionUpdate === 'tool_call_update') &&
+        (u.status === 'completed' || u.status === 'failed')
+      )
+        state.afterToolResult = true
+    }
     if (u.sessionUpdate === 'config_option_update') {
       state.metadata.configOptions = u.configOptions
       publishConfig()
@@ -266,7 +323,7 @@ async function createSession(
       if (state.metadata.modes)
         state.metadata.modes.currentModeId = u.currentModeId
       publishConfig()
-    } else if (u.sessionUpdate === 'available_commands_update')
+    } else if (u.sessionUpdate === 'available_commands_update') {
       emit({
         type: 'session.commands',
         sessionId: id,
@@ -276,9 +333,14 @@ async function createSession(
           argumentHint: c.input?.hint,
         })),
       })
-    else if (u.sessionUpdate === 'usage_update') {
+      commandsReceived = true
+      resolveCommands()
+    } else if (u.sessionUpdate === 'usage_update') {
       const next = contextUsage(u)
-      if (next && (!state.loading || state.replay)) publishUsage(next)
+      if (next && (!state.loading || state.replay)) {
+        if (state.turn) state.turnHadContextUsage = true
+        publishUsage(next)
+      }
     } else {
       if (state.loading && !state.replay) return
       if (u.sessionUpdate === 'user_message_chunk' && !state.loading) {
@@ -386,6 +448,7 @@ async function createSession(
     (error) => {
       if (state.failed) return
       state.failed = true
+      resolveCommands()
       cancelPermissions()
       terminalize('failed', error.message)
       if (!state.opening)
@@ -422,20 +485,42 @@ async function createSession(
       publishUsage,
       terminalize,
       drain,
+      waitForCommands,
       flush() {
         state.opening = false
         for (const item of buffered.splice(0)) update(item)
       },
-      async close() {
-        cancelPermissions()
-        for (const [childId, stop] of children) {
-          stop()
-          emit({ type: 'session.closed', sessionId: childId })
-        }
-        children.clear()
-        terminalize('canceled')
-        await transport.close()
-        transports.delete(transport)
+      close(): Promise<void> {
+        if (closing) return closing
+        state.closing = true
+        resolveCommands()
+        closing = (async () => {
+          cancelPermissions()
+          for (const [childId, stop] of children) {
+            stop()
+            emit({ type: 'session.closed', sessionId: childId })
+          }
+          children.clear()
+          terminalize('canceled')
+          const disposable =
+            !state.persisted &&
+            state.prompts.size === 0 &&
+            sessionIdPattern.test(state.nativeId)
+          if (disposable)
+            await transport
+              .request(
+                transport.rpc.closeSession({ sessionId: state.nativeId }),
+              )
+              .catch(() => undefined)
+          await transport.close()
+          transports.delete(transport)
+          if (disposable)
+            await removeSessionArtifacts(
+              dataDirectory(launch, config?.env, cwd),
+              state.nativeId,
+            ).catch(() => undefined)
+        })()
+        return closing
       },
     }
   } catch (error) {
@@ -543,6 +628,9 @@ async function promptSession(
       : p.input.content.map(promptContent)
   const turnId = randomUUID()
   session.state.turn = turnId
+  session.state.turnSteps = 1
+  session.state.afterToolResult = false
+  session.state.turnHadContextUsage = false
   session.state.prompts.add(p.clientMessageId)
   session.timeline.boundary()
   emit({
@@ -575,7 +663,14 @@ async function promptSession(
       prompt: blocks,
     })
     await session.drain()
-    if (result.usage) session.publishUsage(promptUsage(result.usage))
+    if (result.usage)
+      session.publishUsage(
+        promptUsage(result.usage, {
+          model: configState(session.state.metadata).model,
+          steps: session.state.turnSteps,
+          preserveContext: session.state.turnHadContextUsage,
+        }),
+      )
     const status = result.stopReason === 'cancelled' ? 'canceled' : 'completed'
     session.terminalize(status)
     emit({

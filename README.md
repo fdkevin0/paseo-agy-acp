@@ -39,7 +39,7 @@ These are distribution addresses, not a claim that a release is already availabl
 paseo run --provider agy "Explain this repository"
 ```
 
-In Paseo, create an agent and choose **Antigravity (ACP)**. The model, mode, thinking selector and slash commands come from the native CLI. Use Paseo's session import to open an existing agy conversation.
+In Paseo, create an agent and choose **Antigravity (ACP)**. The model, mode, thinking selector and slash commands come from the native CLI. Use Paseo's session import to open an existing agy conversation. Initial native slash commands are collected before the session becomes ready, including in the draft composer.
 
 The built-in `antigravity` provider remains available alongside `agy`. To hide it after validating this plugin, merge this fragment into the daemon's `~/.paseo/config.json` and reload the configuration:
 
@@ -57,17 +57,28 @@ Existing agents keep their original provider. This plugin does not migrate them.
 
 ## Capabilities
 
-| Capability    | Behavior                                                         |
-| ------------- | ---------------------------------------------------------------- |
-| Sessions      | Create, list, import and restore through native ACP persistence  |
-| Prompts       | Text, images, commands and readable attachment context           |
-| Configuration | Native models, modes and per-model thinking choices              |
-| Permissions   | Native options with tool arguments/details; no implicit bypass   |
-| Timeline      | Streaming responses, reasoning, plans and rich tool cards        |
-| Usage         | Token counters, context usage and USD costs when supplied by agy |
-| Subagents     | Native child links and read-only Brain transcript cards          |
+| Capability    | Behavior                                                             |
+| ------------- | -------------------------------------------------------------------- |
+| Sessions      | Create, list, import and restore through native ACP persistence      |
+| Prompts       | Text, images, commands and readable attachment context               |
+| Configuration | Native models, modes and per-model thinking choices                  |
+| Permissions   | Native options with tool arguments/details; no implicit bypass       |
+| Timeline      | Streaming responses, reasoning, plans and rich tool cards            |
+| Usage         | Token counters, context occupancy and USD costs when supplied by agy |
+| Subscription  | Gemini and Claude/GPT 5-hour and weekly quota windows                |
+| Subagents     | Native child links and read-only Brain transcript cards              |
 
 Steering, rewind, archive/unarchive, structured output and custom system prompts are not implemented. Artifacts panels and recursive child discovery are not implemented. Child transcript cards are a projection of native logs, not an independently controllable ACP session.
+
+## Context and subscription usage
+
+Paseo's Composer context popover shows context occupancy and subscription quota. When agy supplies no context notification, occupancy is estimated from uncached input plus cache reads/writes divided by the observed model steps, then output tokens are added. The fallback capacity is 131,072 tokens for GPT-OSS and 256,000 for other models; native context reports take precedence.
+
+```sh
+paseo usage ls --json
+```
+
+Usage source `agy` runs the local `agy -p /usage --output-format json` command to report **Gemini Models** and **Claude and GPT models** quota windows, reset times and the observed subscription tier. This command does not start a model turn. Account labels come from local login logs; credentials remain in agy's login store. Launch environment overrides are retained; custom ACP directory flags require support from agy print mode. The plan label becomes available after catalog discovery or a session opens.
 
 ## Verification
 

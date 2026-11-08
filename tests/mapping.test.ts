@@ -143,7 +143,13 @@ test('usage rejects invalid context and ignores foreign currency', async () => {
       outputTokens: 2,
       cachedReadTokens: 3,
     }),
-    { inputTokens: 4, outputTokens: 2, cachedInputTokens: 3 },
+    {
+      inputTokens: 4,
+      outputTokens: 2,
+      cachedInputTokens: 3,
+      contextWindowUsedTokens: 9,
+      contextWindowMaxTokens: 256_000,
+    },
   )
 })
 
@@ -424,4 +430,38 @@ test('Brain matches FIFO tool results without fake assistant bubbles', () => {
     })[0].type,
     'user_message',
   )
+})
+
+test('prompt usage normalizes model steps, counts caches and preserves native context', async () => {
+  const { promptUsage, contextWindowForModel } =
+    await import('../server/mapping.ts')
+  const usage = {
+    inputTokens: 120,
+    cachedReadTokens: 40,
+    cachedWriteTokens: 20,
+    outputTokens: 9,
+    totalTokens: 189,
+  }
+  assert.deepEqual(promptUsage(usage, { model: 'gpt-oss-120b', steps: 3 }), {
+    inputTokens: 120,
+    outputTokens: 9,
+    cachedInputTokens: 40,
+    contextWindowUsedTokens: 69,
+    contextWindowMaxTokens: 131_072,
+  })
+  assert.deepEqual(promptUsage(usage, { preserveContext: true }), {
+    inputTokens: 120,
+    outputTokens: 9,
+    cachedInputTokens: 40,
+  })
+  assert.equal(
+    promptUsage(
+      { inputTokens: -1, outputTokens: NaN, totalTokens: 30 },
+      { steps: 3 },
+    ).contextWindowUsedTokens,
+    10,
+  )
+  assert.equal(promptUsage(usage, { steps: 0 }).contextWindowUsedTokens, 189)
+  assert.deepEqual(promptUsage(null), {})
+  assert.equal(contextWindowForModel('gemini'), 256_000)
 })
