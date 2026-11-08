@@ -50,7 +50,13 @@ async function harness(env: Record<string, string> = {}) {
 }
 
 test('open, permission, tool merge, duplicate prompt, cancel and runtime crash', async () => {
-  const h = await harness()
+  const home = await mkdtemp(join(tmpdir(), 'agy-provider-open-'))
+  const log = join(home, 'calls')
+  const h = await harness({
+    HOME: home,
+    AGY_TEST_LOG: log,
+    AGY_TEST_LOG_LOAD: '1',
+  })
   try {
     await h.provider.send({
       type: 'session.open',
@@ -168,6 +174,7 @@ test('open, permission, tool merge, duplicate prompt, cancel and runtime crash',
           e.item.status === 'canceled',
       ),
     )
+    assert.equal(await readFile(log, 'utf8'), 'new\ncancel\n')
     h.events.length = 0
     await h.provider.send({
       ...prompt,
@@ -190,6 +197,7 @@ test('open, permission, tool merge, duplicate prompt, cancel and runtime crash',
     )
   } finally {
     await h.provider.close()
+    await rm(home, { recursive: true, force: true })
   }
 })
 
@@ -393,84 +401,57 @@ test('malformed wire permission is canceled instead of blocking or throwing', as
   }
 })
 
-test('child Brain watching replaces running cards with FIFO results', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'agy-child-'))
-  const id = '22222222-2222-4222-8222-222222222222'
-  const dir = join(
-    home,
-    '.gemini/antigravity-cli/brain',
-    id,
-    '.system_generated/logs',
-  )
-  await mkdir(dir, { recursive: true })
-  await writeFile(
-    join(dir, 'transcript.jsonl'),
-    [
-      {
-        type: 'PLANNER_RESPONSE',
-        source: 'MODEL',
-        step_index: 1,
-        tool_calls: [
-          {
-            id: 'call',
-            name: 'run_command',
-            args: { CommandLine: '"echo child"' },
-          },
-        ],
-      },
-      {
-        type: 'GENERIC',
-        source: 'MODEL',
-        step_index: 2,
-        status: 'DONE',
-        content: 'child output',
-      },
-      {
-        type: 'CHECKPOINT',
-        source: 'SYSTEM',
-        step_index: 3,
-        content: 'metadata',
-      },
-    ]
-      .map((r) => JSON.stringify(r) + '\n')
-      .join(''),
-  )
-  const h = await harness({ HOME: home })
+test('interrupt before transcript baseline resolves never sends the native prompt', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-early-interrupt-'))
+  const log = join(home, 'calls.log')
+  const h = await harness({ HOME: home, AGY_TEST_LOG: log })
+  let interrupt: Promise<void> | undefined
   try {
     await h.provider.send({
       type: 'session.open',
       requestId: 'open',
-      sessionId: 'parent',
+      sessionId: 's',
       config: h.config,
-      history: 'replay',
-      persistence: { version: 1, data: { sessionId: 'native-test' } },
+      history: 'skip',
     })
-    const childId = `parent:child:${id}`
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's')
+    h.provider.onEvent((e) => {
+      if (
+        e.type === 'session.turn' &&
+        e.sessionId === 's' &&
+        e.state === 'started'
+      ) {
+        interrupt = h.provider.send({
+          type: 'session.interrupt',
+          requestId: 'stop',
+          sessionId: 's',
+        })
+      }
+    })
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'p',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'must-not-run-after-interrupt' }],
+        },
+      },
+    })
     await h.wait(
       (e) =>
-        e.type === 'timeline.item' &&
-        e.sessionId === childId &&
-        e.item.type === 'tool_call' &&
-        e.item.status === 'completed',
+        e.type === 'session.turn' &&
+        e.sessionId === 's' &&
+        e.state === 'canceled',
     )
-    const child = h.events.filter(
-      (e) => e.type === 'timeline.item' && e.sessionId === childId,
-    )
-    assert.equal(child.length, 2)
-    assert.ok(
-      child[0].type === 'timeline.item' &&
-        child[0].item.type === 'tool_call' &&
-        child[0].item.status === 'running',
-    )
-    assert.ok(
-      child[1].type === 'timeline.item' &&
-        child[1].item.type === 'tool_call' &&
-        child[1].item.status === 'completed',
-    )
-    assert.equal(child[0].item.id, child[1].item.id)
-    assert.ok(
-      child[1].item.detail.type === 'shell' &&
-        child[1].item.detail.output === 'child output',
+    await interrupt
+    assert.ok(!(await readFile(log, 'utf8')).includes('unexpected-prompt'))
+    assert.equal(
+      h.events.filter((e) => e.type === 'session.turn' && e.state !== 'started')
+        .length,
+      1,
     )
   } finally {
     await h.provider.close()
@@ -509,64 +490,6 @@ test('delayed commands precede readiness on both new and restored sessions; tier
       h.usage.tiers.get(dataDirectory(undefined, { HOME: home })),
       'Google AI Ultra',
     )
-  } finally {
-    await h.provider.close()
-    await rm(home, { recursive: true, force: true })
-  }
-})
-
-test('disposable sessions reuse runtimes and wait for fresh commands before readiness', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'agy-warm-'))
-  const dir = dataDirectory(undefined, { HOME: home })
-  const h = await harness({ HOME: home, AGY_TEST_WARM_COMMANDS: '1' })
-  try {
-    await h.provider.send({
-      type: 'session.open',
-      requestId: 'open-1',
-      sessionId: 's1',
-      config: h.config,
-      history: 'skip',
-    })
-    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's1')
-    const first = h.events.find((e) => e.type === 'session.opened')
-    assert.ok(first?.type === 'session.opened')
-    const id = String(record(first.persistence?.data).sessionId)
-    const db = join(dir, 'conversations', `${id}.db`)
-    const brain = join(dir, 'brain', id)
-    await mkdir(join(dir, 'conversations'), { recursive: true })
-    await mkdir(brain, { recursive: true })
-    await writeFile(db, 'fixture')
-    await h.provider.send({
-      type: 'session.close',
-      requestId: 'close-1',
-      sessionId: 's1',
-    })
-    await h.wait((e) => e.type === 'session.closed' && e.sessionId === 's1')
-    await assert.rejects(stat(db), { code: 'ENOENT' })
-    await assert.rejects(stat(brain), { code: 'ENOENT' })
-
-    h.events.length = 0
-    await h.provider.send({
-      type: 'session.open',
-      requestId: 'open-2',
-      sessionId: 's2',
-      config: h.config,
-      history: 'skip',
-    })
-    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's2')
-    const commands = h.events.filter((e) => e.type === 'session.commands')
-    assert.equal(commands.length, 1)
-    assert.deepEqual(
-      commands[0].commands.map((c) => c.name),
-      ['compact', 'plan'],
-    )
-    assert.ok(
-      h.events.indexOf(commands[0]) <
-        h.events.findIndex((e) => e.type === 'session.ready'),
-    )
-    const second = h.events.find((e) => e.type === 'session.opened')
-    assert.ok(second?.type === 'session.opened')
-    assert.notEqual(record(second.persistence?.data).sessionId, id)
   } finally {
     await h.provider.close()
     await rm(home, { recursive: true, force: true })
@@ -646,7 +569,7 @@ test('close removes only new unprompted session artifacts and retains imported s
   }
 })
 
-test('context fallback counts tool steps and prompted sessions remain resumable', async () => {
+test('context fallback computes prompt usage and prompted sessions remain resumable', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-context-'))
   const log = join(home, 'calls')
   const h = await harness({
@@ -676,7 +599,7 @@ test('context fallback counts tool steps and prompted sessions remain resumable'
     await h.wait((e) => e.type === 'session.turn' && e.state === 'completed')
     const usage = h.events.findLast((e) => e.type === 'session.usage')
     assert.ok(usage?.type === 'session.usage')
-    assert.equal(usage.usage.contextWindowUsedTokens, 11)
+    assert.equal(usage.usage.contextWindowUsedTokens, 19)
     assert.equal(usage.usage.contextWindowMaxTokens, 256_000)
     await h.provider.send({
       type: 'session.close',
@@ -774,43 +697,100 @@ test('stale buffered/live notifications and permissions cannot cross native sess
   }
 })
 
-test('session listing returns its healthy process for the next open', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'agy-list-warm-'))
-  const log = join(home, 'pids')
-  const h = await harness({ HOME: home, AGY_TEST_PID_LOG: log })
+test('cancel is sticky and uses fast path without relaunching after a completed subagent turn', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-cancel-sticky-'))
+  const log = join(home, 'calls')
+  const parentId = '11111111-1111-4111-8111-111111111111'
+  const childId = '22222222-2222-4222-8222-222222222222'
+  const brainDir = join(home, '.gemini/antigravity-cli/brain')
+  const now = new Date().toISOString()
+  await mkdir(join(brainDir, parentId, '.system_generated/subagents'), {
+    recursive: true,
+  })
+  await mkdir(join(brainDir, parentId, '.system_generated/logs'), {
+    recursive: true,
+  })
+  await mkdir(join(brainDir, childId, '.system_generated/messages'), {
+    recursive: true,
+  })
+  await mkdir(join(brainDir, childId, '.system_generated/logs'), {
+    recursive: true,
+  })
+  await writeFile(
+    join(brainDir, parentId, '.system_generated/subagents', `${childId}.json`),
+    JSON.stringify({
+      conversationId: childId,
+      subagentDescriptor: { typeName: 'research', role: 'Researcher' },
+      spawnStepIndex: 2,
+      state: 'SUBAGENT_STATE_ALIVE',
+    }),
+  )
+  await writeFile(
+    join(brainDir, childId, '.system_generated/messages/init.json'),
+    JSON.stringify({
+      id: 'init',
+      sender: parentId,
+      recipient: childId,
+      priority: 'MESSAGE_PRIORITY_HIGH',
+      content: 'work',
+      timestamp: now,
+      sourceMetadata: {
+        tool: {
+          conversationId: parentId,
+          stepIndex: 2,
+          toolCall: {
+            id: 'child',
+            name: 'invoke_subagent',
+            argumentsJson: '{}',
+          },
+        },
+      },
+    }),
+  )
+  await writeFile(
+    join(brainDir, childId, '.system_generated/messages/read.json'),
+    JSON.stringify({ init: true }),
+  )
+  await writeFile(
+    join(brainDir, childId, '.system_generated/logs/transcript_full.jsonl'),
+    [
+      {
+        step_index: 0,
+        type: 'SYSTEM_MESSAGE',
+        content: `<SYSTEM_MESSAGE>\n[Message] timestamp=${now} sender=${parentId} priority=MESSAGE_PRIORITY_HIGH content=work\n</SYSTEM_MESSAGE>`,
+      },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'Child finished',
+      },
+    ]
+      .map((r) => JSON.stringify(r) + '\n')
+      .join(''),
+  )
+  const h = await harness({
+    HOME: home,
+    AGY_TEST_LOG: log,
+    AGY_TEST_LOG_LOAD: '1',
+    AGY_TEST_CANCEL_DELAY: '1',
+  })
   try {
-    await h.provider.send({
-      type: 'sessions',
-      requestId: 'list',
-      cwd: h.config.cwd,
-    })
-    await h.wait((e) => e.type === 'sessions')
     await h.provider.send({
       type: 'session.open',
       requestId: 'open',
       sessionId: 's',
       config: h.config,
-      history: 'skip',
+      history: 'replay',
+      persistence: { version: 1, data: { sessionId: parentId } },
     })
-    await h.wait((e) => e.type === 'session.ready')
-    assert.equal((await readFile(log, 'utf8')).trim().split('\n').length, 1)
-  } finally {
-    await h.provider.close()
-    await rm(home, { recursive: true, force: true })
-  }
-})
-
-test('cancel is sticky when it arrives before the mock installs its prompt resolver', async () => {
-  const h = await harness({ AGY_TEST_CANCEL_DELAY: '1' })
-  try {
-    await h.provider.send({
-      type: 'session.open',
-      requestId: 'open',
-      sessionId: 's',
-      config: h.config,
-      history: 'skip',
-    })
-    await h.wait((e) => e.type === 'session.ready')
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's')
+    await h.wait(
+      (e) =>
+        e.type === 'session.turn' &&
+        e.sessionId === `s:child:${childId}` &&
+        e.state === 'completed',
+    )
     await h.provider.send({
       type: 'session.prompt',
       sessionId: 's',
@@ -832,8 +812,10 @@ test('cancel is sticky when it arrives before the mock installs its prompt resol
       sessionId: 's',
     })
     await h.wait((e) => e.type === 'session.turn' && e.state === 'canceled')
+    assert.equal(await readFile(log, 'utf8'), 'load\ncancel\n')
   } finally {
     await h.provider.close()
+    await rm(home, { recursive: true, force: true })
   }
 })
 
@@ -991,6 +973,89 @@ test('full-access mode launches with --dangerously-skip-permissions, auto-approv
       await readFile(log, 'utf8'),
       'flag:--dangerously-skip-permissions\nnew\nconfigure:mode=accept-edits\nload\nflag:--dangerously-skip-permissions\nload\nconfigure:mode=accept-edits\n',
     )
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('background task wakeup settles before completing turn and deduplicates next-turn replay', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-bg-wakeup-'))
+  const h = await harness({ HOME: home })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      config: h.config,
+      history: 'skip',
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's')
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'bg-1',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'background' }],
+        },
+      },
+    })
+    await h.wait(
+      (e) =>
+        e.type === 'session.turn' &&
+        e.sessionId === 's' &&
+        e.state === 'completed',
+    )
+    const completedTool = h.events.findLast(
+      (e) =>
+        e.type === 'timeline.item' &&
+        e.item.type === 'tool_call' &&
+        e.item.callId === 'bg-scan' &&
+        e.item.status === 'completed',
+    )
+    assert.ok(
+      completedTool?.type === 'timeline.item' &&
+        completedTool.item.type === 'tool_call' &&
+        completedTool.item.detail.type === 'shell' &&
+        completedTool.item.detail.output?.includes('42G'),
+    )
+    assert.ok(
+      h.events.some(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'assistant_message' &&
+          e.item.text === 'Scan complete: 42G.',
+      ),
+    )
+
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'bg-2',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'after-background' }],
+        },
+      },
+    })
+    await h.wait(
+      (e) =>
+        e.type === 'session.turn' &&
+        e.sessionId === 's' &&
+        e.state === 'completed',
+    )
+    const assistantTexts = h.events.flatMap((e) =>
+      e.type === 'timeline.item' && e.item.type === 'assistant_message'
+        ? [e.item.text]
+        : [],
+    )
+    assert.deepEqual(assistantTexts, ['Next turn reply.'])
   } finally {
     await h.provider.close()
     await rm(home, { recursive: true, force: true })

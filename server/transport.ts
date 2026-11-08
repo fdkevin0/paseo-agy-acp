@@ -1,4 +1,6 @@
 import { z } from 'zod'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { RequestPermissionRequestSchema } from './permissions.ts'
 import { TransformStream, WritableStream } from 'node:stream/web'
 import { nativeModelsSchema, record, type SessionMetadata } from './mapping.ts'
@@ -11,7 +13,47 @@ import {
 import { spawnProcess, terminateProcess } from '@getpaseo/plugin/server'
 import type { ProviderLaunch } from '@getpaseo/plugin/server/provider'
 
-/** Own one stdio ACP process, bounded control requests, and process-tree shutdown. */
+const execFileAsync = promisify(execFile)
+
+async function listProcesses(): Promise<number[][]> {
+  const options = { encoding: 'utf8' as const, timeout: 1000 }
+  // procps/BSD accept -A; BusyBox lists every process by default and rejects -A.
+  const { stdout } = await execFileAsync(
+    'ps',
+    ['-A', '-o', 'pid=,ppid=,pgid='],
+    options,
+  ).catch(() => execFileAsync('ps', ['-o', 'pid,ppid,pgid'], options))
+  return stdout
+    .split('\n')
+    .map((line) => line.trim().split(/\s+/).map(Number))
+    .filter((row) => row.length === 3 && row.every(Number.isInteger))
+}
+
+async function ownedProcessGroups(pid: number): Promise<Set<number>> {
+  const processes = await listProcesses()
+  const owned = new Set([pid])
+  let previousSize = 0
+  while (previousSize !== owned.size) {
+    previousSize = owned.size
+    for (const [id, parent] of processes) if (owned.has(parent)) owned.add(id)
+  }
+  // Native run_command starts its own session, outside the ACP process group.
+  return new Set(
+    processes
+      .filter(([id, , group]) => owned.has(id) && owned.has(group))
+      .map(([, , group]) => group),
+  )
+}
+
+function killGroup(group: number) {
+  try {
+    process.kill(-group, 'SIGKILL')
+  } catch {
+    /* Already gone (ESRCH) or no longer ours (EPERM); shutdown stays best-effort. */
+  }
+}
+
+/** Own one ACP process, bounded control requests, and shutdown of its tracked process groups. */
 export function connectAcp(
   launch: ProviderLaunch | undefined,
   cwd: string,
@@ -22,11 +64,14 @@ export function connectAcp(
   const child = spawnProcess(
     launch?.command ?? 'agy',
     launch?.args ?? ['acp'],
-    { cwd, env: { ...(launch?.env ?? process.env), ...env }, stdio: 'pipe' },
+    {
+      cwd,
+      env: { ...(launch?.env ?? process.env), ...env },
+      stdio: 'pipe',
+      detached: process.platform !== 'win32',
+    },
   )
   let stopping = false
-  let activeClient = client
-  let activeOnExit = onExit
   let stderr = ''
   child.stderr.on('data', (chunk) => {
     stderr = (stderr + chunk).slice(-4096)
@@ -38,7 +83,7 @@ export function connectAcp(
     if (stopping) return
     // A broken protocol stream need not mean the child process has exited.
     void close().catch(() => undefined)
-    activeOnExit(error)
+    onExit(error)
   }
   child.on('error', fail)
   child.once('exit', (code) =>
@@ -91,8 +136,13 @@ export function connectAcp(
   )
   const rpc = new ClientSideConnection(
     () => ({
-      sessionUpdate: (params) => activeClient.sessionUpdate(params),
-      requestPermission: (params) => activeClient.requestPermission(params),
+      sessionUpdate: async (params) => {
+        if (!stopping) await client.sessionUpdate(params)
+      },
+      requestPermission: async (params) =>
+        stopping
+          ? { outcome: { outcome: 'cancelled' } }
+          : client.requestPermission(params),
     }),
     { readable, writable },
   )
@@ -102,8 +152,28 @@ export function connectAcp(
     if (closing) return closing
     stopping = true
     closing = (async () => {
+      const groups = new Set<number>()
+      // Best effort: without a usable `ps`, still stop agy's own process group.
+      const collectGroups = async () => {
+        if (process.platform === 'win32' || !child.pid) return
+        groups.add(child.pid)
+        const owned = await ownedProcessGroups(child.pid).catch(
+          () => new Set<number>(),
+        )
+        for (const group of owned) groups.add(group)
+      }
+      await collectGroups()
       child.stdin.end()
-      const timer = setTimeout(() => terminateProcess(child), 500)
+      const stop = async () => {
+        if (process.platform === 'win32') await terminateProcess(child)
+        else {
+          await collectGroups()
+          for (const group of groups) killGroup(group)
+        }
+      }
+      const timer = setTimeout(() => {
+        void stop().catch(() => undefined)
+      }, 500)
       const force = setTimeout(() => child.kill('SIGKILL'), 2000)
       let deadline: NodeJS.Timeout | undefined
       try {
@@ -120,6 +190,9 @@ export function connectAcp(
         clearTimeout(timer)
         clearTimeout(force)
         clearTimeout(deadline)
+        // EOF may exit agy before its detached command sessions have stopped.
+        if (process.platform !== 'win32')
+          for (const group of groups) killGroup(group)
       }
     })()
     return closing
@@ -131,7 +204,7 @@ export function connectAcp(
         operation,
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
-            void close().catch(activeOnExit)
+            void close().catch(onExit)
             reject(new Error('ACP request timed out'))
           }, 30_000)
         }),
@@ -145,10 +218,6 @@ export function connectAcp(
     exited,
     close,
     request,
-    bind(nextClient: Client, nextOnExit: (error: Error) => void) {
-      activeClient = nextClient
-      activeOnExit = nextOnExit
-    },
     get closed() {
       return stopping
     },

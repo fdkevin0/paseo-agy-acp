@@ -181,10 +181,7 @@ export const nativeModelsSchema = z.object({
     }),
   ),
 })
-export type SessionMetadata = Pick<
-  NewSessionResponse,
-  'configOptions' | 'modes'
-> & {
+export type SessionMetadata = Pick<NewSessionResponse, 'configOptions'> & {
   models?: z.infer<typeof nativeModelsSchema>
   fullAccess?: boolean
 }
@@ -243,22 +240,12 @@ export function configState(response: SessionMetadata): ProviderConfigState {
   const modelId = model?.currentValue ?? response.models?.currentModelId
   const currentThinking =
     models.find((m) => m.id === modelId)?.thinkingOptions ?? thinkingOptions
-  const nativeModes = (
-    mode
-      ? choices(mode)
-      : (response.modes?.availableModes.map((m) => ({
-          id: m.id,
-          label: m.name,
-          description: m.description ?? undefined,
-        })) ?? [])
-  )
+  const nativeModes = choices(mode)
     .filter((m) => m.id !== FULL_ACCESS_MODE_ID)
     .map((m) => ({ ...m, ...modeVisuals[m.id] }))
   return {
     model: modelId,
-    mode: response.fullAccess
-      ? FULL_ACCESS_MODE_ID
-      : (mode?.currentValue ?? response.modes?.currentModeId),
+    mode: response.fullAccess ? FULL_ACCESS_MODE_ID : mode?.currentValue,
     thinkingOption: currentThinking.some((o) => o.id === thinking?.currentValue)
       ? thinking?.currentValue
       : undefined,
@@ -342,25 +329,46 @@ export function contextWindowForModel(modelId?: string): number {
   return modelId?.startsWith('gpt-oss') ? 131_072 : 256_000
 }
 
-/** Estimate context occupancy from disjoint counters summed over native model steps. */
+export type StepUsage = {
+  inputTokens: number
+  outputTokens: number
+  cachedReadTokens: number
+  /** Only present when agy records a step-level cache write counter. */
+  cachedWriteTokens?: number
+}
+
+/** Combine ACP turn token counters with per-step context occupancy from transcript_full.jsonl when available. */
 export function promptUsage(
   usage?: Usage | null,
-  options?: { model?: string; steps?: number; preserveContext?: boolean },
+  options?: {
+    model?: string
+    preserveContext?: boolean
+    lastStep?: StepUsage
+  },
 ): ProviderUsage {
-  if (!usage) return {}
+  if (!usage && !options?.lastStep) return {}
   const raw = record(usage)
-  const scale = Math.max(1, options?.steps ?? 1)
-  const input = nonnegative(raw.inputTokens) ? raw.inputTokens : 0
-  const cacheRead = nonnegative(raw.cachedReadTokens) ? raw.cachedReadTokens : 0
+  const input = nonnegative(raw.inputTokens)
+    ? raw.inputTokens
+    : (options?.lastStep?.inputTokens ?? 0)
+  const cacheRead = nonnegative(raw.cachedReadTokens)
+    ? raw.cachedReadTokens
+    : (options?.lastStep?.cachedReadTokens ?? 0)
   const cacheWrite = nonnegative(raw.cachedWriteTokens)
     ? raw.cachedWriteTokens
-    : 0
-  const output = nonnegative(raw.outputTokens) ? raw.outputTokens : 0
-  // shortcut: aggregate counters estimate context; prefer native per-step usage when available.
-  const singleStepInput = Math.round((input + cacheRead + cacheWrite) / scale)
-  const used =
-    singleStepInput + output ||
-    (nonnegative(raw.totalTokens) ? Math.round(raw.totalTokens / scale) : 0)
+    : (options?.lastStep?.cachedWriteTokens ?? 0)
+  const output = nonnegative(raw.outputTokens)
+    ? raw.outputTokens
+    : (options?.lastStep?.outputTokens ?? 0)
+  const step = options?.lastStep
+  // Each source is summed on its own: per-step counters never mix with cumulative turn counters.
+  const used = step
+    ? step.inputTokens +
+      step.cachedReadTokens +
+      (step.cachedWriteTokens ?? 0) +
+      step.outputTokens
+    : input + cacheRead + cacheWrite + output ||
+      (nonnegative(raw.totalTokens) ? raw.totalTokens : 0)
   return {
     inputTokens: input,
     outputTokens: output,
@@ -392,6 +400,14 @@ export class Timeline {
   }
   boundary() {
     this.message = undefined
+  }
+  track(item: ProviderTimelineItem) {
+    if (item.type !== 'tool_call') return
+    if (item.status === 'running') this.running.set(item.id, item)
+    else this.running.delete(item.id)
+  }
+  isRunning(id: string): boolean {
+    return this.running.has(id)
   }
   terminalize(
     status: 'completed' | 'canceled' | 'failed',
@@ -455,18 +471,14 @@ export class Timeline {
           ? {
               ...base,
               status: 'failed',
-              error:
-                toolDetail(tool).type === 'unknown'
-                  ? 'Tool failed'
-                  : JSON.stringify(tool.rawOutput ?? 'Tool failed'),
+              error: JSON.stringify(tool.rawOutput ?? 'Tool failed'),
             }
           : {
               ...base,
               status: tool.status === 'completed' ? 'completed' : 'running',
               error: null,
             }
-      if (item.status === 'running') this.running.set(item.id, item)
-      else this.running.delete(item.id)
+      this.track(item)
       return item
     }
     if (update.sessionUpdate === 'plan')

@@ -1,8 +1,7 @@
 import type { AgyUsageSource } from './usage.ts'
 import { z } from 'zod'
 import { randomUUID } from 'node:crypto'
-import { stat } from 'node:fs/promises'
-import { isAbsolute, join, resolve } from 'node:path'
+import { join } from 'node:path'
 import type {
   RequestPermissionRequest,
   RequestPermissionResponse,
@@ -17,10 +16,21 @@ import type {
   ProviderInput,
   ProviderConfigChanges,
   ProviderSessionConfig,
+  ProviderTimelineItem,
   ProviderUsage,
 } from '@getpaseo/plugin/server/provider'
 import { RequestPermissionRequestSchema } from './permissions.ts'
-import { watchBrain } from './brain.ts'
+import {
+  BrainTranscriptProjector,
+  hasActiveBackgroundWork,
+  readInboxState,
+  readSubagents,
+  readTranscriptRows,
+  readLastStepIndex,
+  settleBrainTurn,
+  watchBrain,
+  type BrainWatchHandle,
+} from './brain.ts'
 import { dataDirectory, removeSessionArtifacts } from './preflight.ts'
 import { connectAcp } from './transport.ts'
 import {
@@ -34,17 +44,12 @@ import {
   promptUsage,
   sessionIdPattern,
   type SessionMetadata,
+  type StepUsage,
 } from './mapping.ts'
 
 type Open = Extract<ProviderInput, { type: 'session.open' }>
 type Prompt = Extract<ProviderInput, { type: 'session.prompt' }>
 type Session = Awaited<ReturnType<typeof createSession>>
-type WarmRuntime = {
-  transport: ReturnType<typeof connectAcp>
-  initialized: Awaited<
-    ReturnType<ReturnType<typeof connectAcp>['rpc']['initialize']>
-  >
-}
 interface SessionOptions {
   usage: AgyUsageSource
   launch?: ProviderLaunch
@@ -85,29 +90,11 @@ function sessionParams(cwd: string, config?: ProviderSessionConfig) {
   }
 }
 
-function launchScope(launch: ProviderLaunch | undefined, cwd: string) {
-  return [launch?.command ?? 'agy', ...(launch?.args ?? ['acp'])].map(
-    (part) => {
-      const eq = part.indexOf('=')
-      if (eq > 0 && part.startsWith('-')) {
-        const val = part.slice(eq + 1)
-        return !isAbsolute(val) && (val.startsWith('.') || /[/\\]/.test(val))
-          ? `${part.slice(0, eq + 1)}${resolve(cwd, val)}`
-          : part
-      }
-      return !isAbsolute(part) && (part.startsWith('.') || /[/\\]/.test(part))
-        ? resolve(cwd, part)
-        : part
-    },
-  )
-}
-
 /** Own native runtimes, session identities and their cancellation across a provider connection. */
 export class SessionManager {
   private sessions = new Map<string, Session>()
   private opening = new Set<string>()
   private transports = new Set<ReturnType<typeof connectAcp>>()
-  private warm = new Map<string, WarmRuntime & { timer: NodeJS.Timeout }>()
   private closed = false
   private options: SessionOptions
   constructor(options: SessionOptions) {
@@ -116,69 +103,7 @@ export class SessionManager {
 
   async start(id: string, cwd: string, config?: ProviderSessionConfig) {
     if (this.closed) throw new Error('Provider connection is closed')
-    const skipPermissions = config?.mode === FULL_ACCESS_MODE_ID
-    const launch = effectiveLaunch(this.options.launch, skipPermissions)
-    const warmKey = JSON.stringify([
-      launchScope(launch, cwd),
-      dataDirectory(launch, config?.env, cwd),
-      Object.entries(config?.env ?? {}).sort(([a], [b]) => a.localeCompare(b)),
-    ])
-    const hasCwd = await stat(cwd).then(
-      (s) => s.isDirectory(),
-      () => false,
-    )
-    if (this.closed) throw new Error('Provider connection is closed')
-    const warm = hasCwd && !skipPermissions ? this.warm.get(warmKey) : undefined
-    if (warm) {
-      clearTimeout(warm.timer)
-      this.warm.delete(warmKey)
-    }
-    return createSession(
-      id,
-      cwd,
-      config,
-      this.options,
-      this.transports,
-      warm && !warm.transport.closed ? warm : undefined,
-      (runtime) => {
-        const agentId =
-          config?.env?.PASEO_AGENT_ID ??
-          (this.options.launch?.env ?? process.env).PASEO_AGENT_ID
-        if (
-          this.closed ||
-          runtime.transport.closed ||
-          this.warm.has(warmKey) ||
-          agentId ||
-          skipPermissions ||
-          config?.systemPrompt?.trim()
-        )
-          return false
-        runtime.transport.bind(
-          {
-            sessionUpdate: async () => {},
-            requestPermission: async () => ({
-              outcome: { outcome: 'cancelled' },
-            }),
-          },
-          () => {
-            if (this.warm.get(warmKey)?.transport === runtime.transport)
-              this.evict(warmKey)
-          },
-        )
-        if (this.warm.size >= 4) this.evict(this.warm.keys().next().value!)
-        const timer = setTimeout(() => this.evict(warmKey), 60_000)
-        timer.unref()
-        this.warm.set(warmKey, { ...runtime, timer })
-        return true
-      },
-    )
-  }
-  private evict(key: string) {
-    const runtime = this.warm.get(key)
-    if (!runtime) return
-    this.warm.delete(key)
-    clearTimeout(runtime.timer)
-    void runtime.transport.close().catch(() => undefined)
+    return createSession(id, cwd, config, this.options, this.transports)
   }
   async open(input: Open) {
     const { emit, capabilities } = this.options
@@ -246,6 +171,7 @@ export class SessionManager {
           },
         })
         session.flush()
+        if (input.persistence) await session.replayTools()
         await configureSession(session, input.config)
         await session.drain()
         session.state.loading = false
@@ -304,10 +230,7 @@ export class SessionManager {
     if (input.type === 'session.configure')
       await configureSession(session, input.changes)
     else if (input.type === 'session.interrupt') {
-      session.cancelPermissions()
-      await session.transport.request(
-        session.transport.rpc.cancel({ sessionId: session.state.nativeId }),
-      )
+      await session.interrupt()
     } else if (input.type === 'session.can_stop_runtime') {
       // ACP cannot prove native background tasks are idle.
       emit({
@@ -326,8 +249,6 @@ export class SessionManager {
   }
   async close() {
     this.closed = true
-    for (const runtime of this.warm.values()) clearTimeout(runtime.timer)
-    this.warm.clear()
     await Promise.all([...this.sessions.values()].map((s) => s.close()))
     await Promise.all([...this.transports].map((t) => t.close()))
     this.sessions.clear()
@@ -340,8 +261,6 @@ async function createSession(
   config: ProviderSessionConfig | undefined,
   options: SessionOptions,
   transports: Set<ReturnType<typeof connectAcp>>,
-  warm: WarmRuntime | undefined,
-  parkWarm: (runtime: WarmRuntime) => boolean,
 ) {
   const { launch, capabilities, emit } = options
   const permissions = new Map<
@@ -352,25 +271,30 @@ async function createSession(
     }
   >()
   const timeline = new Timeline(id)
+  const brainRoot = join(dataDirectory(launch, config?.env, cwd), 'brain')
   const state = {
     nativeId: '',
     opened: false,
     persisted: false,
     closing: false,
     skipPermissions: config?.mode === FULL_ACCESS_MODE_ID,
-    turnSteps: 1,
-    afterToolResult: false,
     turnHadContextUsage: false,
+    turnHadModelOutput: false,
+    turnToolCallIds: [] as string[],
     opening: true,
     loading: true,
     replay: true,
     turn: '',
+    turnAbort: null as AbortController | null,
+    interrupting: null as Promise<void> | null,
     failed: false,
     metadata: { sessionId: '' } as NewSessionResponse & SessionMetadata,
     prompts: new Set<string>(),
   }
   const buffered: SessionNotification[] = []
-  const children = new Map<string, () => void>()
+  const children = new Map<string, BrainWatchHandle>()
+  const killedChildren = new Set<string>()
+  const resuming = new Set<string>()
   let notificationLane = Promise.resolve()
   let usage: ProviderUsage = {}
   let commandsReceived = false
@@ -417,6 +341,122 @@ async function createSession(
     for (const item of timeline.terminalize(status, error))
       emit({ type: 'timeline.item', sessionId: id, item })
   }
+  async function syncKilledChildren(
+    subagents?: Awaited<ReturnType<typeof readSubagents>>,
+  ) {
+    const list =
+      subagents ??
+      (await readSubagents(brainRoot, state.nativeId).catch(() => []))
+    const cancels: Promise<void>[] = []
+    for (const sub of list)
+      if (sub.state === 'SUBAGENT_STATE_KILLED') {
+        const childId = `${id}:child:${sub.conversationId}`
+        killedChildren.add(childId)
+        // Keep the entry: the child session stays open (closed with its parent) and is never reopened.
+        const child = children.get(childId)
+        if (child) cancels.push(child.cancel())
+      }
+    await Promise.all(cancels)
+  }
+  function watchChild(
+    nativeId: string,
+    childId: string,
+    resume?: ReturnType<BrainWatchHandle['resumePoint']>,
+  ) {
+    children.set(
+      childId,
+      watchBrain(
+        brainRoot,
+        nativeId,
+        childId,
+        emit,
+        1000,
+        () => Boolean(state.turn),
+        resume,
+      ),
+    )
+  }
+  /** A child stopped by interruption (not killed) can be woken by a message. */
+  function isResumable(childId: string) {
+    return (
+      !killedChildren.has(childId) &&
+      children.get(childId)?.isStopping() === true
+    )
+  }
+  /** Resume watching the same child session once its previous watcher has drained. */
+  function resumeChild(
+    nativeId: string,
+    childId: string,
+    existing: BrainWatchHandle,
+  ) {
+    if (resuming.has(childId)) return
+    resuming.add(childId)
+    void existing.cancel().then(() => {
+      resuming.delete(childId)
+      if (
+        state.closing ||
+        killedChildren.has(childId) ||
+        children.get(childId) !== existing
+      )
+        return
+      watchChild(nativeId, childId, existing.resumePoint())
+    })
+  }
+  /** Brain-projected items are not yet known to the ACP timeline. */
+  function emitItem(item: ProviderTimelineItem, timestamp?: string) {
+    timeline.track(item)
+    publishItem(item, timestamp)
+  }
+  /** Link child sessions and publish an item the timeline already tracks. */
+  function publishItem(item: ProviderTimelineItem, timestamp?: string) {
+    if (
+      capabilities.includes('session.subsession') &&
+      item.type === 'tool_call' &&
+      item.detail.type === 'sub_agent'
+    ) {
+      const nativeId = item.detail.childSessionId
+      if (nativeId && sessionIdPattern.test(nativeId)) {
+        const childId = `${id}:child:${nativeId}`
+        const existing = children.get(childId)
+        if (
+          existing &&
+          isResumable(childId) &&
+          !state.loading &&
+          item.name.includes('send_message')
+        ) {
+          resumeChild(nativeId, childId, existing)
+        } else if (!existing) {
+          emit({
+            type: 'session.opened',
+            sessionId: childId,
+            parentSessionId: id,
+            toolCallId: item.callId,
+            cwd,
+            capabilities: [],
+            restoration: 'parent',
+            title: item.detail.subAgentType ?? 'Antigravity subagent',
+          })
+          watchChild(nativeId, childId)
+          emit({ type: 'session.ready', sessionId: childId })
+        }
+        item.detail.childSessionId = childId
+      }
+    }
+    if (
+      item.type === 'tool_call' &&
+      item.status === 'completed' &&
+      item.name.includes('manage_subagents')
+    ) {
+      void syncKilledChildren()
+    }
+    if (state.replay)
+      emit({
+        type: 'timeline.item',
+        sessionId: id,
+        item,
+        ...(timestamp ? { timestamp } : {}),
+      })
+  }
   function update(notification: SessionNotification) {
     if (state.closing || state.failed) return
     if (state.nativeId && notification.sessionId !== state.nativeId) return
@@ -426,32 +466,10 @@ async function createSession(
     }
     if (notification.sessionId !== state.nativeId) return
     const u = notification.update
-    if (state.turn) {
-      if (
-        state.afterToolResult &&
-        (u.sessionUpdate === 'agent_message_chunk' ||
-          u.sessionUpdate === 'agent_thought_chunk' ||
-          u.sessionUpdate === 'tool_call')
-      ) {
-        state.turnSteps += 1
-        state.afterToolResult = false
-      }
-      if (
-        (u.sessionUpdate === 'tool_call' ||
-          u.sessionUpdate === 'tool_call_update') &&
-        (u.status === 'completed' || u.status === 'failed')
-      )
-        state.afterToolResult = true
-    }
     if (u.sessionUpdate === 'config_option_update') {
       state.metadata.configOptions = u.configOptions
       if (configState({ ...state.metadata, fullAccess: false }).mode === 'plan')
         state.metadata.fullAccess = false
-      publishConfig()
-    } else if (u.sessionUpdate === 'current_mode_update') {
-      if (state.metadata.modes)
-        state.metadata.modes.currentModeId = u.currentModeId
-      if (u.currentModeId === 'plan') state.metadata.fullAccess = false
       publishConfig()
     } else if (u.sessionUpdate === 'available_commands_update') {
       const next = u.availableCommands.map((c) => ({
@@ -482,43 +500,21 @@ async function createSession(
         timeline.boundary()
         return
       }
+      if (
+        u.sessionUpdate === 'tool_call' &&
+        !state.turnToolCallIds.includes(u.toolCallId)
+      )
+        state.turnToolCallIds.push(u.toolCallId)
+      if (
+        state.turn &&
+        (u.sessionUpdate === 'agent_message_chunk' ||
+          u.sessionUpdate === 'agent_thought_chunk' ||
+          u.sessionUpdate === 'tool_call')
+      )
+        state.turnHadModelOutput = true
+      // Timeline.update already tracks the ACP item.
       const item = timeline.update(u)
-      if (item) {
-        if (
-          capabilities.includes('session.subsession') &&
-          item.type === 'tool_call' &&
-          item.detail.type === 'sub_agent'
-        ) {
-          const nativeId = item.detail.childSessionId
-          if (nativeId && sessionIdPattern.test(nativeId)) {
-            const childId = `${id}:child:${nativeId}`
-            if (!children.has(childId)) {
-              emit({
-                type: 'session.opened',
-                sessionId: childId,
-                parentSessionId: id,
-                toolCallId: item.callId,
-                cwd,
-                capabilities: [],
-                restoration: 'parent',
-                title: item.detail.subAgentType ?? 'Antigravity subagent',
-              })
-              children.set(
-                childId,
-                watchBrain(
-                  join(dataDirectory(launch, config?.env, cwd), 'brain'),
-                  nativeId,
-                  childId,
-                  emit,
-                ),
-              )
-              emit({ type: 'session.ready', sessionId: childId })
-            }
-            item.detail.childSessionId = childId
-          }
-        }
-        if (state.replay) emit({ type: 'timeline.item', sessionId: id, item })
-      }
+      if (item) publishItem(item)
     }
   }
   function publishConfig() {
@@ -595,6 +591,7 @@ async function createSession(
   const onExit = (error: Error) => {
     if (state.failed || state.closing) return
     state.failed = true
+    state.turnAbort?.abort(error)
     resolveCommands()
     cancelPermissions()
     terminalize('failed', error.message)
@@ -605,41 +602,44 @@ async function createSession(
         error: { message: error.message },
       })
   }
-  let currentTransport = warm
-    ? (warm.transport.bind(client, onExit), warm.transport)
-    : connectAcp(
-        effectiveLaunch(launch, state.skipPermissions),
-        cwd,
-        config?.env ?? {},
-        client,
-        onExit,
-      )
-  if (!warm) {
-    transports.add(currentTransport)
-    void currentTransport.exited
-      .then(() => currentTransport.close())
+  /** Start an owned ACP runtime; it leaves the connection's transports once it exits and stops. */
+  function startRuntime(skipPermissions: boolean) {
+    const transport = connectAcp(
+      effectiveLaunch(launch, skipPermissions),
+      cwd,
+      config?.env ?? {},
+      client,
+      onExit,
+    )
+    transports.add(transport)
+    void transport.exited
+      .then(() => transport.close())
       .then(
-        () => transports.delete(currentTransport),
+        () => transports.delete(transport),
         () => undefined,
       )
+    return transport
   }
+  function initializeRuntime(transport: ReturnType<typeof connectAcp>) {
+    return transport.request(
+      transport.rpc.initialize({
+        protocolVersion: 1,
+        clientInfo: { name: 'paseo-agy-acp', version: '0.1.0' },
+        clientCapabilities: {
+          fs: { readTextFile: false, writeTextFile: false },
+          terminal: false,
+        },
+      }),
+    )
+  }
+  let currentTransport = startRuntime(state.skipPermissions)
   try {
-    let currentInitialized = warm
-      ? warm.initialized
-      : await currentTransport.request(
-          currentTransport.rpc.initialize({
-            protocolVersion: 1,
-            clientInfo: { name: 'paseo-agy-acp', version: '0.1.0' },
-            clientCapabilities: {
-              fs: { readTextFile: false, writeTextFile: false },
-              terminal: false,
-            },
-          }),
-        )
+    let currentInitialized = await initializeRuntime(currentTransport)
     return {
       id,
       cwd,
       config,
+      brainRoot,
       state,
       get initialized() {
         return currentInitialized
@@ -653,59 +653,104 @@ async function createSession(
       publishConfig,
       publishUsage,
       terminalize,
+      emitItem,
+      hasChild(nativeId: string) {
+        return children.has(`${id}:child:${nativeId}`)
+      },
+      isChildResumable(nativeId: string) {
+        return isResumable(`${id}:child:${nativeId}`)
+      },
+      syncKilledChildren,
       drain,
       waitForCommands,
+      async replayTools() {
+        if (!state.replay) return
+        const [inbox, subagents, rows] = await Promise.all([
+          readInboxState(brainRoot, state.nativeId),
+          readSubagents(brainRoot, state.nativeId),
+          readTranscriptRows(brainRoot, state.nativeId),
+        ])
+        const projector = new BrainTranscriptProjector(id)
+        projector.syncMetadata(inbox, subagents)
+        projector.bindToolCallIds(state.turnToolCallIds)
+        for (const row of rows)
+          for (const item of projector.project(row)) {
+            if (item.type !== 'tool_call') continue
+            await Promise.all(
+              [...children.values()].map((child) => child.ready),
+            )
+            emitItem(item)
+          }
+        // A child opened by the last replayed tool must read its history before a historical kill cancels it.
+        await Promise.all([...children.values()].map((child) => child.ready))
+        await syncKilledChildren(subagents)
+      },
       flush() {
         state.opening = false
         for (const item of buffered.splice(0)) update(item)
       },
-      async relaunch(skipPermissions: boolean) {
+      async interrupt(): Promise<void> {
+        if (state.interrupting) return state.interrupting
+        state.turnAbort?.abort()
+        cancelPermissions()
+        // Children stay registered when canceled so they are neither reopened nor left unclosed.
+        const runningChildren = [...children.values()].filter((child) =>
+          child.isRunning(),
+        )
+        const canceling = runningChildren.map((child) => child.cancel())
+        // Native session/cancel leaves background tasks alive; stop their owner when background work is active.
+        state.interrupting = (async () => {
+          await Promise.all(canceling)
+          const needsRelaunch =
+            runningChildren.length > 0 ||
+            (await hasActiveBackgroundWork(brainRoot, state.nativeId).catch(
+              () => true,
+            ))
+          if (needsRelaunch)
+            await Promise.all([...children.values()].map((c) => c.cancel()))
+          try {
+            await currentTransport.request(
+              currentTransport.rpc.cancel({ sessionId: state.nativeId }),
+            )
+          } catch (error) {
+            // A concurrent close already stops the runtime; its closed stream is not an interrupt failure.
+            if (!state.closing) throw error
+          } finally {
+            if (needsRelaunch) await this.relaunch(state.skipPermissions, true)
+          }
+        })()
+        try {
+          await state.interrupting
+        } finally {
+          state.interrupting = null
+        }
+      },
+      async relaunch(skipPermissions: boolean, force = false): Promise<void> {
         if (
-          state.skipPermissions === skipPermissions ||
-          !currentInitialized.agentCapabilities?.loadSession
+          !force &&
+          (state.skipPermissions === skipPermissions ||
+            !currentInitialized.agentCapabilities?.loadSession)
         )
           return
         const prev = configState(state.metadata)
-        const old = currentTransport
-        old.bind(
-          {
-            sessionUpdate: async () => {},
-            requestPermission: async () => ({
-              outcome: { outcome: 'cancelled' },
-            }),
-          },
-          () => {},
-        )
-        await old.close().catch(() => undefined)
-        const next = connectAcp(
-          effectiveLaunch(launch, skipPermissions),
-          cwd,
-          config?.env ?? {},
-          client,
-          onExit,
-        )
-        currentTransport = next
-        transports.add(next)
-        void next.exited
-          .then(() => next.close())
-          .then(
-            () => transports.delete(next),
-            () => undefined,
-          )
-        currentInitialized = await next.request(
-          next.rpc.initialize({
-            protocolVersion: 1,
-            clientInfo: { name: 'paseo-agy-acp', version: '0.1.0' },
-            clientCapabilities: {
-              fs: { readTextFile: false, writeTextFile: false },
-              terminal: false,
-            },
-          }),
-        )
-        state.skipPermissions = skipPermissions
+        const nativeMode = configState({
+          ...state.metadata,
+          fullAccess: false,
+        }).mode
         state.loading = true
         state.replay = false
         try {
+          await currentTransport.close()
+          if (state.closing) return
+          if (!currentInitialized.agentCapabilities?.loadSession)
+            throw new Error(
+              'agy cannot reload after interruption; reopen the session',
+            )
+          const next = startRuntime(skipPermissions)
+          currentTransport = next
+          currentInitialized = await initializeRuntime(next)
+          if (state.closing) return
+          state.skipPermissions = skipPermissions
           state.metadata = {
             ...(await next.request(
               next.rpc.loadSession({
@@ -718,32 +763,32 @@ async function createSession(
             fullAccess: skipPermissions,
           }
           await drain()
+          if (state.closing) return
+          for (const [k, v] of [
+            ['model', prev.model],
+            ['thought_level', prev.thinkingOption],
+            ['mode', force ? nativeMode : undefined],
+          ] as const) {
+            await applyNativeConfigOption(
+              next,
+              state.nativeId,
+              state.metadata,
+              k,
+              v,
+            )
+          }
+        } catch (error) {
+          onExit(error instanceof Error ? error : new Error(String(error)))
+          throw error
         } finally {
           state.loading = false
           state.replay = true
         }
-        for (const [k, v] of [
-          ['model', prev.model],
-          ['thought_level', prev.thinkingOption],
-        ] as const) {
-          const opt = state.metadata.configOptions?.find(
-            (o) => o.id === k || o.category === k,
-          )
-          if (v && opt && opt.currentValue !== v) {
-            const res = await next.request(
-              next.rpc.setSessionConfigOption({
-                sessionId: state.nativeId,
-                configId: opt.id,
-                value: v,
-              }),
-            )
-            state.metadata.configOptions = res.configOptions
-          }
-        }
       },
-      close(reuseUnbound = false): Promise<void> {
+      close(): Promise<void> {
         if (closing) return closing
         state.closing = true
+        state.turnAbort?.abort()
         resolveCommands()
         closing = (async () => {
           cancelPermissions()
@@ -757,35 +802,15 @@ async function createSession(
             !state.persisted &&
             state.prompts.size === 0 &&
             sessionIdPattern.test(state.nativeId)
-          const closedNatively = disposable
-            ? await currentTransport
-                .request(
-                  currentTransport.rpc.closeSession({
-                    sessionId: state.nativeId,
-                  }),
-                )
-                .then(
-                  () => true,
-                  () => false,
-                )
-            : false
-          const dir = dataDirectory(launch, config?.env, cwd)
-          if (
-            ((reuseUnbound && !state.nativeId) ||
-              (disposable && closedNatively)) &&
-            !state.failed &&
-            !state.skipPermissions &&
-            parkWarm({
-              transport: currentTransport,
-              initialized: currentInitialized,
-            })
-          ) {
-            if (disposable)
-              await removeSessionArtifacts(dir, state.nativeId).catch(
-                () => undefined,
+          if (disposable)
+            await currentTransport
+              .request(
+                currentTransport.rpc.closeSession({
+                  sessionId: state.nativeId,
+                }),
               )
-            return
-          }
+              .catch(() => undefined)
+          const dir = dataDirectory(launch, config?.env, cwd)
           const stopped = await currentTransport.close().then(
             () => true,
             () => false,
@@ -802,6 +827,33 @@ async function createSession(
     await currentTransport.close()
     throw error
   }
+}
+
+async function applyNativeConfigOption(
+  transport: ReturnType<typeof connectAcp>,
+  nativeId: string,
+  metadata: NewSessionResponse & SessionMetadata,
+  key: 'model' | 'mode' | 'thought_level',
+  value: string | undefined,
+  strict = false,
+) {
+  if (!value) return
+  const option = metadata.configOptions?.find(
+    (o) => o.id === key || o.category === key,
+  )
+  if (!option) {
+    if (strict) throw new Error(`agy does not advertise ${key}`)
+    return
+  }
+  if (option.currentValue === value) return
+  const result = await transport.request(
+    transport.rpc.setSessionConfigOption({
+      sessionId: nativeId,
+      configId: option.id,
+      value,
+    }),
+  )
+  metadata.configOptions = result.configOptions
 }
 
 async function configureSession(
@@ -829,9 +881,6 @@ async function configureSession(
     if (key === 'mode' && value === FULL_ACCESS_MODE_ID) {
       await session.relaunch(true)
       session.state.metadata.fullAccess = true
-      const option = session.state.metadata.configOptions?.find(
-        (o) => o.id === key || o.category === key,
-      )
       const nativeModes = configState({
         ...session.state.metadata,
         fullAccess: false,
@@ -839,58 +888,27 @@ async function configureSession(
       const target = ['accept-edits', 'default'].find((m) =>
         nativeModes.includes(m),
       )
-      if (!target) continue
-      if (option && option.currentValue !== target) {
-        const result = await session.transport.request(
-          session.transport.rpc.setSessionConfigOption({
-            sessionId: session.state.nativeId,
-            configId: option.id,
-            value: target,
-          }),
-        )
-        session.state.metadata.configOptions = result.configOptions
-      } else if (
-        !option &&
-        session.state.metadata.modes &&
-        session.state.metadata.modes.currentModeId !== target
-      ) {
-        await session.transport.request(
-          session.transport.rpc.setSessionMode({
-            sessionId: session.state.nativeId,
-            modeId: target,
-          }),
-        )
-        session.state.metadata.modes.currentModeId = target
-      }
+      await applyNativeConfigOption(
+        session.transport,
+        session.state.nativeId,
+        session.state.metadata,
+        key,
+        target,
+      )
       continue
     }
     if (key === 'mode') {
       await session.relaunch(false)
       session.state.metadata.fullAccess = false
     }
-    const option = session.state.metadata.configOptions?.find(
-      (o) => o.id === key || o.category === key,
+    await applyNativeConfigOption(
+      session.transport,
+      session.state.nativeId,
+      session.state.metadata,
+      key,
+      value,
+      true,
     )
-    if (option) {
-      if (option.currentValue === value) continue
-      const result = await session.transport.request(
-        session.transport.rpc.setSessionConfigOption({
-          sessionId: session.state.nativeId,
-          configId: option.id,
-          value,
-        }),
-      )
-      session.state.metadata.configOptions = result.configOptions
-    } else if (key === 'mode') {
-      await session.transport.request(
-        session.transport.rpc.setSessionMode({
-          sessionId: session.state.nativeId,
-          modeId: value,
-        }),
-      )
-      if (session.state.metadata.modes)
-        session.state.metadata.modes.currentModeId = value
-    } else throw new Error(`agy does not advertise ${key}`)
   }
   session.publishConfig()
 }
@@ -944,10 +962,12 @@ async function promptSession(
         ]
       : p.input.content.map(promptContent)
   const turnId = randomUUID()
+  const turnAbort = new AbortController()
   session.state.turn = turnId
-  session.state.turnSteps = 1
-  session.state.afterToolResult = false
+  session.state.turnAbort = turnAbort
   session.state.turnHadContextUsage = false
+  session.state.turnHadModelOutput = false
+  session.state.turnToolCallIds = []
   session.state.prompts.add(p.clientMessageId)
   session.timeline.boundary()
   emit({
@@ -975,38 +995,90 @@ async function promptSession(
     state: 'started',
   })
   try {
+    const minStepIndex = await readLastStepIndex(
+      session.brainRoot,
+      session.state.nativeId,
+    ).catch(() => -1)
+    turnAbort.signal.throwIfAborted()
     const result = await session.transport.rpc.prompt({
       sessionId: session.state.nativeId,
       prompt: blocks,
     })
     await session.drain()
+    let status: 'completed' | 'canceled' | 'failed' =
+      result.stopReason === 'cancelled' ? 'canceled' : 'completed'
+    let turnError: string | undefined
+    let lastStep: StepUsage | undefined
+    if (status === 'completed') {
+      const settled = await settleBrainTurn(
+        session.brainRoot,
+        session.state.nativeId,
+        session.id,
+        session.emitItem,
+        {
+          signal: turnAbort.signal,
+          minStepIndex,
+          acpToolCallIds: session.state.turnToolCallIds,
+          shouldEmitPreWakeupTool: (item) =>
+            session.timeline.isRunning(item.id) ||
+            (item.detail.type === 'sub_agent' &&
+              item.detail.childSessionId !== undefined &&
+              // Unknown children open, interrupted ones resume.
+              (!session.hasChild(item.detail.childSessionId) ||
+                session.isChildResumable(item.detail.childSessionId))),
+          // A model turn always writes USER_INPUT; give agy a moment to flush it. Native commands may write none.
+          transcriptGraceMs: session.state.turnHadModelOutput ? 2000 : 0,
+          isWaitingOnUser: () => session.permissions.size > 0,
+        },
+      )
+      await session.syncKilledChildren()
+      status = settled.status
+      turnError = settled.error
+      lastStep = settled.lastStepUsage
+    }
     if (result.usage)
       session.publishUsage(
         promptUsage(result.usage, {
           model: configState(session.state.metadata).model,
-          steps: session.state.turnSteps,
           preserveContext: session.state.turnHadContextUsage,
+          lastStep,
         }),
       )
-    const status = result.stopReason === 'cancelled' ? 'canceled' : 'completed'
-    session.terminalize(status)
+    await session.state.interrupting
+    session.terminalize(status, turnError)
     emit({
       type: 'session.turn',
       sessionId: session.id,
       turnId,
       state: status,
+      ...(status === 'failed' && turnError
+        ? { error: { message: turnError } }
+        : {}),
     })
   } catch (error) {
     await session.drain()
-    session.terminalize('failed', String(error))
+    const restartError = await session.state.interrupting?.then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    error = restartError ?? error
+    const status =
+      !restartError &&
+      turnAbort.signal.aborted &&
+      turnAbort.signal.reason instanceof Error &&
+      turnAbort.signal.reason.name === 'AbortError'
+        ? 'canceled'
+        : 'failed'
+    session.terminalize(status, String(error))
     emit({
       type: 'session.turn',
       sessionId: session.id,
       turnId,
-      state: 'failed',
-      error: { message: String(error) },
+      state: status,
+      ...(status === 'failed' ? { error: { message: String(error) } } : {}),
     })
   } finally {
+    session.state.turnAbort = null
     session.state.turn = ''
     session.timeline.boundary()
     session.cancelPermissions()
