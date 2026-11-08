@@ -112,7 +112,8 @@ export class SessionManager {
           this.closed ||
           runtime.transport.closed ||
           this.warm.has(warmKey) ||
-          agentId
+          agentId ||
+          config?.systemPrompt?.trim()
         )
           return false
         runtime.transport.bind(
@@ -146,8 +147,6 @@ export class SessionManager {
     const { emit, capabilities } = this.options
     if (this.sessions.has(input.sessionId) || this.opening.has(input.sessionId))
       throw new Error('Session already open')
-    if (input.config.systemPrompt)
-      throw new Error('Custom systemPrompt is not supported by agy ACP')
     this.opening.add(input.sessionId)
     try {
       const session = await this.start(
@@ -167,6 +166,15 @@ export class SessionManager {
         const params = {
           cwd: input.config.cwd,
           mcpServers: mcpServers(input.config),
+          ...(input.config.systemPrompt?.trim()
+            ? {
+                _meta: {
+                  antigravity: {
+                    systemPrompt: { append: input.config.systemPrompt },
+                  },
+                },
+              }
+            : {}),
         }
         session.state.persisted = Boolean(input.persistence)
         session.state.replay = input.history === 'replay'

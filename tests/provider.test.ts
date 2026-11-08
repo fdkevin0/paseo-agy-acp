@@ -836,3 +836,41 @@ test('cancel is sticky when it arrives before the mock installs its prompt resol
     await h.provider.close()
   }
 })
+
+test('forwards systemPrompt via _meta.antigravity.systemPrompt.append on new and loaded sessions', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-sysprompt-'))
+  const log = join(home, 'calls')
+  const h = await harness({ HOME: home, AGY_TEST_LOG: log })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'new-sys',
+      sessionId: 's1',
+      config: { ...h.config, systemPrompt: 'Follow Paseo peer protocol.' },
+      history: 'skip',
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's1')
+    await h.provider.send({
+      type: 'session.close',
+      requestId: 'close-1',
+      sessionId: 's1',
+    })
+    await h.wait((e) => e.type === 'session.closed' && e.sessionId === 's1')
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'load-sys',
+      sessionId: 's2',
+      config: { ...h.config, systemPrompt: 'Follow Paseo peer protocol.' },
+      history: 'skip',
+      persistence: { version: 1, data: { sessionId: 'native-test' } },
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's2')
+    assert.equal(
+      await readFile(log, 'utf8'),
+      'new:Follow Paseo peer protocol.\nclose\nload:Follow Paseo peer protocol.\n',
+    )
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})

@@ -4,7 +4,7 @@ For installation and your first request, start with the [installation guide](../
 
 ## Launch and data directories
 
-Plugin `agy-acp` registers provider `agy`. The default command is `agy acp`. Paseo resolves the executable, argument prefix and launch environment; session environment overrides are applied on top. Session MCP servers are translated into ACP stdio, HTTP or SSE configurations.
+Plugin `agy-acp` registers provider `agy`. The default command is `agy acp`. Paseo resolves the executable, argument prefix and launch environment; session environment overrides are applied on top. Session MCP servers are translated into ACP stdio, HTTP or SSE configurations; non-empty session system prompts are forwarded via `_meta.antigravity.systemPrompt.append`.
 
 | Setting                            | Behavior                                                                                     |
 | ---------------------------------- | -------------------------------------------------------------------------------------------- |
@@ -82,11 +82,11 @@ Permission events include the native title, input, detail card and available act
 
 Control RPCs time out after 30 seconds. Prompt generation remains open until completion, interruption or process failure. Shutdown ends stdin, then escalates process termination with a bounded wait. Explicit close stops Brain polling and preserves imported and prompted conversations; their processes are stopped. Healthy temporary sessions can return their process to the warm pool after native close succeeds. Successful session listing can also return a process without creating a native session. Failed operations without a known native session are stopped.
 
-The warm pool belongs to one provider connection, whose launch command and environment are fixed. Reuse additionally requires the same resolved launch paths, session environment and native data directory (so relative launch or directory arguments stay scoped to their working directory). At most four idle processes are retained, with oldest-first eviction and a 60-second idle expiry timer that does not keep the host alive. Environments containing a nonempty `PASEO_AGENT_ID` are not parked. A duplicate idle scope is stopped instead of replacing its parked process. Open sessions are not subject to this pool's limits: Paseo's automatic idle cleanup is vetoed because native background tasks cannot be safely queried.
+The warm pool belongs to one provider connection, whose launch command and environment are fixed. Reuse additionally requires the same resolved launch paths, session environment and native data directory (so relative launch or directory arguments stay scoped to their working directory). At most four idle processes are retained, with oldest-first eviction and a 60-second idle expiry timer that does not keep the host alive. Environments containing a nonempty `PASEO_AGENT_ID` or a custom system prompt are not parked. A duplicate idle scope is stopped instead of replacing its parked process. Open sessions are not subject to this pool's limits: Paseo's automatic idle cleanup is vetoed because native background tasks cannot be safely queried.
 
 Protocol disconnection terminates the child even if the process is still alive. Parked runtimes cancel permissions and ignore notifications; a checked-out runtime binds the new session's handlers. Provider connection shutdown terminates both active and parked processes and waits for shutdown to finish.
 
-Steering, rewind, archive operations, structured output and custom system prompts are unsupported.
+Steering, rewind, archive operations and structured output are unsupported.
 
 ## Context window occupancy
 

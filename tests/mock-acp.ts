@@ -120,11 +120,14 @@ new AgentSideConnection((client) => {
     async authenticate() {
       return {}
     },
-    async newSession() {
+    async newSession(params) {
       const previousId = nativeId || randomUUID()
       nativeId = randomUUID()
       sessions += 1
-      log('new')
+      const append = (
+        params._meta?.antigravity as { systemPrompt?: { append?: string } }
+      )?.systemPrompt?.append
+      log(append ? `new:${append}` : 'new')
       if (process.env.AGY_TEST_STALE_EVENTS) await staleEvents(previousId)
       sendCommands(nativeId)
       return { sessionId: nativeId, configOptions }
@@ -135,7 +138,11 @@ new AgentSideConnection((client) => {
       if (process.env.AGY_TEST_CLOSE_ERROR) throw new Error('close failed')
       return {}
     },
-    async loadSession({ sessionId }) {
+    async loadSession({ sessionId, _meta }) {
+      const append = (
+        _meta?.antigravity as { systemPrompt?: { append?: string } }
+      )?.systemPrompt?.append
+      if (append) log(`load:${append}`)
       sendCommands(sessionId)
       await client.sessionUpdate({
         sessionId,

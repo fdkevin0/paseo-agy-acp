@@ -14,7 +14,7 @@ Linux has been smoke-tested; other operating systems have not been verified. See
 
 ## Capabilities and data flow
 
-Supports text, images, attachment context, native commands, permission decisions, persistent sessions, rich tool cards and child conversation timelines. Prompt content, tool results and configured MCP services are handled by the local agy process, which communicates with its configured model service. The plugin reads local Brain child transcripts to populate timelines; events go to connected Paseo clients.
+Supports text, images, attachment context, appended system prompts, native commands, permission decisions, persistent sessions, rich tool cards and child conversation timelines. Prompt content, tool results and configured MCP services are handled by the local agy process, which communicates with its configured model service. The plugin reads local Brain child transcripts to populate timelines; events go to connected Paseo clients.
 
 The Composer context popover shows context occupancy and subscription quota. Usage Source `agy`, also available through `paseo usage ls --json`, reports Gemini and Claude/GPT 5-hour and weekly quotas, reset times and the subscription tier when known. It calls agy's `/usage` command without starting a model turn. Account labels come from local login logs; token contents are not read by the plugin or exposed in usage reports.
 
@@ -24,4 +24,4 @@ Temporary discovery sessions and new sessions closed before their first prompt a
 
 Context occupancy is an estimate when native measurements are unavailable. Current agy print mode rejects custom ACP directory flags; quota queries with those flags return an error instead of querying another account. Subagent timelines depend on native logs and do not provide independent session control.
 
-Steering, rewind, archive operations, structured output, custom system prompts, recursive child discovery and Artifacts panels are unsupported. Automatic idle cleanup of open sessions is disabled because ACP cannot confirm that background work has stopped. This does not prevent expiry of parked discovery runtimes.
+Steering, rewind, archive operations, structured output, recursive child discovery and Artifacts panels are unsupported. Automatic idle cleanup of open sessions is disabled because ACP cannot confirm that background work has stopped. This does not prevent expiry of parked discovery runtimes.
