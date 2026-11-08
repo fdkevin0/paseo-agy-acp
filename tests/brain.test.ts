@@ -4,6 +4,7 @@ import { test } from 'node:test'
 import {
   mkdtemp,
   mkdir,
+  open,
   readFile,
   writeFile,
   appendFile,
@@ -91,6 +92,21 @@ async function fixture() {
     await mkdir(join(root, id, '.system_generated/logs'), { recursive: true })
     await writeFile(path(id), encode(rows))
   }
+  /** Rewrite like agy's WriteFullTranscript: O_TRUNC on the same inode, optionally pausing while empty. */
+  async function rewrite(
+    id: string,
+    rows: Row[],
+    whileEmpty?: () => Promise<void>,
+  ) {
+    const file = await open(path(id), 'r+')
+    try {
+      await file.truncate(0)
+      await whileEmpty?.()
+      await file.write(encode(rows), 0)
+    } finally {
+      await file.close()
+    }
+  }
   async function subagent(
     parentId: string,
     childId: string,
@@ -174,6 +190,7 @@ async function fixture() {
     root,
     path,
     put,
+    rewrite,
     subagent,
     deliver,
     close: () => rm(root, { recursive: true, force: true }),
@@ -475,15 +492,18 @@ test('watching retains split UTF-8 records, resets on replacement and truncation
     )
     await delay(30)
     assert.equal(events.length, countBeforeCancel)
-    assert.throws(() => watchBrain(f.root, '../escape', 'c', () => {}))
-    assert.equal(
-      new BrainTranscriptProjector('c').project({ step_index: 'bad' }).length,
-      0,
-    )
   } finally {
     stop?.()
     await f.close()
   }
+})
+
+test('Brain rejects escaping session IDs and rows without an integer step', () => {
+  assert.throws(() => watchBrain('/tmp', '../escape', 'c', () => {}))
+  assert.equal(
+    new BrainTranscriptProjector('c').project({ step_index: 'bad' }).length,
+    0,
+  )
 })
 
 test('Brain matches FIFO tool results without fake assistant bubbles or mutating pending IDs', () => {
@@ -1219,7 +1239,7 @@ test('an in-place O_TRUNC rewrite re-delivers changed steps once and drops unlog
     await delay(40)
     assert.equal(settled, false)
     // Same inode, larger file: only content probes can notice the rewrite.
-    const rewritten = encode([
+    await f.rewrite(parent, [
       { step_index: 1, type: 'USER_INPUT', content: 'run' },
       plan,
       {
@@ -1230,12 +1250,6 @@ test('an in-place O_TRUNC rewrite re-delivers changed steps once and drops unlog
       },
       { step_index: 4, type: 'PLANNER_RESPONSE', status: 'GENERATING' },
     ])
-    const handle = await (
-      await import('node:fs/promises')
-    ).open(f.path(parent), 'r+')
-    await handle.truncate(0)
-    await handle.write(rewritten, 0)
-    await handle.close()
     await delay(40)
     assert.equal(settled, false, 'a GENERATING row is superseded, not final')
     await appendFile(f.path(parent), encode([done(4, 'All done')]))
@@ -1394,34 +1408,56 @@ test('a settled ALIVE child does not suspend the parent stall timeout', async ()
   }
 })
 
-test('pending approvals and background tasks suspend the stall timeout', async () => {
-  const f = await fixture()
-  const abort = new AbortController()
-  try {
-    await f.put(parent, [
-      { step_index: 1, type: 'USER_INPUT', content: 'run' },
-      { step_index: 2, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
-    ])
-    let settled = false
-    const running = alive(
-      settleBrainTurn(f.root, parent, 'p', () => {}, {
-        signal: abort.signal,
-        pollIntervalMs: 5,
-        stallTimeoutMs: 20,
-        isWaitingOnUser: () => true,
-      }),
-    ).then((result) => {
-      settled = true
-      return result
-    })
-    await delay(100)
-    assert.equal(settled, false, 'a pending approval is not a stall')
-    abort.abort()
-    assert.equal((await running).status, 'canceled')
-  } finally {
-    await f.close()
-  }
-})
+for (const wait of ['approval', 'background task'] as const)
+  test(`a pending ${wait} suspends the stall timeout`, async () => {
+    const f = await fixture()
+    const abort = new AbortController()
+    try {
+      const taskId = `${parent}/task-3`
+      await f.put(
+        parent,
+        wait === 'approval'
+          ? [
+              { step_index: 1, type: 'USER_INPUT', content: 'run' },
+              { step_index: 2, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+            ]
+          : [
+              { step_index: 1, type: 'USER_INPUT', content: 'run' },
+              {
+                step_index: 2,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                tool_calls: [{ id: 'bg', name: 'run_command', args: {} }],
+              },
+              {
+                step_index: 3,
+                type: 'GENERIC',
+                status: 'RUNNING',
+                content: `Tool is running as a background task with task id: ${taskId}\n`,
+              },
+              done(4, 'Waiting'),
+            ],
+      )
+      let settled = false
+      const running = alive(
+        settleBrainTurn(f.root, parent, 'p', () => {}, {
+          signal: abort.signal,
+          pollIntervalMs: 5,
+          stallTimeoutMs: 20,
+          isWaitingOnUser: () => wait === 'approval',
+        }),
+      ).then((result) => {
+        settled = true
+        return result
+      })
+      await delay(100)
+      assert.equal(settled, false, `a pending ${wait} is not a stall`)
+      abort.abort()
+      assert.equal((await running).status, 'canceled')
+    } finally {
+      await f.close()
+    }
+  })
 
 test('unknown subagent states do not count as active background work', async () => {
   const f = await fixture()
@@ -1512,14 +1548,7 @@ test('a child watcher does not restart turns when its transcript is rewritten in
       events.some((e) => e.type === 'session.turn' && e.state === 'completed'),
     )
     const before = events.length
-    const fs = await import('node:fs/promises')
-    const file = await fs.open(f.path(child), 'r+')
-    await file.truncate(0)
-    await file.write(
-      encode([...rows, { step_index: 2, type: 'CHECKPOINT' }]),
-      0,
-    )
-    await file.close()
+    await f.rewrite(child, [...rows, { step_index: 2, type: 'CHECKPOINT' }])
     await delay(50)
     assert.equal(events.length, before, 'unchanged steps are not new activity')
   } finally {
@@ -1548,13 +1577,10 @@ test('a rewrite observed mid-O_TRUNC does not end an anchored turn', async () =>
       return result
     })
     await delay(30)
-    const fs = await import('node:fs/promises')
-    const file = await fs.open(f.path(parent), 'r+')
-    await file.truncate(0)
-    await delay(30)
-    assert.equal(settled, false, 'an empty file mid-rewrite is not "no turn"')
-    await file.write(encode([...rows, done(3, 'ok')]), 0)
-    await file.close()
+    await f.rewrite(parent, [...rows, done(3, 'ok')], async () => {
+      await delay(30)
+      assert.equal(settled, false, 'an empty file mid-rewrite is not "no turn"')
+    })
     assert.equal((await running).status, 'completed')
   } finally {
     abort.abort()

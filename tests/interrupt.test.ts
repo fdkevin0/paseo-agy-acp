@@ -12,30 +12,42 @@ import {
 } from '@getpaseo/plugin/server/provider'
 import { createProvider } from '../server/provider.ts'
 
+/** Connect a provider to interrupt-acp.ts and record its events. */
+async function connect(home: string, timeoutMs = 2000) {
+  const provider = await createProvider().connect({
+    versions: [1],
+    capabilities: PROVIDER_CAPABILITIES,
+    launch: {
+      command: process.execPath,
+      args: [fileURLToPath(new URL('./interrupt-acp.ts', import.meta.url))],
+      env: { HOME: home, PATH: process.env.PATH ?? '' },
+    },
+  })
+  const events: ProviderEvent[] = []
+  provider.onEvent((event) => {
+    ProviderEventSchema.parse(event)
+    events.push(event)
+  })
+  async function until(predicate: (event: ProviderEvent) => boolean) {
+    const deadline = Date.now() + timeoutMs
+    while (!events.some(predicate)) {
+      assert.ok(Date.now() < deadline, JSON.stringify(events))
+      await delay(5)
+    }
+  }
+  /** Runtime start and exit records written by interrupt-acp.ts. */
+  const log = async () =>
+    (await readFile(join(home, 'runtime.jsonl'), 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+  return { provider, events, until, log }
+}
+
 for (const mode of ['plan', 'full-access']) {
   test(`interrupt stops native background owner and restores ${mode} session without history replay`, async () => {
     const home = await mkdtemp(join(tmpdir(), 'agy-interrupt-'))
-    const provider = await createProvider().connect({
-      versions: [1],
-      capabilities: PROVIDER_CAPABILITIES,
-      launch: {
-        command: process.execPath,
-        args: [fileURLToPath(new URL('./interrupt-acp.ts', import.meta.url))],
-        env: { HOME: home, PATH: process.env.PATH ?? '' },
-      },
-    })
-    const events: ProviderEvent[] = []
-    provider.onEvent((event) => {
-      ProviderEventSchema.parse(event)
-      events.push(event)
-    })
-    async function until(predicate: (event: ProviderEvent) => boolean) {
-      const deadline = Date.now() + 5000
-      while (!events.some(predicate)) {
-        assert.ok(Date.now() < deadline, JSON.stringify(events))
-        await delay(10)
-      }
-    }
+    const { provider, events, until } = await connect(home, 5000)
     const prompt = (text: string) =>
       provider.send({
         type: 'session.prompt',
@@ -173,32 +185,7 @@ for (const mode of ['plan', 'full-access']) {
 
 test('closing during interruption cannot start a replacement runtime after session.closed', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-interrupt-close-'))
-  const provider = await createProvider().connect({
-    versions: [1],
-    capabilities: PROVIDER_CAPABILITIES,
-    launch: {
-      command: process.execPath,
-      args: [fileURLToPath(new URL('./interrupt-acp.ts', import.meta.url))],
-      env: { HOME: home, PATH: process.env.PATH ?? '' },
-    },
-  })
-  const events: ProviderEvent[] = []
-  provider.onEvent((event) => {
-    ProviderEventSchema.parse(event)
-    events.push(event)
-  })
-  const log = async () =>
-    (await readFile(join(home, 'runtime.jsonl'), 'utf8'))
-      .trim()
-      .split('\n')
-      .map((line) => JSON.parse(line))
-  async function until(predicate: (event: ProviderEvent) => boolean) {
-    const deadline = Date.now() + 2000
-    while (!events.some(predicate)) {
-      assert.ok(Date.now() < deadline, JSON.stringify(events))
-      await delay(5)
-    }
-  }
+  const { provider, events, until, log } = await connect(home)
   try {
     await provider.send({
       type: 'session.open',
@@ -292,27 +279,7 @@ test('closing during interruption cannot start a replacement runtime after sessi
 
 test('interrupt without active background work uses native session/cancel fast path without relaunching', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-interrupt-fast-'))
-  const provider = await createProvider().connect({
-    versions: [1],
-    capabilities: PROVIDER_CAPABILITIES,
-    launch: {
-      command: process.execPath,
-      args: [fileURLToPath(new URL('./interrupt-acp.ts', import.meta.url))],
-      env: { HOME: home, PATH: process.env.PATH ?? '' },
-    },
-  })
-  const events: ProviderEvent[] = []
-  provider.onEvent((event) => {
-    ProviderEventSchema.parse(event)
-    events.push(event)
-  })
-  async function until(predicate: (event: ProviderEvent) => boolean) {
-    const deadline = Date.now() + 2000
-    while (!events.some(predicate)) {
-      assert.ok(Date.now() < deadline, JSON.stringify(events))
-      await delay(5)
-    }
-  }
+  const { provider, events, until } = await connect(home)
   try {
     await provider.send({
       type: 'session.open',

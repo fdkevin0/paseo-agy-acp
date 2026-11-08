@@ -224,7 +224,11 @@ for (const scenario of ['kill', 'kill-all'])
             event.state === 'completed',
         )
         assert.ok(
-          canceled >= 0 && canceled < parentDone,
+          canceled >= 0,
+          'a successful native cancellation must stop the child watcher',
+        )
+        assert.ok(
+          canceled < parentDone,
           'the child is canceled before the parent turn completes',
         )
       },
@@ -237,22 +241,4 @@ for (const scenario of ['kill', 'kill-all'])
           'closing the parent closes the killed child session',
         ),
     )
-    await run(scenario, (events) => {
-      assert.ok(
-        events.some(
-          (event) =>
-            event.type === 'session.opened' && event.parentSessionId === 's',
-        ),
-      )
-      assert.ok(
-        events.some(
-          (event) =>
-            event.type === 'session.turn' &&
-            event.sessionId ===
-              's:child:22222222-2222-4222-8222-222222222222' &&
-            event.state === 'canceled',
-        ),
-        'a successful native cancellation must stop the child watcher',
-      )
-    })
   })

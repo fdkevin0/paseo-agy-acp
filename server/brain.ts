@@ -27,7 +27,7 @@ type PendingTool = {
   stepIndex: number
 }
 
-export type SubagentRecord = {
+type SubagentRecord = {
   conversationId: string
   /** Native lifecycle state; only SUBAGENT_STATE_ALIVE counts as active work. */
   state: string
@@ -37,7 +37,7 @@ export type SubagentRecord = {
 
 const SUBAGENT_ALIVE = 'SUBAGENT_STATE_ALIVE'
 
-export type BrainMessageRecord = {
+type BrainMessageRecord = {
   id: string
   sender: string
   priority?: string
@@ -50,7 +50,7 @@ export type BrainMessageRecord = {
   }
 }
 
-export type InboxState = {
+type InboxState = {
   messages: BrainMessageRecord[]
   readIds: Set<string>
   unconsumedHighPriority: BrainMessageRecord[]
@@ -74,6 +74,10 @@ const restartNoticePattern =
 const unloggedStepStatuses = new Set(['PENDING', 'QUEUED', 'GENERATING'])
 /** Logged while still running: the transcript never records this step's own result. */
 const runningStepStatuses = new Set(['RUNNING', 'WAITING'])
+
+function isMissing(error: unknown) {
+  return (error as NodeJS.ErrnoException).code === 'ENOENT'
+}
 
 function isUnloggedStep(row: Record<string, unknown>) {
   return typeof row.status === 'string' && unloggedStepStatuses.has(row.status)
@@ -237,7 +241,7 @@ export async function readInboxState(
   try {
     dir = await resolveBrainPath(root, nativeId, 'messages')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return empty
+    if (isMissing(error)) return empty
     throw error
   }
   const entries = await readdir(dir).catch(() => [] as string[])
@@ -306,7 +310,7 @@ export async function readSubagents(
   try {
     dir = await resolveBrainPath(root, nativeId, 'subagents')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+    if (isMissing(error)) return []
     throw error
   }
   const entries = await readdir(dir).catch(() => [] as string[])
@@ -712,7 +716,7 @@ export async function readTranscriptRows(
   try {
     return (await new TranscriptReader().read(root, nativeId)).rows
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+    if (isMissing(error)) return []
     throw error
   }
 }
@@ -727,7 +731,7 @@ export async function readLastStepIndex(
   try {
     file = await open(await resolveTranscriptPath(root, nativeId), 'r')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return -1
+    if (isMissing(error)) return -1
     throw error
   }
   try {
@@ -773,6 +777,20 @@ function activeChildIdsForTurn(
   return [...ids]
 }
 
+/** Remembers each step's delivered (type, status), so a rewrite re-delivers only changed steps. */
+class StepDedupe {
+  private seen = new Map<number, string>()
+
+  /** Whether this row is new or changed since its step was last seen. */
+  fresh(row: Record<string, unknown>): boolean {
+    const step = Number(row.step_index)
+    const signature = `${String(row.type)}:${String(row.status ?? '')}`
+    if (this.seen.get(step) === signature) return false
+    this.seen.set(step, signature)
+    return true
+  }
+}
+
 class BrainNode {
   readonly reader = new TranscriptReader()
   projector: BrainTranscriptProjector
@@ -802,6 +820,14 @@ class BrainNode {
     ])
     this.projector.syncMetadata(inbox, subagents)
     return { inbox, subagents }
+  }
+
+  /** Fold one transcript row into message accounting, projection and the last step. */
+  ingest(row: Record<string, unknown>): ProviderTimelineItem[] {
+    this.consumedMessages += countRowMessages(row)
+    const items = this.projector.project(row)
+    if (row.type !== 'CHECKPOINT') this.lastStep = row
+    return items
   }
 
   hasUnprocessedMessages(inbox: InboxState): boolean {
@@ -840,9 +866,7 @@ export async function hasActiveBackgroundWork(
     if (isChild && rows.length === 0) return true
     let minTurnStepIndex = -1
     for (const row of rows) {
-      node.consumedMessages += countRowMessages(row)
-      node.projector.project(row)
-      if (row.type !== 'CHECKPOINT') node.lastStep = row
+      node.ingest(row)
       if (
         !isChild &&
         (row.type === 'USER_INPUT' ||
@@ -853,15 +877,13 @@ export async function hasActiveBackgroundWork(
       }
     }
     if (node.projector.hasBackground()) return true
-    if (isChild) {
-      if (node.consumedMessages < inbox.consumedNonUserCount) return true
-      if (
-        node.projector.hasPending() ||
-        (!isCompletePlannerResponse(node.lastStep) &&
-          node.lastStep?.type !== 'ERROR_MESSAGE')
-      )
-        return true
-    }
+    // A failed child is finished; anything else unsettled is still working.
+    if (
+      isChild &&
+      (node.hasUnprocessedMessages(inbox) ||
+        (!node.isSettled(inbox) && node.lastStep?.type !== 'ERROR_MESSAGE'))
+    )
+      return true
     const activeChildIds = activeChildIdsForTurn(
       subagents,
       node.projector,
@@ -899,14 +921,9 @@ async function settleChildren(
       try {
         const { rows, reset } = await child.reader.read(root, childId)
         if (reset) child.reset(childInbox, childSubagents)
-        for (const row of rows) {
-          child.consumedMessages += countRowMessages(row)
-          child.projector.project(row)
-          if (row.type !== 'CHECKPOINT') child.lastStep = row
-        }
+        for (const row of rows) child.ingest(row)
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT')
-          return { settled: false }
+        if (isMissing(error)) return { settled: false }
         throw error
       }
       if (child.hasUnprocessedMessages(childInbox)) return { settled: false }
@@ -930,15 +947,9 @@ async function settleChildren(
       )
       if (nested.error) return nested
       if (!nested.settled) return { settled: false }
-      const hasUnconsumedReport = parentInbox.messages.some(
-        (m) =>
-          m.sender === childId &&
-          !m.hideFromUser &&
-          m.priority !== 'MESSAGE_PRIORITY_LOW' &&
-          !parentInbox.readIds.has(m.id),
-      )
+      // This child's report must reach the parent's transcript before the child counts as settled.
       if (
-        hasUnconsumedReport ||
+        parentInbox.unconsumedHighPriority.some((m) => m.sender === childId) ||
         parentNode.consumedMessages < parentInbox.consumedNonUserCount
       )
         return { settled: false }
@@ -1014,8 +1025,7 @@ export async function settleBrainTurn(
   let foregroundIdleReached = false
   let wokeUp = false
   let lastStepIndex = -1
-  // A rewrite may re-deliver a step with a newer status; emit each (step, status) once.
-  const emitted = new Map<number, string>()
+  const dedupe = new StepDedupe()
   let lastStepUsage: StepUsage | undefined
   const withinGrace = () => Date.now() - startedAt < transcriptGraceMs
   // Without a Brain directory this session never persists a transcript; there is nothing to wait for.
@@ -1051,7 +1061,7 @@ export async function settleBrainTurn(
         node.reset(inbox, subagents)
       }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      if (!isMissing(error)) throw error
       // A missing transcript cannot be settled from; it only delays completion while agy may still flush it.
       if (!withinGrace() || !(await sessionDirExists()))
         return { status: 'completed' }
@@ -1091,21 +1101,18 @@ export async function settleBrainTurn(
     }
     for (const row of slice) {
       const stepIndex = Number(row.step_index)
-      node.consumedMessages += countRowMessages(row)
       if (
         row.type === 'SYSTEM_MESSAGE' &&
         !restartNoticePattern.test(String(row.content ?? '')) &&
         foregroundIdleReached
       )
         wokeUp = true
-      const items = node.projector.project(row)
+      const items = node.ingest(row)
       const usage = extractStepUsage(row)
       if (usage) lastStepUsage = usage
       if (Number.isInteger(stepIndex) && stepIndex > lastStepIndex)
         lastStepIndex = stepIndex
-      const signature = `${String(row.type)}:${String(row.status ?? '')}`
-      if (emitted.get(stepIndex) !== signature) {
-        emitted.set(stepIndex, signature)
+      if (dedupe.fresh(row)) {
         const timestamp =
           typeof row.created_at === 'string' ? row.created_at : undefined
         for (const item of items) {
@@ -1120,7 +1127,6 @@ export async function settleBrainTurn(
           }
         }
       }
-      if (row.type !== 'CHECKPOINT') node.lastStep = row
       if (row.type === 'PLANNER_RESPONSE') seenPlannerResponse = true
       if (
         seenPlannerResponse &&
@@ -1150,11 +1156,7 @@ export async function settleBrainTurn(
       }
     if (childStatus.settled && node.isSettled(inbox)) {
       if (activeChildIds.length > 0) {
-        const latestInbox = await readInboxState(root, nativeId)
-        if (
-          latestInbox.unconsumedHighPriority.length > 0 ||
-          node.consumedMessages < latestInbox.consumedNonUserCount
-        )
+        if (node.hasUnprocessedMessages(await readInboxState(root, nativeId)))
           continue
       }
       return { status: 'completed', lastStepUsage }
@@ -1214,8 +1216,7 @@ export function watchBrain(
   let turnSeq = resume?.turnSeq ?? 1
   let turnId = `${sessionId}:turn:${turnSeq}`
   let lastStepIndex = resume?.afterStep ?? -1
-  // A rewrite re-delivers earlier steps; only a new (step, status) is new child activity.
-  const emitted = new Map<number, string>()
+  const dedupe = new StepDedupe()
   function finishTurn(
     state: 'completed' | 'failed' | 'canceled',
     error?: string,
@@ -1247,17 +1248,14 @@ export function watchBrain(
       if (reset) node.reset(inbox, subagents)
       for (const row of rows) {
         if (stopped) return
-        node.consumedMessages += countRowMessages(row)
         const stepIndex = Number(row.step_index)
-        const signature = `${String(row.type)}:${String(row.status ?? '')}`
+        // A rewrite re-delivers earlier steps; only a new (step, status) is new child activity.
         const replayed =
-          emitted.get(stepIndex) === signature ||
+          !dedupe.fresh(row) ||
           (resume !== undefined && stepIndex <= resume.afterStep)
-        emitted.set(stepIndex, signature)
         if (Number.isInteger(stepIndex) && stepIndex > lastStepIndex)
           lastStepIndex = stepIndex
-        const items = node.projector.project(row)
-        if (row.type !== 'CHECKPOINT') node.lastStep = row
+        const items = node.ingest(row)
         if (replayed) continue
         const isSystemNotice =
           row.type === 'SYSTEM_MESSAGE' &&
@@ -1317,7 +1315,7 @@ export function watchBrain(
         }
       }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      if (isMissing(error)) {
         if (isParentTurnActive && !isParentTurnActive()) finishTurn('completed')
         return
       }

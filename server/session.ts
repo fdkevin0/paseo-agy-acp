@@ -357,8 +357,31 @@ async function createSession(
       }
     await Promise.all(cancels)
   }
+  function watchChild(
+    nativeId: string,
+    childId: string,
+    resume?: ReturnType<BrainWatchHandle['resumePoint']>,
+  ) {
+    children.set(
+      childId,
+      watchBrain(
+        brainRoot,
+        nativeId,
+        childId,
+        emit,
+        1000,
+        () => Boolean(state.turn),
+        resume,
+      ),
+    )
+  }
+  /** Brain-projected items are not yet known to the ACP timeline. */
   function emitItem(item: ProviderTimelineItem, timestamp?: string) {
     timeline.track(item)
+    publishItem(item, timestamp)
+  }
+  /** Link child sessions and publish an item the timeline already tracks. */
+  function publishItem(item: ProviderTimelineItem, timestamp?: string) {
     if (
       capabilities.includes('session.subsession') &&
       item.type === 'tool_call' &&
@@ -375,18 +398,7 @@ async function createSession(
           /\bsend_message\b/.test(item.name)
         ) {
           // A message wakes a child stopped by interruption; resume watching the same child session.
-          children.set(
-            childId,
-            watchBrain(
-              brainRoot,
-              nativeId,
-              childId,
-              emit,
-              1000,
-              () => Boolean(state.turn),
-              existing.resumePoint(),
-            ),
-          )
+          watchChild(nativeId, childId, existing.resumePoint())
         } else if (!existing) {
           emit({
             type: 'session.opened',
@@ -398,12 +410,7 @@ async function createSession(
             restoration: 'parent',
             title: item.detail.subAgentType ?? 'Antigravity subagent',
           })
-          children.set(
-            childId,
-            watchBrain(brainRoot, nativeId, childId, emit, 1000, () =>
-              Boolean(state.turn),
-            ),
-          )
+          watchChild(nativeId, childId)
           emit({ type: 'session.ready', sessionId: childId })
         }
         item.detail.childSessionId = childId
@@ -479,8 +486,9 @@ async function createSession(
           u.sessionUpdate === 'tool_call')
       )
         state.turnHadModelOutput = true
+      // Timeline.update already tracks the ACP item.
       const item = timeline.update(u)
-      if (item) emitItem(item)
+      if (item) publishItem(item)
     }
   }
   function publishConfig() {
@@ -568,24 +576,27 @@ async function createSession(
         error: { message: error.message },
       })
   }
-  let currentTransport = connectAcp(
-    effectiveLaunch(launch, state.skipPermissions),
-    cwd,
-    config?.env ?? {},
-    client,
-    onExit,
-  )
-  const initialTransport = currentTransport
-  transports.add(initialTransport)
-  void initialTransport.exited
-    .then(() => initialTransport.close())
-    .then(
-      () => transports.delete(initialTransport),
-      () => undefined,
+  /** Start an owned ACP runtime; it leaves the connection's transports once it exits and stops. */
+  function startRuntime(skipPermissions: boolean) {
+    const transport = connectAcp(
+      effectiveLaunch(launch, skipPermissions),
+      cwd,
+      config?.env ?? {},
+      client,
+      onExit,
     )
-  try {
-    let currentInitialized = await currentTransport.request(
-      currentTransport.rpc.initialize({
+    transports.add(transport)
+    void transport.exited
+      .then(() => transport.close())
+      .then(
+        () => transports.delete(transport),
+        () => undefined,
+      )
+    return transport
+  }
+  function initializeRuntime(transport: ReturnType<typeof connectAcp>) {
+    return transport.request(
+      transport.rpc.initialize({
         protocolVersion: 1,
         clientInfo: { name: 'paseo-agy-acp', version: '0.1.0' },
         clientCapabilities: {
@@ -594,6 +605,10 @@ async function createSession(
         },
       }),
     )
+  }
+  let currentTransport = startRuntime(state.skipPermissions)
+  try {
+    let currentInitialized = await initializeRuntime(currentTransport)
     return {
       id,
       cwd,
@@ -702,31 +717,9 @@ async function createSession(
             throw new Error(
               'agy cannot reload after interruption; reopen the session',
             )
-          const next = connectAcp(
-            effectiveLaunch(launch, skipPermissions),
-            cwd,
-            config?.env ?? {},
-            client,
-            onExit,
-          )
+          const next = startRuntime(skipPermissions)
           currentTransport = next
-          transports.add(next)
-          void next.exited
-            .then(() => next.close())
-            .then(
-              () => transports.delete(next),
-              () => undefined,
-            )
-          currentInitialized = await next.request(
-            next.rpc.initialize({
-              protocolVersion: 1,
-              clientInfo: { name: 'paseo-agy-acp', version: '0.1.0' },
-              clientCapabilities: {
-                fs: { readTextFile: false, writeTextFile: false },
-                terminal: false,
-              },
-            }),
-          )
+          currentInitialized = await initializeRuntime(next)
           if (state.closing) return
           state.skipPermissions = skipPermissions
           state.metadata = {

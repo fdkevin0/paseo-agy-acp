@@ -23,21 +23,22 @@ Paseo compiles the TypeScript plugin; no separate build output is required. Git/
 
 ## Source layout
 
-| File                                       | Responsibility                                                             |
-| ------------------------------------------ | -------------------------------------------------------------------------- |
-| `index.server.ts`                          | Register the provider and shared usage source.                             |
-| `server/provider.ts`                       | Provider contract, capability negotiation and cached catalog discovery.    |
-| `server/session.ts`                        | Session manager, notifications, prompts, commands and lifecycle.           |
-| `server/permissions.ts`                    | Validate permission requests before queuing approvals.                     |
-| `server/transport.ts`                      | ACP stdio process, metadata capture and control deadlines.                 |
-| `server/mapping.ts`                        | Timeline, configuration, attachment and context usage mapping.             |
-| `server/brain.ts`                          | Incremental transcript reading, projection and background turn completion. |
-| `server/preflight.ts`                      | Version checks, cache identity, data directories and scoped cleanup.       |
-| `server/usage.ts`                          | Account discovery, bounded login-log reads and subscription quota windows. |
-| `tests/mock-acp.ts`, `tests/mock-usage.ts` | Offline CLI substitutes.                                                   |
-| `tests/*.test.ts`                          | Mapping, permissions, lifecycle, discovery and quota regression tests.     |
-| `tests/workflows.test.ts`                  | Execute release workflow scripts against local command substitutes.        |
-| `.github/workflows/`                       | CI checks and tagged npm/GitHub releases.                                  |
+| File                                                                      | Responsibility                                                                         |
+| ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `index.server.ts`                                                         | Register the provider and shared usage source.                                         |
+| `server/provider.ts`                                                      | Provider contract, capability negotiation and cached catalog discovery.                |
+| `server/session.ts`                                                       | Session manager, notifications, prompts, commands and lifecycle.                       |
+| `server/permissions.ts`                                                   | Validate permission requests before queuing approvals.                                 |
+| `server/transport.ts`                                                     | ACP stdio process, metadata capture and control deadlines.                             |
+| `server/mapping.ts`                                                       | Timeline, configuration, attachment and context usage mapping.                         |
+| `server/brain.ts`                                                         | Incremental transcript reading, projection and background turn completion.             |
+| `server/preflight.ts`                                                     | Version checks, cache identity, data directories and scoped cleanup.                   |
+| `server/usage.ts`                                                         | Account discovery, bounded login-log reads and subscription quota windows.             |
+| `tests/mock-acp.ts`, `tests/mock-usage.ts`                                | Offline CLI substitutes.                                                               |
+| `tests/compat-acp.ts`, `tests/interrupt-acp.ts`, `tests/transport-acp.ts` | Native agy behavior models for Brain compatibility, interruption and process shutdown. |
+| `tests/*.test.ts`                                                         | Mapping, permissions, lifecycle, discovery and quota regression tests.                 |
+| `tests/workflows.test.ts`                                                 | Execute release workflow scripts against local command substitutes.                    |
+| `.github/workflows/`                                                      | CI checks and tagged npm/GitHub releases.                                              |
 
 ## Verification
 
@@ -51,11 +52,11 @@ npm test
 npm pack --dry-run --ignore-scripts
 ```
 
-`tests/compat-acp.ts` models observed native notifications: display titles, omitted tool output and transcript calls without IDs. `tests/interrupt-acp.ts` models background work that outlives ordinary cancellation, so regression tests verify process shutdown and restoration rather than trusting a canceled UI state.
+`tests/compat-acp.ts` models observed native notifications: display titles, omitted tool output and transcript calls without IDs. `tests/interrupt-acp.ts` models background work that outlives ordinary cancellation, so regression tests verify process shutdown and restoration rather than trusting a canceled UI state. `tests/transport-acp.ts` starts a detached command that outlives ACP EOF, so shutdown tests verify process-group cleanup, including hosts without `ps`.
 
 Tests run with Node's native TypeScript support and temporary files; they require no login or model quota. Workflow tests require Bash and stub `curl`, `gh` and `npm`, so they neither contact registries nor publish artifacts.
 
-Coverage includes tool terminalization, PascalCase arguments, FIFO and structured Brain results, history suppression, permissions, attachment mapping, fresh commands before readiness, stale notification/permission rejection, cancellation races, conditional interruption (fast-path `session/cancel` vs. background-owner relaunch), protocol disconnect shutdown, catalog concurrency and cleanup containment. Usage tests cover per-step context occupancy from `transcript_full.jsonl`, native-measurement precedence, account discovery, quota mapping, deleted-workspace fallback and error handling. Workflow tests exercise tag/version validation, registry failures, manifest preparation and GitHub Release recovery.
+Coverage includes tool terminalization, PascalCase arguments, FIFO and structured Brain results, history suppression, permissions, attachment mapping, fresh commands before readiness, stale notification/permission rejection, cancellation races, conditional interruption (fast-path `session/cancel` vs. background-owner relaunch), native step statuses (each step logged once; `CANCELED`/`INTERRUPTED`; superseded `PENDING`/`QUEUED`/`GENERATING` rows), in-place `O_TRUNC` rewrites (including an empty file mid-rewrite), stall timeouts and what suspends them, transcript flush grace, child cancellation ordering, killed-child close without reopening, resumed child watchers, protocol disconnect shutdown, catalog concurrency and cleanup containment. Usage tests cover per-step context occupancy from `transcript_full.jsonl`, native-measurement precedence, account discovery, quota mapping, deleted-workspace fallback and error handling. Workflow tests exercise tag/version validation, registry failures, manifest preparation and GitHub Release recovery.
 
 ### Live Paseo smoke checks
 
