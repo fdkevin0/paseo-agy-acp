@@ -589,7 +589,8 @@ async function createSession(
         !parsed.success ||
         !state.nativeId ||
         request.sessionId !== state.nativeId ||
-        !state.turn ||
+        state.opening ||
+        state.loading ||
         state.closing ||
         state.failed
       )
@@ -613,6 +614,8 @@ async function createSession(
             : { outcome: 'cancelled' as const },
         })
       }
+      if (!state.turn)
+        return Promise.resolve({ outcome: { outcome: 'cancelled' as const } })
       const detail = toolDetail(request.toolCall)
       const kind = permissionKind(request, detail)
       return new Promise<RequestPermissionResponse>((resolve) => {
