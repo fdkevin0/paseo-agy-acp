@@ -23,7 +23,7 @@ paseo plugin install git:fdkevin0/paseo-agy-acp
 从 npm 安装：
 
 ```sh
-paseo plugin install npm:@fdkevin0/paseo-agy-acp
+paseo plugin install npm:@fdkevin/paseo-agy-acp
 ```
 
 从本地克隆安装：

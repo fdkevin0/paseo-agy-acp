@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-Only the latest published release of `@fdkevin0/paseo-agy-acp` receives security updates.
+Only the latest published release of `@fdkevin/paseo-agy-acp` receives security updates.
 
 | Version | Supported |
 | ------- | --------- |

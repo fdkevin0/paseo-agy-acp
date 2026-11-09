@@ -33,7 +33,7 @@ body:
     attributes:
       label: Plugin Installation Source
       options:
-        - npm (@fdkevin0/paseo-agy-acp)
+        - npm (@fdkevin/paseo-agy-acp)
         - GitHub (git:fdkevin0/paseo-agy-acp)
         - Local clone
     validations:

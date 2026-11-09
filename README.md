@@ -23,7 +23,7 @@ paseo plugin install git:fdkevin0/paseo-agy-acp
 From npm:
 
 ```sh
-paseo plugin install npm:@fdkevin0/paseo-agy-acp
+paseo plugin install npm:@fdkevin/paseo-agy-acp
 ```
 
 From a local clone:
