@@ -64,7 +64,7 @@ test(
         env: { HOME: home, PATH: process.env.PATH ?? '' },
       },
       usage: new AgyUsageSource(),
-      capabilities: ['prompt.message', 'permission'],
+      capabilities: ['prompt.message', 'permission', 'session.configure'],
       emit(event) {
         events.push(event)
       },
@@ -135,7 +135,12 @@ test(
         },
       })
       await waitTurn('failed')
-      await delay(90)
+      await m.handle({
+        type: 'session.configure',
+        requestId: 'cfg-after-stall',
+        sessionId: 's',
+        changes: { thinkingOption: 'high' },
+      })
       const afterStallLog = await readRuntimeLog()
       assert.equal(
         afterStallLog.some((r) => r.event === 'cancel'),

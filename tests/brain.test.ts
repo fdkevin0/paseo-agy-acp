@@ -1566,16 +1566,22 @@ test('woken-turn LLM generation after SYSTEM_MESSAGE or completed GENERIC uses w
       { step_index: 7, type: 'GENERIC', status: 'DONE', content: 'code' },
     ])
     const stalledItems: ProviderTimelineItem[] = []
+    const wokenStallStartedAt = Date.now()
     const stalledResult = await alive(
       settleBrainTurn(f.root, parent, 'p', (item) => stalledItems.push(item), {
         minStepIndex: -1,
         pollIntervalMs: 5,
         stallTimeoutMs: 20,
-        wokenStallTimeoutMs: 60,
+        wokenStallTimeoutMs: 80,
       }),
     )
+    const wokenStallElapsed = Date.now() - wokenStallStartedAt
     assert.equal(stalledResult.status, 'failed')
     assert.equal(stalledResult.stalled, true)
+    assert.ok(
+      wokenStallElapsed >= 70,
+      `expected woken stall to wait for wokenStallTimeoutMs (80ms), got ${wokenStallElapsed}ms`,
+    )
     assert.ok(
       stalledItems.some(
         (i) => i.type === 'error' && i.id === 'p:step:7:stalled',
@@ -1599,6 +1605,7 @@ test('unmatched foreground tool calls and permanent consumed-message drift still
         tool_calls: [{ id: 'orphan', name: 'read_file', args: {} }],
       },
     ])
+    const orphanStartedAt = Date.now()
     const orphanResult = await alive(
       settleBrainTurn(f.root, parent, 'p', () => {}, {
         pollIntervalMs: 5,
@@ -1606,8 +1613,13 @@ test('unmatched foreground tool calls and permanent consumed-message drift still
         wokenStallTimeoutMs: 500,
       }),
     )
+    const orphanElapsed = Date.now() - orphanStartedAt
     assert.equal(orphanResult.status, 'failed')
     assert.equal(orphanResult.stalled, true)
+    assert.ok(
+      orphanElapsed < 250,
+      `expected orphan foreground call to stall at stallTimeoutMs (30ms), got ${orphanElapsed}ms`,
+    )
 
     // 2. Permanent gap between inbox.consumedNonUserCount and rendered [Message] sender= lines
     await f.deliver(parent, child, 'Unrendered message', true, 'drift')
@@ -1615,6 +1627,7 @@ test('unmatched foreground tool calls and permanent consumed-message drift still
       { step_index: 1, type: 'USER_INPUT', content: 'run' },
       done(2, 'Done without rendering inbox message'),
     ])
+    const driftStartedAt = Date.now()
     const driftResult = await alive(
       settleBrainTurn(f.root, parent, 'p', () => {}, {
         pollIntervalMs: 5,
@@ -1622,8 +1635,13 @@ test('unmatched foreground tool calls and permanent consumed-message drift still
         wokenStallTimeoutMs: 500,
       }),
     )
+    const driftElapsed = Date.now() - driftStartedAt
     assert.equal(driftResult.status, 'failed')
     assert.equal(driftResult.stalled, true)
+    assert.ok(
+      driftElapsed < 250,
+      `expected consumed-message drift to stall at stallTimeoutMs (30ms), got ${driftElapsed}ms`,
+    )
   } finally {
     await f.close()
   }
@@ -1721,7 +1739,7 @@ test('hasActiveBackgroundWork tracks woken and about-to-wake parent turns withou
     ])
     assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
 
-    // Native command GENERIC row without a prior PLANNER_RESPONSE followed by SYSTEM_MESSAGE does not count as woken
+    // A synchronous GENERIC row followed by SYSTEM_MESSAGE without a completed foreground response does not count as woken
     await f.put(parent, [
       { step_index: 10, type: 'USER_INPUT', content: '/compact' },
       { step_index: 11, type: 'GENERIC', status: 'DONE', content: 'compacted' },

@@ -87,6 +87,22 @@ new AgentSideConnection(
         configOptions.find(
           (option) => option.id === params.configId,
         )!.currentValue = params.value
+        if (
+          probeLatePermissionOnCancel &&
+          params.configId === 'thought_level'
+        ) {
+          probeLatePermissionOnCancel = false
+          const permission = await client.requestPermission({
+            sessionId: nativeId,
+            toolCall: {
+              toolCallId: 'late-permission',
+              title: 'late-probe',
+              rawInput: {},
+            },
+            options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }],
+          })
+          log('late-permission', permission)
+        }
         return { configOptions }
       },
       async closeSession() {
@@ -95,23 +111,6 @@ new AgentSideConnection(
       // Like native agy, cancel ends the model turn but leaves background work alive.
       async cancel() {
         log('cancel')
-        if (probeLatePermissionOnCancel) {
-          probeLatePermissionOnCancel = false
-          setTimeout(async () => {
-            const permission = await client.requestPermission({
-              sessionId: nativeId,
-              toolCall: {
-                toolCallId: 'late-permission',
-                title: 'late-probe',
-                rawInput: {},
-              },
-              options: [
-                { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
-              ],
-            })
-            log('late-permission', permission)
-          }, 30)
-        }
       },
       async prompt(params) {
         const text = params.prompt
