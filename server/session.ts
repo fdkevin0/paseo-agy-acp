@@ -55,6 +55,7 @@ interface SessionOptions {
   launch?: ProviderLaunch
   capabilities: readonly string[]
   emit: (event: ProviderEvent) => void
+  stallTimeoutMs?: number
 }
 
 const SKIP_PERMISSIONS_FLAG = '--dangerously-skip-permissions'
@@ -556,6 +557,7 @@ async function createSession(
         !parsed.success ||
         !state.nativeId ||
         request.sessionId !== state.nativeId ||
+        !state.turn ||
         state.closing ||
         state.failed
       )
@@ -650,6 +652,7 @@ async function createSession(
       cwd,
       config,
       brainRoot,
+      stallTimeoutMs: options.stallTimeoutMs,
       state,
       get initialized() {
         return currentInitialized
@@ -1072,6 +1075,7 @@ async function promptSession(
           // A model turn always writes USER_INPUT; give agy a moment to flush it. Native commands may write none.
           transcriptGraceMs:
             session.state.turnHadModelOutput || suppressedForeground ? 2000 : 0,
+          stallTimeoutMs: session.stallTimeoutMs,
           isWaitingOnUser: () => session.permissions.size > 0,
         },
       )
@@ -1082,6 +1086,14 @@ async function promptSession(
       turnWokeUp = Boolean(settled.wokeUp)
       turnWakeupUsage = settled.wakeupUsage
       if (turnWokeUp) session.state.wakeup.pendingReplay = true
+      if (
+        settled.stalled &&
+        !turnAbort.signal.aborted &&
+        !session.state.closing &&
+        !session.state.failed
+      ) {
+        await session.interrupt().catch(() => undefined)
+      }
     }
     if (result.usage || turnWakeupUsage) {
       const carriedWakeup = result.usage

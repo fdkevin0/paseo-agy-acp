@@ -1442,7 +1442,8 @@ test('settlement stops waiting on an idle transcript without a final response', 
         stallTimeoutMs: 50,
       }),
     )
-    assert.equal(result.status, 'completed')
+    assert.equal(result.status, 'failed')
+    assert.match(result.error ?? '', /idle for 0s without a final response/)
     assert.deepEqual(
       items.map((i) => (i.type === 'error' ? i.id : i.type)),
       ['p:step:2:stalled'],
@@ -1475,10 +1476,286 @@ test('a settled ALIVE child does not suspend the parent stall timeout', async ()
         stallTimeoutMs: 50,
       }),
     )
-    assert.equal(result.status, 'completed')
+    assert.equal(result.status, 'failed')
     assert.ok(
       items.some((i) => i.type === 'error' && i.id.endsWith(':stalled')),
     )
+  } finally {
+    await f.close()
+  }
+})
+
+test('woken-turn LLM generation after SYSTEM_MESSAGE or completed GENERIC uses wokenStallTimeoutMs and stalls if that cap expires', async () => {
+  const f = await fixture()
+  try {
+    await f.subagent(parent, child)
+    await f.deliver(parent, child, 'Report', true, 'report')
+    await f.put(child, [
+      message(0, parent, 'work'),
+      ...report(parent, 'Report'),
+    ])
+    await f.put(parent, [
+      ...invoke(child),
+      message(5, child, 'Report'),
+      {
+        step_index: 6,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ id: 'r1', name: 'read_file', args: { Path: '/a.ts' } }],
+      },
+      { step_index: 7, type: 'GENERIC', status: 'DONE', content: 'code' },
+    ])
+    const items: ProviderTimelineItem[] = []
+    let settled = false
+    const running = alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+        minStepIndex: -1,
+        pollIntervalMs: 5,
+        stallTimeoutMs: 25,
+        wokenStallTimeoutMs: 200,
+      }),
+    ).then((res) => {
+      settled = true
+      return res
+    })
+    await delay(70)
+    assert.equal(
+      settled,
+      false,
+      'post-GENERIC LLM generation in a woken turn must not trigger the short stallTimeoutMs',
+    )
+    await appendFile(
+      f.path(parent),
+      encode([
+        {
+          step_index: 8,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [
+            { id: 'w1', name: 'write_file', args: { Path: '/out.md' } },
+          ],
+        },
+        { step_index: 9, type: 'GENERIC', status: 'DONE', content: 'Created' },
+        done(10, 'Final synthesis complete.'),
+      ]),
+    )
+    const result = await running
+    assert.equal(result.status, 'completed')
+    assert.equal(
+      items.some((i) => i.type === 'error'),
+      false,
+    )
+    assert.ok(
+      items.some(
+        (i) =>
+          i.type === 'assistant_message' &&
+          i.text === 'Final synthesis complete.',
+      ),
+    )
+
+    // A woken turn that never produces a follow-up response after SYSTEM_MESSAGE or GENERIC still stalls at wokenStallTimeoutMs.
+    await f.put(parent, [
+      ...invoke(child),
+      message(5, child, 'Report'),
+      {
+        step_index: 6,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ id: 'r1', name: 'read_file', args: { Path: '/a.ts' } }],
+      },
+      { step_index: 7, type: 'GENERIC', status: 'DONE', content: 'code' },
+    ])
+    const stalledItems: ProviderTimelineItem[] = []
+    const wokenStallStartedAt = Date.now()
+    const stalledResult = await alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => stalledItems.push(item), {
+        minStepIndex: -1,
+        pollIntervalMs: 5,
+        stallTimeoutMs: 20,
+        wokenStallTimeoutMs: 80,
+      }),
+    )
+    const wokenStallElapsed = Date.now() - wokenStallStartedAt
+    assert.equal(stalledResult.status, 'failed')
+    assert.equal(stalledResult.stalled, true)
+    assert.ok(
+      wokenStallElapsed >= 70,
+      `expected woken stall to wait for wokenStallTimeoutMs (80ms), got ${wokenStallElapsed}ms`,
+    )
+    assert.ok(
+      stalledItems.some(
+        (i) => i.type === 'error' && i.id === 'p:step:7:stalled',
+      ),
+    )
+  } finally {
+    await f.close()
+  }
+})
+
+test('unmatched foreground tool calls and permanent consumed-message drift still stall at stallTimeoutMs', async () => {
+  const f = await fixture()
+  try {
+    // 1. Unmatched foreground tool call (!wokeUp with hasPending() === true)
+    await f.put(parent, [
+      { step_index: 1, type: 'USER_INPUT', content: 'run' },
+      {
+        step_index: 2,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ id: 'orphan', name: 'read_file', args: {} }],
+      },
+    ])
+    const orphanStartedAt = Date.now()
+    const orphanResult = await alive(
+      settleBrainTurn(f.root, parent, 'p', () => {}, {
+        pollIntervalMs: 5,
+        stallTimeoutMs: 30,
+        wokenStallTimeoutMs: 500,
+      }),
+    )
+    const orphanElapsed = Date.now() - orphanStartedAt
+    assert.equal(orphanResult.status, 'failed')
+    assert.equal(orphanResult.stalled, true)
+    assert.ok(
+      orphanElapsed < 250,
+      `expected orphan foreground call to stall at stallTimeoutMs (30ms), got ${orphanElapsed}ms`,
+    )
+
+    // 2. Permanent gap between inbox.consumedNonUserCount and rendered [Message] sender= lines
+    await f.deliver(parent, child, 'Unrendered message', true, 'drift')
+    await f.put(parent, [
+      { step_index: 1, type: 'USER_INPUT', content: 'run' },
+      done(2, 'Done without rendering inbox message'),
+    ])
+    const driftStartedAt = Date.now()
+    const driftResult = await alive(
+      settleBrainTurn(f.root, parent, 'p', () => {}, {
+        pollIntervalMs: 5,
+        stallTimeoutMs: 30,
+        wokenStallTimeoutMs: 500,
+      }),
+    )
+    const driftElapsed = Date.now() - driftStartedAt
+    assert.equal(driftResult.status, 'failed')
+    assert.equal(driftResult.stalled, true)
+    assert.ok(
+      driftElapsed < 250,
+      `expected consumed-message drift to stall at stallTimeoutMs (30ms), got ${driftElapsed}ms`,
+    )
+  } finally {
+    await f.close()
+  }
+})
+
+test('a restart notice inside a woken turn keeps projecting the woken response', async () => {
+  const f = await fixture()
+  try {
+    const notice = message(
+      4,
+      'system',
+      '[Notice] All your subagents and background tasks have been stopped due to server restart.',
+    )
+    await f.put(parent, [
+      { step_index: 1, type: 'USER_INPUT', content: 'go' },
+      done(2, 'Foreground answer'),
+      message(3, child, 'Wake up'),
+      notice,
+      done(5, 'Woken answer after notice'),
+    ])
+    const items: ProviderTimelineItem[] = []
+    const result = await alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+        minStepIndex: -1,
+        pollIntervalMs: 5,
+        stallTimeoutMs: 50,
+      }),
+    )
+    assert.equal(result.status, 'completed')
+    assert.ok(
+      items.some(
+        (i) =>
+          i.type === 'assistant_message' &&
+          i.text === 'Woken answer after notice',
+      ),
+    )
+
+    // The restarted runtime has no woken turn left running, even if a stopped child's report lands after the notice.
+    await f.put(parent, [
+      { step_index: 1, type: 'USER_INPUT', content: 'go' },
+      done(2, 'Foreground answer'),
+      message(3, child, 'Wake up'),
+      notice,
+      message(5, child, 'Late report'),
+    ])
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
+  } finally {
+    await f.close()
+  }
+})
+
+test('hasActiveBackgroundWork tracks woken and about-to-wake parent turns without false positives from native GENERIC rows', async () => {
+  const f = await fixture()
+  try {
+    await f.subagent(parent, child)
+    await f.deliver(parent, child, 'Report', true, 'report')
+    await f.put(child, [
+      message(0, parent, 'work'),
+      ...report(parent, 'Report'),
+    ])
+
+    // Woken parent awaiting LLM generation after SYSTEM_MESSAGE or GENERIC is active
+    await f.put(parent, [...invoke(child), message(5, child, 'Report')])
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), true)
+
+    await appendFile(
+      f.path(parent),
+      encode([
+        {
+          step_index: 6,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [{ id: 'r1', name: 'read_file', args: {} }],
+        },
+        { step_index: 7, type: 'GENERIC', status: 'DONE', content: 'ok' },
+      ]),
+    )
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), true)
+
+    // Once the woken parent emits its final PLANNER_RESPONSE, it is no longer active
+    await appendFile(f.path(parent), encode([done(8, 'All done')]))
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
+
+    // Woken parent ending on a CANCELED GENERIC row is not working
+    await f.put(parent, [
+      ...invoke(child),
+      message(5, child, 'Report'),
+      {
+        step_index: 6,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ id: 'r1', name: 'read_file', args: {} }],
+      },
+      { step_index: 7, type: 'GENERIC', status: 'CANCELED' },
+    ])
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
+
+    // A synchronous GENERIC row followed by SYSTEM_MESSAGE without a completed foreground response does not count as woken
+    await f.put(parent, [
+      { step_index: 10, type: 'USER_INPUT', content: '/compact' },
+      { step_index: 11, type: 'GENERIC', status: 'DONE', content: 'compacted' },
+      { step_index: 12, type: 'SYSTEM_MESSAGE', content: 'info' },
+    ])
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
+
+    // After the foreground goes idle, a wakeup message agy has read but not yet logged is about to wake the parent
+    await f.put(parent, [
+      ...invoke(child),
+      message(5, child, 'Report'),
+      done(6, 'All done'),
+    ])
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
+    await f.deliver(parent, child, 'Unlogged wakeup', true, 'unlogged')
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), true)
   } finally {
     await f.close()
   }
