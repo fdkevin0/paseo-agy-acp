@@ -1661,12 +1661,13 @@ test('a restart notice inside a woken turn keeps projecting the woken response',
       ),
     )
 
-    // The restarted runtime has no woken turn left running.
+    // The restarted runtime has no woken turn left running, even if a stopped child's report lands after the notice.
     await f.put(parent, [
       { step_index: 1, type: 'USER_INPUT', content: 'go' },
       done(2, 'Foreground answer'),
       message(3, child, 'Wake up'),
       notice,
+      message(5, child, 'Late report'),
     ])
     assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
   } finally {
