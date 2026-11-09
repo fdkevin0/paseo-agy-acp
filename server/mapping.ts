@@ -163,12 +163,17 @@ export function toolDetail(
     }
   const query = str(
     input.Query ??
-      input.SearchDirectory ??
       input.Pattern ??
       input.query ??
-      input.pattern,
+      input.pattern ??
+      input.SearchDirectory,
   )
-  if (query) {
+  if (
+    query &&
+    tool.kind !== 'read' &&
+    tool.kind !== 'edit' &&
+    !/^(read|view|write|edit|replace|multi_replace)/.test(name)
+  ) {
     const toolName = name.includes('grep')
       ? ('grep' as const)
       : name.includes('find_by_name') || name.includes('glob')

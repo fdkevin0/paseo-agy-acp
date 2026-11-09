@@ -372,7 +372,7 @@ export async function readSubagents(
 export class BrainTranscriptProjector {
   private pending: PendingTool[] = []
   private background = new Map<string, PendingTool>()
-  private daemons = new Set<string>()
+  private daemons = new Map<string, number>()
   private touchedSubagents = new Set<string>()
   private stepCallIds = new Map<number, string>()
   private stepSubagents = new Map<number, SubagentRecord>()
@@ -492,6 +492,11 @@ export class BrainTranscriptProjector {
         }
         const senders = [...text.matchAll(/\bsender=(\S+)/g)].map((m) => m[1])
         for (const sender of senders) {
+          const remaining = this.daemons.get(sender)
+          if (remaining !== undefined && !finishedIds.has(sender)) {
+            if (remaining <= 1) this.daemons.delete(sender)
+            else this.daemons.set(sender, remaining - 1)
+          }
           for (const [taskId, task] of this.background)
             if (
               task.name === 'schedule' &&
@@ -551,8 +556,15 @@ export class BrainTranscriptProjector {
         if (runningStepStatuses.has(String(row.status))) {
           const taskId = text.match(backgroundTaskPattern)?.[1]
           if (taskId) {
-            if (pending.args.IsDaemon === true) this.daemons.add(taskId)
-            else this.background.set(taskId, pending)
+            if (pending.args.IsDaemon === true) {
+              const max = Number(pending.args.MaxIterations)
+              this.daemons.set(
+                taskId,
+                Number.isInteger(max) && max > 0 ? max : Infinity,
+              )
+            } else {
+              this.background.set(taskId, pending)
+            }
           }
           return []
         }
@@ -869,10 +881,11 @@ class BrainNode {
   }
 }
 
-/** Determine whether the session has running background tasks or active subagents that require process termination on interrupt. */
+/** Determine whether the session has running background tasks or active subagents. Standing IsDaemon schedules are excluded by default so foreground interrupts do not kill them, and included when checking whether an idle runtime can stop. */
 export async function hasActiveBackgroundWork(
   root: string,
   nativeId: string,
+  options: { includeDaemons?: boolean } = {},
   visiting = new Set<string>(),
   isChild = false,
 ): Promise<boolean> {
@@ -898,7 +911,10 @@ export async function hasActiveBackgroundWork(
         minTurnStepIndex = Number(row.step_index)
       }
     }
-    if (node.projector.hasBackground() || node.projector.hasDaemons())
+    if (
+      node.projector.hasBackground() ||
+      (options.includeDaemons && node.projector.hasDaemons())
+    )
       return true
     // A failed child is finished; anything else unsettled is still working.
     if (
@@ -913,7 +929,7 @@ export async function hasActiveBackgroundWork(
       minTurnStepIndex,
     )
     for (const childId of activeChildIds) {
-      if (await hasActiveBackgroundWork(root, childId, visiting, true))
+      if (await hasActiveBackgroundWork(root, childId, options, visiting, true))
         return true
     }
     return false

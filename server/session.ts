@@ -755,9 +755,9 @@ async function createSession(
           [...children.values()].some((child) => child.isRunning())
         )
           return false
-        return !(await hasActiveBackgroundWork(brainRoot, state.nativeId).catch(
-          () => true,
-        ))
+        return !(await hasActiveBackgroundWork(brainRoot, state.nativeId, {
+          includeDaemons: true,
+        }).catch(() => true))
       },
       flush() {
         state.opening = false

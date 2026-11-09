@@ -446,6 +446,19 @@ test('tool details enrich shell exit codes, clean read gutters, map plan artifac
       content: 'server/mapping.ts:25',
     },
   )
+  assert.deepEqual(
+    toolDetail({
+      title: 'find_by_name',
+      rawInput: { SearchDirectory: '/repo/server', Pattern: '*.ts' },
+      rawOutput: 'server/mapping.ts',
+    }),
+    {
+      type: 'search',
+      query: '*.ts',
+      toolName: 'glob',
+      content: 'server/mapping.ts',
+    },
+  )
   const timeline = new Timeline('s')
   const failed = timeline.update({
     sessionUpdate: 'tool_call',
