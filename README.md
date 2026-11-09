@@ -76,18 +76,18 @@ Existing agents keep their original provider; they are not migrated. Remove the 
 
 ## Capabilities
 
-| Capability    | Behavior                                                                                                                               |
-| ------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Sessions      | Create, list, import and restore native conversations.                                                                                 |
-| Prompts       | Text, images, slash commands and attachment context.                                                                                   |
-| Configuration | Native models, modes (`default`, `accept-edits`, `plan`) plus **Full Access**, per-model thinking choices and appended system prompts. |
-| Permissions   | Native approval options with tool arguments and details, or unattended auto-approval in **Full Access** mode.                          |
-| Timeline      | Streaming responses, reasoning, plans and rich tool cards.                                                                             |
-| Context       | Token counters, context occupancy and reported USD costs.                                                                              |
-| Subscription  | Gemini and Claude/GPT 5-hour and weekly quota windows.                                                                                 |
-| Subagents     | Native child links and read-only Brain transcript cards.                                                                               |
+| Capability    | Behavior                                                                                                                                  |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Sessions      | Create, list, import and restore native conversations.                                                                                    |
+| Prompts       | Text, images, slash commands and attachment context.                                                                                      |
+| Configuration | Native models, modes (`default`, `accept-edits`, `plan`) plus **Full Access**, per-model thinking choices and appended system prompts.    |
+| Permissions   | Native approval options with tool arguments, details, MCP `toolPolicy` preapprovals, or unattended auto-approval in **Full Access** mode. |
+| Timeline      | Streaming responses, reasoning, plans and rich tool cards.                                                                                |
+| Context       | Token counters, context occupancy and reported USD costs.                                                                                 |
+| Subscription  | Gemini and Claude/GPT 5-hour and weekly quota windows.                                                                                    |
+| Subagents     | Native multi-level child links and read-only Brain transcript cards.                                                                      |
 
-Steering, rewind, archive operations, structured output, Artifacts panels and recursive child discovery are unsupported. Child cards do not provide independent session control. When agy supplies no native `usage_update` notification, context occupancy is computed from per-step token counters in `transcript_full.jsonl` (falling back to prompt counters); current agy print mode rejects custom ACP directory flags for quota queries. See [reference limitations](docs/reference.md) for details.
+Steering, rewind, archive operations, structured output and Artifacts panels are unsupported. Child cards do not provide independent session control. When agy supplies no native `usage_update` notification, context occupancy is computed from per-step token counters in `transcript_full.jsonl` (falling back to prompt counters); current agy print mode rejects custom ACP directory flags for quota queries. See [reference limitations](docs/reference.md) for details.
 
 ## More information
 

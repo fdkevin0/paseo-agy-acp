@@ -1,5 +1,9 @@
 import { z } from 'zod'
-import type { ProviderToolPolicy } from '@getpaseo/plugin/server/provider'
+import type {
+  ProviderToolCallDetail,
+  ProviderToolPolicy,
+} from '@getpaseo/plugin/server/provider'
+import { str } from './mapping.ts'
 
 /** Validate the permission fields consumed by the bridge before creating pending work. */
 export const RequestPermissionRequestSchema = z.object({
@@ -40,6 +44,50 @@ export function isChooserRequest(
   return false
 }
 
+/** Select the matching ACP permission option for an allow/deny decision, preferring *_once when no optionId is specified. */
+export function pickPermissionOption<
+  T extends { optionId: string; kind: string },
+>(
+  options: readonly T[],
+  behavior: 'allow' | 'deny',
+  selectedActionId?: string,
+): T | undefined {
+  const prefix = behavior === 'allow' ? 'allow' : 'reject'
+  if (selectedActionId) {
+    return options.find(
+      (o) => o.optionId === selectedActionId && o.kind.startsWith(prefix),
+    )
+  }
+  const preferred = `${prefix}_once`
+  return (
+    options.find((o) => o.kind === preferred) ??
+    options.find((o) => o.kind.startsWith(prefix))
+  )
+}
+
+/** Classify an ACP permission request into Paseo's permission kinds. */
+export function permissionKind(
+  request: {
+    options: ReadonlyArray<{ kind: string }>
+    toolCall: { title?: string | null; kind?: unknown }
+  },
+  detail: ProviderToolCallDetail,
+): 'question' | 'mode' | 'plan' | 'tool' {
+  const title = request.toolCall.title ?? ''
+  if (
+    isChooserRequest(request.options) ||
+    /^ask_(?:question|user)$/i.test(title)
+  )
+    return 'question'
+  if (
+    request.toolCall.kind === 'switch_mode' ||
+    /^(?:switch_mode|exit_plan_mode)$/i.test(title)
+  )
+    return 'mode'
+  if (detail.type === 'plan') return 'plan'
+  return 'tool'
+}
+
 /** Check whether an ACP tool call matches an exact MCP preapproval grant in config.toolPolicy. */
 export function isPreapprovedMcpTool(
   title: string | null | undefined,
@@ -48,14 +96,8 @@ export function isPreapprovedMcpTool(
 ): boolean {
   if (!policy?.preapproved.length) return false
   const name = title ?? ''
-  const lazyServer =
-    typeof (input.ServerName ?? input.serverName ?? input.server) === 'string'
-      ? String(input.ServerName ?? input.serverName ?? input.server)
-      : undefined
-  const lazyTool =
-    typeof (input.ToolName ?? input.toolName ?? input.tool) === 'string'
-      ? String(input.ToolName ?? input.toolName ?? input.tool)
-      : undefined
+  const lazyServer = str(input.ServerName ?? input.serverName ?? input.server)
+  const lazyTool = str(input.ToolName ?? input.toolName ?? input.tool)
   return policy.preapproved.some((grant) => {
     if (grant.kind !== 'mcp') return false
     if (
@@ -65,11 +107,8 @@ export function isPreapprovedMcpTool(
     )
       return true
     return (
-      name === `mcp_${grant.server}_${grant.tool}` ||
       name === `mcp__${grant.server}__${grant.tool}` ||
-      name === `${grant.server}/${grant.tool}` ||
-      name === `${grant.server}:${grant.tool}` ||
-      name === `${grant.server}.${grant.tool}`
+      name === `${grant.server}:${grant.tool}`
     )
   })
 }

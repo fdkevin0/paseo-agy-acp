@@ -415,6 +415,11 @@ export class BrainTranscriptProjector {
     return this.daemons.size > 0
   }
 
+  private forgetTask(taskId: string) {
+    this.background.delete(taskId)
+    this.daemons.delete(taskId)
+  }
+
   touchedSubagentIds(): ReadonlySet<string> {
     const ids = new Set(this.touchedSubagents)
     for (const p of this.pending) {
@@ -574,8 +579,7 @@ export class BrainTranscriptProjector {
           typeof pending.args.TaskId === 'string' &&
           terminalToolStatus(row.status) === 'completed'
         ) {
-          this.background.delete(pending.args.TaskId)
-          this.daemons.delete(pending.args.TaskId)
+          this.forgetTask(pending.args.TaskId)
         }
         const subagent =
           this.callSubagents.get(pending.callId) ??

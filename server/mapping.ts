@@ -43,12 +43,36 @@ export function record(value: unknown): Record<string, unknown> {
     ? (value as Record<string, unknown>)
     : {}
 }
-function str(value: unknown): string | undefined {
+export function str(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined
 }
 function num(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
+function joinChunks(
+  chunks: readonly Record<string, unknown>[] | undefined,
+  ...keys: string[]
+): string | undefined {
+  if (!chunks) return undefined
+  return chunks
+    .map((c) => {
+      for (const k of keys) {
+        const v = str(c[k])
+        if (v !== undefined) return v
+      }
+      return ''
+    })
+    .join('\n...\n')
+}
+const searchToolNames: ReadonlyArray<
+  readonly [string, 'grep' | 'glob' | 'web_search']
+> = [
+  ['grep', 'grep'],
+  ['find_by_name', 'glob'],
+  ['glob', 'glob'],
+  ['search_web', 'web_search'],
+  ['web_search', 'web_search'],
+]
 function cleanReadOutput(output: string | undefined): {
   content: string | undefined
   startLine?: number
@@ -174,13 +198,7 @@ export function toolDetail(
     tool.kind !== 'edit' &&
     !/^(read|view|write|edit|replace|multi_replace)/.test(name)
   ) {
-    const toolName = name.includes('grep')
-      ? ('grep' as const)
-      : name.includes('find_by_name') || name.includes('glob')
-        ? ('glob' as const)
-        : name.includes('search_web') || name.includes('web_search')
-          ? ('web_search' as const)
-          : undefined
+    const toolName = searchToolNames.find(([pat]) => name.includes(pat))?.[1]
     const filePaths = tool.locations
       ?.map((l) => l.path)
       .filter((p): p is string => Boolean(p))
@@ -208,20 +226,11 @@ export function toolDetail(
         filePath,
         oldString:
           str(input.Target ?? input.TargetContent ?? input.old_string) ??
-          (chunks
-            ? chunks
-                .map((c) => str(c.TargetContent ?? c.Target) ?? '')
-                .join('\n...\n')
-            : undefined),
+          joinChunks(chunks, 'TargetContent', 'Target'),
         newString:
           str(
             input.Replacement ?? input.ReplacementContent ?? input.new_string,
-          ) ??
-          (chunks
-            ? chunks
-                .map((c) => str(c.ReplacementContent ?? c.Replacement) ?? '')
-                .join('\n...\n')
-            : undefined),
+          ) ?? joinChunks(chunks, 'ReplacementContent', 'Replacement'),
       }
     }
     const cleaned = cleanReadOutput(output)

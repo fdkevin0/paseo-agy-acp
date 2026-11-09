@@ -23,6 +23,8 @@ import {
   RequestPermissionRequestSchema,
   isChooserRequest,
   isPreapprovedMcpTool,
+  permissionKind,
+  pickPermissionOption,
 } from './permissions.ts'
 import {
   BrainTranscriptProjector,
@@ -225,19 +227,11 @@ export class SessionManager {
     if (input.type === 'session.permission') {
       const permission = session.permissions.get(input.permissionId)
       if (!permission) throw new Error('Permission is no longer pending')
-      const allowed = (kind: string) =>
-        kind.startsWith(
-          input.response.behavior === 'allow' ? 'allow' : 'reject',
-        )
-      const preferred =
-        input.response.behavior === 'allow' ? 'allow_once' : 'reject_once'
-      const option = input.response.selectedActionId
-        ? permission.request.options.find(
-            (o) =>
-              o.optionId === input.response.selectedActionId && allowed(o.kind),
-          )
-        : (permission.request.options.find((o) => o.kind === preferred) ??
-          permission.request.options.find((o) => allowed(o.kind)))
+      const option = pickPermissionOption(
+        permission.request.options,
+        input.response.behavior,
+        input.response.selectedActionId,
+      )
       permission.resolve({
         outcome: option
           ? { outcome: 'selected', optionId: option.optionId }
@@ -600,9 +594,7 @@ async function createSession(
         config?.toolPolicy,
       )
       if (!chooser && (state.metadata.fullAccess || preapproved)) {
-        const allow =
-          request.options.find((o) => o.kind === 'allow_once') ??
-          request.options.find((o) => o.kind.startsWith('allow'))
+        const allow = pickPermissionOption(request.options, 'allow')
         return Promise.resolve({
           outcome: allow
             ? { outcome: 'selected' as const, optionId: allow.optionId }
@@ -610,16 +602,7 @@ async function createSession(
         })
       }
       const detail = toolDetail(request.toolCall)
-      const title = request.toolCall.title ?? ''
-      const kind =
-        chooser || /^ask_(?:question|user)$/i.test(title)
-          ? ('question' as const)
-          : request.toolCall.kind === 'switch_mode' ||
-              /^(?:switch_mode|exit_plan_mode)$/i.test(title)
-            ? ('mode' as const)
-            : detail.type === 'plan'
-              ? ('plan' as const)
-              : ('tool' as const)
+      const kind = permissionKind(request, detail)
       return new Promise<RequestPermissionResponse>((resolve) => {
         const permissionId = randomUUID()
         permissions.set(permissionId, { request, resolve })
@@ -737,9 +720,9 @@ async function createSession(
             emitItem(item)
           }
         // A child opened by the last replayed tool must read its history before a historical kill cancels it.
-        let settledCount = 0
-        while (settledCount !== children.size) {
-          settledCount = children.size
+        let knownChildren = 0
+        while (knownChildren !== children.size) {
+          knownChildren = children.size
           await Promise.all([...children.values()].map((child) => child.ready))
         }
         await syncKilledChildren(subagents)
