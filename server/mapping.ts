@@ -43,11 +43,60 @@ export function record(value: unknown): Record<string, unknown> {
     ? (value as Record<string, unknown>)
     : {}
 }
-function str(value: unknown): string | undefined {
+export function str(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined
 }
 function num(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+function joinChunks(
+  chunks: readonly Record<string, unknown>[] | undefined,
+  ...keys: string[]
+): string | undefined {
+  if (!chunks) return undefined
+  return chunks
+    .map((c) => {
+      for (const k of keys) {
+        const v = str(c[k])
+        if (v !== undefined) return v
+      }
+      return ''
+    })
+    .join('\n...\n')
+}
+const searchToolNames: ReadonlyArray<
+  readonly [string, 'grep' | 'glob' | 'web_search']
+> = [
+  ['grep', 'grep'],
+  ['find_by_name', 'glob'],
+  ['glob', 'glob'],
+  ['search_web', 'web_search'],
+  ['web_search', 'web_search'],
+]
+function cleanReadOutput(output: string | undefined): {
+  content: string | undefined
+  startLine?: number
+  endLine?: number
+} {
+  if (!output) return { content: output }
+  const header = output.match(
+    /^(?:Created At:[^\n]*\n)?(?:Completed At:[^\n]*\n)?Showing lines (\d+)-(\d+) of \d+\r?\n/,
+  )
+  const body = header ? output.slice(header[0].length) : output
+  const lines = body.split('\n')
+  const numbered =
+    lines.length > 0 &&
+    lines.every((line, i) =>
+      i === lines.length - 1 && line === '' ? true : /^\d+:(?: |$)/.test(line),
+    )
+  return {
+    content: numbered
+      ? lines.map((line) => line.replace(/^\d+:(?: |$)/, '')).join('\n')
+      : body,
+    ...(header
+      ? { startLine: Number(header[1]), endLine: Number(header[2]) }
+      : {}),
+  }
 }
 /** Map native tool arguments and output to Paseo detail cards. */
 export function toolDetail(
@@ -76,8 +125,19 @@ export function toolDetail(
         input.path,
     ) ?? tool.locations?.[0]?.path
   const command = str(input.CommandLine ?? input.command)
-  if (command)
-    return { type: 'shell', command, cwd: str(input.Cwd ?? input.cwd), output }
+  if (command) {
+    const exitMatch = output?.match(/Command exited with code (\d+)/)
+    const exitCode =
+      num(record(tool.rawOutput).exitCode) ??
+      (exitMatch ? Number(exitMatch[1]) : undefined)
+    return {
+      type: 'shell',
+      command,
+      cwd: str(input.Cwd ?? input.cwd),
+      output,
+      ...(exitCode !== undefined ? { exitCode } : {}),
+    }
+  }
   const url = str(input.Url ?? input.url)
   if ((name === 'read_url_content' || tool.kind === 'fetch') && url)
     return { type: 'fetch', url, ...(output ? { result: output } : {}) }
@@ -112,6 +172,11 @@ export function toolDetail(
       log: output ?? '',
     }
   }
+  const planText =
+    record(input.ArtifactMetadata).RequestFeedback === true
+      ? str(input.Content ?? input.CodeContent ?? input.Replacement)
+      : undefined
+  if (planText) return { type: 'plan', text: planText }
   const diff = tool.content?.find((c) => c.type === 'diff')
   if (diff?.type === 'diff')
     return {
@@ -120,6 +185,31 @@ export function toolDetail(
       oldString: diff.oldText ?? '',
       newString: diff.newText,
     }
+  const query = str(
+    input.Query ??
+      input.Pattern ??
+      input.query ??
+      input.pattern ??
+      input.SearchDirectory,
+  )
+  if (
+    query &&
+    tool.kind !== 'read' &&
+    tool.kind !== 'edit' &&
+    !/^(read|view|write|edit|replace|multi_replace)/.test(name)
+  ) {
+    const toolName = searchToolNames.find(([pat]) => name.includes(pat))?.[1]
+    const filePaths = tool.locations
+      ?.map((l) => l.path)
+      .filter((p): p is string => Boolean(p))
+    return {
+      type: 'search',
+      query,
+      ...(toolName ? { toolName } : {}),
+      content: output,
+      ...(filePaths?.length ? { filePaths } : {}),
+    }
+  }
   if (filePath) {
     if (/write/.test(name))
       return {
@@ -127,27 +217,36 @@ export function toolDetail(
         filePath,
         content: str(input.Content ?? input.CodeContent ?? input.content),
       }
-    if (tool.kind === 'edit' || /edit|replace/.test(name))
+    if (tool.kind === 'edit' || /edit|replace/.test(name)) {
+      const chunks = Array.isArray(input.ReplacementChunks)
+        ? input.ReplacementChunks.map(record)
+        : undefined
       return {
         type: 'edit',
         filePath,
-        oldString: str(input.Target ?? input.TargetContent ?? input.old_string),
-        newString: str(
-          input.Replacement ?? input.ReplacementContent ?? input.new_string,
-        ),
+        oldString:
+          str(input.Target ?? input.TargetContent ?? input.old_string) ??
+          joinChunks(chunks, 'TargetContent', 'Target'),
+        newString:
+          str(
+            input.Replacement ?? input.ReplacementContent ?? input.new_string,
+          ) ?? joinChunks(chunks, 'ReplacementContent', 'Replacement'),
       }
-    const start = num(input.StartLine)
-    const end = num(input.EndLine)
+    }
+    const cleaned = cleanReadOutput(output)
+    const start = num(input.StartLine) ?? cleaned.startLine
+    const end = num(input.EndLine) ?? cleaned.endLine
     return {
       type: 'read',
       filePath,
-      content: output,
-      offset: num(
-        input.offset ??
-          input.StartLine ??
-          input.ByteOffset ??
-          input.ContentOffset,
-      ),
+      content: cleaned.content,
+      offset:
+        num(
+          input.offset ??
+            input.StartLine ??
+            input.ByteOffset ??
+            input.ContentOffset,
+        ) ?? cleaned.startLine,
       limit:
         num(input.limit) ??
         (start !== undefined && end !== undefined
@@ -155,14 +254,6 @@ export function toolDetail(
           : undefined),
     }
   }
-  const query = str(
-    input.Query ??
-      input.SearchDirectory ??
-      input.Pattern ??
-      input.query ??
-      input.pattern,
-  )
-  if (query) return { type: 'search', query, content: output }
   return {
     type: 'plain_text',
     label: name,
@@ -516,7 +607,12 @@ export class Timeline {
           ? {
               ...base,
               status: 'failed',
-              error: JSON.stringify(tool.rawOutput ?? 'Tool failed'),
+              error:
+                typeof tool.rawOutput === 'string'
+                  ? tool.rawOutput
+                  : tool.rawOutput != null
+                    ? JSON.stringify(tool.rawOutput)
+                    : 'Tool failed',
             }
           : {
               ...base,

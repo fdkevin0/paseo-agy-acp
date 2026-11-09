@@ -120,7 +120,10 @@ new AgentSideConnection((client) => {
         protocolVersion: 1,
         agentCapabilities: {
           loadSession: true,
-          sessionCapabilities: { list: {} },
+          sessionCapabilities: {
+            list: {},
+            ...(process.env.AGY_TEST_RESUME_CAP ? { resume: {} } : {}),
+          },
         },
       }
     },
@@ -177,6 +180,14 @@ new AgentSideConnection((client) => {
       })
       return { configOptions }
     },
+    async resumeSession({ sessionId, _meta }) {
+      const append = (
+        _meta?.antigravity as { systemPrompt?: { append?: string } }
+      )?.systemPrompt?.append
+      log(append ? `resume:${append}` : 'resume')
+      sendCommands(sessionId)
+      return { configOptions }
+    },
     async listSessions({ cwd }) {
       return {
         sessions: [
@@ -184,6 +195,7 @@ new AgentSideConnection((client) => {
             sessionId: 'native-test',
             cwd: cwd ?? process.cwd(),
             title: 'Test session',
+            _meta: { description: 'Last prompt preview' },
           },
         ],
       }
@@ -441,6 +453,78 @@ new AgentSideConnection((client) => {
             cachedReadTokens: 0,
           },
         }
+      }
+      if (text === 'mcp-preapproved') {
+        const lazy = await client.requestPermission({
+          sessionId,
+          toolCall: {
+            toolCallId: 'mcp-lazy',
+            title: 'call_mcp_tool',
+            rawInput: { ServerName: 'rea', ToolName: 'open_binary' },
+          },
+          options: [
+            { optionId: 'always', name: 'Always', kind: 'allow_always' },
+            { optionId: 'yes', name: 'Allow', kind: 'allow_once' },
+            { optionId: 'no', name: 'Deny', kind: 'reject_once' },
+          ],
+        })
+        const direct = await client.requestPermission({
+          sessionId,
+          toolCall: {
+            toolCallId: 'mcp-direct',
+            title: 'mcp__rea__open_binary',
+            rawInput: { path: '/bin/ls' },
+          },
+          options: [
+            { optionId: 'always', name: 'Always', kind: 'allow_always' },
+            { optionId: 'yes', name: 'Allow', kind: 'allow_once' },
+            { optionId: 'no', name: 'Deny', kind: 'reject_once' },
+          ],
+        })
+        const fmt = (r: typeof lazy) =>
+          r.outcome.outcome === 'selected'
+            ? r.outcome.optionId
+            : r.outcome.outcome
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: `mcp:${fmt(lazy)},${fmt(direct)}`,
+            },
+          },
+        })
+        return { stopReason: 'end_turn' as const }
+      }
+      if (text === 'chooser') {
+        const choice = await client.requestPermission({
+          sessionId,
+          toolCall: {
+            toolCallId: 'ask',
+            title: 'ask_question',
+            rawInput: { question: 'Which environment?' },
+          },
+          options: [
+            { optionId: 'staging', name: 'Staging', kind: 'allow_once' },
+            { optionId: 'prod', name: 'Production', kind: 'allow_once' },
+            { optionId: 'cancel', name: 'Cancel', kind: 'reject_once' },
+          ],
+        })
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text:
+                choice.outcome.outcome === 'selected'
+                  ? `choice:${choice.outcome.optionId}`
+                  : choice.outcome.outcome,
+            },
+          },
+        })
+        return { stopReason: 'end_turn' as const }
       }
       if (text === 'wait') {
         if (process.env.AGY_TEST_CANCEL_DELAY)

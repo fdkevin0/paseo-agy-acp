@@ -14,7 +14,7 @@ import type {
   ProviderInput,
 } from '@getpaseo/plugin/server/provider'
 import { providerStatus, catalogCacheKey } from './preflight.ts'
-import { configState } from './mapping.ts'
+import { configState, record } from './mapping.ts'
 import { AgyUsageSource } from './usage.ts'
 import { SessionManager } from './session.ts'
 const supported = [
@@ -26,6 +26,7 @@ const supported = [
   'session.persistence',
   'session.can_stop_runtime',
   'permission',
+  'permission.tool_policy',
   'session.subsession',
 ] as const
 /** Register the direct ACP provider and own every runtime for its connection. */
@@ -180,15 +181,26 @@ async function listSessions(
                 .toLowerCase()
                 .includes(input.query.toLowerCase()),
           )
-          .map((s) => ({
-            persistence: {
-              version: 1,
-              data: { sessionId: s.sessionId },
-            },
-            cwd: s.cwd,
-            title: s.title ?? undefined,
-            updatedAt: s.updatedAt ?? undefined,
-          })),
+          .map((s) => {
+            const raw = record(s)
+            const meta = record(s._meta)
+            const description = [
+              raw.description,
+              raw.lastPromptPreview,
+              meta.description,
+              meta.lastPromptPreview,
+            ].find((v): v is string => typeof v === 'string' && v.length > 0)
+            return {
+              persistence: {
+                version: 1,
+                data: { sessionId: s.sessionId },
+              },
+              cwd: s.cwd,
+              title: s.title ?? undefined,
+              ...(description ? { description } : {}),
+              updatedAt: s.updatedAt ?? undefined,
+            }
+          }),
       )
       cursor = response.nextCursor ?? undefined
       if (cursor && cursors.has(cursor))

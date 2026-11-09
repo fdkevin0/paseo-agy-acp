@@ -402,3 +402,110 @@ test('native PascalCase tools retain paths, content, ranges and recipients', () 
     read.type === 'read' && read.offset === 8 && read.limit === undefined,
   )
 })
+
+test('tool details enrich shell exit codes, clean read gutters, map plan artifacts, multi-chunk edits, search metadata, and plain failed errors', () => {
+  assert.deepEqual(
+    toolDetail({
+      title: 'run_command',
+      rawInput: { CommandLine: 'false' },
+      rawOutput: 'Command exited with code 2.\n\nCommand output:\nfail',
+    }),
+    {
+      type: 'shell',
+      command: 'false',
+      cwd: undefined,
+      output: 'Command exited with code 2.\n\nCommand output:\nfail',
+      exitCode: 2,
+    },
+  )
+  assert.deepEqual(
+    toolDetail({
+      title: 'read_file',
+      rawInput: { Path: '/src/index.ts' },
+      rawOutput:
+        'Created At: 2026-11-09T10:00:00Z\nCompleted At: 2026-11-09T10:00:01Z\nShowing lines 10-12 of 50\n10: const a = 1\n11: const b = 2\n12: export { a, b }',
+    }),
+    {
+      type: 'read',
+      filePath: '/src/index.ts',
+      content: 'const a = 1\nconst b = 2\nexport { a, b }',
+      offset: 10,
+      limit: 3,
+    },
+  )
+  assert.deepEqual(
+    toolDetail({
+      title: 'write_file',
+      rawInput: {
+        Path: '/brain/plan.md',
+        Content: '# Implementation Plan',
+        ArtifactMetadata: {
+          Summary: 'Plan',
+          UserFacing: true,
+          RequestFeedback: true,
+        },
+      },
+    }),
+    {
+      type: 'plan',
+      text: '# Implementation Plan',
+    },
+  )
+  assert.deepEqual(
+    toolDetail({
+      title: 'multi_replace_file_content',
+      rawInput: {
+        TargetFile: '/src/app.ts',
+        ReplacementChunks: [
+          { TargetContent: 'old1', ReplacementContent: 'new1' },
+          { TargetContent: 'old2', ReplacementContent: 'new2' },
+        ],
+      },
+    }),
+    {
+      type: 'edit',
+      filePath: '/src/app.ts',
+      oldString: 'old1\n...\nold2',
+      newString: 'new1\n...\nnew2',
+    },
+  )
+  assert.deepEqual(
+    toolDetail({
+      title: 'grep_search',
+      rawInput: { Query: 'Timeline' },
+      rawOutput: 'server/mapping.ts:25',
+      locations: [{ path: '/repo/server/mapping.ts' }],
+    }),
+    {
+      type: 'search',
+      query: 'Timeline',
+      toolName: 'grep',
+      filePaths: ['/repo/server/mapping.ts'],
+      content: 'server/mapping.ts:25',
+    },
+  )
+  assert.deepEqual(
+    toolDetail({
+      title: 'find_by_name',
+      rawInput: { SearchDirectory: '/repo/server', Pattern: '*.ts' },
+      rawOutput: 'server/mapping.ts',
+    }),
+    {
+      type: 'search',
+      query: '*.ts',
+      toolName: 'glob',
+      content: 'server/mapping.ts',
+    },
+  )
+  const timeline = new Timeline('s')
+  const failed = timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'err-1',
+    title: 'run_command',
+    status: 'failed',
+    rawInput: { CommandLine: 'bad' },
+    rawOutput: 'permission denied',
+  })
+  assert.ok(failed?.type === 'tool_call')
+  assert.equal(failed.error, 'permission denied')
+})

@@ -380,6 +380,7 @@ export async function readSubagents(
 export class BrainTranscriptProjector {
   private pending: PendingTool[] = []
   private background = new Map<string, PendingTool>()
+  private daemons = new Map<string, number>()
   private touchedSubagents = new Set<string>()
   private stepCallIds = new Map<number, string>()
   private stepSubagents = new Map<number, SubagentRecord>()
@@ -416,6 +417,15 @@ export class BrainTranscriptProjector {
 
   hasBackground(): boolean {
     return this.background.size > 0
+  }
+
+  hasDaemons(): boolean {
+    return this.daemons.size > 0
+  }
+
+  private forgetTask(taskId: string) {
+    this.background.delete(taskId)
+    this.daemons.delete(taskId)
   }
 
   touchedSubagentIds(): ReadonlySet<string> {
@@ -481,6 +491,7 @@ export class BrainTranscriptProjector {
           // Stopped calls never log a result; child transcripts have no USER_INPUT to reset them.
           this.pending = []
           this.background.clear()
+          this.daemons.clear()
           this.touchedSubagents.clear()
           return []
         }
@@ -489,9 +500,16 @@ export class BrainTranscriptProjector {
         for (const match of taskResults) {
           finishedIds.add(match[1])
           finishedIds.add(match[2])
+          this.daemons.delete(match[1])
+          this.daemons.delete(match[2])
         }
         const senders = [...text.matchAll(/\bsender=(\S+)/g)].map((m) => m[1])
         for (const sender of senders) {
+          const remaining = this.daemons.get(sender)
+          if (remaining !== undefined && !finishedIds.has(sender)) {
+            if (remaining <= 1) this.daemons.delete(sender)
+            else this.daemons.set(sender, remaining - 1)
+          }
           for (const [taskId, task] of this.background)
             if (
               task.name === 'schedule' &&
@@ -535,6 +553,7 @@ export class BrainTranscriptProjector {
       case 'ERROR_MESSAGE':
         this.pending = []
         this.background.clear()
+        this.daemons.clear()
         this.touchedSubagents.clear()
         return [
           {
@@ -549,9 +568,26 @@ export class BrainTranscriptProjector {
         if (!pending) return []
         if (runningStepStatuses.has(String(row.status))) {
           const taskId = text.match(backgroundTaskPattern)?.[1]
-          if (taskId && pending.args.IsDaemon !== true)
-            this.background.set(taskId, pending)
+          if (taskId) {
+            if (pending.args.IsDaemon === true) {
+              const max = Number(pending.args.MaxIterations)
+              this.daemons.set(
+                taskId,
+                Number.isInteger(max) && max > 0 ? max : Infinity,
+              )
+            } else {
+              this.background.set(taskId, pending)
+            }
+          }
           return []
+        }
+        if (
+          pending.name.includes('manage_task') &&
+          pending.args.Action === 'kill' &&
+          typeof pending.args.TaskId === 'string' &&
+          terminalToolStatus(row.status) === 'completed'
+        ) {
+          this.forgetTask(pending.args.TaskId)
         }
         const subagent =
           this.callSubagents.get(pending.callId) ??
@@ -916,10 +952,11 @@ class BrainNode {
   }
 }
 
-/** Determine whether the session has running background tasks or active subagents that require process termination on interrupt. */
+/** Determine whether the session has running background tasks or active subagents. Standing IsDaemon schedules are excluded by default so foreground interrupts do not kill them, and included when checking whether an idle runtime can stop. */
 export async function hasActiveBackgroundWork(
   root: string,
   nativeId: string,
+  options: { includeDaemons?: boolean } = {},
   visiting = new Set<string>(),
   isChild = false,
 ): Promise<boolean> {
@@ -938,7 +975,11 @@ export async function hasActiveBackgroundWork(
       if (isRestartNotice(row)) node.resetPhase()
       node.ingest(row)
     }
-    if (node.projector.hasBackground()) return true
+    if (
+      node.projector.hasBackground() ||
+      (options.includeDaemons && node.projector.hasDaemons())
+    )
+      return true
     // A failed step is finished; an unsettled child or woken parent turn is still working outside ACP prompt RPC.
     if (
       isChild
@@ -954,7 +995,7 @@ export async function hasActiveBackgroundWork(
       isChild ? -1 : node.turnStartStep,
     )
     for (const childId of activeChildIds) {
-      if (await hasActiveBackgroundWork(root, childId, visiting, true))
+      if (await hasActiveBackgroundWork(root, childId, options, visiting, true))
         return true
     }
     return false

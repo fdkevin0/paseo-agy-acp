@@ -2045,3 +2045,138 @@ test('resuming after a drained cancel neither repeats nor skips child rows', asy
     await f.close()
   }
 })
+
+test('daemon schedule does not block foreground settlement or trigger interrupt relaunch, keeps includeDaemons true, and clears on MaxIterations or manage_task kill', async () => {
+  const f = await fixture()
+  try {
+    const daemonId = `${parent}/task-2`
+    await f.put(parent, [
+      { step_index: 0, type: 'USER_INPUT', content: 'start daemon cron' },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          {
+            id: 'cron-1',
+            name: 'schedule',
+            args: {
+              CronExpression: '*/5 * * * *',
+              Prompt: 'check status',
+              IsDaemon: true,
+              MaxIterations: 2,
+            },
+          },
+        ],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: `Tool is running as a background task with task id: ${daemonId}\n`,
+      },
+      done(3, 'Standing cron scheduled.'),
+    ])
+    const settled = await settleBrainTurn(f.root, parent, 'p', () => {}, {
+      minStepIndex: -1,
+    })
+    assert.equal(settled.status, 'completed')
+    assert.equal(
+      await hasActiveBackgroundWork(f.root, parent),
+      false,
+      'foreground interrupt check excludes standing daemons so they are not killed',
+    )
+    assert.equal(
+      await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
+      true,
+      'idle runtime check includes standing daemons',
+    )
+
+    // First cron trigger decrements remaining iterations (2 -> 1), still active
+    await appendFile(
+      f.path(parent),
+      encode([message(4, daemonId, 'check status'), done(5, 'Checked #1.')]),
+    )
+    assert.equal(
+      await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
+      true,
+    )
+
+    // Second cron trigger reaches MaxIterations (1 -> 0) and clears the daemon automatically
+    await appendFile(
+      f.path(parent),
+      encode([message(6, daemonId, 'check status'), done(7, 'Checked #2.')]),
+    )
+    assert.equal(
+      await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
+      false,
+    )
+
+    // Unlimited daemon clears on explicit manage_task kill
+    const daemon2Id = `${parent}/task-9`
+    await appendFile(
+      f.path(parent),
+      encode([
+        { step_index: 8, type: 'USER_INPUT', content: 'start unlimited cron' },
+        {
+          step_index: 9,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [
+            {
+              id: 'cron-2',
+              name: 'schedule',
+              args: {
+                CronExpression: '*/5 * * * *',
+                Prompt: 'check forever',
+                IsDaemon: true,
+              },
+            },
+          ],
+        },
+        {
+          step_index: 10,
+          type: 'GENERIC',
+          status: 'RUNNING',
+          content: `Tool is running as a background task with task id: ${daemon2Id}\n`,
+        },
+        done(11, 'Unlimited cron started.'),
+      ]),
+    )
+    assert.equal(
+      await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
+      true,
+    )
+    await appendFile(
+      f.path(parent),
+      encode([
+        { step_index: 12, type: 'USER_INPUT', content: 'stop daemon cron' },
+        {
+          step_index: 13,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [
+            {
+              id: 'kill-1',
+              name: 'manage_task',
+              args: { Action: 'kill', TaskId: daemon2Id },
+            },
+          ],
+        },
+        {
+          step_index: 14,
+          type: 'GENERIC',
+          status: 'DONE',
+          content: `Killed task ${daemon2Id}`,
+        },
+        done(15, 'Stopped standing cron.'),
+      ]),
+    )
+    assert.equal(
+      await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
+      false,
+    )
+  } finally {
+    await f.close()
+  }
+})
