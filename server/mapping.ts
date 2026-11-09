@@ -17,6 +17,7 @@ import type {
   ProviderContent,
   ProviderUsage,
 } from '@getpaseo/plugin/server/provider'
+import { normalizeAskQuestionInput } from './permissions.ts'
 
 export const FULL_ACCESS_MODE_ID = 'full-access'
 
@@ -115,7 +116,29 @@ export function toolDetail(
           .filter(Boolean)
           .join('\n') ||
         (tool.rawOutput != null ? JSON.stringify(tool.rawOutput) : undefined)
-  const name = tool.title ?? ''
+  const name = (tool.title ?? '').replace(/^default_api:/, '')
+  if (
+    name === 'ask_question' ||
+    name === 'ask_user' ||
+    Array.isArray(input.questions)
+  ) {
+    const questions = normalizeAskQuestionInput(input)
+    if (questions.length > 0) {
+      const formatted = questions
+        .map((q) => {
+          const opts = q.options
+            .map((o, i) => `  ${i + 1}. ${o.label}`)
+            .join('\n')
+          return opts ? `${q.question}\n${opts}` : q.question
+        })
+        .join('\n\n')
+      return {
+        type: 'plain_text',
+        label: name || 'ask_question',
+        text: output ? `${formatted}\n\nAnswer:\n${output}` : formatted,
+      }
+    }
+  }
   const filePath =
     str(
       input.Path ??
@@ -599,7 +622,7 @@ export class Timeline {
         type: 'tool_call' as const,
         id: `${this.prefix}:tool:${tool.toolCallId}`,
         callId: tool.toolCallId,
-        name: tool.title ?? old?.title ?? 'Tool',
+        name: (tool.title ?? old?.title ?? 'Tool').replace(/^default_api:/, ''),
         detail: toolDetail(tool),
       }
       const item: Extract<ProviderTimelineItem, { type: 'tool_call' }> =

@@ -1384,3 +1384,252 @@ test('recursive multi-level subagents link depth-2 grandchild under child sessio
     await rm(home, { recursive: true, force: true })
   }
 })
+
+test('elicitation/create and post-RPC woken ask_question emit QuestionCard permissions even in full-access mode and interrupt without relaunch', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-elicitation-'))
+  const log = join(home, 'calls')
+  const h = await harness({
+    HOME: home,
+    AGY_TEST_LOG: log,
+    AGY_TEST_LOG_LOAD: '1',
+    AGY_TEST_LOG_ELICITATION_CAP: '1',
+  })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      config: { ...h.config, mode: 'full-access' },
+      history: 'skip',
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's')
+    assert.ok(
+      (await readFile(log, 'utf8')).includes('cap:elicitation.form\n'),
+      'initialize must advertise elicitation.form capability',
+    )
+
+    // 1. Foreground elicitation/create in full-access mode is never auto-approved
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'fg-elicit',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'elicitation' }],
+        },
+      },
+    })
+    const fgPerm = await h.wait((e) => e.type === 'session.permission')
+    assert.ok(fgPerm.type === 'session.permission')
+    assert.equal(fgPerm.request.kind, 'question')
+    assert.equal(fgPerm.request.name, 'ask_question')
+    await h.provider.send({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: fgPerm.request.id,
+      response: {
+        behavior: 'allow',
+        updatedInput: {
+          answers: {
+            'Question 1': '(Recommended) Option 1',
+            'Question 2': 'Linux, x86_64, FreeBSD',
+          },
+        },
+      },
+    })
+    await h.wait((e) => e.type === 'session.turn' && e.state === 'completed')
+    assert.ok(
+      h.events.some(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'assistant_message' &&
+          e.item.text ===
+            'elicited:{"action":"accept","content":{"q1":"0","q2":["linux"],"q2_other":"FreeBSD"}}',
+      ),
+    )
+
+    // 2. Post-RPC Reactive Wakeup ask_question bridges QuestionCard, continues turn, and suppresses duplicate replay
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'woken-q-1',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'woken-question' }],
+        },
+      },
+    })
+    const wokenPerm = await h.wait((e) => e.type === 'session.permission')
+    assert.ok(wokenPerm.type === 'session.permission')
+    assert.equal(wokenPerm.request.kind, 'question')
+    await h.provider.send({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: wokenPerm.request.id,
+      response: {
+        behavior: 'allow',
+        updatedInput: {
+          answers: {
+            'Question 1': '(Recommended) Option 1',
+          },
+        },
+      },
+    })
+    await h.wait((e) => e.type === 'session.turn' && e.state === 'completed')
+    assert.equal(
+      h.events.filter((e) => e.type === 'session.permission').length,
+      1,
+      'replayed elicitation/create during continuation must be auto-resolved by preStagedElicitation',
+    )
+    const assistantTexts = h.events.flatMap((e) =>
+      e.type === 'timeline.item' && e.item.type === 'assistant_message'
+        ? [e.item.text]
+        : [],
+    )
+    assert.deepEqual(assistantTexts, [
+      'Waiting for background check...',
+      'Background check finished. Please select:',
+      'Completed woken question:{"action":"accept","content":{"q1":"schema_0"}}',
+    ])
+
+    // 3. A different elicitation/create question during continuation is NOT auto-answered with the old answer
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'woken-q-mismatch',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'woken-question' }],
+        },
+      },
+    })
+    const firstPerm = await h.wait((e) => e.type === 'session.permission')
+    assert.ok(firstPerm.type === 'session.permission')
+    await h.provider.send({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: firstPerm.request.id,
+      response: {
+        behavior: 'allow',
+        updatedInput: {
+          answers: {
+            'Question 1': 'Option 2',
+          },
+        },
+      },
+    })
+    const secondPerm = await h.wait(
+      (e) =>
+        e.type === 'session.permission' &&
+        e.request.id !== firstPerm.request.id,
+    )
+    assert.ok(secondPerm.type === 'session.permission')
+    await h.provider.send({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: secondPerm.request.id,
+      response: {
+        behavior: 'allow',
+        updatedInput: {
+          answers: {
+            'Question 1': 'Custom follow-up answer',
+          },
+        },
+      },
+    })
+    await h.wait((e) => e.type === 'session.turn' && e.state === 'completed')
+    assert.ok(
+      h.events.some(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'assistant_message' &&
+          e.item.text ===
+            'Completed woken question:{"action":"accept","content":{"q1_other":"Custom follow-up answer"}}',
+      ),
+    )
+
+    // 4. Denying (Cancel) a woken ask_question cancels the native session and ends tool/turn as canceled
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'woken-q-deny',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'woken-question' }],
+        },
+      },
+    })
+    const denyPerm = await h.wait((e) => e.type === 'session.permission')
+    assert.ok(denyPerm.type === 'session.permission')
+    const logBeforeDeny = await readFile(log, 'utf8')
+    await h.provider.send({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: denyPerm.request.id,
+      response: { behavior: 'deny' },
+    })
+    await h.wait((e) => e.type === 'session.turn' && e.state === 'canceled')
+    const logAfterDeny = await readFile(log, 'utf8')
+    assert.equal(
+      logAfterDeny.slice(logBeforeDeny.length),
+      'cancel\n',
+      'denying a woken ask_question must cancel the native session without relaunching',
+    )
+    assert.ok(
+      h.events.some(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'tool_call' &&
+          e.item.name === 'ask_question' &&
+          e.item.status === 'canceled',
+      ),
+    )
+
+    // 5. Interrupting a woken ask_question uses the fast cancel path without relaunching
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'woken-q-interrupt',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'woken-question' }],
+        },
+      },
+    })
+    await h.wait((e) => e.type === 'session.permission')
+    const logBeforeInterrupt = await readFile(log, 'utf8')
+    await h.provider.send({
+      type: 'session.interrupt',
+      requestId: 'int-woken-q',
+      sessionId: 's',
+    })
+    await h.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'int-woken-q',
+    )
+    await h.wait((e) => e.type === 'session.turn' && e.state === 'canceled')
+    const logAfterInterrupt = await readFile(log, 'utf8')
+    assert.equal(
+      logAfterInterrupt.slice(logBeforeInterrupt.length),
+      'cancel\n',
+      'interrupting a woken ask_question must not relaunch the runtime',
+    )
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})

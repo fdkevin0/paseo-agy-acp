@@ -21,10 +21,16 @@ import type {
 } from '@getpaseo/plugin/server/provider'
 import {
   RequestPermissionRequestSchema,
+  buildElicitationResponse,
+  formatQuestionAnswersText,
   isChooserRequest,
   isPreapprovedMcpTool,
+  normalizeElicitationQuestions,
   permissionKind,
   pickPermissionOption,
+  sameNormalizedQuestions,
+  toQuestionPermissionInput,
+  type NormalizedQuestion,
 } from './permissions.ts'
 import {
   BrainTranscriptProjector,
@@ -55,6 +61,21 @@ import {
 
 type Open = Extract<ProviderInput, { type: 'session.open' }>
 type Prompt = Extract<ProviderInput, { type: 'session.prompt' }>
+type PermissionResponseInput = Extract<
+  ProviderInput,
+  { type: 'session.permission' }
+>['response']
+type PendingPermission =
+  | {
+      type: 'acp'
+      request: RequestPermissionRequest
+      resolve: (r: RequestPermissionResponse) => void
+    }
+  | {
+      type: 'question'
+      questions: NormalizedQuestion[]
+      resolve: (r: PermissionResponseInput | null) => void
+    }
 type Session = Awaited<ReturnType<typeof createSession>>
 interface SessionOptions {
   usage: AgyUsageSource
@@ -229,17 +250,21 @@ export class SessionManager {
     if (input.type === 'session.permission') {
       const permission = session.permissions.get(input.permissionId)
       if (!permission) throw new Error('Permission is no longer pending')
-      const option = pickPermissionOption(
-        permission.request.options,
-        input.response.behavior,
-        input.response.selectedActionId,
-      )
-      permission.resolve({
-        outcome: option
-          ? { outcome: 'selected', optionId: option.optionId }
-          : { outcome: 'cancelled' },
-      })
       session.permissions.delete(input.permissionId)
+      if (permission.type === 'acp') {
+        const option = pickPermissionOption(
+          permission.request.options,
+          input.response.behavior,
+          input.response.selectedActionId,
+        )
+        permission.resolve({
+          outcome: option
+            ? { outcome: 'selected', optionId: option.optionId }
+            : { outcome: 'cancelled' },
+        })
+      } else {
+        permission.resolve(input.response)
+      }
       emit({
         type: 'session.permission_resolved',
         sessionId: session.id,
@@ -284,13 +309,7 @@ async function createSession(
   transports: Set<ReturnType<typeof connectAcp>>,
 ) {
   const { launch, capabilities, emit } = options
-  const permissions = new Map<
-    string,
-    {
-      request: RequestPermissionRequest
-      resolve: (r: RequestPermissionResponse) => void
-    }
-  >()
+  const permissions = new Map<string, PendingPermission>()
   const timeline = new Timeline(id)
   const brainRoot = join(dataDirectory(launch, config?.env, cwd), 'brain')
   const state = {
@@ -301,6 +320,14 @@ async function createSession(
     skipPermissions: config?.mode === FULL_ACCESS_MODE_ID,
     turnHadContextUsage: false,
     turnHadModelOutput: false,
+    turnHandledElicitation: false,
+    suppressContinuationAcp: false,
+    preStagedQuestion: undefined as
+      | {
+          questions: NormalizedQuestion[]
+          response: PermissionResponseInput
+        }
+      | undefined,
     turnToolCallIds: [] as string[],
     lastKnownStepIndex: -1,
     wakeup: {
@@ -529,7 +556,7 @@ async function createSession(
       commandsReceived = true
       resolveCommands()
     } else if (u.sessionUpdate === 'usage_update') {
-      if (state.wakeup.suppressEcho) return
+      if (state.wakeup.suppressEcho || state.suppressContinuationAcp) return
       const next = contextUsage(u)
       if (next && (!state.loading || state.replay)) {
         if (state.turn) state.turnHadContextUsage = true
@@ -537,6 +564,21 @@ async function createSession(
       }
     } else {
       if (state.loading && !state.replay) return
+      if (state.suppressContinuationAcp) {
+        if (
+          u.sessionUpdate === 'tool_call' &&
+          !state.turnToolCallIds.includes(u.toolCallId)
+        )
+          state.turnToolCallIds.push(u.toolCallId)
+        if (
+          state.turn &&
+          (u.sessionUpdate === 'agent_message_chunk' ||
+            u.sessionUpdate === 'agent_thought_chunk' ||
+            u.sessionUpdate === 'tool_call')
+        )
+          state.turnHadModelOutput = true
+        return
+      }
       if (u.sessionUpdate === 'user_message_chunk' && !state.loading) {
         state.wakeup.suppressEcho = false
         timeline.boundary()
@@ -569,7 +611,8 @@ async function createSession(
   }
   function cancelPermissions() {
     for (const [permissionId, p] of permissions) {
-      p.resolve({ outcome: { outcome: 'cancelled' } })
+      if (p.type === 'acp') p.resolve({ outcome: { outcome: 'cancelled' } })
+      else p.resolve(null)
       emit({
         type: 'session.permission_resolved',
         sessionId: id,
@@ -578,10 +621,85 @@ async function createSession(
     }
     permissions.clear()
   }
+  function askUserQuestion(
+    questions: NormalizedQuestion[],
+    title?: string,
+  ): Promise<PermissionResponseInput | null> {
+    if (
+      !questions.length ||
+      !state.nativeId ||
+      !state.turn ||
+      state.closing ||
+      state.failed
+    )
+      return Promise.resolve(null)
+    const input = toQuestionPermissionInput(questions)
+    const detail = toolDetail({
+      title: 'ask_question',
+      rawInput: input,
+    })
+    return new Promise<PermissionResponseInput | null>((resolve) => {
+      const permissionId = randomUUID()
+      permissions.set(permissionId, {
+        type: 'question',
+        questions,
+        resolve,
+      })
+      emit({
+        type: 'session.permission',
+        sessionId: id,
+        request: {
+          id: permissionId,
+          name: 'ask_question',
+          kind: 'question',
+          title: title ?? questions[0]?.question ?? 'Question',
+          input,
+          detail,
+          actions: [
+            { id: 'allow', label: 'Submit', behavior: 'allow' },
+            { id: 'deny', label: 'Cancel', behavior: 'deny' },
+          ],
+        },
+      })
+    })
+  }
   const client = {
     sessionUpdate: (notification: SessionNotification) => {
       notificationLane = notificationLane.then(() => update(notification))
       return notificationLane
+    },
+    requestElicitation: async (params: Record<string, unknown>) => {
+      if (
+        !state.nativeId ||
+        (typeof params.sessionId === 'string' &&
+          params.sessionId !== state.nativeId) ||
+        !state.turn ||
+        state.closing ||
+        state.failed
+      )
+        return { action: 'cancel' }
+      const questions = normalizeElicitationQuestions(params)
+      if (!questions.length) return { action: 'cancel' }
+      if (state.preStagedQuestion) {
+        const staged = state.preStagedQuestion
+        state.preStagedQuestion = undefined
+        if (sameNormalizedQuestions(staged.questions, questions)) {
+          return buildElicitationResponse(
+            questions,
+            staged.response,
+            staged.questions,
+          )
+        }
+      }
+      state.turnHandledElicitation = true
+      const response = await askUserQuestion(
+        questions,
+        typeof params.message === 'string' && params.message.trim()
+          ? params.message.trim()
+          : undefined,
+      )
+      if (!response) return { action: 'cancel' }
+      return buildElicitationResponse(questions, response)
     },
     requestPermission: (request: RequestPermissionRequest) => {
       const parsed = RequestPermissionRequestSchema.safeParse(request)
@@ -617,7 +735,7 @@ async function createSession(
       const kind = permissionKind(request, detail)
       return new Promise<RequestPermissionResponse>((resolve) => {
         const permissionId = randomUUID()
-        permissions.set(permissionId, { request, resolve })
+        permissions.set(permissionId, { type: 'acp', request, resolve })
         emit({
           type: 'session.permission',
           sessionId: id,
@@ -678,6 +796,7 @@ async function createSession(
         clientCapabilities: {
           fs: { readTextFile: false, writeTextFile: false },
           terminal: false,
+          elicitation: { form: {} },
         },
       }),
     )
@@ -700,6 +819,7 @@ async function createSession(
       },
       timeline,
       permissions,
+      askUserQuestion,
       cancelPermissions,
       publishConfig,
       publishUsage,
@@ -1056,6 +1176,9 @@ async function promptSession(
   session.state.turnAbort = turnAbort
   session.state.turnHadContextUsage = false
   session.state.turnHadModelOutput = false
+  session.state.turnHandledElicitation = false
+  session.state.suppressContinuationAcp = false
+  session.state.preStagedQuestion = undefined
   session.state.turnToolCallIds = []
   session.state.wakeup.suppressEcho =
     session.state.wakeup.pendingReplay && expectsUserEcho
@@ -1134,6 +1257,48 @@ async function promptSession(
             session.state.turnHadModelOutput || suppressedForeground ? 2000 : 0,
           stallTimeoutMs: session.stallTimeoutMs,
           isWaitingOnUser: () => session.permissions.size > 0,
+          onQuestion: async (pendingQuestion) => {
+            if (
+              !pendingQuestion.wokeUp &&
+              session.state.turnHandledElicitation
+            ) {
+              session.state.turnHandledElicitation = false
+              return { status: 'already_handled' }
+            }
+            const response = await session.askUserQuestion(
+              pendingQuestion.questions,
+              pendingQuestion.questions[0]?.question,
+            )
+            if (!response || turnAbort.signal.aborted) {
+              return { status: 'canceled' }
+            }
+            if (response.behavior === 'deny') {
+              await session.interrupt()
+              return { status: 'canceled' }
+            }
+            const answerText =
+              formatQuestionAnswersText(pendingQuestion.questions, response) ||
+              'Proceed'
+            session.state.preStagedQuestion = {
+              questions: pendingQuestion.questions,
+              response,
+            }
+            session.state.suppressContinuationAcp = true
+            try {
+              const contResult = await session.transport.rpc.prompt({
+                sessionId: session.state.nativeId,
+                prompt: [{ type: 'text', text: answerText }],
+              })
+              await session.drain()
+              if (contResult.stopReason === 'cancelled') {
+                return { status: 'canceled' }
+              }
+            } finally {
+              session.state.suppressContinuationAcp = false
+              session.state.preStagedQuestion = undefined
+            }
+            return { status: 'answered', answerText }
+          },
         },
       )
       await session.syncKilledChildren()
@@ -1204,6 +1369,9 @@ async function promptSession(
     })
   } finally {
     session.state.wakeup.suppressEcho = false
+    session.state.turnHandledElicitation = false
+    session.state.suppressContinuationAcp = false
+    session.state.preStagedQuestion = undefined
     session.state.turnAbort = null
     session.state.turn = ''
     session.timeline.boundary()

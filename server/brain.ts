@@ -20,14 +20,32 @@ import type {
   ProviderEvent,
   ProviderTimelineItem,
 } from '@getpaseo/plugin/server/provider'
+import {
+  normalizeAskQuestionInput,
+  type NormalizedQuestion,
+} from './permissions.ts'
 
-type PendingTool = {
+export type PendingTool = {
   id: string
   callId: string
   name: string
   args: Record<string, unknown>
   stepIndex: number
+  isQuestion?: boolean
+  questions?: NormalizedQuestion[]
+  questionConsumed?: boolean
+  questionCompleted?: boolean
 }
+
+export type PendingQuestion = {
+  tool: PendingTool
+  questions: NormalizedQuestion[]
+  wokeUp: boolean
+}
+
+export type QuestionOutcome =
+  | { status: 'answered'; answerText?: string }
+  | { status: 'declined' | 'already_handled' | 'canceled' }
 
 type SubagentRecord = {
   conversationId: string
@@ -93,11 +111,18 @@ function terminalToolStatus(
   return 'completed'
 }
 
+function isAskQuestionToolCall(value: unknown): boolean {
+  const name = String(record(value).name ?? '').replace(/^default_api:/, '')
+  return name === 'ask_question' || name === 'ask_user'
+}
+
 function isCompletePlannerResponse(step: Record<string, unknown> | undefined) {
   return (
     step?.type === 'PLANNER_RESPONSE' &&
     step.status === 'DONE' &&
-    (!Array.isArray(step.tool_calls) || step.tool_calls.length === 0)
+    (!Array.isArray(step.tool_calls) ||
+      step.tool_calls.length === 0 ||
+      step.tool_calls.every(isAskQuestionToolCall))
   )
 }
 
@@ -412,7 +437,7 @@ export class BrainTranscriptProjector {
   }
 
   hasPending(): boolean {
-    return this.pending.length > 0
+    return this.pending.some((p) => !p.isQuestion)
   }
 
   hasBackground(): boolean {
@@ -421,6 +446,34 @@ export class BrainTranscriptProjector {
 
   hasDaemons(): boolean {
     return this.daemons.size > 0
+  }
+
+  peekPendingQuestion() {
+    const next = this.pending.find((p) => !p.questionConsumed)
+    return next?.isQuestion
+      ? { tool: next, questions: next.questions ?? [] }
+      : undefined
+  }
+
+  consumePendingQuestion() {
+    const next = this.pending.find((p) => !p.questionConsumed)
+    if (!next?.isQuestion) return undefined
+    next.questionConsumed = true
+    return { tool: next, questions: next.questions ?? [] }
+  }
+
+  completePendingQuestion(
+    pending: PendingTool,
+    output: unknown,
+    status: 'completed' | 'failed' | 'canceled' = 'completed',
+  ): ProviderTimelineItem {
+    pending.questionCompleted = true
+    return this.finishTool(
+      pending,
+      output,
+      status,
+      typeof output === 'string' ? output : '',
+    )
   }
 
   private forgetTask(taskId: string) {
@@ -549,6 +602,9 @@ export class BrainTranscriptProjector {
         return []
       }
       case 'CHECKPOINT':
+        for (const p of this.pending) {
+          if (p.stepIndex >= stepIndex) p.stepIndex++
+        }
         return []
       case 'ERROR_MESSAGE':
         this.pending = []
@@ -563,9 +619,16 @@ export class BrainTranscriptProjector {
           },
         ]
       case 'GENERIC': {
-        // Every tool call is logged exactly once, so each GENERIC row consumes one call in FIFO order.
-        const pending = this.pending.shift()
-        if (!pending) return []
+        // Match by stepIndex first so an unlogged WAITING ask_question never steals a sibling tool's GENERIC row.
+        let matchIndex = this.pending.findIndex(
+          (p) => p.stepIndex === stepIndex,
+        )
+        if (matchIndex < 0) {
+          matchIndex = this.pending.findIndex((p) => !p.isQuestion)
+          if (matchIndex < 0) matchIndex = 0
+        }
+        const [pending] = this.pending.splice(matchIndex, 1)
+        if (!pending || pending.questionCompleted) return []
         if (runningStepStatuses.has(String(row.status))) {
           const taskId = text.match(backgroundTaskPattern)?.[1]
           if (taskId) {
@@ -631,12 +694,24 @@ export class BrainTranscriptProjector {
               this.stepCallIds.get(genericStep) ??
               acpId ??
               `tool-${stepIndex}-${index}`
+            const cleanName = String(tool.name ?? 'Tool').replace(
+              /^default_api:/,
+              '',
+            )
+            const isQuestion =
+              cleanName === 'ask_question' || cleanName === 'ask_user'
             const pending: PendingTool = {
               id: `${this.sessionId}:tool:${callId}`,
               callId,
-              name: String(tool.name ?? 'Tool'),
+              name: cleanName,
               args,
               stepIndex: genericStep,
+              ...(isQuestion
+                ? {
+                    isQuestion: true,
+                    questions: normalizeAskQuestionInput(args),
+                  }
+                : {}),
             }
             this.pending.push(pending)
             items.push({
@@ -863,6 +938,8 @@ class BrainNode {
   seenPlannerResponse = false
   foregroundIdleReached = false
   wokeUp = false
+  continuingQuestion = false
+  questionSettled = false
   lastStep?: Record<string, unknown>
   readonly nativeId: string
   readonly sessionId: string
@@ -887,6 +964,18 @@ class BrainNode {
     this.seenPlannerResponse = false
     this.foregroundIdleReached = false
     this.wokeUp = false
+    this.continuingQuestion = false
+    this.questionSettled = false
+  }
+
+  markQuestionContinuation() {
+    this.continuingQuestion = true
+    this.questionSettled = false
+    this.wokeUp = true
+  }
+
+  markQuestionSettled() {
+    this.questionSettled = true
   }
 
   async pollMetadata(root: string) {
@@ -900,11 +989,15 @@ class BrainNode {
 
   /** Fold one transcript row into wakeup phase, message accounting, projection and the last step. */
   ingest(row: Record<string, unknown>): ProviderTimelineItem[] {
+    this.questionSettled = false
     if (row.type === 'USER_INPUT' || isRestartNotice(row))
       this.turnStartStep = Number(row.step_index)
-    // A restart notice does not end a woken turn: the rows after it are still Brain's to project.
-    if (row.type === 'USER_INPUT') this.resetPhase()
-    else if (
+    // A restart notice or a question-continuation USER_INPUT does not end a woken turn:
+    // the rows after it are still Brain's to project.
+    if (row.type === 'USER_INPUT') {
+      if (this.continuingQuestion) this.continuingQuestion = false
+      else this.resetPhase()
+    } else if (
       row.type === 'SYSTEM_MESSAGE' &&
       !isRestartNotice(row) &&
       this.foregroundIdleReached
@@ -947,7 +1040,7 @@ class BrainNode {
       !this.hasUnprocessedMessages(inbox) &&
       !this.projector.hasPending() &&
       !this.projector.hasBackground() &&
-      isCompletePlannerResponse(this.lastStep)
+      (isCompletePlannerResponse(this.lastStep) || this.questionSettled)
     )
   }
 }
@@ -1100,6 +1193,7 @@ export async function settleBrainTurn(
     stallTimeoutMs = 120_000,
     wokenStallTimeoutMs = 15 * 60_000,
     isWaitingOnUser,
+    onQuestion,
   }: {
     signal?: AbortSignal
     minStepIndex?: number
@@ -1120,6 +1214,8 @@ export async function settleBrainTurn(
     wokenStallTimeoutMs?: number
     /** Pending approvals legitimately block agy; they suspend the stall timeout. */
     isWaitingOnUser?: () => boolean
+    /** Handle an unlogged ask_question step discovered at the tail of the transcript. */
+    onQuestion?: (question: PendingQuestion) => Promise<QuestionOutcome>
   } = {},
 ): Promise<{
   status: 'completed' | 'canceled' | 'failed'
@@ -1264,6 +1360,59 @@ export async function settleBrainTurn(
     }
     if (node.lastStep?.type === 'ERROR_MESSAGE')
       return finish('failed', stepErrorMessage(node.lastStep, 'Turn failed'))
+    let continuedQuestion = false
+    while (onQuestion ? true : !node.projector.hasPending()) {
+      const pendingQuestion = node.projector.consumePendingQuestion()
+      if (!pendingQuestion) break
+      if (onQuestion) {
+        const outcome = await onQuestion({
+          ...pendingQuestion,
+          wokeUp: node.wokeUp,
+        })
+        if (signal?.aborted || outcome.status === 'canceled') {
+          onItem(
+            node.projector.completePendingQuestion(
+              pendingQuestion.tool,
+              null,
+              'canceled',
+            ),
+          )
+          return finish('canceled')
+        }
+        if (outcome.status === 'answered') {
+          onItem(
+            node.projector.completePendingQuestion(
+              pendingQuestion.tool,
+              outcome.answerText ?? '',
+              'completed',
+            ),
+          )
+          node.markQuestionContinuation()
+          lastActivity = Date.now()
+          continuedQuestion = true
+          break
+        }
+        if (outcome.status === 'declined') {
+          onItem(
+            node.projector.completePendingQuestion(
+              pendingQuestion.tool,
+              'Declined',
+              'completed',
+            ),
+          )
+        }
+      } else if (node.wokeUp || emitForeground) {
+        onItem(
+          node.projector.completePendingQuestion(
+            pendingQuestion.tool,
+            null,
+            'completed',
+          ),
+        )
+      }
+      node.markQuestionSettled()
+    }
+    if (continuedQuestion) continue
     const activeChildIds = activeChildIdsForTurn(
       subagents,
       node.projector,
