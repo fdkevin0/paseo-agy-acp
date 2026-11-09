@@ -1692,3 +1692,70 @@ test('resuming after a drained cancel neither repeats nor skips child rows', asy
     await f.close()
   }
 })
+
+test('daemon schedule does not block foreground settlement, keeps hasActiveBackgroundWork true, and clears on manage_task kill', async () => {
+  const f = await fixture()
+  try {
+    const daemonId = `${parent}/task-2`
+    await f.put(parent, [
+      { step_index: 0, type: 'USER_INPUT', content: 'start daemon cron' },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          {
+            id: 'cron-1',
+            name: 'schedule',
+            args: {
+              CronExpression: '*/5 * * * *',
+              Prompt: 'check status',
+              IsDaemon: true,
+            },
+          },
+        ],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: `Tool is running as a background task with task id: ${daemonId}\n`,
+      },
+      done(3, 'Standing cron scheduled.'),
+    ])
+    const settled = await settleBrainTurn(f.root, parent, 'p', () => {}, {
+      minStepIndex: -1,
+    })
+    assert.equal(settled.status, 'completed')
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), true)
+
+    await appendFile(
+      f.path(parent),
+      encode([
+        { step_index: 4, type: 'USER_INPUT', content: 'stop daemon cron' },
+        {
+          step_index: 5,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [
+            {
+              id: 'kill-1',
+              name: 'manage_task',
+              args: { Action: 'kill', TaskId: daemonId },
+            },
+          ],
+        },
+        {
+          step_index: 6,
+          type: 'GENERIC',
+          status: 'DONE',
+          content: `Killed task ${daemonId}`,
+        },
+        done(7, 'Stopped standing cron.'),
+      ]),
+    )
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
+  } finally {
+    await f.close()
+  }
+})

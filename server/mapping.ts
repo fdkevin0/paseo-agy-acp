@@ -49,6 +49,31 @@ function str(value: unknown): string | undefined {
 function num(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
+function cleanReadOutput(output: string | undefined): {
+  content: string | undefined
+  startLine?: number
+  endLine?: number
+} {
+  if (!output) return { content: output }
+  const header = output.match(
+    /^(?:Created At:[^\n]*\n)?(?:Completed At:[^\n]*\n)?Showing lines (\d+)-(\d+) of \d+\r?\n/,
+  )
+  const body = header ? output.slice(header[0].length) : output
+  const lines = body.split('\n')
+  const numbered =
+    lines.length > 0 &&
+    lines.every((line, i) =>
+      i === lines.length - 1 && line === '' ? true : /^\d+:(?: |$)/.test(line),
+    )
+  return {
+    content: numbered
+      ? lines.map((line) => line.replace(/^\d+:(?: |$)/, '')).join('\n')
+      : body,
+    ...(header
+      ? { startLine: Number(header[1]), endLine: Number(header[2]) }
+      : {}),
+  }
+}
 /** Map native tool arguments and output to Paseo detail cards. */
 export function toolDetail(
   tool: Partial<ToolCall> | ToolCallUpdate,
@@ -76,8 +101,19 @@ export function toolDetail(
         input.path,
     ) ?? tool.locations?.[0]?.path
   const command = str(input.CommandLine ?? input.command)
-  if (command)
-    return { type: 'shell', command, cwd: str(input.Cwd ?? input.cwd), output }
+  if (command) {
+    const exitMatch = output?.match(/Command exited with code (\d+)/)
+    const exitCode =
+      num(record(tool.rawOutput).exitCode) ??
+      (exitMatch ? Number(exitMatch[1]) : undefined)
+    return {
+      type: 'shell',
+      command,
+      cwd: str(input.Cwd ?? input.cwd),
+      output,
+      ...(exitCode !== undefined ? { exitCode } : {}),
+    }
+  }
   const url = str(input.Url ?? input.url)
   if ((name === 'read_url_content' || tool.kind === 'fetch') && url)
     return { type: 'fetch', url, ...(output ? { result: output } : {}) }
@@ -112,6 +148,11 @@ export function toolDetail(
       log: output ?? '',
     }
   }
+  const planText =
+    record(input.ArtifactMetadata).RequestFeedback === true
+      ? str(input.Content ?? input.CodeContent ?? input.Replacement)
+      : undefined
+  if (planText) return { type: 'plan', text: planText }
   const diff = tool.content?.find((c) => c.type === 'diff')
   if (diff?.type === 'diff')
     return {
@@ -120,41 +161,6 @@ export function toolDetail(
       oldString: diff.oldText ?? '',
       newString: diff.newText,
     }
-  if (filePath) {
-    if (/write/.test(name))
-      return {
-        type: 'write',
-        filePath,
-        content: str(input.Content ?? input.CodeContent ?? input.content),
-      }
-    if (tool.kind === 'edit' || /edit|replace/.test(name))
-      return {
-        type: 'edit',
-        filePath,
-        oldString: str(input.Target ?? input.TargetContent ?? input.old_string),
-        newString: str(
-          input.Replacement ?? input.ReplacementContent ?? input.new_string,
-        ),
-      }
-    const start = num(input.StartLine)
-    const end = num(input.EndLine)
-    return {
-      type: 'read',
-      filePath,
-      content: output,
-      offset: num(
-        input.offset ??
-          input.StartLine ??
-          input.ByteOffset ??
-          input.ContentOffset,
-      ),
-      limit:
-        num(input.limit) ??
-        (start !== undefined && end !== undefined
-          ? Math.max(1, end - start + 1)
-          : undefined),
-    }
-  }
   const query = str(
     input.Query ??
       input.SearchDirectory ??
@@ -162,7 +168,78 @@ export function toolDetail(
       input.query ??
       input.pattern,
   )
-  if (query) return { type: 'search', query, content: output }
+  if (query) {
+    const toolName = name.includes('grep')
+      ? ('grep' as const)
+      : name.includes('find_by_name') || name.includes('glob')
+        ? ('glob' as const)
+        : name.includes('search_web') || name.includes('web_search')
+          ? ('web_search' as const)
+          : undefined
+    const filePaths = tool.locations
+      ?.map((l) => l.path)
+      .filter((p): p is string => Boolean(p))
+    return {
+      type: 'search',
+      query,
+      ...(toolName ? { toolName } : {}),
+      content: output,
+      ...(filePaths?.length ? { filePaths } : {}),
+    }
+  }
+  if (filePath) {
+    if (/write/.test(name))
+      return {
+        type: 'write',
+        filePath,
+        content: str(input.Content ?? input.CodeContent ?? input.content),
+      }
+    if (tool.kind === 'edit' || /edit|replace/.test(name)) {
+      const chunks = Array.isArray(input.ReplacementChunks)
+        ? input.ReplacementChunks.map(record)
+        : undefined
+      return {
+        type: 'edit',
+        filePath,
+        oldString:
+          str(input.Target ?? input.TargetContent ?? input.old_string) ??
+          (chunks
+            ? chunks
+                .map((c) => str(c.TargetContent ?? c.Target) ?? '')
+                .join('\n...\n')
+            : undefined),
+        newString:
+          str(
+            input.Replacement ?? input.ReplacementContent ?? input.new_string,
+          ) ??
+          (chunks
+            ? chunks
+                .map((c) => str(c.ReplacementContent ?? c.Replacement) ?? '')
+                .join('\n...\n')
+            : undefined),
+      }
+    }
+    const cleaned = cleanReadOutput(output)
+    const start = num(input.StartLine) ?? cleaned.startLine
+    const end = num(input.EndLine) ?? cleaned.endLine
+    return {
+      type: 'read',
+      filePath,
+      content: cleaned.content,
+      offset:
+        num(
+          input.offset ??
+            input.StartLine ??
+            input.ByteOffset ??
+            input.ContentOffset,
+        ) ?? cleaned.startLine,
+      limit:
+        num(input.limit) ??
+        (start !== undefined && end !== undefined
+          ? Math.max(1, end - start + 1)
+          : undefined),
+    }
+  }
   return {
     type: 'plain_text',
     label: name,
@@ -471,7 +548,12 @@ export class Timeline {
           ? {
               ...base,
               status: 'failed',
-              error: JSON.stringify(tool.rawOutput ?? 'Tool failed'),
+              error:
+                typeof tool.rawOutput === 'string'
+                  ? tool.rawOutput
+                  : tool.rawOutput != null
+                    ? JSON.stringify(tool.rawOutput)
+                    : 'Tool failed',
             }
           : {
               ...base,

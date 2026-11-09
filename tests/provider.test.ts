@@ -211,6 +211,7 @@ test('list/import and replay before ready; skip does not replay', async () => {
     })
     const list = await h.wait((e) => e.type === 'sessions')
     assert.ok(list.type === 'sessions' && list.sessions.length === 1)
+    assert.equal(list.sessions[0].description, 'Last prompt preview')
     for (const history of ['replay', 'skip'] as const) {
       h.events.length = 0
       await h.provider.send({
@@ -1056,6 +1057,305 @@ test('background task wakeup settles before completing turn and deduplicates nex
         : [],
     )
     assert.deepEqual(assistantTexts, ['Next turn reply.'])
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('toolPolicy MCP preapprovals, allow_once default, deny interrupt, chooser question kind, and can_stop_runtime', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-permissions-layer-a-'))
+  const log = join(home, 'calls')
+  const h = await harness({ HOME: home, AGY_TEST_LOG: log })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      config: {
+        ...h.config,
+        toolPolicy: {
+          preapproved: [{ kind: 'mcp', server: 'rea', tool: 'open_binary' }],
+        },
+      },
+      history: 'skip',
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's')
+
+    // Idle session can stop runtime
+    await h.provider.send({
+      type: 'session.can_stop_runtime',
+      requestId: 'stop-idle',
+      sessionId: 's',
+    })
+    const idleStop = await h.wait(
+      (e) =>
+        e.type === 'session.can_stop_runtime' && e.requestId === 'stop-idle',
+    )
+    assert.ok(idleStop.type === 'session.can_stop_runtime' && idleStop.canStop)
+
+    // Preapproved MCP tools (both call_mcp_tool and mcp__rea__open_binary) auto-approve with allow_once ('yes')
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'mcp-1',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'mcp-preapproved' }],
+        },
+      },
+    })
+    await h.wait((e) => e.type === 'session.turn' && e.state === 'completed')
+    assert.ok(!h.events.some((e) => e.type === 'session.permission'))
+    assert.ok(
+      h.events.some(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'assistant_message' &&
+          e.item.text === 'mcp:yes,yes',
+      ),
+    )
+
+    // Non-preapproved tool prompts; active turn with pending permission cannot stop runtime; allow without selectedActionId picks allow_once ('yes')
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'perm-default-allow',
+        delivery: 'auto',
+        input: { type: 'message', content: [{ type: 'text', text: 'hello' }] },
+      },
+    })
+    const perm = await h.wait((e) => e.type === 'session.permission')
+    assert.ok(perm.type === 'session.permission')
+    assert.equal(perm.request.kind, 'tool')
+
+    await h.provider.send({
+      type: 'session.can_stop_runtime',
+      requestId: 'stop-busy',
+      sessionId: 's',
+    })
+    const busyStop = await h.wait(
+      (e) =>
+        e.type === 'session.can_stop_runtime' && e.requestId === 'stop-busy',
+    )
+    assert.ok(busyStop.type === 'session.can_stop_runtime' && !busyStop.canStop)
+
+    await h.provider.send({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: perm.request.id,
+      response: { behavior: 'allow' },
+    })
+    await h.wait((e) => e.type === 'session.turn' && e.state === 'completed')
+    assert.ok(
+      h.events.some(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'assistant_message' &&
+          e.item.text === 'selected:yes',
+      ),
+    )
+
+    // deny with interrupt: true cancels the active turn
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'perm-deny-interrupt',
+        delivery: 'auto',
+        input: { type: 'message', content: [{ type: 'text', text: 'hello' }] },
+      },
+    })
+    const permDeny = await h.wait((e) => e.type === 'session.permission')
+    assert.ok(permDeny.type === 'session.permission')
+    await h.provider.send({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: permDeny.request.id,
+      response: { behavior: 'deny', interrupt: true },
+    })
+    await h.wait((e) => e.type === 'session.turn' && e.state === 'canceled')
+
+    // Chooser request in full-access mode is classified as 'question' and is NOT auto-approved
+    await h.provider.send({
+      type: 'session.configure',
+      requestId: 'cfg-full',
+      sessionId: 's',
+      changes: { mode: 'full-access' },
+    })
+    await h.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'cfg-full',
+    )
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'chooser-1',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'chooser' }],
+        },
+      },
+    })
+    const chooserPerm = await h.wait((e) => e.type === 'session.permission')
+    assert.ok(chooserPerm.type === 'session.permission')
+    assert.equal(chooserPerm.request.kind, 'question')
+    await h.provider.send({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: chooserPerm.request.id,
+      response: { behavior: 'allow', selectedActionId: 'prod' },
+    })
+    await h.wait((e) => e.type === 'session.turn' && e.state === 'completed')
+    assert.ok(
+      h.events.some(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'assistant_message' &&
+          e.item.text === 'choice:prod',
+      ),
+    )
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('recursive multi-level subagents link depth-2 grandchild under child session, persist:false omits persistence, and session/resume is used on skip when supported', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-depth2-resume-'))
+  const log = join(home, 'calls')
+  const parentId = '11111111-1111-4111-8111-111111111111'
+  const childId = '22222222-2222-4222-8222-222222222222'
+  const grandId = '33333333-3333-4333-8333-333333333333'
+  const brainDir = join(home, '.gemini/antigravity-cli/brain')
+  const now = new Date().toISOString()
+
+  await mkdir(join(brainDir, childId, '.system_generated/logs'), {
+    recursive: true,
+  })
+  await mkdir(join(brainDir, grandId, '.system_generated/logs'), {
+    recursive: true,
+  })
+  await writeFile(
+    join(brainDir, childId, '.system_generated/logs/transcript_full.jsonl'),
+    [
+      {
+        step_index: 0,
+        type: 'SYSTEM_MESSAGE',
+        content: `<SYSTEM_MESSAGE>\n[Message] timestamp=${now} sender=${parentId} priority=MESSAGE_PRIORITY_HIGH content=spawn grandchild\n</SYSTEM_MESSAGE>`,
+      },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          {
+            id: 'spawn-grand',
+            name: 'invoke_subagent',
+            args: { Role: 'Grandchild Auditor', Prompt: 'audit details' },
+          },
+        ],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: JSON.stringify({ conversationId: grandId }),
+      },
+      {
+        step_index: 3,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'Child waiting for grandchild.',
+      },
+    ]
+      .map((r) => JSON.stringify(r) + '\n')
+      .join(''),
+  )
+  await writeFile(
+    join(brainDir, grandId, '.system_generated/logs/transcript_full.jsonl'),
+    [
+      {
+        step_index: 0,
+        type: 'SYSTEM_MESSAGE',
+        content: `<SYSTEM_MESSAGE>\n[Message] timestamp=${now} sender=${childId} priority=MESSAGE_PRIORITY_HIGH content=audit details\n</SYSTEM_MESSAGE>`,
+      },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'Grandchild done.',
+      },
+    ]
+      .map((r) => JSON.stringify(r) + '\n')
+      .join(''),
+  )
+
+  const h = await harness({
+    HOME: home,
+    AGY_TEST_LOG: log,
+    AGY_TEST_RESUME_CAP: '1',
+  })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-replay',
+      sessionId: 's',
+      config: h.config,
+      history: 'replay',
+      persistence: { version: 1, data: { sessionId: parentId } },
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's')
+    const grandOpened = h.events.find(
+      (e) =>
+        e.type === 'session.opened' && e.sessionId === `s:child:${grandId}`,
+    )
+    assert.ok(grandOpened?.type === 'session.opened')
+    assert.equal(grandOpened.parentSessionId, `s:child:${childId}`)
+    assert.equal(grandOpened.title, 'Grandchild Auditor')
+
+    // history: 'skip' uses session/resume when resume capability is advertised
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-resume',
+      sessionId: 's-resumed',
+      config: { ...h.config, systemPrompt: 'Resume instructions' },
+      history: 'skip',
+      persistence: { version: 1, data: { sessionId: 'native-test' } },
+    })
+    await h.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 's-resumed',
+    )
+    assert.ok(
+      (await readFile(log, 'utf8')).includes('resume:Resume instructions\n'),
+    )
+
+    // persist: false omits persistence on session.opened
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-ephemeral',
+      sessionId: 's-ephemeral',
+      config: { ...h.config, persist: false, title: 'Ephemeral Task' },
+      history: 'skip',
+    })
+    await h.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 's-ephemeral',
+    )
+    const ephOpened = h.events.find(
+      (e) => e.type === 'session.opened' && e.sessionId === 's-ephemeral',
+    )
+    assert.ok(ephOpened?.type === 'session.opened')
+    assert.equal(ephOpened.persistence, undefined)
+    assert.equal(ephOpened.title, 'Ephemeral Task')
   } finally {
     await h.provider.close()
     await rm(home, { recursive: true, force: true })

@@ -372,6 +372,7 @@ export async function readSubagents(
 export class BrainTranscriptProjector {
   private pending: PendingTool[] = []
   private background = new Map<string, PendingTool>()
+  private daemons = new Set<string>()
   private touchedSubagents = new Set<string>()
   private stepCallIds = new Map<number, string>()
   private stepSubagents = new Map<number, SubagentRecord>()
@@ -408,6 +409,10 @@ export class BrainTranscriptProjector {
 
   hasBackground(): boolean {
     return this.background.size > 0
+  }
+
+  hasDaemons(): boolean {
+    return this.daemons.size > 0
   }
 
   touchedSubagentIds(): ReadonlySet<string> {
@@ -473,6 +478,7 @@ export class BrainTranscriptProjector {
           // Stopped calls never log a result; child transcripts have no USER_INPUT to reset them.
           this.pending = []
           this.background.clear()
+          this.daemons.clear()
           this.touchedSubagents.clear()
           return []
         }
@@ -481,6 +487,8 @@ export class BrainTranscriptProjector {
         for (const match of taskResults) {
           finishedIds.add(match[1])
           finishedIds.add(match[2])
+          this.daemons.delete(match[1])
+          this.daemons.delete(match[2])
         }
         const senders = [...text.matchAll(/\bsender=(\S+)/g)].map((m) => m[1])
         for (const sender of senders) {
@@ -527,6 +535,7 @@ export class BrainTranscriptProjector {
       case 'ERROR_MESSAGE':
         this.pending = []
         this.background.clear()
+        this.daemons.clear()
         this.touchedSubagents.clear()
         return [
           {
@@ -541,9 +550,20 @@ export class BrainTranscriptProjector {
         if (!pending) return []
         if (runningStepStatuses.has(String(row.status))) {
           const taskId = text.match(backgroundTaskPattern)?.[1]
-          if (taskId && pending.args.IsDaemon !== true)
-            this.background.set(taskId, pending)
+          if (taskId) {
+            if (pending.args.IsDaemon === true) this.daemons.add(taskId)
+            else this.background.set(taskId, pending)
+          }
           return []
+        }
+        if (
+          pending.name.includes('manage_task') &&
+          pending.args.Action === 'kill' &&
+          typeof pending.args.TaskId === 'string' &&
+          terminalToolStatus(row.status) === 'completed'
+        ) {
+          this.background.delete(pending.args.TaskId)
+          this.daemons.delete(pending.args.TaskId)
         }
         const subagent =
           this.callSubagents.get(pending.callId) ??
@@ -878,7 +898,8 @@ export async function hasActiveBackgroundWork(
         minTurnStepIndex = Number(row.step_index)
       }
     }
-    if (node.projector.hasBackground()) return true
+    if (node.projector.hasBackground() || node.projector.hasDaemons())
+      return true
     // A failed child is finished; anything else unsettled is still working.
     if (
       isChild &&

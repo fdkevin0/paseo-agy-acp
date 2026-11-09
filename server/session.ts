@@ -19,7 +19,11 @@ import type {
   ProviderTimelineItem,
   ProviderUsage,
 } from '@getpaseo/plugin/server/provider'
-import { RequestPermissionRequestSchema } from './permissions.ts'
+import {
+  RequestPermissionRequestSchema,
+  isChooserRequest,
+  isPreapprovedMcpTool,
+} from './permissions.ts'
 import {
   BrainTranscriptProjector,
   hasActiveBackgroundWork,
@@ -129,15 +133,26 @@ export class SessionManager {
         session.state.persisted = Boolean(input.persistence)
         session.state.replay = input.history === 'replay'
         if (input.persistence) {
-          if (!session.initialized.agentCapabilities?.loadSession)
+          const canResume =
+            input.history === 'skip' &&
+            Boolean(
+              session.initialized.agentCapabilities?.sessionCapabilities
+                ?.resume,
+            )
+          if (!canResume && !session.initialized.agentCapabilities?.loadSession)
             throw new Error('agy does not support session/load')
           session.state.nativeId = data.sessionId as string
           session.state.metadata = {
             ...(await session.transport.request(
-              session.transport.rpc.loadSession({
-                ...params,
-                sessionId: session.state.nativeId,
-              }),
+              canResume
+                ? session.transport.rpc.resumeSession({
+                    ...params,
+                    sessionId: session.state.nativeId,
+                  })
+                : session.transport.rpc.loadSession({
+                    ...params,
+                    sessionId: session.state.nativeId,
+                  }),
             )),
             sessionId: session.state.nativeId,
           }
@@ -165,10 +180,15 @@ export class SessionManager {
           cwd: input.config.cwd,
           restoration: 'core',
           capabilities,
-          persistence: {
-            version: 1,
-            data: { sessionId: session.state.nativeId },
-          },
+          ...(input.config.title ? { title: input.config.title } : {}),
+          ...(input.config.persist !== false
+            ? {
+                persistence: {
+                  version: 1,
+                  data: { sessionId: session.state.nativeId },
+                },
+              }
+            : {}),
         })
         session.flush()
         if (input.persistence) await session.replayTools()
@@ -209,11 +229,15 @@ export class SessionManager {
         kind.startsWith(
           input.response.behavior === 'allow' ? 'allow' : 'reject',
         )
-      const option = permission.request.options.find((o) =>
-        input.response.selectedActionId
-          ? o.optionId === input.response.selectedActionId && allowed(o.kind)
-          : allowed(o.kind),
-      )
+      const preferred =
+        input.response.behavior === 'allow' ? 'allow_once' : 'reject_once'
+      const option = input.response.selectedActionId
+        ? permission.request.options.find(
+            (o) =>
+              o.optionId === input.response.selectedActionId && allowed(o.kind),
+          )
+        : (permission.request.options.find((o) => o.kind === preferred) ??
+          permission.request.options.find((o) => allowed(o.kind)))
       permission.resolve({
         outcome: option
           ? { outcome: 'selected', optionId: option.optionId }
@@ -225,6 +249,8 @@ export class SessionManager {
         sessionId: session.id,
         permissionId: input.permissionId,
       })
+      if (input.response.behavior === 'deny' && input.response.interrupt)
+        await session.interrupt()
       return
     }
     if (input.type === 'session.configure')
@@ -232,12 +258,11 @@ export class SessionManager {
     else if (input.type === 'session.interrupt') {
       await session.interrupt()
     } else if (input.type === 'session.can_stop_runtime') {
-      // ACP cannot prove native background tasks are idle.
       emit({
         type: input.type,
         requestId: input.requestId,
         sessionId: session.id,
-        canStop: false,
+        canStop: await session.canStop(),
       })
       return
     } else if (input.type === 'session.close') {
@@ -343,10 +368,11 @@ async function createSession(
   }
   async function syncKilledChildren(
     subagents?: Awaited<ReturnType<typeof readSubagents>>,
+    parentNativeId = state.nativeId,
   ) {
     const list =
       subagents ??
-      (await readSubagents(brainRoot, state.nativeId).catch(() => []))
+      (await readSubagents(brainRoot, parentNativeId).catch(() => []))
     const cancels: Promise<void>[] = []
     for (const sub of list)
       if (sub.state === 'SUBAGENT_STATE_KILLED') {
@@ -369,7 +395,11 @@ async function createSession(
         brainRoot,
         nativeId,
         childId,
-        emit,
+        (event) => {
+          if (event.type === 'timeline.item')
+            linkSubsession(childId, nativeId, event.item)
+          emit(event)
+        },
         1000,
         () => Boolean(state.turn),
         resume,
@@ -402,13 +432,12 @@ async function createSession(
       watchChild(nativeId, childId, existing.resumePoint())
     })
   }
-  /** Brain-projected items are not yet known to the ACP timeline. */
-  function emitItem(item: ProviderTimelineItem, timestamp?: string) {
-    timeline.track(item)
-    publishItem(item, timestamp)
-  }
-  /** Link child sessions and publish an item the timeline already tracks. */
-  function publishItem(item: ProviderTimelineItem, timestamp?: string) {
+  /** Open or resume direct child sub-sessions for root or nested subagents. */
+  function linkSubsession(
+    parentSessionId: string,
+    parentNativeId: string,
+    item: ProviderTimelineItem,
+  ) {
     if (
       capabilities.includes('session.subsession') &&
       item.type === 'tool_call' &&
@@ -429,7 +458,7 @@ async function createSession(
           emit({
             type: 'session.opened',
             sessionId: childId,
-            parentSessionId: id,
+            parentSessionId,
             toolCallId: item.callId,
             cwd,
             capabilities: [],
@@ -447,8 +476,17 @@ async function createSession(
       item.status === 'completed' &&
       item.name.includes('manage_subagents')
     ) {
-      void syncKilledChildren()
+      void syncKilledChildren(undefined, parentNativeId)
     }
+  }
+  /** Brain-projected items are not yet known to the ACP timeline. */
+  function emitItem(item: ProviderTimelineItem, timestamp?: string) {
+    timeline.track(item)
+    publishItem(item, timestamp)
+  }
+  /** Link child sessions and publish an item the timeline already tracks. */
+  function publishItem(item: ProviderTimelineItem, timestamp?: string) {
+    linkSubsession(id, state.nativeId, item)
     if (state.replay)
       emit({
         type: 'timeline.item',
@@ -555,7 +593,13 @@ async function createSession(
         .safeParse(record(request.toolCall?.rawInput))
       if (!input.success)
         return Promise.resolve({ outcome: { outcome: 'cancelled' as const } })
-      if (state.metadata.fullAccess) {
+      const chooser = isChooserRequest(request.options)
+      const preapproved = isPreapprovedMcpTool(
+        request.toolCall.title,
+        input.data,
+        config?.toolPolicy,
+      )
+      if (!chooser && (state.metadata.fullAccess || preapproved)) {
         const allow =
           request.options.find((o) => o.kind === 'allow_once') ??
           request.options.find((o) => o.kind.startsWith('allow'))
@@ -565,6 +609,17 @@ async function createSession(
             : { outcome: 'cancelled' as const },
         })
       }
+      const detail = toolDetail(request.toolCall)
+      const title = request.toolCall.title ?? ''
+      const kind =
+        chooser || /^ask_(?:question|user)$/i.test(title)
+          ? ('question' as const)
+          : request.toolCall.kind === 'switch_mode' ||
+              /^(?:switch_mode|exit_plan_mode)$/i.test(title)
+            ? ('mode' as const)
+            : detail.type === 'plan'
+              ? ('plan' as const)
+              : ('tool' as const)
       return new Promise<RequestPermissionResponse>((resolve) => {
         const permissionId = randomUUID()
         permissions.set(permissionId, { request, resolve })
@@ -574,10 +629,10 @@ async function createSession(
           request: {
             id: permissionId,
             name: request.toolCall.title ?? 'Tool',
-            kind: 'tool',
+            kind,
             title: request.toolCall.title ?? undefined,
             input: input.data,
-            detail: toolDetail(request.toolCall),
+            detail,
             actions: request.options.map((o) => ({
               id: o.optionId,
               label: o.name,
@@ -682,8 +737,27 @@ async function createSession(
             emitItem(item)
           }
         // A child opened by the last replayed tool must read its history before a historical kill cancels it.
-        await Promise.all([...children.values()].map((child) => child.ready))
+        let settledCount = 0
+        while (settledCount !== children.size) {
+          settledCount = children.size
+          await Promise.all([...children.values()].map((child) => child.ready))
+        }
         await syncKilledChildren(subagents)
+      },
+      async canStop(): Promise<boolean> {
+        if (
+          state.closing ||
+          state.opening ||
+          state.loading ||
+          state.turn ||
+          state.interrupting ||
+          permissions.size > 0 ||
+          [...children.values()].some((child) => child.isRunning())
+        )
+          return false
+        return !(await hasActiveBackgroundWork(brainRoot, state.nativeId).catch(
+          () => true,
+        ))
       },
       flush() {
         state.opening = false
@@ -800,7 +874,7 @@ async function createSession(
           terminalize('canceled')
           const disposable =
             !state.persisted &&
-            state.prompts.size === 0 &&
+            (config?.persist === false || state.prompts.size === 0) &&
             sessionIdPattern.test(state.nativeId)
           if (disposable)
             await currentTransport
