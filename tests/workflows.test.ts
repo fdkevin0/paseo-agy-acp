@@ -40,7 +40,7 @@ function fixture(t: TestContext, version = '1.2.3') {
   mkdirSync(join(root, 'bin'))
   writeFileSync(
     join(root, 'package.json'),
-    JSON.stringify({ name: '@fdkevin0/paseo-agy-acp', version }),
+    JSON.stringify({ name: '@fdkevin/paseo-agy-acp', version }),
   )
   for (const [command, script] of Object.entries({
     curl: 'printf "curl %s\\n" "$*" >> "$CALLS_FILE"\nprintf "%s" "$HTTP_STATUS"\nexit "${CURL_EXIT:-0}"\n',
@@ -165,7 +165,7 @@ test('only registry 404 allows publication; HTTP errors and timeouts fail closed
     assert.equal(result.output, `published=${published}\n`)
     assert.equal(
       result.calls,
-      'curl --silent --show-error --max-time 30 --output /dev/null --write-out %{http_code} https://registry.npmjs.org/@fdkevin0/paseo-agy-acp/1.2.3\n',
+      'curl --silent --show-error --max-time 30 --output /dev/null --write-out %{http_code} https://registry.npmjs.org/@fdkevin/paseo-agy-acp/1.2.3\n',
     )
   }
   for (const env of [
