@@ -867,6 +867,7 @@ export async function hasActiveBackgroundWork(
     if (inbox.unconsumedHighPriority.length > 0) return true
     if (isChild && rows.length === 0) return true
     let minTurnStepIndex = -1
+    let seenPlannerResponse = false
     let foregroundIdle = false
     let wokeUp = false
     for (const row of rows) {
@@ -877,6 +878,7 @@ export async function hasActiveBackgroundWork(
             restartNoticePattern.test(String(row.content ?? ''))))
       ) {
         minTurnStepIndex = Number(row.step_index)
+        seenPlannerResponse = false
         foregroundIdle = false
         wokeUp = false
       }
@@ -889,20 +891,29 @@ export async function hasActiveBackgroundWork(
         wokeUp = true
       }
       node.ingest(row)
+      if (!isChild && row.type === 'PLANNER_RESPONSE')
+        seenPlannerResponse = true
       if (
         !isChild &&
+        seenPlannerResponse &&
         !node.projector.hasPending() &&
         (isCompletePlannerResponse(row) || row.type === 'GENERIC')
       ) {
         foregroundIdle = true
       }
     }
-    if (node.hasUnprocessedMessages(inbox) || node.projector.hasBackground())
-      return true
+    if (node.projector.hasBackground()) return true
     // A failed step is finished; an unsettled child or woken parent turn is still working outside ACP prompt RPC.
     if (
-      (isChild || wokeUp) &&
-      !node.isSettled(inbox) &&
+      isChild &&
+      (node.hasUnprocessedMessages(inbox) ||
+        (!node.isSettled(inbox) && node.lastStep?.type !== 'ERROR_MESSAGE'))
+    )
+      return true
+    if (
+      wokeUp &&
+      (node.projector.hasPending() ||
+        !isCompletePlannerResponse(node.lastStep)) &&
       node.lastStep?.type !== 'ERROR_MESSAGE'
     )
       return true
@@ -1013,6 +1024,7 @@ export async function settleBrainTurn(
     shouldEmitPreWakeupTool,
     transcriptGraceMs = 0,
     stallTimeoutMs = 120_000,
+    wokenStallTimeoutMs = 15 * 60_000,
     isWaitingOnUser,
   }: {
     signal?: AbortSignal
@@ -1026,11 +1038,14 @@ export async function settleBrainTurn(
     transcriptGraceMs?: number
     /** Give up when nothing tracked is running and the transcript stays idle without a final response. */
     stallTimeoutMs?: number
+    /** Upper bound on a single silent woken-turn step (tool execution or post-wakeup/post-tool LLM generation). */
+    wokenStallTimeoutMs?: number
     /** Pending approvals legitimately block agy; they suspend the stall timeout. */
     isWaitingOnUser?: () => boolean
   } = {},
 ): Promise<{
   status: 'completed' | 'canceled' | 'failed'
+  stalled?: boolean
   error?: string
   lastStepUsage?: StepUsage
 }> {
@@ -1050,14 +1065,19 @@ export async function settleBrainTurn(
   const dedupe = new StepDedupe()
   let lastStepUsage: StepUsage | undefined
   const withinGrace = () => Date.now() - startedAt < transcriptGraceMs
-  const stall = () => {
-    const error = `Stopped waiting for agy: transcript_full.jsonl was idle for ${Math.round(stallTimeoutMs / 1000)}s without a final response.`
+  const stall = (timeoutMs = stallTimeoutMs) => {
+    const error = `Stopped waiting for agy: transcript_full.jsonl was idle for ${Math.round(timeoutMs / 1000)}s without a final response.`
     onItem({
       type: 'error',
       id: `${sessionId}:step:${lastStepIndex}:stalled`,
       message: error,
     })
-    return { status: 'failed' as const, error, lastStepUsage }
+    return {
+      status: 'failed' as const,
+      stalled: true,
+      error,
+      lastStepUsage,
+    }
   }
   // Without a Brain directory this session never persists a transcript; there is nothing to wait for.
   const sessionDirExists = () =>
@@ -1192,27 +1212,24 @@ export async function settleBrainTurn(
       }
       return { status: 'completed', lastStepUsage }
     }
-    // Background tasks, live children, running/pending tools and woken-turn LLM generation may legitimately
-    // run for a long time without writing to transcript_full.jsonl; anything else idle is a stall.
-    const awaitingWokenPlanner =
-      node.consumedMessages < inbox.consumedNonUserCount ||
-      (wokeUp &&
-        ((node.lastStep?.type === 'SYSTEM_MESSAGE' &&
+    // Background tasks, live children and user approvals may run indefinitely; woken-turn tools and
+    // post-wakeup/post-tool LLM generation get a bounded longer window (wokenStallTimeoutMs) before stalling.
+    const wokenWorking =
+      wokeUp &&
+      (node.projector.hasPending() ||
+        (node.lastStep?.type === 'SYSTEM_MESSAGE' &&
           !restartNoticePattern.test(String(node.lastStep.content ?? ''))) ||
-          (node.lastStep?.type === 'GENERIC' &&
-            node.lastStep.status !== 'CANCELED' &&
-            node.lastStep.status !== 'INTERRUPTED')))
+        (node.lastStep?.type === 'GENERIC' &&
+          node.lastStep.status !== 'CANCELED' &&
+          node.lastStep.status !== 'INTERRUPTED'))
     const tracking =
       node.projector.hasBackground() ||
-      node.projector.hasPending() ||
-      (node.lastStep?.type === 'GENERIC' &&
-        runningStepStatuses.has(String(node.lastStep.status))) ||
-      awaitingWokenPlanner ||
       !childStatus.settled ||
       isWaitingOnUser?.() === true
+    const idleLimitMs = wokenWorking ? wokenStallTimeoutMs : stallTimeoutMs
     if (tracking) lastActivity = Date.now()
-    else if (Date.now() - lastActivity >= stallTimeoutMs) {
-      return stall()
+    else if (Date.now() - lastActivity >= idleLimitMs) {
+      return stall(idleLimitMs)
     }
     await pause(pollIntervalMs, signal)
   }

@@ -1409,7 +1409,7 @@ test('a settled ALIVE child does not suspend the parent stall timeout', async ()
   }
 })
 
-test('woken-turn LLM generation after SYSTEM_MESSAGE or completed GENERIC suspends the stall timeout until the final response', async () => {
+test('woken-turn LLM generation after SYSTEM_MESSAGE or completed GENERIC uses wokenStallTimeoutMs and stalls if that cap expires', async () => {
   const f = await fixture()
   try {
     await f.subagent(parent, child)
@@ -1435,17 +1435,18 @@ test('woken-turn LLM generation after SYSTEM_MESSAGE or completed GENERIC suspen
       settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
         minStepIndex: -1,
         pollIntervalMs: 5,
-        stallTimeoutMs: 30,
+        stallTimeoutMs: 25,
+        wokenStallTimeoutMs: 200,
       }),
     ).then((res) => {
       settled = true
       return res
     })
-    await delay(80)
+    await delay(70)
     assert.equal(
       settled,
       false,
-      'post-GENERIC LLM generation in a woken turn must not trigger a stall timeout',
+      'post-GENERIC LLM generation in a woken turn must not trigger the short stallTimeoutMs',
     )
     await appendFile(
       f.path(parent),
@@ -1475,6 +1476,127 @@ test('woken-turn LLM generation after SYSTEM_MESSAGE or completed GENERIC suspen
           i.text === 'Final synthesis complete.',
       ),
     )
+
+    // A woken turn that never produces a follow-up response after SYSTEM_MESSAGE or GENERIC still stalls at wokenStallTimeoutMs.
+    await f.put(parent, [
+      ...invoke(child),
+      message(5, child, 'Report'),
+      {
+        step_index: 6,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ id: 'r1', name: 'read_file', args: { Path: '/a.ts' } }],
+      },
+      { step_index: 7, type: 'GENERIC', status: 'DONE', content: 'code' },
+    ])
+    const stalledItems: ProviderTimelineItem[] = []
+    const stalledResult = await alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => stalledItems.push(item), {
+        minStepIndex: -1,
+        pollIntervalMs: 5,
+        stallTimeoutMs: 20,
+        wokenStallTimeoutMs: 60,
+      }),
+    )
+    assert.equal(stalledResult.status, 'failed')
+    assert.equal(stalledResult.stalled, true)
+    assert.ok(
+      stalledItems.some(
+        (i) => i.type === 'error' && i.id === 'p:step:7:stalled',
+      ),
+    )
+  } finally {
+    await f.close()
+  }
+})
+
+test('unmatched foreground tool calls and permanent consumed-message drift still stall at stallTimeoutMs', async () => {
+  const f = await fixture()
+  try {
+    // 1. Unmatched foreground tool call (!wokeUp with hasPending() === true)
+    await f.put(parent, [
+      { step_index: 1, type: 'USER_INPUT', content: 'run' },
+      {
+        step_index: 2,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ id: 'orphan', name: 'read_file', args: {} }],
+      },
+    ])
+    const orphanResult = await alive(
+      settleBrainTurn(f.root, parent, 'p', () => {}, {
+        pollIntervalMs: 5,
+        stallTimeoutMs: 30,
+        wokenStallTimeoutMs: 500,
+      }),
+    )
+    assert.equal(orphanResult.status, 'failed')
+    assert.equal(orphanResult.stalled, true)
+
+    // 2. Permanent gap between inbox.consumedNonUserCount and rendered [Message] sender= lines
+    await f.deliver(parent, child, 'Unrendered message', true, 'drift')
+    await f.put(parent, [
+      { step_index: 1, type: 'USER_INPUT', content: 'run' },
+      done(2, 'Done without rendering inbox message'),
+    ])
+    const driftResult = await alive(
+      settleBrainTurn(f.root, parent, 'p', () => {}, {
+        pollIntervalMs: 5,
+        stallTimeoutMs: 30,
+        wokenStallTimeoutMs: 500,
+      }),
+    )
+    assert.equal(driftResult.status, 'failed')
+    assert.equal(driftResult.stalled, true)
+  } finally {
+    await f.close()
+  }
+})
+
+test('hasActiveBackgroundWork tracks woken parent turns without false positives from native GENERIC rows or message drift', async () => {
+  const f = await fixture()
+  try {
+    await f.subagent(parent, child)
+    await f.deliver(parent, child, 'Report', true, 'report')
+    await f.put(child, [
+      message(0, parent, 'work'),
+      ...report(parent, 'Report'),
+    ])
+
+    // Woken parent awaiting LLM generation after SYSTEM_MESSAGE or GENERIC is active
+    await f.put(parent, [...invoke(child), message(5, child, 'Report')])
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), true)
+
+    await appendFile(
+      f.path(parent),
+      encode([
+        {
+          step_index: 6,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [{ id: 'r1', name: 'read_file', args: {} }],
+        },
+        { step_index: 7, type: 'GENERIC', status: 'DONE', content: 'ok' },
+      ]),
+    )
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), true)
+
+    // Once woken parent emits final PLANNER_RESPONSE, it is no longer active even if consumedNonUserCount drifted
+    await f.deliver(parent, child, 'Unrendered drift', true, 'drift-msg')
+    await appendFile(f.path(parent), encode([done(8, 'All done')]))
+    assert.equal(
+      await hasActiveBackgroundWork(f.root, parent),
+      false,
+      'settled woken parent must not stay active due to consumedNonUserCount drift',
+    )
+
+    // Native command GENERIC row without a prior PLANNER_RESPONSE followed by SYSTEM_MESSAGE does not count as woken
+    await f.put(parent, [
+      { step_index: 10, type: 'USER_INPUT', content: '/compact' },
+      { step_index: 11, type: 'GENERIC', status: 'DONE', content: 'compacted' },
+      { step_index: 12, type: 'SYSTEM_MESSAGE', content: 'info' },
+    ])
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
   } finally {
     await f.close()
   }
