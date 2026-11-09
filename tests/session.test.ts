@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -158,3 +158,264 @@ test(
     }
   },
 )
+
+for (const blocked of ['closing', 'failed', 'capability'] as const) {
+  test(`subagent items clear native IDs when linking is blocked by ${blocked}`, async () => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-blocked-link-'))
+    const events: ProviderEvent[] = []
+    const m = new SessionManager({
+      launch: {
+        command: process.execPath,
+        args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+        env: { HOME: home, PATH: process.env.PATH ?? '' },
+      },
+      usage: new AgyUsageSource(),
+      capabilities: blocked === 'capability' ? [] : ['session.subsession'],
+      emit: (e) => events.push(structuredClone(e)),
+    })
+    const session = await m.start('s', home)
+    try {
+      session.state.nativeId = '11111111-1111-4111-8111-111111111111'
+      session.state.persisted = true
+      if (blocked !== 'capability') session.state[blocked] = true
+      session.emitItem({
+        type: 'tool_call',
+        id: 'tool',
+        callId: 'tool',
+        name: 'invoke_subagent',
+        status: 'completed',
+        error: null,
+        detail: {
+          type: 'sub_agent',
+          log: '',
+          childSessionId: '22222222-2222-4222-8222-222222222222',
+        },
+      })
+      assert.equal(events.filter((e) => e.type === 'session.opened').length, 0)
+      const item = events.find((e) => e.type === 'timeline.item')
+      assert.ok(
+        item?.type === 'timeline.item' &&
+          item.item.type === 'tool_call' &&
+          item.item.detail.type === 'sub_agent',
+      )
+      assert.equal(item.item.detail.childSessionId, undefined)
+    } finally {
+      await session.close()
+      await m.close()
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+}
+
+for (const failure of ['closing', 'failed'] as const) {
+  test(`terminalizing during ownership refresh never exposes native IDs: ${failure}`, async (t) => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-refresh-boundary-'))
+    const events: ProviderEvent[] = []
+    const m = new SessionManager({
+      launch: {
+        command: process.execPath,
+        args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+        env: { HOME: home, PATH: process.env.PATH ?? '' },
+      },
+      usage: new AgyUsageSource(),
+      capabilities: ['session.subsession'],
+      emit: (e) => events.push(structuredClone(e)),
+    })
+    const session = await m.start('s', home)
+    try {
+      session.state.nativeId = '11111111-1111-4111-8111-111111111111'
+      session.state.persisted = true
+      session.state.loading = false
+      await session.flush()
+      const update = session.timeline.update.bind(session.timeline)
+      let interrupted = false
+      t.mock.method(
+        session.timeline,
+        'update',
+        (...args: Parameters<typeof update>) => {
+          const item = update(...args)
+          if (item?.type === 'tool_call' && item.name === 'send_message')
+            queueMicrotask(() => {
+              interrupted = true
+              session.state[failure] = true
+              session.terminalize(failure === 'failed' ? 'failed' : 'canceled')
+            })
+          return item
+        },
+      )
+      await session.transport.rpc.prompt({
+        sessionId: session.state.nativeId,
+        prompt: [{ type: 'text', text: 'message-refresh-boundary' }],
+      })
+      await session.drain()
+      assert.equal(interrupted, true)
+      const tools = events.filter(
+        (e) => e.type === 'timeline.item' && e.item.type === 'tool_call',
+      )
+      assert.equal(tools.length, 1)
+      for (const event of tools) {
+        assert.ok(
+          event.type === 'timeline.item' &&
+            event.item.type === 'tool_call' &&
+            event.item.detail.type === 'sub_agent',
+        )
+        assert.equal(event.item.detail.childSessionId, undefined)
+        assert.equal(
+          event.item.status,
+          failure === 'failed' ? 'failed' : 'canceled',
+        )
+      }
+    } finally {
+      await session.close()
+      await m.close()
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+}
+
+for (const killedAtSpawn of [false, true]) {
+  test(`syncKilledChildren waits for grandchild history and cancellation (killed at spawn: ${killedAtSpawn})`, async () => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-grandchild-cancel-'))
+    const events: ProviderEvent[] = []
+    const root = '11111111-1111-4111-8111-111111111111'
+    const child = '22222222-2222-4222-8222-222222222222'
+    const grand = '33333333-3333-4333-8333-333333333333'
+    const logs = join(
+      home,
+      '.gemini/antigravity-cli/brain',
+      child,
+      '.system_generated/logs',
+    )
+    await mkdir(logs, { recursive: true })
+    await writeFile(
+      join(logs, 'transcript_full.jsonl'),
+      [
+        {
+          step_index: 0,
+          type: 'PLANNER_RESPONSE',
+          tool_calls: [
+            {
+              id: 'spawn-grand',
+              name: 'invoke_subagent',
+              args: { Prompt: 'work' },
+            },
+          ],
+        },
+        {
+          step_index: 1,
+          type: 'GENERIC',
+          status: 'DONE',
+          content: JSON.stringify({ conversationId: grand }),
+        },
+      ]
+        .map((row) => JSON.stringify(row) + '\n')
+        .join(''),
+    )
+    if (killedAtSpawn) {
+      const descriptors = join(
+        home,
+        '.gemini/antigravity-cli/brain',
+        child,
+        '.system_generated/subagents',
+      )
+      await mkdir(descriptors, { recursive: true })
+      await writeFile(
+        join(descriptors, `${grand}.json`),
+        JSON.stringify({
+          conversationId: grand,
+          state: 'SUBAGENT_STATE_KILLED',
+        }),
+      )
+    }
+    const grandLogs = join(
+      home,
+      '.gemini/antigravity-cli/brain',
+      grand,
+      '.system_generated/logs',
+    )
+    await mkdir(grandLogs, { recursive: true })
+    await writeFile(
+      join(grandLogs, 'transcript_full.jsonl'),
+      [
+        {
+          step_index: 0,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: 'Grandchild before kill',
+        },
+        {
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          tool_calls: [
+            {
+              id: 'pending',
+              name: 'run_command',
+              args: { CommandLine: 'work' },
+            },
+          ],
+        },
+      ]
+        .map((row) => JSON.stringify(row) + '\n')
+        .join(''),
+    )
+    const m = new SessionManager({
+      launch: {
+        command: process.execPath,
+        args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+        env: { HOME: home, PATH: process.env.PATH ?? '' },
+      },
+      usage: new AgyUsageSource(),
+      capabilities: ['session.subsession'],
+      emit: (e) => events.push(structuredClone(e)),
+    })
+    const session = await m.start('s', home)
+    try {
+      session.state.nativeId = root
+      session.state.persisted = true
+      session.state.loading = false
+      session.emitItem({
+        type: 'tool_call',
+        id: 'spawn-child',
+        callId: 'spawn-child',
+        name: 'invoke_subagent',
+        status: 'completed',
+        error: null,
+        detail: { type: 'sub_agent', log: '', childSessionId: child },
+      })
+      const deadline = Date.now() + 2000
+      while (!session.hasChild(grand)) {
+        assert.ok(Date.now() < deadline, 'grandchild not opened')
+        await delay(5)
+      }
+      session.rememberSubagents(
+        [
+          {
+            conversationId: grand,
+            state: 'SUBAGENT_STATE_KILLED',
+            spawnStepIndex: 1,
+          },
+        ],
+        child,
+      )
+      await session.syncKilledChildren([])
+      const saved = events.findIndex(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.sessionId === `s:child:${grand}` &&
+          e.item.type === 'assistant_message' &&
+          e.item.text === 'Grandchild before kill',
+      )
+      const canceled = events.findIndex(
+        (e) =>
+          e.type === 'session.turn' &&
+          e.sessionId === `s:child:${grand}` &&
+          e.state === 'canceled',
+      )
+      assert.ok(saved >= 0 && canceled > saved)
+    } finally {
+      await session.close()
+      await m.close()
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+}
