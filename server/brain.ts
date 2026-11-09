@@ -6,6 +6,7 @@ import {
   stat,
   type FileHandle,
 } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { join, sep } from 'node:path'
 import {
   Timeline,
@@ -792,13 +793,18 @@ class StepDedupe {
   /** Whether this row is new or changed since its step was last seen. */
   fresh(row: Record<string, unknown>): boolean {
     const step = Number(row.step_index)
-    const signature = JSON.stringify([
-      row.type,
-      row.status ?? '',
-      row.content ?? '',
-      row.thinking ?? '',
-      row.tool_calls ?? null,
-    ])
+    // Store a digest, not the payload: long-lived watchers would otherwise retain every step's full text.
+    const signature = createHash('sha1')
+      .update(
+        JSON.stringify([
+          row.type,
+          row.status ?? '',
+          row.content ?? '',
+          row.thinking ?? '',
+          row.tool_calls ?? null,
+        ]),
+      )
+      .digest('base64')
     if (this.seen.get(step) === signature) return false
     this.seen.set(step, signature)
     return true
