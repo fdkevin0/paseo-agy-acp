@@ -12,6 +12,7 @@ import {
   record,
   toolDetail,
   sessionIdPattern,
+  addStepUsage,
   type StepUsage,
 } from './mapping.ts'
 import type {
@@ -791,9 +792,13 @@ class StepDedupe {
   /** Whether this row is new or changed since its step was last seen. */
   fresh(row: Record<string, unknown>): boolean {
     const step = Number(row.step_index)
-    const contentLen = typeof row.content === 'string' ? row.content.length : 0
-    const toolsLen = Array.isArray(row.tool_calls) ? row.tool_calls.length : 0
-    const signature = `${String(row.type)}:${String(row.status ?? '')}:${contentLen}:${toolsLen}`
+    const signature = JSON.stringify([
+      row.type,
+      row.status ?? '',
+      row.content ?? '',
+      row.thinking ?? '',
+      row.tool_calls ?? null,
+    ])
     if (this.seen.get(step) === signature) return false
     this.seen.set(step, signature)
     return true
@@ -805,6 +810,7 @@ class BrainNode {
   projector: BrainTranscriptProjector
   readonly children = new Map<string, BrainNode>()
   consumedMessages = 0
+  turnStartStep = -1
   seenPlannerResponse = false
   foregroundIdleReached = false
   wokeUp = false
@@ -822,6 +828,7 @@ class BrainNode {
     this.projector = new BrainTranscriptProjector(this.sessionId)
     this.projector.syncMetadata(inbox, subagents)
     this.consumedMessages = 0
+    this.turnStartStep = -1
     this.seenPlannerResponse = false
     this.foregroundIdleReached = false
     this.wokeUp = false
@@ -843,6 +850,7 @@ class BrainNode {
       row.type === 'SYSTEM_MESSAGE' &&
       restartNoticePattern.test(String(row.content ?? ''))
     if (row.type === 'USER_INPUT' || isRestart) {
+      this.turnStartStep = Number(row.step_index)
       this.seenPlannerResponse = false
       this.foregroundIdleReached = false
       this.wokeUp = false
@@ -896,18 +904,7 @@ export async function hasActiveBackgroundWork(
     ])
     if (inbox.unconsumedHighPriority.length > 0) return true
     if (isChild && rows.length === 0) return true
-    let minTurnStepIndex = -1
-    for (const row of rows) {
-      node.ingest(row)
-      if (
-        !isChild &&
-        (row.type === 'USER_INPUT' ||
-          (row.type === 'SYSTEM_MESSAGE' &&
-            restartNoticePattern.test(String(row.content ?? ''))))
-      ) {
-        minTurnStepIndex = Number(row.step_index)
-      }
-    }
+    for (const row of rows) node.ingest(row)
     if (node.projector.hasBackground()) return true
     // A failed session is finished; a child or post-RPC woken parent still unsettled is working.
     if (
@@ -921,7 +918,7 @@ export async function hasActiveBackgroundWork(
     const activeChildIds = activeChildIdsForTurn(
       subagents,
       node.projector,
-      minTurnStepIndex,
+      isChild ? -1 : node.turnStartStep,
     )
     for (const childId of activeChildIds) {
       if (await hasActiveBackgroundWork(root, childId, visiting, true))
@@ -1024,7 +1021,6 @@ export async function settleBrainTurn(
     acpToolCallIds = [],
     shouldEmitPreWakeupTool,
     emitForeground = false,
-    onWakeup,
     onStep,
     transcriptGraceMs = 0,
     stallTimeoutMs = 120_000,
@@ -1039,8 +1035,6 @@ export async function settleBrainTurn(
     ) => boolean
     /** Emit foreground assistant/reasoning/tool items from the transcript if ACP suppressed them. */
     emitForeground?: boolean
-    /** Invoked when post-RPC Reactive Wakeup steps are observed, with cumulative wakeup token usage. */
-    onWakeup?: (usage?: StepUsage) => void
     /** Invoked with the highest step_index observed so far. */
     onStep?: (stepIndex: number) => void
     /** How long to wait for agy to flush this turn's USER_INPUT row before treating the turn as transcript-less. */
@@ -1054,6 +1048,8 @@ export async function settleBrainTurn(
   status: 'completed' | 'canceled' | 'failed'
   error?: string
   lastStepUsage?: StepUsage
+  wokeUp?: true
+  wakeupUsage?: StepUsage
 }> {
   if (!sessionIdPattern.test(nativeId)) return { status: 'completed' }
   const node = new BrainNode(nativeId, sessionId)
@@ -1068,6 +1064,16 @@ export async function settleBrainTurn(
   const dedupe = new StepDedupe()
   let lastStepUsage: StepUsage | undefined
   let wakeupUsage: StepUsage | undefined
+  const finish = (
+    status: 'completed' | 'canceled' | 'failed',
+    error?: string,
+  ) => ({
+    status,
+    ...(error !== undefined ? { error } : {}),
+    lastStepUsage,
+    ...(node.wokeUp ? { wokeUp: true as const } : {}),
+    ...(wakeupUsage ? { wakeupUsage } : {}),
+  })
   const withinGrace = () => Date.now() - startedAt < transcriptGraceMs
   // Without a Brain directory this session never persists a transcript; there is nothing to wait for.
   const sessionDirExists = () =>
@@ -1079,7 +1085,7 @@ export async function settleBrainTurn(
     if (signal?.aborted) {
       if (signal.reason instanceof Error && signal.reason.name !== 'AbortError')
         throw signal.reason
-      return { status: 'canceled', lastStepUsage }
+      return finish('canceled')
     }
     const { inbox, subagents } = await node.pollMetadata(root)
     const nextFingerprint = `${inbox.messages.length}:${inbox.readIds.size}:${subagents
@@ -1127,7 +1133,7 @@ export async function settleBrainTurn(
         if (!anchored && !withinGrace()) return { status: 'completed' }
         // A rewrite that dropped this turn altogether is bounded like any other stall.
         if (anchored && Date.now() - lastActivity >= stallTimeoutMs)
-          return { status: 'completed', lastStepUsage }
+          return finish('completed')
         await pause(pollIntervalMs, signal)
         continue
       }
@@ -1141,24 +1147,12 @@ export async function settleBrainTurn(
     }
     for (const row of slice) {
       const stepIndex = Number(row.step_index)
-      const wasWoken = node.wokeUp
       const items = node.ingest(row)
-      if (!wasWoken && node.wokeUp) onWakeup?.(wakeupUsage)
       const usage = extractStepUsage(row)
       if (usage) {
         lastStepUsage = usage
-        if (node.wokeUp && row.status === 'DONE') {
-          const prevWrite = wakeupUsage?.cachedWriteTokens ?? 0
-          const nextWrite = prevWrite + (usage.cachedWriteTokens ?? 0)
-          wakeupUsage = {
-            inputTokens: (wakeupUsage?.inputTokens ?? 0) + usage.inputTokens,
-            outputTokens: (wakeupUsage?.outputTokens ?? 0) + usage.outputTokens,
-            cachedReadTokens:
-              (wakeupUsage?.cachedReadTokens ?? 0) + usage.cachedReadTokens,
-            ...(nextWrite > 0 ? { cachedWriteTokens: nextWrite } : {}),
-          }
-          onWakeup?.(wakeupUsage)
-        }
+        if (node.wokeUp && row.status === 'DONE')
+          wakeupUsage = addStepUsage(wakeupUsage, usage)
       }
       if (Number.isInteger(stepIndex) && stepIndex > lastStepIndex) {
         lastStepIndex = stepIndex
@@ -1181,31 +1175,21 @@ export async function settleBrainTurn(
         }
       }
     }
-    if (node.lastStep?.type === 'ERROR_MESSAGE') {
-      return {
-        status: 'failed',
-        error: stepErrorMessage(node.lastStep, 'Turn failed'),
-        lastStepUsage,
-      }
-    }
+    if (node.lastStep?.type === 'ERROR_MESSAGE')
+      return finish('failed', stepErrorMessage(node.lastStep, 'Turn failed'))
     const activeChildIds = activeChildIdsForTurn(
       subagents,
       node.projector,
       minStepIndex,
     )
     const childStatus = await settleChildren(root, node, inbox, activeChildIds)
-    if (childStatus.error)
-      return {
-        status: 'failed',
-        error: childStatus.error,
-        lastStepUsage,
-      }
+    if (childStatus.error) return finish('failed', childStatus.error)
     if (childStatus.settled && node.isSettled(inbox)) {
       if (activeChildIds.length > 0) {
         if (node.hasUnprocessedMessages(await readInboxState(root, nativeId)))
           continue
       }
-      return { status: 'completed', lastStepUsage }
+      return finish('completed')
     }
     // Background tasks, live children and tools of a woken turn may legitimately run for a long time;
     // anything else idle (e.g. an unrecognized final row) is a stall.
@@ -1221,7 +1205,7 @@ export async function settleBrainTurn(
         id: `${sessionId}:step:${lastStepIndex}:stalled`,
         message: `Stopped waiting for agy: transcript_full.jsonl was idle for ${Math.round(stallTimeoutMs / 1000)}s without a final response.`,
       })
-      return { status: 'completed', lastStepUsage }
+      return finish('completed')
     }
     await pause(pollIntervalMs, signal)
   }

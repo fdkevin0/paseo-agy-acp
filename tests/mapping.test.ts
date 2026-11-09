@@ -196,6 +196,23 @@ test('usage rejects invalid context, ignores foreign currency, and computes last
     },
     'missing ACP cachedReadTokens still falls back to lastStep when carriedWakeup is deducted',
   )
+  assert.deepEqual(
+    promptUsage(
+      { totalTokens: 60, inputTokens: 50, outputTokens: 10 },
+      {
+        wakeup: { inputTokens: 10, outputTokens: 2, cachedReadTokens: 0 },
+        lastStep: { inputTokens: 60, cachedReadTokens: 15, outputTokens: 12 },
+      },
+    ),
+    {
+      inputTokens: 60,
+      outputTokens: 12,
+      cachedInputTokens: 15,
+      contextWindowUsedTokens: 87,
+      contextWindowMaxTokens: 256_000,
+    },
+    'missing ACP cachedReadTokens falls back to lastStep even when wakeup step defaulted cachedReadTokens to 0',
+  )
   assert.equal(contextWindowForModel('gemini'), 256_000)
 })
 

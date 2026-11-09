@@ -337,6 +337,20 @@ export type StepUsage = {
   cachedWriteTokens?: number
 }
 
+export function addStepUsage(
+  a: StepUsage | undefined,
+  b: StepUsage,
+): StepUsage {
+  const cachedWriteTokens =
+    (a?.cachedWriteTokens ?? 0) + (b.cachedWriteTokens ?? 0)
+  return {
+    inputTokens: (a?.inputTokens ?? 0) + b.inputTokens,
+    outputTokens: (a?.outputTokens ?? 0) + b.outputTokens,
+    cachedReadTokens: (a?.cachedReadTokens ?? 0) + b.cachedReadTokens,
+    ...(cachedWriteTokens > 0 ? { cachedWriteTokens } : {}),
+  }
+}
+
 /** Combine ACP turn token counters with per-step context occupancy from transcript_full.jsonl when available. */
 export function promptUsage(
   usage?: Usage | null,
@@ -366,9 +380,7 @@ export function promptUsage(
   ) =>
     nonnegative(rawVal)
       ? Math.max(0, rawVal - (sub ?? 0)) + (add ?? 0)
-      : add !== undefined
-        ? add
-        : (fallback ?? 0)
+      : ((add || fallback) ?? 0)
   const input = field(
     raw.inputTokens,
     carried?.inputTokens,

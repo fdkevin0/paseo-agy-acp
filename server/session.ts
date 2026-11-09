@@ -283,9 +283,11 @@ async function createSession(
     turnHadModelOutput: false,
     turnToolCallIds: [] as string[],
     lastKnownStepIndex: -1,
-    pendingWakeupReplay: false,
-    suppressPreUserEcho: false,
-    carriedWakeupUsage: undefined as StepUsage | undefined,
+    wakeup: {
+      pendingReplay: false,
+      suppressEcho: false,
+      carriedUsage: undefined as StepUsage | undefined,
+    },
     opening: true,
     loading: true,
     replay: true,
@@ -494,7 +496,7 @@ async function createSession(
       commandsReceived = true
       resolveCommands()
     } else if (u.sessionUpdate === 'usage_update') {
-      if (state.suppressPreUserEcho) return
+      if (state.wakeup.suppressEcho) return
       const next = contextUsage(u)
       if (next && (!state.loading || state.replay)) {
         if (state.turn) state.turnHadContextUsage = true
@@ -503,11 +505,11 @@ async function createSession(
     } else {
       if (state.loading && !state.replay) return
       if (u.sessionUpdate === 'user_message_chunk' && !state.loading) {
-        state.suppressPreUserEcho = false
+        state.wakeup.suppressEcho = false
         timeline.boundary()
         return
       }
-      if (state.suppressPreUserEcho) return
+      if (state.wakeup.suppressEcho) return
       if (
         u.sessionUpdate === 'tool_call' &&
         !state.turnToolCallIds.includes(u.toolCallId)
@@ -662,6 +664,13 @@ async function createSession(
       publishUsage,
       terminalize,
       emitItem,
+      resetWakeup() {
+        state.wakeup = {
+          pendingReplay: false,
+          suppressEcho: false,
+          carriedUsage: undefined,
+        }
+      },
       hasChild(nativeId: string) {
         return children.has(`${id}:child:${nativeId}`)
       },
@@ -796,9 +805,7 @@ async function createSession(
           onExit(error instanceof Error ? error : new Error(String(error)))
           throw error
         } finally {
-          state.pendingWakeupReplay = false
-          state.suppressPreUserEcho = false
-          state.carriedWakeupUsage = undefined
+          this.resetWakeup()
           state.turnToolCallIds = []
           state.loading = false
           state.replay = true
@@ -990,9 +997,9 @@ async function promptSession(
   session.state.turnHadContextUsage = false
   session.state.turnHadModelOutput = false
   session.state.turnToolCallIds = []
-  session.state.suppressPreUserEcho =
-    session.state.pendingWakeupReplay && expectsUserEcho
-  session.state.pendingWakeupReplay = false
+  session.state.wakeup.suppressEcho =
+    session.state.wakeup.pendingReplay && expectsUserEcho
+  session.state.wakeup.pendingReplay = false
   session.state.prompts.add(p.clientMessageId)
   session.timeline.boundary()
   emit({
@@ -1032,8 +1039,8 @@ async function promptSession(
       prompt: blocks,
     })
     await session.drain()
-    const suppressedForeground = session.state.suppressPreUserEcho
-    session.state.suppressPreUserEcho = false
+    const suppressedForeground = session.state.wakeup.suppressEcho
+    session.state.wakeup.suppressEcho = false
     let status: 'completed' | 'canceled' | 'failed' =
       result.stopReason === 'cancelled' ? 'canceled' : 'completed'
     let turnError: string | undefined
@@ -1058,11 +1065,6 @@ async function promptSession(
               // Unknown children open, interrupted ones resume.
               (!session.hasChild(item.detail.childSessionId) ||
                 session.isChildResumable(item.detail.childSessionId))),
-          onWakeup: (usage) => {
-            turnWokeUp = true
-            session.state.pendingWakeupReplay = true
-            turnWakeupUsage = usage
-          },
           onStep: (stepIndex) => {
             if (stepIndex > session.state.lastKnownStepIndex)
               session.state.lastKnownStepIndex = stepIndex
@@ -1077,12 +1079,15 @@ async function promptSession(
       status = settled.status
       turnError = settled.error
       lastStep = settled.lastStepUsage
+      turnWokeUp = Boolean(settled.wokeUp)
+      turnWakeupUsage = settled.wakeupUsage
+      if (turnWokeUp) session.state.wakeup.pendingReplay = true
     }
     if (result.usage || turnWakeupUsage) {
       const carriedWakeup = result.usage
-        ? session.state.carriedWakeupUsage
+        ? session.state.wakeup.carriedUsage
         : undefined
-      session.state.carriedWakeupUsage = turnWakeupUsage
+      session.state.wakeup.carriedUsage = turnWakeupUsage
       session.publishUsage(
         promptUsage(result.usage, {
           model: configState(session.state.metadata).model,
@@ -1093,7 +1098,7 @@ async function promptSession(
         }),
       )
     } else if (turnWokeUp) {
-      session.state.carriedWakeupUsage = undefined
+      session.state.wakeup.carriedUsage = undefined
     }
     await session.state.interrupting
     session.terminalize(status, turnError)
@@ -1129,7 +1134,7 @@ async function promptSession(
       ...(status === 'failed' ? { error: { message: String(error) } } : {}),
     })
   } finally {
-    session.state.suppressPreUserEcho = false
+    session.state.wakeup.suppressEcho = false
     session.state.turnAbort = null
     session.state.turn = ''
     session.timeline.boundary()
