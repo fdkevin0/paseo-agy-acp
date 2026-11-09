@@ -42,6 +42,7 @@ process.stdin.on('end', () => {
 })
 new AgentSideConnection(
   (client) => {
+    let probeLatePermissionOnCancel = false
     const update = (
       update: Parameters<typeof client.sessionUpdate>[0]['update'],
     ) => client.sessionUpdate({ sessionId: nativeId, update })
@@ -86,6 +87,22 @@ new AgentSideConnection(
         configOptions.find(
           (option) => option.id === params.configId,
         )!.currentValue = params.value
+        if (
+          probeLatePermissionOnCancel &&
+          params.configId === 'thought_level'
+        ) {
+          probeLatePermissionOnCancel = false
+          const permission = await client.requestPermission({
+            sessionId: nativeId,
+            toolCall: {
+              toolCallId: 'late-permission',
+              title: 'late-probe',
+              rawInput: {},
+            },
+            options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }],
+          })
+          log('late-permission', permission)
+        }
         return { configOptions }
       },
       async closeSession() {
@@ -161,6 +178,31 @@ new AgentSideConnection(
             sessionUpdate: 'agent_message_chunk',
             content: { type: 'text', text: 'WAITING' },
           })
+        } else if (text === 'error-step') {
+          rows(
+            [
+              { step_index: 0, type: 'USER_INPUT', content: text },
+              {
+                step_index: 1,
+                type: 'ERROR_MESSAGE',
+                content: 'Model quota exceeded',
+              },
+            ],
+            false,
+          )
+        } else if (text === 'stall') {
+          probeLatePermissionOnCancel = true
+          rows(
+            [
+              { step_index: 2, type: 'USER_INPUT', content: text },
+              {
+                step_index: 3,
+                type: 'PLANNER_RESPONSE',
+                status: 'RUNNING',
+              },
+            ],
+            true,
+          )
         } else {
           if (fullAccess) {
             const permission = await client.requestPermission({

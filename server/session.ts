@@ -61,6 +61,7 @@ interface SessionOptions {
   launch?: ProviderLaunch
   capabilities: readonly string[]
   emit: (event: ProviderEvent) => void
+  stallTimeoutMs?: number
 }
 
 const SKIP_PERMISSIONS_FLAG = '--dangerously-skip-permissions'
@@ -194,6 +195,7 @@ export class SessionManager {
         })
         session.flush()
         if (input.persistence) await session.replayTools()
+        session.state.turnToolCallIds = []
         await configureSession(session, input.config)
         await session.drain()
         session.state.loading = false
@@ -300,6 +302,12 @@ async function createSession(
     turnHadContextUsage: false,
     turnHadModelOutput: false,
     turnToolCallIds: [] as string[],
+    lastKnownStepIndex: -1,
+    wakeup: {
+      pendingReplay: false,
+      suppressEcho: false,
+      carriedUsage: undefined as StepUsage | undefined,
+    },
     opening: true,
     loading: true,
     replay: true,
@@ -521,6 +529,7 @@ async function createSession(
       commandsReceived = true
       resolveCommands()
     } else if (u.sessionUpdate === 'usage_update') {
+      if (state.wakeup.suppressEcho) return
       const next = contextUsage(u)
       if (next && (!state.loading || state.replay)) {
         if (state.turn) state.turnHadContextUsage = true
@@ -529,9 +538,11 @@ async function createSession(
     } else {
       if (state.loading && !state.replay) return
       if (u.sessionUpdate === 'user_message_chunk' && !state.loading) {
+        state.wakeup.suppressEcho = false
         timeline.boundary()
         return
       }
+      if (state.wakeup.suppressEcho) return
       if (
         u.sessionUpdate === 'tool_call' &&
         !state.turnToolCallIds.includes(u.toolCallId)
@@ -578,6 +589,7 @@ async function createSession(
         !parsed.success ||
         !state.nativeId ||
         request.sessionId !== state.nativeId ||
+        !state.turn ||
         state.closing ||
         state.failed
       )
@@ -678,6 +690,7 @@ async function createSession(
       cwd,
       config,
       brainRoot,
+      stallTimeoutMs: options.stallTimeoutMs,
       state,
       get initialized() {
         return currentInitialized
@@ -692,6 +705,13 @@ async function createSession(
       publishUsage,
       terminalize,
       emitItem,
+      resetWakeup() {
+        state.wakeup = {
+          pendingReplay: false,
+          suppressEcho: false,
+          carriedUsage: undefined,
+        }
+      },
       hasChild(nativeId: string) {
         return children.has(`${id}:child:${nativeId}`)
       },
@@ -711,14 +731,21 @@ async function createSession(
         const projector = new BrainTranscriptProjector(id)
         projector.syncMetadata(inbox, subagents)
         projector.bindToolCallIds(state.turnToolCallIds)
-        for (const row of rows)
+        for (const row of rows) {
+          const stepIndex = Number(row.step_index)
+          if (
+            Number.isInteger(stepIndex) &&
+            stepIndex > state.lastKnownStepIndex
+          )
+            state.lastKnownStepIndex = stepIndex
           for (const item of projector.project(row)) {
-            if (item.type !== 'tool_call') continue
+            if (item.type !== 'tool_call' || item.status === 'running') continue
             await Promise.all(
               [...children.values()].map((child) => child.ready),
             )
             emitItem(item)
           }
+        }
         // A child opened by the last replayed tool must read its history before a historical kill cancels it.
         let knownChildren = 0
         while (knownChildren !== children.size) {
@@ -838,6 +865,8 @@ async function createSession(
           onExit(error instanceof Error ? error : new Error(String(error)))
           throw error
         } finally {
+          this.resetWakeup()
+          state.turnToolCallIds = []
           state.loading = false
           state.replay = true
         }
@@ -1020,11 +1049,17 @@ async function promptSession(
       : p.input.content.map(promptContent)
   const turnId = randomUUID()
   const turnAbort = new AbortController()
+  const expectsUserEcho =
+    p.input.type === 'message' &&
+    blocks.some((c) => c.type !== 'text' || c.text.trim().length > 0)
   session.state.turn = turnId
   session.state.turnAbort = turnAbort
   session.state.turnHadContextUsage = false
   session.state.turnHadModelOutput = false
   session.state.turnToolCallIds = []
+  session.state.wakeup.suppressEcho =
+    session.state.wakeup.pendingReplay && expectsUserEcho
+  session.state.wakeup.pendingReplay = false
   session.state.prompts.add(p.clientMessageId)
   session.timeline.boundary()
   emit({
@@ -1052,20 +1087,26 @@ async function promptSession(
     state: 'started',
   })
   try {
-    const minStepIndex = await readLastStepIndex(
+    const readStep = await readLastStepIndex(
       session.brainRoot,
       session.state.nativeId,
     ).catch(() => -1)
+    const minStepIndex = Math.max(session.state.lastKnownStepIndex, readStep)
+    session.state.lastKnownStepIndex = minStepIndex
     turnAbort.signal.throwIfAborted()
     const result = await session.transport.rpc.prompt({
       sessionId: session.state.nativeId,
       prompt: blocks,
     })
     await session.drain()
+    const suppressedForeground = session.state.wakeup.suppressEcho
+    session.state.wakeup.suppressEcho = false
     let status: 'completed' | 'canceled' | 'failed' =
       result.stopReason === 'cancelled' ? 'canceled' : 'completed'
     let turnError: string | undefined
     let lastStep: StepUsage | undefined
+    let turnWokeUp = false
+    let turnWakeupUsage: StepUsage | undefined
     if (status === 'completed') {
       const settled = await settleBrainTurn(
         session.brainRoot,
@@ -1076,6 +1117,7 @@ async function promptSession(
           signal: turnAbort.signal,
           minStepIndex,
           acpToolCallIds: session.state.turnToolCallIds,
+          emitForeground: suppressedForeground,
           shouldEmitPreWakeupTool: (item) =>
             session.timeline.isRunning(item.id) ||
             (item.detail.type === 'sub_agent' &&
@@ -1083,8 +1125,14 @@ async function promptSession(
               // Unknown children open, interrupted ones resume.
               (!session.hasChild(item.detail.childSessionId) ||
                 session.isChildResumable(item.detail.childSessionId))),
+          onStep: (stepIndex) => {
+            if (stepIndex > session.state.lastKnownStepIndex)
+              session.state.lastKnownStepIndex = stepIndex
+          },
           // A model turn always writes USER_INPUT; give agy a moment to flush it. Native commands may write none.
-          transcriptGraceMs: session.state.turnHadModelOutput ? 2000 : 0,
+          transcriptGraceMs:
+            session.state.turnHadModelOutput || suppressedForeground ? 2000 : 0,
+          stallTimeoutMs: session.stallTimeoutMs,
           isWaitingOnUser: () => session.permissions.size > 0,
         },
       )
@@ -1092,15 +1140,35 @@ async function promptSession(
       status = settled.status
       turnError = settled.error
       lastStep = settled.lastStepUsage
+      turnWokeUp = Boolean(settled.wokeUp)
+      turnWakeupUsage = settled.wakeupUsage
+      if (turnWokeUp) session.state.wakeup.pendingReplay = true
+      if (
+        settled.stalled &&
+        !turnAbort.signal.aborted &&
+        !session.state.closing &&
+        !session.state.failed
+      ) {
+        await session.interrupt().catch(() => undefined)
+      }
     }
-    if (result.usage)
+    if (result.usage || turnWakeupUsage) {
+      const carriedWakeup = result.usage
+        ? session.state.wakeup.carriedUsage
+        : undefined
+      session.state.wakeup.carriedUsage = turnWakeupUsage
       session.publishUsage(
         promptUsage(result.usage, {
           model: configState(session.state.metadata).model,
-          preserveContext: session.state.turnHadContextUsage,
+          preserveContext: session.state.turnHadContextUsage && !turnWokeUp,
           lastStep,
+          carriedWakeup,
+          wakeup: turnWakeupUsage,
         }),
       )
+    } else if (turnWokeUp) {
+      session.state.wakeup.carriedUsage = undefined
+    }
     await session.state.interrupting
     session.terminalize(status, turnError)
     emit({
@@ -1135,6 +1203,7 @@ async function promptSession(
       ...(status === 'failed' ? { error: { message: String(error) } } : {}),
     })
   } finally {
+    session.state.wakeup.suppressEcho = false
     session.state.turnAbort = null
     session.state.turn = ''
     session.timeline.boundary()

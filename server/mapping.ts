@@ -428,6 +428,20 @@ export type StepUsage = {
   cachedWriteTokens?: number
 }
 
+export function addStepUsage(
+  a: StepUsage | undefined,
+  b: StepUsage,
+): StepUsage {
+  const cachedWriteTokens =
+    (a?.cachedWriteTokens ?? 0) + (b.cachedWriteTokens ?? 0)
+  return {
+    inputTokens: (a?.inputTokens ?? 0) + b.inputTokens,
+    outputTokens: (a?.outputTokens ?? 0) + b.outputTokens,
+    cachedReadTokens: (a?.cachedReadTokens ?? 0) + b.cachedReadTokens,
+    ...(cachedWriteTokens > 0 ? { cachedWriteTokens } : {}),
+  }
+}
+
 /** Combine ACP turn token counters with per-step context occupancy from transcript_full.jsonl when available. */
 export function promptUsage(
   usage?: Usage | null,
@@ -435,22 +449,53 @@ export function promptUsage(
     model?: string
     preserveContext?: boolean
     lastStep?: StepUsage
+    carriedWakeup?: StepUsage
+    wakeup?: StepUsage
   },
 ): ProviderUsage {
-  if (!usage && !options?.lastStep) return {}
+  if (!usage && !options?.lastStep && !options?.wakeup) return {}
   const raw = record(usage)
-  const input = nonnegative(raw.inputTokens)
-    ? raw.inputTokens
-    : (options?.lastStep?.inputTokens ?? 0)
-  const cacheRead = nonnegative(raw.cachedReadTokens)
-    ? raw.cachedReadTokens
-    : (options?.lastStep?.cachedReadTokens ?? 0)
-  const cacheWrite = nonnegative(raw.cachedWriteTokens)
-    ? raw.cachedWriteTokens
-    : (options?.lastStep?.cachedWriteTokens ?? 0)
-  const output = nonnegative(raw.outputTokens)
-    ? raw.outputTokens
-    : (options?.lastStep?.outputTokens ?? 0)
+  const carried =
+    options?.carriedWakeup &&
+    nonnegative(raw.inputTokens) &&
+    raw.inputTokens >= options.carriedWakeup.inputTokens &&
+    nonnegative(raw.outputTokens) &&
+    raw.outputTokens >= options.carriedWakeup.outputTokens
+      ? options.carriedWakeup
+      : undefined
+  const field = (
+    rawVal: unknown,
+    sub: number | undefined,
+    add: number | undefined,
+    fallback: number | undefined,
+  ) =>
+    nonnegative(rawVal)
+      ? Math.max(0, rawVal - (sub ?? 0)) + (add ?? 0)
+      : ((add || fallback) ?? 0)
+  const input = field(
+    raw.inputTokens,
+    carried?.inputTokens,
+    options?.wakeup?.inputTokens,
+    options?.lastStep?.inputTokens,
+  )
+  const cacheRead = field(
+    raw.cachedReadTokens,
+    carried?.cachedReadTokens,
+    options?.wakeup?.cachedReadTokens,
+    options?.lastStep?.cachedReadTokens,
+  )
+  const cacheWrite = field(
+    raw.cachedWriteTokens,
+    carried?.cachedWriteTokens,
+    options?.wakeup?.cachedWriteTokens,
+    options?.lastStep?.cachedWriteTokens,
+  )
+  const output = field(
+    raw.outputTokens,
+    carried?.outputTokens,
+    options?.wakeup?.outputTokens,
+    options?.lastStep?.outputTokens,
+  )
   const step = options?.lastStep
   // Each source is summed on its own: per-step counters never mix with cumulative turn counters.
   const used = step

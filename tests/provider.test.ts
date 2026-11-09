@@ -1031,6 +1031,15 @@ test('background task wakeup settles before completing turn and deduplicates nex
           e.item.text === 'Scan complete: 42G.',
       ),
     )
+    const turn1Usage = h.events.findLast((e) => e.type === 'session.usage')
+    assert.ok(turn1Usage?.type === 'session.usage')
+    assert.deepEqual(turn1Usage.usage, {
+      inputTokens: 50,
+      outputTokens: 7,
+      cachedInputTokens: 10,
+      contextWindowUsedTokens: 55,
+      contextWindowMaxTokens: 256_000,
+    })
 
     h.events.length = 0
     await h.provider.send({
@@ -1051,12 +1060,26 @@ test('background task wakeup settles before completing turn and deduplicates nex
         e.sessionId === 's' &&
         e.state === 'completed',
     )
-    const assistantTexts = h.events.flatMap((e) =>
-      e.type === 'timeline.item' && e.item.type === 'assistant_message'
-        ? [e.item.text]
+    const timelineItems = h.events.flatMap((e) =>
+      e.type === 'timeline.item'
+        ? [
+            `${e.item.type}:${'text' in e.item ? e.item.text : e.item.type === 'tool_call' ? e.item.callId : ''}`,
+          ]
         : [],
     )
-    assert.deepEqual(assistantTexts, ['Next turn reply.'])
+    assert.deepEqual(timelineItems, [
+      'user_message:after-background',
+      'assistant_message:Next turn reply.',
+    ])
+    const turn2Usage = h.events.findLast((e) => e.type === 'session.usage')
+    assert.ok(turn2Usage?.type === 'session.usage')
+    assert.deepEqual(turn2Usage.usage, {
+      inputTokens: 20,
+      outputTokens: 3,
+      cachedInputTokens: 0,
+      contextWindowUsedTokens: 23,
+      contextWindowMaxTokens: 256_000,
+    })
   } finally {
     await h.provider.close()
     await rm(home, { recursive: true, force: true })
