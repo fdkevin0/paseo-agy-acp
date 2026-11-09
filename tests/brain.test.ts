@@ -1590,6 +1590,20 @@ test('hasActiveBackgroundWork tracks woken parent turns without false positives 
       'settled woken parent must not stay active due to consumedNonUserCount drift',
     )
 
+    // Woken parent ending on a CANCELED GENERIC row is not working
+    await f.put(parent, [
+      ...invoke(child),
+      message(5, child, 'Report'),
+      {
+        step_index: 6,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ id: 'r1', name: 'read_file', args: {} }],
+      },
+      { step_index: 7, type: 'GENERIC', status: 'CANCELED' },
+    ])
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
+
     // Native command GENERIC row without a prior PLANNER_RESPONSE followed by SYSTEM_MESSAGE does not count as woken
     await f.put(parent, [
       { step_index: 10, type: 'USER_INPUT', content: '/compact' },

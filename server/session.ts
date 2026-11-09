@@ -202,7 +202,7 @@ export class SessionManager {
     const session = this.sessions.get(input.sessionId)
     if (!session) throw new Error('Session is not open')
     if (input.type === 'session.prompt')
-      return promptSession(session, input, emit, this.options.stallTimeoutMs)
+      return promptSession(session, input, emit)
     if (input.type === 'session.permission') {
       const permission = session.permissions.get(input.permissionId)
       if (!permission) throw new Error('Permission is no longer pending')
@@ -642,6 +642,7 @@ async function createSession(
       cwd,
       config,
       brainRoot,
+      stallTimeoutMs: options.stallTimeoutMs,
       state,
       get initialized() {
         return currentInitialized
@@ -942,7 +943,6 @@ async function promptSession(
   session: Session,
   input: Prompt,
   emit: SessionOptions['emit'],
-  stallTimeoutMs?: number,
 ) {
   const p = input.prompt
   if (session.state.prompts.has(p.clientMessageId)) return
@@ -1031,7 +1031,7 @@ async function promptSession(
                 session.isChildResumable(item.detail.childSessionId))),
           // A model turn always writes USER_INPUT; give agy a moment to flush it. Native commands may write none.
           transcriptGraceMs: session.state.turnHadModelOutput ? 2000 : 0,
-          ...(stallTimeoutMs !== undefined ? { stallTimeoutMs } : {}),
+          stallTimeoutMs: session.stallTimeoutMs,
           isWaitingOnUser: () => session.permissions.size > 0,
         },
       )

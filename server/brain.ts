@@ -99,6 +99,13 @@ function isCompletePlannerResponse(step: Record<string, unknown> | undefined) {
   )
 }
 
+function isRestartNotice(row: Record<string, unknown> | undefined) {
+  return (
+    row?.type === 'SYSTEM_MESSAGE' &&
+    restartNoticePattern.test(String(row.content ?? ''))
+  )
+}
+
 function stepErrorMessage(
   step: Record<string, unknown> | undefined,
   fallback = 'Turn failed',
@@ -469,7 +476,7 @@ export class BrainTranscriptProjector {
         this.touchedSubagents.clear()
         return text ? [{ type: 'user_message', id, text }] : []
       case 'SYSTEM_MESSAGE': {
-        if (restartNoticePattern.test(text)) {
+        if (isRestartNotice(row)) {
           // Stopped calls never log a result; child transcripts have no USER_INPUT to reset them.
           this.pending = []
           this.background.clear()
@@ -799,6 +806,9 @@ class BrainNode {
   readonly children = new Map<string, BrainNode>()
   consumedMessages = 0
   lastStep?: Record<string, unknown>
+  seenPlannerResponse = false
+  foregroundIdle = false
+  wokeUp = false
   readonly nativeId: string
   readonly sessionId: string
 
@@ -813,6 +823,9 @@ class BrainNode {
     this.projector.syncMetadata(inbox, subagents)
     this.consumedMessages = 0
     this.lastStep = undefined
+    this.seenPlannerResponse = false
+    this.foregroundIdle = false
+    this.wokeUp = false
   }
 
   async pollMetadata(root: string) {
@@ -824,11 +837,25 @@ class BrainNode {
     return { inbox, subagents }
   }
 
-  /** Fold one transcript row into message accounting, projection and the last step. */
+  /** Fold one transcript row into wakeup phase, message accounting, projection and the last step. */
   ingest(row: Record<string, unknown>): ProviderTimelineItem[] {
+    if (row.type === 'USER_INPUT' || isRestartNotice(row)) {
+      this.seenPlannerResponse = false
+      this.foregroundIdle = false
+      this.wokeUp = false
+    } else if (row.type === 'SYSTEM_MESSAGE' && this.foregroundIdle) {
+      this.wokeUp = true
+    }
     this.consumedMessages += countRowMessages(row)
     const items = this.projector.project(row)
     if (row.type !== 'CHECKPOINT') this.lastStep = row
+    if (row.type === 'PLANNER_RESPONSE') this.seenPlannerResponse = true
+    if (
+      this.seenPlannerResponse &&
+      !this.projector.hasPending() &&
+      (isCompletePlannerResponse(row) || row.type === 'GENERIC')
+    )
+      this.foregroundIdle = true
     return items
   }
 
@@ -836,6 +863,18 @@ class BrainNode {
     return (
       inbox.unconsumedHighPriority.length > 0 ||
       this.consumedMessages < inbox.consumedNonUserCount
+    )
+  }
+
+  isWokenWorking(): boolean {
+    return (
+      this.wokeUp &&
+      (this.projector.hasPending() ||
+        (this.lastStep?.type === 'SYSTEM_MESSAGE' &&
+          !isRestartNotice(this.lastStep)) ||
+        (this.lastStep?.type === 'GENERIC' &&
+          this.lastStep.status !== 'CANCELED' &&
+          this.lastStep.status !== 'INTERRUPTED'))
     )
   }
 
@@ -867,54 +906,19 @@ export async function hasActiveBackgroundWork(
     if (inbox.unconsumedHighPriority.length > 0) return true
     if (isChild && rows.length === 0) return true
     let minTurnStepIndex = -1
-    let seenPlannerResponse = false
-    let foregroundIdle = false
-    let wokeUp = false
     for (const row of rows) {
-      if (
-        !isChild &&
-        (row.type === 'USER_INPUT' ||
-          (row.type === 'SYSTEM_MESSAGE' &&
-            restartNoticePattern.test(String(row.content ?? ''))))
-      ) {
+      if (!isChild && (row.type === 'USER_INPUT' || isRestartNotice(row))) {
         minTurnStepIndex = Number(row.step_index)
-        seenPlannerResponse = false
-        foregroundIdle = false
-        wokeUp = false
-      }
-      if (
-        !isChild &&
-        row.type === 'SYSTEM_MESSAGE' &&
-        !restartNoticePattern.test(String(row.content ?? '')) &&
-        foregroundIdle
-      ) {
-        wokeUp = true
       }
       node.ingest(row)
-      if (!isChild && row.type === 'PLANNER_RESPONSE')
-        seenPlannerResponse = true
-      if (
-        !isChild &&
-        seenPlannerResponse &&
-        !node.projector.hasPending() &&
-        (isCompletePlannerResponse(row) || row.type === 'GENERIC')
-      ) {
-        foregroundIdle = true
-      }
     }
     if (node.projector.hasBackground()) return true
     // A failed step is finished; an unsettled child or woken parent turn is still working outside ACP prompt RPC.
     if (
-      isChild &&
-      (node.hasUnprocessedMessages(inbox) ||
-        (!node.isSettled(inbox) && node.lastStep?.type !== 'ERROR_MESSAGE'))
-    )
-      return true
-    if (
-      wokeUp &&
-      (node.projector.hasPending() ||
-        !isCompletePlannerResponse(node.lastStep)) &&
-      node.lastStep?.type !== 'ERROR_MESSAGE'
+      isChild
+        ? node.hasUnprocessedMessages(inbox) ||
+          (!node.isSettled(inbox) && node.lastStep?.type !== 'ERROR_MESSAGE')
+        : node.isWokenWorking()
     )
       return true
     const activeChildIds = activeChildIdsForTurn(
@@ -1058,9 +1062,6 @@ export async function settleBrainTurn(
   // Once anchored, a rewrite caught mid-O_TRUNC (empty or partial file) is not "no turn".
   let anchored = false
   let preamble: Record<string, unknown>[] = []
-  let seenPlannerResponse = false
-  let foregroundIdleReached = false
-  let wokeUp = false
   let lastStepIndex = -1
   const dedupe = new StepDedupe()
   let lastStepUsage: StepUsage | undefined
@@ -1106,9 +1107,6 @@ export async function settleBrainTurn(
       if (result.reset) {
         initial = true
         preamble = []
-        seenPlannerResponse = false
-        foregroundIdleReached = false
-        wokeUp = false
         node.reset(inbox, subagents)
       }
     } catch (error) {
@@ -1152,12 +1150,6 @@ export async function settleBrainTurn(
     }
     for (const row of slice) {
       const stepIndex = Number(row.step_index)
-      if (
-        row.type === 'SYSTEM_MESSAGE' &&
-        !restartNoticePattern.test(String(row.content ?? '')) &&
-        foregroundIdleReached
-      )
-        wokeUp = true
       const items = node.ingest(row)
       const usage = extractStepUsage(row)
       if (usage) lastStepUsage = usage
@@ -1167,7 +1159,7 @@ export async function settleBrainTurn(
         const timestamp =
           typeof row.created_at === 'string' ? row.created_at : undefined
         for (const item of items) {
-          if (wokeUp || item.type === 'error') {
+          if (node.wokeUp || item.type === 'error') {
             onItem(item, timestamp)
           } else if (
             item.type === 'tool_call' &&
@@ -1178,13 +1170,6 @@ export async function settleBrainTurn(
           }
         }
       }
-      if (row.type === 'PLANNER_RESPONSE') seenPlannerResponse = true
-      if (
-        seenPlannerResponse &&
-        !node.projector.hasPending() &&
-        (isCompletePlannerResponse(row) || row.type === 'GENERIC')
-      )
-        foregroundIdleReached = true
     }
     if (node.lastStep?.type === 'ERROR_MESSAGE') {
       return {
@@ -1214,19 +1199,13 @@ export async function settleBrainTurn(
     }
     // Background tasks, live children and user approvals may run indefinitely; woken-turn tools and
     // post-wakeup/post-tool LLM generation get a bounded longer window (wokenStallTimeoutMs) before stalling.
-    const wokenWorking =
-      wokeUp &&
-      (node.projector.hasPending() ||
-        (node.lastStep?.type === 'SYSTEM_MESSAGE' &&
-          !restartNoticePattern.test(String(node.lastStep.content ?? ''))) ||
-        (node.lastStep?.type === 'GENERIC' &&
-          node.lastStep.status !== 'CANCELED' &&
-          node.lastStep.status !== 'INTERRUPTED'))
     const tracking =
       node.projector.hasBackground() ||
       !childStatus.settled ||
       isWaitingOnUser?.() === true
-    const idleLimitMs = wokenWorking ? wokenStallTimeoutMs : stallTimeoutMs
+    const idleLimitMs = node.isWokenWorking()
+      ? wokenStallTimeoutMs
+      : stallTimeoutMs
     if (tracking) lastActivity = Date.now()
     else if (Date.now() - lastActivity >= idleLimitMs) {
       return stall(idleLimitMs)
@@ -1313,12 +1292,9 @@ export function watchBrain(
           lastStepIndex = stepIndex
         const items = node.ingest(row)
         if (replayed) continue
-        const isSystemNotice =
-          row.type === 'SYSTEM_MESSAGE' &&
-          restartNoticePattern.test(String(row.content ?? ''))
         if (
           !running &&
-          !isSystemNotice &&
+          !isRestartNotice(row) &&
           (row.type === 'USER_INPUT' ||
             row.type === 'SYSTEM_MESSAGE' ||
             row.type === 'PLANNER_RESPONSE')
