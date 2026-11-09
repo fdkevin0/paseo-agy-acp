@@ -1553,6 +1553,51 @@ test('unmatched foreground tool calls and permanent consumed-message drift still
   }
 })
 
+test('a restart notice inside a woken turn keeps projecting the woken response', async () => {
+  const f = await fixture()
+  try {
+    const notice = message(
+      4,
+      'system',
+      '[Notice] All your subagents and background tasks have been stopped due to server restart.',
+    )
+    await f.put(parent, [
+      { step_index: 1, type: 'USER_INPUT', content: 'go' },
+      done(2, 'Foreground answer'),
+      message(3, child, 'Wake up'),
+      notice,
+      done(5, 'Woken answer after notice'),
+    ])
+    const items: ProviderTimelineItem[] = []
+    const result = await alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+        minStepIndex: -1,
+        pollIntervalMs: 5,
+        stallTimeoutMs: 50,
+      }),
+    )
+    assert.equal(result.status, 'completed')
+    assert.ok(
+      items.some(
+        (i) =>
+          i.type === 'assistant_message' &&
+          i.text === 'Woken answer after notice',
+      ),
+    )
+
+    // The restarted runtime has no woken turn left running.
+    await f.put(parent, [
+      { step_index: 1, type: 'USER_INPUT', content: 'go' },
+      done(2, 'Foreground answer'),
+      message(3, child, 'Wake up'),
+      notice,
+    ])
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
+  } finally {
+    await f.close()
+  }
+})
+
 test('hasActiveBackgroundWork tracks woken parent turns without false positives from native GENERIC rows or message drift', async () => {
   const f = await fixture()
   try {

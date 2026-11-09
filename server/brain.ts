@@ -823,6 +823,11 @@ class BrainNode {
     this.projector.syncMetadata(inbox, subagents)
     this.consumedMessages = 0
     this.lastStep = undefined
+    this.resetPhase()
+  }
+
+  /** Forget the wakeup phase: a new USER_INPUT, a transcript rewrite or (for hasActiveBackgroundWork) a runtime restart. */
+  resetPhase() {
     this.seenPlannerResponse = false
     this.foregroundIdle = false
     this.wokeUp = false
@@ -839,13 +844,14 @@ class BrainNode {
 
   /** Fold one transcript row into wakeup phase, message accounting, projection and the last step. */
   ingest(row: Record<string, unknown>): ProviderTimelineItem[] {
-    if (row.type === 'USER_INPUT' || isRestartNotice(row)) {
-      this.seenPlannerResponse = false
-      this.foregroundIdle = false
-      this.wokeUp = false
-    } else if (row.type === 'SYSTEM_MESSAGE' && this.foregroundIdle) {
+    // A restart notice does not end a woken turn: the rows after it are still Brain's to project.
+    if (row.type === 'USER_INPUT') this.resetPhase()
+    else if (
+      row.type === 'SYSTEM_MESSAGE' &&
+      !isRestartNotice(row) &&
+      this.foregroundIdle
+    )
       this.wokeUp = true
-    }
     this.consumedMessages += countRowMessages(row)
     const items = this.projector.project(row)
     if (row.type !== 'CHECKPOINT') this.lastStep = row
@@ -909,6 +915,8 @@ export async function hasActiveBackgroundWork(
     for (const row of rows) {
       if (!isChild && (row.type === 'USER_INPUT' || isRestartNotice(row))) {
         minTurnStepIndex = Number(row.step_index)
+        // The restarted runtime left no woken turn running.
+        node.resetPhase()
       }
       node.ingest(row)
     }
