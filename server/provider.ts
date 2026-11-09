@@ -93,6 +93,7 @@ export function createProvider(
           if (closed) throw new Error('Provider connection is closed')
           input = ProviderInputSchema.parse(input)
           requireProviderCapabilities(capabilities, input)
+          if (input.type === 'session.permission') return handle(input)
           const task = handle(input).catch((error) => {
             if ('requestId' in input)
               emit({

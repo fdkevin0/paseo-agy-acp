@@ -982,9 +982,9 @@ async function promptSession(
       : p.input.content.map(promptContent)
   const turnId = randomUUID()
   const turnAbort = new AbortController()
-  const expectsUserEcho = blocks.some(
-    (c) => c.type !== 'text' || c.text.trim().length > 0,
-  )
+  const expectsUserEcho =
+    p.input.type === 'message' &&
+    blocks.some((c) => c.type !== 'text' || c.text.trim().length > 0)
   session.state.turn = turnId
   session.state.turnAbort = turnAbort
   session.state.turnHadContextUsage = false
@@ -993,8 +993,6 @@ async function promptSession(
   session.state.suppressPreUserEcho =
     session.state.pendingWakeupReplay && expectsUserEcho
   session.state.pendingWakeupReplay = false
-  const carriedWakeupUsage = session.state.carriedWakeupUsage
-  session.state.carriedWakeupUsage = undefined
   session.state.prompts.add(p.clientMessageId)
   session.timeline.boundary()
   emit({
@@ -1034,6 +1032,8 @@ async function promptSession(
       prompt: blocks,
     })
     await session.drain()
+    const suppressedForeground = session.state.suppressPreUserEcho
+    session.state.suppressPreUserEcho = false
     let status: 'completed' | 'canceled' | 'failed' =
       result.stopReason === 'cancelled' ? 'canceled' : 'completed'
     let turnError: string | undefined
@@ -1050,6 +1050,7 @@ async function promptSession(
           signal: turnAbort.signal,
           minStepIndex,
           acpToolCallIds: session.state.turnToolCallIds,
+          emitForeground: suppressedForeground,
           shouldEmitPreWakeupTool: (item) =>
             session.timeline.isRunning(item.id) ||
             (item.detail.type === 'sub_agent' &&
@@ -1067,7 +1068,8 @@ async function promptSession(
               session.state.lastKnownStepIndex = stepIndex
           },
           // A model turn always writes USER_INPUT; give agy a moment to flush it. Native commands may write none.
-          transcriptGraceMs: session.state.turnHadModelOutput ? 2000 : 0,
+          transcriptGraceMs:
+            session.state.turnHadModelOutput || suppressedForeground ? 2000 : 0,
           isWaitingOnUser: () => session.permissions.size > 0,
         },
       )
@@ -1076,51 +1078,22 @@ async function promptSession(
       turnError = settled.error
       lastStep = settled.lastStepUsage
     }
-    session.state.carriedWakeupUsage = turnWakeupUsage
     if (result.usage || turnWakeupUsage) {
-      const raw = record(result.usage)
-      const subtract =
-        carriedWakeupUsage &&
-        typeof raw.inputTokens === 'number' &&
-        raw.inputTokens >= carriedWakeupUsage.inputTokens &&
-        typeof raw.outputTokens === 'number' &&
-        raw.outputTokens >= carriedWakeupUsage.outputTokens
-          ? carriedWakeupUsage
-          : undefined
-      const inputTokens =
-        (typeof raw.inputTokens === 'number' ? raw.inputTokens : 0) -
-        (subtract?.inputTokens ?? 0) +
-        (turnWakeupUsage?.inputTokens ?? 0)
-      const outputTokens =
-        (typeof raw.outputTokens === 'number' ? raw.outputTokens : 0) -
-        (subtract?.outputTokens ?? 0) +
-        (turnWakeupUsage?.outputTokens ?? 0)
-      const cachedReadTokens =
-        (typeof raw.cachedReadTokens === 'number' ? raw.cachedReadTokens : 0) -
-        (subtract?.cachedReadTokens ?? 0) +
-        (turnWakeupUsage?.cachedReadTokens ?? 0)
-      const cachedWriteTokens =
-        (typeof raw.cachedWriteTokens === 'number'
-          ? raw.cachedWriteTokens
-          : 0) -
-        (subtract?.cachedWriteTokens ?? 0) +
-        (turnWakeupUsage?.cachedWriteTokens ?? 0)
-      const adjustedUsage = {
-        ...result.usage,
-        inputTokens,
-        outputTokens,
-        cachedReadTokens,
-        cachedWriteTokens,
-        totalTokens:
-          inputTokens + outputTokens + cachedReadTokens + cachedWriteTokens,
-      }
+      const carriedWakeup = result.usage
+        ? session.state.carriedWakeupUsage
+        : undefined
+      session.state.carriedWakeupUsage = turnWakeupUsage
       session.publishUsage(
-        promptUsage(adjustedUsage, {
+        promptUsage(result.usage, {
           model: configState(session.state.metadata).model,
           preserveContext: session.state.turnHadContextUsage && !turnWokeUp,
           lastStep,
+          carriedWakeup,
+          wakeup: turnWakeupUsage,
         }),
       )
+    } else if (turnWokeUp) {
+      session.state.carriedWakeupUsage = undefined
     }
     await session.state.interrupting
     session.terminalize(status, turnError)
