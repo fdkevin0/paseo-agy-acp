@@ -228,11 +228,38 @@ new AgentSideConnection((client) => {
               type: 'PLANNER_RESPONSE',
               status: 'DONE',
               content: 'Next turn reply.',
+              input_tokens: 20,
+              output_tokens: 3,
             },
           ]
             .map((r) => JSON.stringify(r) + '\n')
             .join(''),
         )
+        // agy replays post-RPC Reactive Wakeup steps from Turn 1 before emitting Turn 2's user_message_chunk.
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_thought_chunk',
+            content: { type: 'text', text: 'Analyzing scan output' },
+          },
+        })
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'stale-wakeup-tool',
+            title: 'manage_subagents',
+            status: 'completed',
+            rawInput: { Action: 'list' },
+          },
+        })
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'Scan complete: 42G.' },
+          },
+        })
         await client.sessionUpdate({
           sessionId,
           update: {
@@ -247,7 +274,15 @@ new AgentSideConnection((client) => {
             content: { type: 'text', text: 'Next turn reply.' },
           },
         })
-        return { stopReason: 'end_turn' as const }
+        return {
+          stopReason: 'end_turn' as const,
+          usage: {
+            inputTokens: 60,
+            outputTokens: 8,
+            totalTokens: 78,
+            cachedReadTokens: 10,
+          },
+        }
       }
       await client.sessionUpdate({
         sessionId,
@@ -388,13 +423,24 @@ new AgentSideConnection((client) => {
                 status: 'DONE',
                 thinking: 'Analyzing scan output',
                 content: 'Scan complete: 42G.',
+                input_tokens: 40,
+                cache_read_tokens: 10,
+                output_tokens: 5,
               },
             ]
               .map((r) => JSON.stringify(r) + '\n')
               .join(''),
           )
         }, 80)
-        return { stopReason: 'end_turn' as const }
+        return {
+          stopReason: 'end_turn' as const,
+          usage: {
+            inputTokens: 10,
+            outputTokens: 2,
+            totalTokens: 12,
+            cachedReadTokens: 0,
+          },
+        }
       }
       if (text === 'wait') {
         if (process.env.AGY_TEST_CANCEL_DELAY)

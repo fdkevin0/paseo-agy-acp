@@ -1168,6 +1168,26 @@ test('hasActiveBackgroundWork preserves Turn 1 background tasks in Turn 2 and ig
       true,
       'Turn 1 background task must remain active across Turn 2 USER_INPUT',
     )
+
+    // Parent in an active post-RPC Reactive Wakeup turn after all children settled
+    await f.put(parent, [
+      { step_index: 1, type: 'USER_INPUT', content: 'Turn 1' },
+      done(2, 'Foreground idle'),
+      message(3, child, 'Child report'),
+      {
+        step_index: 4,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          { id: 'sync-tool', name: 'write_file', args: { Path: '/out.md' } },
+        ],
+      },
+    ])
+    assert.equal(
+      await hasActiveBackgroundWork(f.root, parent),
+      true,
+      'unsettled post-RPC wakeup turn on parent must count as active work',
+    )
   } finally {
     await f.close()
   }
