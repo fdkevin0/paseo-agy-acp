@@ -546,6 +546,7 @@ async function createSession(
         !parsed.success ||
         !state.nativeId ||
         request.sessionId !== state.nativeId ||
+        !state.turn ||
         state.closing ||
         state.failed
       )
@@ -1035,6 +1036,14 @@ async function promptSession(
       status = settled.status
       turnError = settled.error
       lastStep = settled.lastStepUsage
+      if (
+        status === 'failed' &&
+        !turnAbort.signal.aborted &&
+        !session.state.closing &&
+        !session.state.failed
+      ) {
+        await session.interrupt().catch(() => undefined)
+      }
     }
     if (result.usage)
       session.publishUsage(

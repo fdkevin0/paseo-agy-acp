@@ -1366,7 +1366,8 @@ test('settlement stops waiting on an idle transcript without a final response', 
         stallTimeoutMs: 50,
       }),
     )
-    assert.equal(result.status, 'completed')
+    assert.equal(result.status, 'failed')
+    assert.match(result.error ?? '', /idle for 0s without a final response/)
     assert.deepEqual(
       items.map((i) => (i.type === 'error' ? i.id : i.type)),
       ['p:step:2:stalled'],
@@ -1399,9 +1400,80 @@ test('a settled ALIVE child does not suspend the parent stall timeout', async ()
         stallTimeoutMs: 50,
       }),
     )
-    assert.equal(result.status, 'completed')
+    assert.equal(result.status, 'failed')
     assert.ok(
       items.some((i) => i.type === 'error' && i.id.endsWith(':stalled')),
+    )
+  } finally {
+    await f.close()
+  }
+})
+
+test('woken-turn LLM generation after SYSTEM_MESSAGE or completed GENERIC suspends the stall timeout until the final response', async () => {
+  const f = await fixture()
+  try {
+    await f.subagent(parent, child)
+    await f.deliver(parent, child, 'Report', true, 'report')
+    await f.put(child, [
+      message(0, parent, 'work'),
+      ...report(parent, 'Report'),
+    ])
+    await f.put(parent, [
+      ...invoke(child),
+      message(5, child, 'Report'),
+      {
+        step_index: 6,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ id: 'r1', name: 'read_file', args: { Path: '/a.ts' } }],
+      },
+      { step_index: 7, type: 'GENERIC', status: 'DONE', content: 'code' },
+    ])
+    const items: ProviderTimelineItem[] = []
+    let settled = false
+    const running = alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+        minStepIndex: -1,
+        pollIntervalMs: 5,
+        stallTimeoutMs: 30,
+      }),
+    ).then((res) => {
+      settled = true
+      return res
+    })
+    await delay(80)
+    assert.equal(
+      settled,
+      false,
+      'post-GENERIC LLM generation in a woken turn must not trigger a stall timeout',
+    )
+    await appendFile(
+      f.path(parent),
+      encode([
+        {
+          step_index: 8,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [
+            { id: 'w1', name: 'write_file', args: { Path: '/out.md' } },
+          ],
+        },
+        { step_index: 9, type: 'GENERIC', status: 'DONE', content: 'Created' },
+        done(10, 'Final synthesis complete.'),
+      ]),
+    )
+    const result = await running
+    assert.equal(result.status, 'completed')
+    assert.equal(
+      items.some((i) => i.type === 'error'),
+      false,
+    )
+    assert.ok(
+      items.some(
+        (i) =>
+          i.type === 'assistant_message' &&
+          i.text === 'Final synthesis complete.',
+      ),
     )
   } finally {
     await f.close()

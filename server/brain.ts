@@ -867,8 +867,9 @@ export async function hasActiveBackgroundWork(
     if (inbox.unconsumedHighPriority.length > 0) return true
     if (isChild && rows.length === 0) return true
     let minTurnStepIndex = -1
+    let foregroundIdle = false
+    let wokeUp = false
     for (const row of rows) {
-      node.ingest(row)
       if (
         !isChild &&
         (row.type === 'USER_INPUT' ||
@@ -876,14 +877,33 @@ export async function hasActiveBackgroundWork(
             restartNoticePattern.test(String(row.content ?? ''))))
       ) {
         minTurnStepIndex = Number(row.step_index)
+        foregroundIdle = false
+        wokeUp = false
+      }
+      if (
+        !isChild &&
+        row.type === 'SYSTEM_MESSAGE' &&
+        !restartNoticePattern.test(String(row.content ?? '')) &&
+        foregroundIdle
+      ) {
+        wokeUp = true
+      }
+      node.ingest(row)
+      if (
+        !isChild &&
+        !node.projector.hasPending() &&
+        (isCompletePlannerResponse(row) || row.type === 'GENERIC')
+      ) {
+        foregroundIdle = true
       }
     }
-    if (node.projector.hasBackground()) return true
-    // A failed child is finished; anything else unsettled is still working.
+    if (node.hasUnprocessedMessages(inbox) || node.projector.hasBackground())
+      return true
+    // A failed step is finished; an unsettled child or woken parent turn is still working outside ACP prompt RPC.
     if (
-      isChild &&
-      (node.hasUnprocessedMessages(inbox) ||
-        (!node.isSettled(inbox) && node.lastStep?.type !== 'ERROR_MESSAGE'))
+      (isChild || wokeUp) &&
+      !node.isSettled(inbox) &&
+      node.lastStep?.type !== 'ERROR_MESSAGE'
     )
       return true
     const activeChildIds = activeChildIdsForTurn(
@@ -1030,6 +1050,15 @@ export async function settleBrainTurn(
   const dedupe = new StepDedupe()
   let lastStepUsage: StepUsage | undefined
   const withinGrace = () => Date.now() - startedAt < transcriptGraceMs
+  const stall = () => {
+    const error = `Stopped waiting for agy: transcript_full.jsonl was idle for ${Math.round(stallTimeoutMs / 1000)}s without a final response.`
+    onItem({
+      type: 'error',
+      id: `${sessionId}:step:${lastStepIndex}:stalled`,
+      message: error,
+    })
+    return { status: 'failed' as const, error, lastStepUsage }
+  }
   // Without a Brain directory this session never persists a transcript; there is nothing to wait for.
   const sessionDirExists = () =>
     stat(join(root, nativeId)).then(
@@ -1089,7 +1118,7 @@ export async function settleBrainTurn(
         if (!anchored && !withinGrace()) return { status: 'completed' }
         // A rewrite that dropped this turn altogether is bounded like any other stall.
         if (anchored && Date.now() - lastActivity >= stallTimeoutMs)
-          return { status: 'completed', lastStepUsage }
+          return stall()
         await pause(pollIntervalMs, signal)
         continue
       }
@@ -1163,21 +1192,27 @@ export async function settleBrainTurn(
       }
       return { status: 'completed', lastStepUsage }
     }
-    // Background tasks, live children and tools of a woken turn may legitimately run for a long time;
-    // anything else idle (e.g. an unrecognized final row) is a stall.
+    // Background tasks, live children, running/pending tools and woken-turn LLM generation may legitimately
+    // run for a long time without writing to transcript_full.jsonl; anything else idle is a stall.
+    const awaitingWokenPlanner =
+      node.consumedMessages < inbox.consumedNonUserCount ||
+      (wokeUp &&
+        ((node.lastStep?.type === 'SYSTEM_MESSAGE' &&
+          !restartNoticePattern.test(String(node.lastStep.content ?? ''))) ||
+          (node.lastStep?.type === 'GENERIC' &&
+            node.lastStep.status !== 'CANCELED' &&
+            node.lastStep.status !== 'INTERRUPTED')))
     const tracking =
       node.projector.hasBackground() ||
-      (wokeUp && node.projector.hasPending()) ||
+      node.projector.hasPending() ||
+      (node.lastStep?.type === 'GENERIC' &&
+        runningStepStatuses.has(String(node.lastStep.status))) ||
+      awaitingWokenPlanner ||
       !childStatus.settled ||
       isWaitingOnUser?.() === true
     if (tracking) lastActivity = Date.now()
     else if (Date.now() - lastActivity >= stallTimeoutMs) {
-      onItem({
-        type: 'error',
-        id: `${sessionId}:step:${lastStepIndex}:stalled`,
-        message: `Stopped waiting for agy: transcript_full.jsonl was idle for ${Math.round(stallTimeoutMs / 1000)}s without a final response.`,
-      })
-      return { status: 'completed', lastStepUsage }
+      return stall()
     }
     await pause(pollIntervalMs, signal)
   }
