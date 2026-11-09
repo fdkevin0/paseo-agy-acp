@@ -321,6 +321,12 @@ test('parent waits for the terminal child report, then its own response, without
         outputTokens: 20,
         cachedReadTokens: 30,
       },
+      wokeUp: true,
+      wakeupUsage: {
+        inputTokens: 100,
+        outputTokens: 20,
+        cachedReadTokens: 30,
+      },
     })
     assert.ok(
       items.some(
@@ -367,6 +373,7 @@ test('nested child completion uses delivered reports and sending to parent never
     assert.deepEqual(await settleBrainTurn(f.root, parent, 'p', () => {}), {
       status: 'completed',
       lastStepUsage: undefined,
+      wokeUp: true,
     })
   } finally {
     stop?.()
@@ -692,6 +699,7 @@ test('a child can report to its parent and a sibling before completing', async (
     assert.deepEqual(await settleBrainTurn(f.root, parent, 'p', () => {}), {
       status: 'completed',
       lastStepUsage: undefined,
+      wokeUp: true,
     })
   } finally {
     await f.close()
@@ -917,6 +925,7 @@ test('batched SYSTEM_MESSAGE with multiple task completions resolves all tasks a
     assert.deepEqual(result, {
       status: 'completed',
       lastStepUsage: undefined,
+      wokeUp: true,
     })
     const completedTools = items.filter(
       (i): i is Extract<ProviderTimelineItem, { type: 'tool_call' }> =>
@@ -980,6 +989,7 @@ test('literal [Message] inside a subagent report body does not over-count consum
     assert.deepEqual(await running, {
       status: 'completed',
       lastStepUsage: undefined,
+      wokeUp: true,
     })
   } finally {
     abort.abort()
@@ -1089,6 +1099,52 @@ test('shouldEmitPreWakeupTool suppresses completed foreground tools while emitti
         'assistant_message:OK',
       ],
     )
+
+    // When emitForeground is true (fallback if user_message_chunk never arrived), foreground items are recovered without duplicating user_message
+    const recovered: ProviderTimelineItem[] = []
+    await appendFile(
+      f.path(parent),
+      encode([
+        { step_index: 10, type: 'USER_INPUT', content: 'next turn' },
+        {
+          step_index: 11,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          thinking: 'Think',
+          content: 'Recovered reply',
+          tool_calls: [{ id: 'rec-tool', name: 'read_file', args: {} }],
+        },
+        {
+          step_index: 12,
+          type: 'GENERIC',
+          status: 'DONE',
+          content: 'read output',
+        },
+        done(13, 'Final reply'),
+      ]),
+    )
+    const recResult = await settleBrainTurn(
+      f.root,
+      parent,
+      'p',
+      (item) => recovered.push(item),
+      { minStepIndex: 9, emitForeground: true },
+    )
+    assert.equal(recResult.status, 'completed')
+    assert.deepEqual(
+      recovered.map((i) =>
+        i.type === 'tool_call'
+          ? `${i.type}:${i.callId}:${i.status}`
+          : `${i.type}:${'text' in i ? i.text : ''}`,
+      ),
+      [
+        'reasoning:Think',
+        'assistant_message:Recovered reply',
+        'tool_call:rec-tool:running',
+        'tool_call:rec-tool:completed',
+        'assistant_message:Final reply',
+      ],
+    )
   } finally {
     await f.close()
   }
@@ -1167,6 +1223,26 @@ test('hasActiveBackgroundWork preserves Turn 1 background tasks in Turn 2 and ig
       await hasActiveBackgroundWork(f.root, parent),
       true,
       'Turn 1 background task must remain active across Turn 2 USER_INPUT',
+    )
+
+    // Parent in an active post-RPC Reactive Wakeup turn after all children settled
+    await f.put(parent, [
+      { step_index: 1, type: 'USER_INPUT', content: 'Turn 1' },
+      done(2, 'Foreground idle'),
+      message(3, child, 'Child report'),
+      {
+        step_index: 4,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          { id: 'sync-tool', name: 'write_file', args: { Path: '/out.md' } },
+        ],
+      },
+    ])
+    assert.equal(
+      await hasActiveBackgroundWork(f.root, parent),
+      true,
+      'unsettled post-RPC wakeup turn on parent must count as active work',
     )
   } finally {
     await f.close()
