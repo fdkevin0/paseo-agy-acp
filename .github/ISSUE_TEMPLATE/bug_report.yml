@@ -1,0 +1,61 @@
+name: Bug Report
+description: Report a bug or unexpected behavior in paseo-agy-acp
+title: '[Bug]: '
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue. Before submitting, please check the [Reference documentation](https://github.com/fdkevin0/paseo-agy-acp/blob/main/docs/reference.md) for known limits and strip any personal paths, emails, or credentials from logs.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal steps to reproduce the issue (e.g., session mode, model, tool approval, subagent, or `/usage` query).
+      placeholder: |
+        1. Open a session with provider `agy` in mode ...
+        2. Send prompt ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-source
+    attributes:
+      label: Plugin Installation Source
+      options:
+        - npm (@fdkevin0/paseo-agy-acp)
+        - GitHub (git:fdkevin0/paseo-agy-acp)
+        - Local clone
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment & Versions
+      description: Output of version checks on the Paseo daemon host.
+      value: |
+        - Plugin version:
+        - Paseo (`paseo --version`):
+        - Antigravity CLI (`agy --version`):
+        - Node.js (`node --version`):
+        - OS / Architecture:
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Plugin Logs & Diagnostics
+      description: Relevant output from `paseo plugin ls`, `paseo plugin logs agy-acp`, or `paseo usage ls --json --refresh` (sanitized).
+      render: shell
