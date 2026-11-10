@@ -1515,3 +1515,293 @@ test('messages recover only owned children and never create root, self or unknow
     await rm(home, { recursive: true, force: true })
   }
 })
+
+/** Open a full-access session so question cards prove they are never auto-approved. */
+async function questionSession(name: string) {
+  const home = await mkdtemp(join(tmpdir(), `agy-${name}-`))
+  const log = join(home, 'calls')
+  const h = await harness({
+    HOME: home,
+    AGY_TEST_LOG: log,
+    // Also logs `cancel`, which proves an interrupt did not relaunch agy.
+    AGY_TEST_LOG_LOAD: '1',
+    AGY_TEST_LOG_ELICITATION_CAP: '1',
+  })
+  await h.provider.send({
+    type: 'session.open',
+    requestId: 'open',
+    sessionId: 's',
+    config: { ...h.config, mode: 'full-access' },
+    history: 'skip',
+  })
+  await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's')
+  h.events.length = 0
+  const prompt = (text: string) =>
+    h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: text,
+        delivery: 'auto',
+        input: { type: 'message', content: [{ type: 'text', text }] },
+      },
+    })
+  const seen = new Set<string>()
+  /** Wait for the next unseen QuestionCard. */
+  const nextQuestion = async () => {
+    const e = await h.wait(
+      (e) => e.type === 'session.permission' && !seen.has(e.request.id),
+    )
+    assert.ok(e.type === 'session.permission')
+    seen.add(e.request.id)
+    return e.request
+  }
+  const answer = (id: string, answers: Record<string, string>) =>
+    h.provider.send({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: id,
+      response: { behavior: 'allow', updatedInput: { answers } },
+    })
+  const turn = (state: 'completed' | 'canceled') =>
+    h.wait((e) => e.type === 'session.turn' && e.state === state)
+  const assistantTexts = () =>
+    h.events.flatMap((e) =>
+      e.type === 'timeline.item' && e.item.type === 'assistant_message'
+        ? [e.item.text]
+        : [],
+    )
+  const questionCards = () =>
+    h.events.filter((e) => e.type === 'session.permission').length
+  const close = async () => {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+  return {
+    h,
+    log,
+    prompt,
+    nextQuestion,
+    answer,
+    turn,
+    assistantTexts,
+    questionCards,
+    close,
+  }
+}
+
+test('a foreground elicitation becomes a QuestionCard in full-access mode and returns schema values', async () => {
+  const q = await questionSession('elicitation')
+  try {
+    assert.ok(
+      (await readFile(q.log, 'utf8')).includes('cap:elicitation.form\n'),
+      'initialize must advertise elicitation.form',
+    )
+    await q.prompt('elicitation')
+    const card = await q.nextQuestion()
+    assert.equal(card.kind, 'question')
+    assert.equal(card.name, 'ask_question')
+    await q.answer(card.id, {
+      'Question 1': '(Recommended) Option 1',
+      'Question 2': 'Linux, x86_64, FreeBSD',
+    })
+    await q.turn('completed')
+    assert.ok(
+      q
+        .assistantTexts()
+        .includes(
+          'elicited:{"action":"accept","content":{"q1":"1","q2":["1"],"q2_other":"FreeBSD"}}',
+        ),
+    )
+  } finally {
+    await q.close()
+  }
+})
+
+test('an ask_question permission request is not auto-approved in full-access mode', async () => {
+  const q = await questionSession('ask-permission')
+  try {
+    await q.prompt('ask-permission-binary')
+    const card = await q.nextQuestion()
+    assert.equal(card.kind, 'question')
+    await q.h.provider.send({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: card.id,
+      response: { behavior: 'allow', selectedActionId: 'allow_once' },
+    })
+    await q.turn('completed')
+    assert.ok(
+      q
+        .assistantTexts()
+        .includes('ask-bin:{"outcome":"selected","optionId":"allow_once"}'),
+    )
+  } finally {
+    await q.close()
+  }
+})
+
+test('two elicitations in one turn ask once each and settle both unlogged cards', async () => {
+  const q = await questionSession('double-elicitation')
+  try {
+    await q.prompt('double-elicitation')
+    await q.answer((await q.nextQuestion()).id, { 'Question 1': 'Yes' })
+    await q.answer((await q.nextQuestion()).id, { 'Question 1': 'No' })
+    await q.turn('completed')
+    assert.equal(q.questionCards(), 2)
+    assert.equal(
+      q.h.events.filter(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'tool_call' &&
+          e.item.name === 'ask_question' &&
+          e.item.status === 'completed',
+      ).length,
+      2,
+    )
+  } finally {
+    await q.close()
+  }
+})
+
+test('a woken ask_question is answered once and its replayed elicitation reuses the answer', async () => {
+  const q = await questionSession('woken-question')
+  try {
+    await q.prompt('woken-question')
+    const card = await q.nextQuestion()
+    assert.equal(card.kind, 'question')
+    await q.answer(card.id, { 'Question 1': '(Recommended) Option 1' })
+    await q.turn('completed')
+    assert.equal(q.questionCards(), 1)
+    assert.deepEqual(q.assistantTexts(), [
+      'Waiting for background check...',
+      'Background check finished. Please select:',
+      'Completed woken question:{"action":"accept","content":{"q1":"1"}}',
+    ])
+  } finally {
+    await q.close()
+  }
+})
+
+test('an elicitation sent during a native background wakeup reuses the pending card without sending an extra prompt', async () => {
+  const q = await questionSession('woken-native-elicitation')
+  try {
+    await q.prompt('woken-native-elicitation')
+    const card = await q.nextQuestion()
+    assert.equal(card.kind, 'question')
+    // Wait until elicitation/create has arrived while Brain's QuestionCard is still open.
+    const deadline = Date.now() + 2000
+    while (!(await readFile(q.log, 'utf8')).includes('elicit\n')) {
+      assert.ok(
+        Date.now() < deadline,
+        'Timed out waiting for woken elicitation',
+      )
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal(q.questionCards(), 1)
+    await q.answer(card.id, { 'Question 1': '(Recommended) Option 1' })
+    await q.turn('completed')
+    assert.equal(q.questionCards(), 1)
+    assert.deepEqual(
+      (await readFile(q.log, 'utf8'))
+        .split('\n')
+        .filter((line) => line.startsWith('prompt:')),
+      ['prompt:woken-native-elicitation'],
+    )
+    assert.ok(
+      q
+        .assistantTexts()
+        .includes('Native woken:{"action":"accept","content":{"q1":"1"}}'),
+    )
+    assert.equal(
+      q.h.events.filter(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'tool_call' &&
+          e.item.name === 'ask_question' &&
+          e.item.status === 'completed',
+      ).length,
+      1,
+    )
+  } finally {
+    await q.close()
+  }
+})
+
+test('a different question during a woken continuation gets its own card', async () => {
+  const q = await questionSession('woken-mismatch')
+  try {
+    await q.prompt('woken-question')
+    await q.answer((await q.nextQuestion()).id, { 'Question 1': 'Option 2' })
+    await q.answer((await q.nextQuestion()).id, {
+      'Question 1': 'Custom follow-up answer',
+    })
+    await q.turn('completed')
+    assert.equal(q.questionCards(), 2)
+    assert.ok(
+      q
+        .assistantTexts()
+        .includes(
+          'Completed woken question:{"action":"accept","content":{"q1_other":"Custom follow-up answer"}}',
+        ),
+    )
+  } finally {
+    await q.close()
+  }
+})
+
+test('canceling a woken ask_question cancels the native turn without relaunching', async () => {
+  const q = await questionSession('woken-deny')
+  try {
+    await q.prompt('woken-question')
+    const card = await q.nextQuestion()
+    const before = await readFile(q.log, 'utf8')
+    await q.h.provider.send({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: card.id,
+      response: { behavior: 'deny' },
+    })
+    await q.turn('canceled')
+    assert.equal(
+      (await readFile(q.log, 'utf8')).slice(before.length),
+      'cancel\n',
+    )
+    assert.ok(
+      q.h.events.some(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'tool_call' &&
+          e.item.name === 'ask_question' &&
+          e.item.status === 'canceled',
+      ),
+    )
+  } finally {
+    await q.close()
+  }
+})
+
+test('interrupting a woken ask_question cancels without relaunching', async () => {
+  const q = await questionSession('woken-interrupt')
+  try {
+    await q.prompt('woken-question')
+    await q.nextQuestion()
+    const before = await readFile(q.log, 'utf8')
+    await q.h.provider.send({
+      type: 'session.interrupt',
+      requestId: 'interrupt',
+      sessionId: 's',
+    })
+    await q.h.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'interrupt',
+    )
+    await q.turn('canceled')
+    assert.equal(
+      (await readFile(q.log, 'utf8')).slice(before.length),
+      'cancel\n',
+    )
+  } finally {
+    await q.close()
+  }
+})
