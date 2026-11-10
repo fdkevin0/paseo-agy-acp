@@ -508,4 +508,46 @@ test('tool details enrich shell exit codes, clean read gutters, map plan artifac
   })
   assert.ok(failed?.type === 'tool_call')
   assert.equal(failed.error, 'permission denied')
+
+  const askRunning = timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'ask-1',
+    title: 'default_api:ask_question',
+    status: 'in_progress',
+    rawInput: {
+      questions: [
+        {
+          question: 'Which approach?',
+          options: ['Option A', 'Option B'],
+          is_multi_select: false,
+        },
+      ],
+    },
+  })
+  assert.ok(askRunning?.type === 'tool_call')
+  assert.equal(askRunning.name, 'ask_question')
+  assert.deepEqual(askRunning.detail, {
+    type: 'plain_text',
+    label: 'ask_question',
+    text: 'Which approach?\n  1. Option A\n  2. Option B',
+  })
+  assert.deepEqual(
+    toolDetail({
+      title: 'default_api:ask_question',
+      rawInput: {
+        questions: [
+          {
+            question: 'Which approach?',
+            options: ['Option A', 'Option B'],
+          },
+        ],
+      },
+      rawOutput: 'Option A',
+    }),
+    {
+      type: 'plain_text',
+      label: 'ask_question',
+      text: 'Which approach?\n  1. Option A\n  2. Option B\n\nAnswer:\nOption A',
+    },
+  )
 })

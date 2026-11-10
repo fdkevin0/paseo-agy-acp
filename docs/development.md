@@ -87,7 +87,7 @@ Inspect `npm pack --dry-run --ignore-scripts` for the manifest, icon, both overv
 
 ### CI and tag validation
 
-`ci.yml` checks pull requests, pushes to `main` and manual runs on Node 22.18 and 24. It installs the locked dependencies, checks formatting and types, runs the offline suite and verifies package contents.
+`ci.yml` checks pull requests, pushes to `main` and manual runs on Node 24. It installs the locked dependencies, checks formatting and types, runs the offline suite and verifies package contents.
 
 `release.yml` runs for version-tag pushes or manual dispatch on an existing tag. It rejects branch dispatches, mismatched tags and non-stable versions before contacting npm. The tag must equal `v` plus `package.json`'s stable `X.Y.Z` version. Only a registry HTTP 404 means the version is absent; HTTP 200 marks it as already published. Authentication failures, server errors and timeouts stop the workflow.
 
@@ -95,7 +95,7 @@ For an unpublished version, the job installs dependencies, verifies formatting/t
 
 ### Trusted Publishing and release procedure
 
-Configure npm [Trusted Publishing](https://docs.npmjs.com/trusted-publishers/) for owner `fdkevin0`, repository `paseo-agy-acp` and workflow filename `release.yml`. The publish job grants `id-token: write` and installs npm >=11.5.1. An optional `NPM_TOKEN` repository secret is passed as `NODE_AUTH_TOKEN` for token-based authentication. Repository ownership, npm package permissions and publisher setup must be configured before releasing.
+Configure npm [Trusted Publishing](https://docs.npmjs.com/trusted-publishers/) for owner `fdkevin0`, repository `paseo-agy-acp` and workflow filename `release.yml`. The publish job grants `id-token: write` and installs npm >=11.5.1 for OIDC authentication without repository token secrets. Repository ownership, npm package permissions and publisher setup must be configured before releasing.
 
 1. Bump the stable package version and synchronize the shrinkwrap.
 2. Run offline checks, inspect the prepared tarball and complete live smoke checks.

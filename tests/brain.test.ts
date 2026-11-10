@@ -2180,3 +2180,344 @@ test('daemon schedule does not block foreground settlement or trigger interrupt 
     await f.close()
   }
 })
+
+const loadWokenQuestionFixture = async (): Promise<Row[]> =>
+  (
+    await readFile(
+      new URL('./fixtures/woken-question-transcript.jsonl', import.meta.url),
+      'utf8',
+    )
+  )
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line) as Row)
+
+test('a woken ask_question is not background work and closes without a question handler', async () => {
+  const f = await fixture()
+  try {
+    const rows = await loadWokenQuestionFixture()
+    // Steps 0..5: background run_command wakes the session, and step 5 calls ask_question with no GENERIC row yet.
+    await f.put(parent, rows.slice(0, 6))
+
+    // Waiting on user question in a woken turn is NOT active background work (must not relaunch on interrupt)
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
+
+    // Without onQuestion, settleBrainTurn completes immediately instead of stalling for 15m
+    const directItems: ProviderTimelineItem[] = []
+    const direct = await settleBrainTurn(
+      f.root,
+      parent,
+      'p',
+      (item) => directItems.push(item),
+      { minStepIndex: -1, pollIntervalMs: 5, stallTimeoutMs: 30 },
+    )
+    assert.equal(direct.status, 'completed')
+    assert.equal(direct.wokeUp, true)
+    assert.ok(
+      directItems.some(
+        (i) =>
+          i.type === 'tool_call' &&
+          i.name === 'ask_question' &&
+          i.status === 'completed',
+      ),
+    )
+  } finally {
+    await f.close()
+  }
+})
+
+test('answering a woken ask_question continues the turn and records the answer', async () => {
+  const f = await fixture()
+  try {
+    const rows = await loadWokenQuestionFixture()
+    await f.put(parent, rows.slice(0, 6))
+
+    // With onQuestion answering and appending agy's GENERIC + PLANNER_RESPONSE (steps 6..7), settleBrainTurn continues and emits the final reply
+    const contItems: ProviderTimelineItem[] = []
+    const cont = await settleBrainTurn(
+      f.root,
+      parent,
+      'p',
+      (item) => contItems.push(item),
+      {
+        minStepIndex: -1,
+        pollIntervalMs: 5,
+        stallTimeoutMs: 50,
+        onQuestion: async (q) => {
+          assert.equal(q.wokeUp, true)
+          assert.equal(q.questions.length, 1)
+          assert.equal(
+            q.questions[0].question,
+            'Background check finished. Which option?',
+          )
+          await appendFile(f.path(parent), encode(rows.slice(6)))
+          return {
+            status: 'answered',
+            answerText: '(Recommended) Option 1',
+          }
+        },
+      },
+    )
+    assert.equal(cont.status, 'completed')
+    assert.equal(cont.wokeUp, true)
+    const completedAsk = contItems.findLast(
+      (i) =>
+        i.type === 'tool_call' &&
+        i.name === 'ask_question' &&
+        i.status === 'completed',
+    )
+    assert.ok(
+      completedAsk?.type === 'tool_call' &&
+        completedAsk.detail.type === 'plain_text' &&
+        completedAsk.detail.text?.includes('Answer:\n(Recommended) Option 1'),
+    )
+    assert.deepEqual(
+      contItems.flatMap((i) =>
+        i.type === 'assistant_message' ? [i.text] : [],
+      ),
+      ['Done: (Recommended) Option 1'],
+    )
+  } finally {
+    await f.close()
+  }
+})
+
+test('a woken question answered through elicitation waits for agy to reply to the answer', async () => {
+  const f = await fixture()
+  try {
+    const rows = await loadWokenQuestionFixture()
+    await f.put(parent, rows.slice(0, 6))
+    const items: ProviderTimelineItem[] = []
+    const settled = await alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+        minStepIndex: -1,
+        pollIntervalMs: 5,
+        stallTimeoutMs: 1000,
+        onQuestion: async () => {
+          // agy logs the tool result and its reply only after the elicitation response, so later than this return.
+          setTimeout(() => {
+            void appendFile(
+              f.path(parent),
+              encode([rows[6], done(7, 'Done: (Recommended) Option 1')]),
+            )
+          }, 60)
+          return { status: 'answered', answerText: '(Recommended) Option 1' }
+        },
+      }),
+    )
+    assert.equal(settled.status, 'completed')
+    assert.deepEqual(
+      items.flatMap((i) => (i.type === 'assistant_message' ? [i.text] : [])),
+      ['Done: (Recommended) Option 1'],
+    )
+  } finally {
+    await f.close()
+  }
+})
+
+test('ask_question results stay attributed by step next to sibling tool calls', () => {
+  // Mixed [ask_question, run_command] in one PLANNER_RESPONSE preserves FIFO/step attribution
+  const p1 = new BrainTranscriptProjector('s')
+  const mixedLogged = [
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          id: 'ask',
+          name: 'ask_question',
+          args: { questions: [{ question: 'Choose', options: ['A', 'B'] }] },
+        },
+        {
+          id: 'cmd',
+          name: 'run_command',
+          args: { CommandLine: 'echo hi' },
+        },
+      ],
+    },
+    {
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: 'User chose A',
+    },
+    { step_index: 3, type: 'GENERIC', status: 'DONE', content: 'hi' },
+  ].flatMap((row) => p1.project(row))
+  const completedMixed = mixedLogged.filter(
+    (i): i is Extract<ProviderTimelineItem, { type: 'tool_call' }> =>
+      i.type === 'tool_call' && i.status === 'completed',
+  )
+  assert.equal(completedMixed.length, 2)
+  assert.equal(completedMixed[0].callId, 'ask')
+  assert.ok(
+    completedMixed[0].detail.type === 'plain_text' &&
+      completedMixed[0].detail.text?.includes('Answer:\nUser chose A'),
+  )
+  assert.equal(completedMixed[1].callId, 'cmd')
+  assert.ok(
+    completedMixed[1].detail.type === 'shell' &&
+      completedMixed[1].detail.output === 'hi',
+  )
+
+  // When leading ask_question stays unlogged in WAITING (step 2), GENERIC(step 3) still attributes to cmd (step 3)
+  const p2 = new BrainTranscriptProjector('s')
+  const mixedUnlogged = [
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          id: 'ask',
+          name: 'ask_question',
+          args: { questions: [{ question: 'Choose', options: ['A', 'B'] }] },
+        },
+        {
+          id: 'cmd',
+          name: 'run_command',
+          args: { CommandLine: 'echo hi' },
+        },
+      ],
+    },
+    { step_index: 3, type: 'GENERIC', status: 'DONE', content: 'hi' },
+  ].flatMap((row) => p2.project(row))
+  const completedUnlogged = mixedUnlogged.filter(
+    (i): i is Extract<ProviderTimelineItem, { type: 'tool_call' }> =>
+      i.type === 'tool_call' && i.status === 'completed',
+  )
+  assert.equal(completedUnlogged.length, 1)
+  assert.equal(completedUnlogged[0].callId, 'cmd')
+  assert.equal(p2.hasPending(), false)
+  assert.equal(p2.consumePendingQuestion()?.tool.callId, 'ask')
+
+  // A CHECKPOINT between the response and its GENERIC rows shifts the expected step of later calls.
+  const p3 = new BrainTranscriptProjector('s')
+  const checkpointed = [
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          id: 'ask',
+          name: 'ask_question',
+          args: { questions: [{ question: 'Choose', options: ['A', 'B'] }] },
+        },
+        { id: 'cmd', name: 'run_command', args: { CommandLine: 'echo hi' } },
+      ],
+    },
+    { step_index: 2, type: 'CHECKPOINT' },
+    { step_index: 3, type: 'GENERIC', status: 'DONE', content: 'User chose A' },
+    { step_index: 4, type: 'GENERIC', status: 'DONE', content: 'hi' },
+  ].flatMap((row) => p3.project(row))
+  assert.deepEqual(
+    checkpointed.flatMap((i) =>
+      i.type === 'tool_call' &&
+      i.status === 'completed' &&
+      i.detail.type !== 'unknown'
+        ? [
+            [
+              i.callId,
+              i.detail.type === 'shell'
+                ? i.detail.output
+                : i.detail.type === 'plain_text'
+                  ? i.detail.text
+                  : '',
+            ],
+          ]
+        : [],
+    ),
+    [
+      ['ask', 'Choose\n  1. A\n  2. B\n\nAnswer:\nUser chose A'],
+      ['cmd', 'hi'],
+    ],
+  )
+})
+
+test('a leading ask_question fires onQuestion before its sibling has a GENERIC row', async () => {
+  const f = await fixture()
+  try {
+    // Same PLANNER_RESPONSE [ask_question, run_command] with no GENERIC rows yet still fires onQuestion immediately
+    await f.put(parent, [
+      {
+        step_index: 0,
+        type: 'USER_INPUT',
+        content: '<USER_REQUEST>Ask then run</USER_REQUEST>',
+      },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'Need confirmation before running command:',
+        tool_calls: [
+          {
+            id: 'ask-first',
+            name: 'ask_question',
+            args: {
+              questions: [{ question: 'Run echo?', options: ['Yes', 'No'] }],
+            },
+          },
+          {
+            id: 'cmd-second',
+            name: 'run_command',
+            args: { CommandLine: 'echo hi' },
+          },
+        ],
+      },
+    ])
+    const leadingAskItems: ProviderTimelineItem[] = []
+    let leadingAskTriggered = false
+    const leadingAskSettled = await alive(
+      settleBrainTurn(
+        f.root,
+        parent,
+        'p',
+        (item) => leadingAskItems.push(item),
+        {
+          minStepIndex: -1,
+          pollIntervalMs: 5,
+          stallTimeoutMs: 80,
+          onQuestion: async (q) => {
+            leadingAskTriggered = true
+            assert.equal(q.tool.callId, 'ask-first')
+            assert.equal(q.questions[0]?.question, 'Run echo?')
+            await appendFile(
+              f.path(parent),
+              encode([
+                {
+                  step_index: 2,
+                  type: 'GENERIC',
+                  status: 'DONE',
+                  content: 'Yes',
+                },
+                {
+                  step_index: 3,
+                  type: 'GENERIC',
+                  status: 'DONE',
+                  content: 'hi',
+                },
+                done(4, 'Command completed.'),
+              ]),
+            )
+            return { status: 'answered', answerText: 'Yes' }
+          },
+        },
+      ),
+    )
+    assert.equal(leadingAskTriggered, true)
+    assert.equal(leadingAskSettled.status, 'completed')
+    const completedCmdSecond = leadingAskItems.find(
+      (i): i is Extract<ProviderTimelineItem, { type: 'tool_call' }> =>
+        i.type === 'tool_call' &&
+        i.callId === 'cmd-second' &&
+        i.status === 'completed',
+    )
+    assert.ok(
+      completedCmdSecond?.detail.type === 'shell' &&
+        completedCmdSecond.detail.output === 'hi',
+    )
+  } finally {
+    await f.close()
+  }
+})

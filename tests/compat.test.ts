@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { mkdtemp, rm } from 'node:fs/promises'
+import { writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -16,11 +17,15 @@ async function run(
   scenario: string,
   verify: (events: ProviderEvent[]) => void,
   afterClose?: (events: ProviderEvent[]) => void,
+  options: {
+    history?: 'replay' | 'skip'
+    capabilities?: readonly string[]
+  } = {},
 ) {
   const home = await mkdtemp(join(tmpdir(), 'agy-compat-'))
   const provider = await createProvider(new AgyUsageSource()).connect({
     versions: [1],
-    capabilities: PROVIDER_CAPABILITIES,
+    capabilities: options.capabilities ?? PROVIDER_CAPABILITIES,
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./compat-acp.ts', import.meta.url))],
@@ -32,9 +37,28 @@ async function run(
     },
   })
   const events: ProviderEvent[] = []
+  const opened = new Map<string, readonly string[]>()
+  const protocolErrors: string[] = []
   provider.onEvent((event) => {
     ProviderEventSchema.parse(event)
-    events.push(event)
+    if (event.type === 'session.opened') {
+      if (
+        event.parentSessionId &&
+        !opened.get(event.parentSessionId)?.includes('session.subsession')
+      )
+        protocolErrors.push(
+          `Parent lacks session.subsession: ${event.parentSessionId}`,
+        )
+      opened.set(event.sessionId, event.capabilities)
+    } else if (event.type === 'session.closed') opened.delete(event.sessionId)
+    events.push(structuredClone(event))
+    if (
+      event.type === 'timeline.item' &&
+      event.item.type === 'tool_call' &&
+      event.item.callId === 'call_345678901' &&
+      event.item.status === 'completed'
+    )
+      writeFileSync(join(home, 'message-observed'), '')
   })
   async function until(predicate: (event: ProviderEvent) => boolean) {
     const deadline = Date.now() + 5000
@@ -51,8 +75,8 @@ async function run(
       type: 'session.open',
       requestId: 'open',
       sessionId: 's',
-      history: 'replay',
-      ...(scenario.startsWith('history')
+      history: options.history ?? 'replay',
+      ...(scenario.startsWith('history') || options.history === 'skip'
         ? {
             persistence: {
               version: 1,
@@ -72,6 +96,7 @@ async function run(
       (event) => event.type === 'session.ready' && event.sessionId === 's',
     )
     if (scenario.startsWith('history')) {
+      assert.deepEqual(protocolErrors, [])
       verify(events)
       return
     }
@@ -90,6 +115,7 @@ async function run(
         event.sessionId === 's' &&
         event.state === 'completed',
     )
+    assert.deepEqual(protocolErrors, [])
     verify(events)
   } finally {
     await provider.close()
@@ -211,6 +237,36 @@ for (const scenario of ['kill', 'kill-all'])
           1,
           'a killed child is never reopened by later settlement',
         )
+        const messages = events.filter(
+          (e) =>
+            e.type === 'timeline.item' &&
+            e.item.type === 'tool_call' &&
+            e.item.callId === 'call_345678901',
+        )
+        assert.equal(
+          messages.length,
+          2,
+          'only the running and completed live message events',
+        )
+        for (const e of messages) {
+          assert.ok(
+            e.type === 'timeline.item' &&
+              e.item.type === 'tool_call' &&
+              e.item.detail.type === 'sub_agent',
+          )
+          assert.equal(e.item.detail.childSessionId, childId)
+        }
+        const firstMessage = events.indexOf(messages[0])
+        const openedIndex = events.findIndex(
+          (e) => e.type === 'session.opened' && e.sessionId === childId,
+        )
+        const manageIndex = events.findIndex(
+          (e) =>
+            e.type === 'timeline.item' &&
+            e.item.type === 'tool_call' &&
+            e.item.callId === 'call_456789012',
+        )
+        assert.ok(openedIndex < firstMessage && firstMessage < manageIndex)
         const canceled = events.findIndex(
           (event) =>
             event.type === 'session.turn' &&
@@ -242,3 +298,124 @@ for (const scenario of ['kill', 'kill-all'])
         ),
     )
   })
+
+for (const scenario of [
+  'owned-message',
+  'owned-message-late',
+  'owned-message-killed',
+  'root-message',
+  'unknown-message',
+  'history-message',
+]) {
+  test(`message ownership is resolved before publishing: ${scenario}`, async () => {
+    await run(scenario, (events) => {
+      const expected =
+        (scenario.startsWith('owned-message') &&
+          !scenario.endsWith('killed')) ||
+        scenario === 'history-message'
+      const messages = events.filter(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'tool_call' &&
+          e.item.callId === 'call_345678901',
+      )
+      assert.equal(messages.length, 2)
+      for (const e of messages) {
+        assert.ok(
+          e.type === 'timeline.item' &&
+            e.item.type === 'tool_call' &&
+            e.item.detail.type === 'sub_agent',
+        )
+        assert.equal(
+          e.item.detail.childSessionId,
+          expected ? 's:child:22222222-2222-4222-8222-222222222222' : undefined,
+        )
+      }
+      assert.equal(
+        events.filter((e) => e.type === 'session.opened').length,
+        expected ? 2 : 1,
+      )
+    })
+  })
+}
+test('skip restoration resolves the first live message to a historical child', async () => {
+  await run(
+    'owned-message',
+    (events) => {
+      const messages = events.filter(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'tool_call' &&
+          e.item.callId === 'call_345678901',
+      )
+      assert.equal(messages.length, 2)
+      for (const e of messages) {
+        assert.ok(
+          e.type === 'timeline.item' &&
+            e.item.type === 'tool_call' &&
+            e.item.detail.type === 'sub_agent',
+        )
+        assert.equal(
+          e.item.detail.childSessionId,
+          's:child:22222222-2222-4222-8222-222222222222',
+        )
+      }
+    },
+    undefined,
+    { history: 'skip' },
+  )
+})
+test('without subsession capability message targets never leak native IDs', async () => {
+  await run(
+    'owned-message',
+    (events) => {
+      assert.equal(events.filter((e) => e.type === 'session.opened').length, 1)
+      for (const e of events) {
+        if (
+          e.type === 'timeline.item' &&
+          e.item.type === 'tool_call' &&
+          e.item.detail.type === 'sub_agent'
+        )
+          assert.equal(e.item.detail.childSessionId, undefined)
+      }
+    },
+    undefined,
+    {
+      capabilities: PROVIDER_CAPABILITIES.filter(
+        (c) => c !== 'session.subsession',
+      ),
+    },
+  )
+})
+
+test('a child spawned and killed in one live poll retains its history before cancellation', async () => {
+  await run('spawn-kill', (events) => {
+    const childId = 's:child:22222222-2222-4222-8222-222222222222'
+    assert.equal(
+      events.filter(
+        (e) => e.type === 'session.opened' && e.sessionId === childId,
+      ).length,
+      1,
+    )
+    const saved = events.findIndex(
+      (e) =>
+        e.type === 'timeline.item' &&
+        e.sessionId === childId &&
+        e.item.type === 'assistant_message' &&
+        e.item.text === 'Saved before kill',
+    )
+    const canceled = events.findIndex(
+      (e) =>
+        e.type === 'session.turn' &&
+        e.sessionId === childId &&
+        e.state === 'canceled',
+    )
+    const completed = events.findIndex(
+      (e) =>
+        e.type === 'session.turn' &&
+        e.sessionId === 's' &&
+        e.state === 'completed',
+    )
+    assert.ok(saved >= 0 && saved < canceled && canceled < completed)
+  })
+})

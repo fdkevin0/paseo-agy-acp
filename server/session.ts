@@ -21,10 +21,15 @@ import type {
 } from '@getpaseo/plugin/server/provider'
 import {
   RequestPermissionRequestSchema,
-  isChooserRequest,
+  buildElicitationResponse,
+  formatQuestionAnswersText,
   isPreapprovedMcpTool,
+  normalizeElicitationQuestions,
   permissionKind,
   pickPermissionOption,
+  sameNormalizedQuestions,
+  toQuestionPermissionInput,
+  type NormalizedQuestion,
 } from './permissions.ts'
 import {
   BrainTranscriptProjector,
@@ -36,6 +41,7 @@ import {
   settleBrainTurn,
   watchBrain,
   type BrainWatchHandle,
+  type SubagentRecord,
 } from './brain.ts'
 import { dataDirectory, removeSessionArtifacts } from './preflight.ts'
 import { connectAcp } from './transport.ts'
@@ -55,6 +61,25 @@ import {
 
 type Open = Extract<ProviderInput, { type: 'session.open' }>
 type Prompt = Extract<ProviderInput, { type: 'session.prompt' }>
+type PermissionResponseInput = Extract<
+  ProviderInput,
+  { type: 'session.permission' }
+>['response']
+type PendingQuestionPermission = {
+  type: 'question'
+  questions: NormalizedQuestion[]
+  promise: Promise<PermissionResponseInput | null>
+  resolve: (r: PermissionResponseInput | null) => void
+  fromElicitation: boolean
+  fromBrain: boolean
+}
+type PendingPermission =
+  | {
+      type: 'acp'
+      request: RequestPermissionRequest
+      resolve: (r: RequestPermissionResponse) => void
+    }
+  | PendingQuestionPermission
 type Session = Awaited<ReturnType<typeof createSession>>
 interface SessionOptions {
   usage: AgyUsageSource
@@ -65,6 +90,9 @@ interface SessionOptions {
 }
 
 const SKIP_PERMISSIONS_FLAG = '--dangerously-skip-permissions'
+
+const isSpawn = (name: string) => name.includes('invoke_subagent')
+const isMessage = (name: string) => name.includes('send_message')
 
 function effectiveLaunch(
   launch: ProviderLaunch | undefined,
@@ -193,7 +221,8 @@ export class SessionManager {
               }
             : {}),
         })
-        session.flush()
+        await session.refreshSubagents()
+        await session.flush()
         if (input.persistence) await session.replayTools()
         session.state.turnToolCallIds = []
         await configureSession(session, input.config)
@@ -229,17 +258,21 @@ export class SessionManager {
     if (input.type === 'session.permission') {
       const permission = session.permissions.get(input.permissionId)
       if (!permission) throw new Error('Permission is no longer pending')
-      const option = pickPermissionOption(
-        permission.request.options,
-        input.response.behavior,
-        input.response.selectedActionId,
-      )
-      permission.resolve({
-        outcome: option
-          ? { outcome: 'selected', optionId: option.optionId }
-          : { outcome: 'cancelled' },
-      })
       session.permissions.delete(input.permissionId)
+      if (permission.type === 'acp') {
+        const option = pickPermissionOption(
+          permission.request.options,
+          input.response.behavior,
+          input.response.selectedActionId,
+        )
+        permission.resolve({
+          outcome: option
+            ? { outcome: 'selected', optionId: option.optionId }
+            : { outcome: 'cancelled' },
+        })
+      } else {
+        permission.resolve(input.response)
+      }
       emit({
         type: 'session.permission_resolved',
         sessionId: session.id,
@@ -284,13 +317,7 @@ async function createSession(
   transports: Set<ReturnType<typeof connectAcp>>,
 ) {
   const { launch, capabilities, emit } = options
-  const permissions = new Map<
-    string,
-    {
-      request: RequestPermissionRequest
-      resolve: (r: RequestPermissionResponse) => void
-    }
-  >()
+  const permissions = new Map<string, PendingPermission>()
   const timeline = new Timeline(id)
   const brainRoot = join(dataDirectory(launch, config?.env, cwd), 'brain')
   const state = {
@@ -301,6 +328,19 @@ async function createSession(
     skipPermissions: config?.mode === FULL_ACCESS_MODE_ID,
     turnHadContextUsage: false,
     turnHadModelOutput: false,
+    inSettle: false,
+    handledElicitations: [] as Array<{
+      questions: NormalizedQuestion[]
+      answerText: string | null
+      wokeUp: boolean
+    }>,
+    suppressContinuationAcp: false,
+    preStagedQuestion: undefined as
+      | {
+          questions: NormalizedQuestion[]
+          response: PermissionResponseInput
+        }
+      | undefined,
     turnToolCallIds: [] as string[],
     lastKnownStepIndex: -1,
     wakeup: {
@@ -320,6 +360,7 @@ async function createSession(
   }
   const buffered: SessionNotification[] = []
   const children = new Map<string, BrainWatchHandle>()
+  const childParents = new Map<string, string>()
   const killedChildren = new Set<string>()
   const resuming = new Set<string>()
   let notificationLane = Promise.resolve()
@@ -368,45 +409,70 @@ async function createSession(
     for (const item of timeline.terminalize(status, error))
       emit({ type: 'timeline.item', sessionId: id, item })
   }
+  const childKey = (nativeId: string) => `${id}:child:${nativeId}`
   async function syncKilledChildren(
-    subagents?: Awaited<ReturnType<typeof readSubagents>>,
+    subagents?: readonly SubagentRecord[],
     parentNativeId = state.nativeId,
   ) {
-    const list =
+    rememberSubagents(
       subagents ??
-      (await readSubagents(brainRoot, parentNativeId).catch(() => []))
-    const cancels: Promise<void>[] = []
-    for (const sub of list)
+        (await readSubagents(brainRoot, parentNativeId).catch(() => [])),
+      parentNativeId,
+    )
+    // Include descendants discovered by their own watchers, not just this parent's descriptors.
+    await Promise.all(
+      [...killedChildren].map((childId) => children.get(childId)?.cancel()),
+    )
+  }
+  function rememberSubagents(
+    subagents: readonly SubagentRecord[],
+    parentNativeId = state.nativeId,
+  ) {
+    for (const sub of subagents) {
+      if (
+        sub.conversationId !== state.nativeId &&
+        sub.conversationId !== parentNativeId &&
+        !childParents.has(sub.conversationId)
+      )
+        childParents.set(sub.conversationId, parentNativeId)
       if (sub.state === 'SUBAGENT_STATE_KILLED') {
-        const childId = `${id}:child:${sub.conversationId}`
+        const childId = childKey(sub.conversationId)
         killedChildren.add(childId)
-        // Keep the entry: the child session stays open (closed with its parent) and is never reopened.
-        const child = children.get(childId)
-        if (child) cancels.push(child.cancel())
+        if (!state.loading) void children.get(childId)?.cancel()
       }
-    await Promise.all(cancels)
+    }
+  }
+  async function refreshSubagents() {
+    // Optional ownership metadata must not poison the serialized ACP notification lane.
+    const subagents = await readSubagents(brainRoot, state.nativeId).catch(
+      () => [],
+    )
+    if (state.loading) rememberSubagents(subagents)
+    else await syncKilledChildren(subagents)
   }
   function watchChild(
     nativeId: string,
     childId: string,
     resume?: ReturnType<BrainWatchHandle['resumePoint']>,
   ) {
-    children.set(
+    const child = watchBrain(
+      brainRoot,
+      nativeId,
       childId,
-      watchBrain(
-        brainRoot,
-        nativeId,
-        childId,
-        (event) => {
-          if (event.type === 'timeline.item')
-            linkSubsession(childId, nativeId, event.item)
-          emit(event)
-        },
-        1000,
-        () => Boolean(state.turn),
-        resume,
-      ),
+      (event) => {
+        if (event.type === 'timeline.item')
+          linkSubsession(childId, nativeId, event.item)
+        emit(event)
+      },
+      1000,
+      () => Boolean(state.turn),
+      resume,
+      (subagents) => rememberSubagents(subagents, nativeId),
     )
+    children.set(childId, child)
+    void child.ready.then(() => {
+      if (killedChildren.has(childId)) return child.cancel()
+    })
   }
   /** A child stopped by interruption (not killed) can be woken by a message. */
   function isResumable(childId: string) {
@@ -427,6 +493,7 @@ async function createSession(
       resuming.delete(childId)
       if (
         state.closing ||
+        state.failed ||
         killedChildren.has(childId) ||
         children.get(childId) !== existing
       )
@@ -434,44 +501,69 @@ async function createSession(
       watchChild(nativeId, childId, existing.resumePoint())
     })
   }
+  function canLinkChild(
+    nativeId: string,
+    parentNativeId: string,
+    name: string,
+  ) {
+    const childId = childKey(nativeId)
+    const spawn = isSpawn(name)
+    // Killed children are only linked for history, their own spawn call, or an already open session.
+    const killedAllowed =
+      state.loading ||
+      spawn ||
+      !killedChildren.has(childId) ||
+      children.has(childId)
+    // Only a recorded parent, or the spawning call of an unseen child, owns it.
+    const owned =
+      childParents.get(nativeId) === parentNativeId ||
+      (spawn && !childParents.has(nativeId))
+    return (
+      !state.closing &&
+      !state.failed &&
+      capabilities.includes('session.subsession') &&
+      sessionIdPattern.test(nativeId) &&
+      nativeId !== state.nativeId &&
+      killedAllowed &&
+      owned
+    )
+  }
   /** Open or resume direct child sub-sessions for root or nested subagents. */
   function linkSubsession(
     parentSessionId: string,
     parentNativeId: string,
     item: ProviderTimelineItem,
   ) {
-    if (
-      capabilities.includes('session.subsession') &&
-      item.type === 'tool_call' &&
-      item.detail.type === 'sub_agent'
-    ) {
+    if (item.type === 'tool_call' && item.detail.type === 'sub_agent') {
       const nativeId = item.detail.childSessionId
-      if (nativeId && sessionIdPattern.test(nativeId)) {
-        const childId = `${id}:child:${nativeId}`
-        const existing = children.get(childId)
-        if (
-          existing &&
-          isResumable(childId) &&
-          !state.loading &&
-          item.name.includes('send_message')
-        ) {
-          resumeChild(nativeId, childId, existing)
-        } else if (!existing) {
-          emit({
-            type: 'session.opened',
-            sessionId: childId,
-            parentSessionId,
-            toolCallId: item.callId,
-            cwd,
-            capabilities: [],
-            restoration: 'parent',
-            title: item.detail.subAgentType ?? 'Antigravity subagent',
-          })
-          watchChild(nativeId, childId)
-          emit({ type: 'session.ready', sessionId: childId })
-        }
-        item.detail.childSessionId = childId
+      delete item.detail.childSessionId
+      if (!nativeId || !canLinkChild(nativeId, parentNativeId, item.name))
+        return
+      childParents.set(nativeId, parentNativeId)
+      const childId = childKey(nativeId)
+      const existing = children.get(childId)
+      if (
+        existing &&
+        isResumable(childId) &&
+        !state.loading &&
+        isMessage(item.name)
+      ) {
+        resumeChild(nativeId, childId, existing)
+      } else if (!existing) {
+        emit({
+          type: 'session.opened',
+          sessionId: childId,
+          parentSessionId,
+          toolCallId: item.callId,
+          cwd,
+          capabilities: ['session.subsession'],
+          restoration: 'parent',
+          title: item.detail.subAgentType ?? 'Antigravity subagent',
+        })
+        watchChild(nativeId, childId)
+        emit({ type: 'session.ready', sessionId: childId })
       }
+      item.detail.childSessionId = childId
     }
     if (
       item.type === 'tool_call' &&
@@ -497,7 +589,7 @@ async function createSession(
         ...(timestamp ? { timestamp } : {}),
       })
   }
-  function update(notification: SessionNotification) {
+  async function update(notification: SessionNotification) {
     if (state.closing || state.failed) return
     if (state.nativeId && notification.sessionId !== state.nativeId) return
     if (state.opening) {
@@ -529,7 +621,7 @@ async function createSession(
       commandsReceived = true
       resolveCommands()
     } else if (u.sessionUpdate === 'usage_update') {
-      if (state.wakeup.suppressEcho) return
+      if (state.wakeup.suppressEcho || state.suppressContinuationAcp) return
       const next = contextUsage(u)
       if (next && (!state.loading || state.replay)) {
         if (state.turn) state.turnHadContextUsage = true
@@ -537,6 +629,21 @@ async function createSession(
       }
     } else {
       if (state.loading && !state.replay) return
+      if (state.suppressContinuationAcp) {
+        if (
+          u.sessionUpdate === 'tool_call' &&
+          !state.turnToolCallIds.includes(u.toolCallId)
+        )
+          state.turnToolCallIds.push(u.toolCallId)
+        if (
+          state.turn &&
+          (u.sessionUpdate === 'agent_message_chunk' ||
+            u.sessionUpdate === 'agent_thought_chunk' ||
+            u.sessionUpdate === 'tool_call')
+        )
+          state.turnHadModelOutput = true
+        return
+      }
       if (u.sessionUpdate === 'user_message_chunk' && !state.loading) {
         state.wakeup.suppressEcho = false
         timeline.boundary()
@@ -557,7 +664,22 @@ async function createSession(
         state.turnHadModelOutput = true
       // Timeline.update already tracks the ACP item.
       const item = timeline.update(u)
-      if (item) publishItem(item)
+      if (item) {
+        if (
+          item.type === 'tool_call' &&
+          item.detail.type === 'sub_agent' &&
+          isMessage(item.name)
+        ) {
+          // Terminalization may run while ownership is being read.
+          const nativeId = item.detail.childSessionId
+          delete item.detail.childSessionId
+          await refreshSubagents()
+          // Do not restore a native ID that a later terminalization could publish.
+          if (state.closing || state.failed) return
+          if (nativeId !== undefined) item.detail.childSessionId = nativeId
+        }
+        publishItem(item)
+      }
     }
   }
   function publishConfig() {
@@ -569,7 +691,8 @@ async function createSession(
   }
   function cancelPermissions() {
     for (const [permissionId, p] of permissions) {
-      p.resolve({ outcome: { outcome: 'cancelled' } })
+      if (p.type === 'acp') p.resolve({ outcome: { outcome: 'cancelled' } })
+      else p.resolve(null)
       emit({
         type: 'session.permission_resolved',
         sessionId: id,
@@ -578,10 +701,122 @@ async function createSession(
     }
     permissions.clear()
   }
+  function askUserQuestion(
+    questions: NormalizedQuestion[],
+    title?: string,
+    source: 'elicitation' | 'brain' = 'elicitation',
+  ): {
+    promise: Promise<PermissionResponseInput | null>
+    entry: PendingQuestionPermission
+  } | null {
+    if (
+      !questions.length ||
+      !state.nativeId ||
+      !state.turn ||
+      state.closing ||
+      state.failed
+    )
+      return null
+    for (const p of permissions.values()) {
+      if (
+        p.type === 'question' &&
+        (source === 'elicitation' ? !p.fromElicitation : !p.fromBrain) &&
+        sameNormalizedQuestions(p.questions, questions)
+      ) {
+        if (source === 'elicitation') p.fromElicitation = true
+        else p.fromBrain = true
+        return { promise: p.promise, entry: p }
+      }
+    }
+    const input = toQuestionPermissionInput(questions)
+    const detail = toolDetail({
+      title: 'ask_question',
+      rawInput: input,
+    })
+    let resolve!: (r: PermissionResponseInput | null) => void
+    const promise = new Promise<PermissionResponseInput | null>((res) => {
+      resolve = res
+    })
+    const entry: PendingQuestionPermission = {
+      type: 'question',
+      questions,
+      promise,
+      resolve,
+      fromElicitation: source === 'elicitation',
+      fromBrain: source === 'brain',
+    }
+    const permissionId = randomUUID()
+    permissions.set(permissionId, entry)
+    emit({
+      type: 'session.permission',
+      sessionId: id,
+      request: {
+        id: permissionId,
+        name: 'ask_question',
+        kind: 'question',
+        title: title ?? questions[0]?.question ?? 'Question',
+        input,
+        detail,
+        actions: [
+          { id: 'allow', label: 'Submit', behavior: 'allow' },
+          { id: 'deny', label: 'Cancel', behavior: 'deny' },
+        ],
+      },
+    })
+    return { promise, entry }
+  }
   const client = {
     sessionUpdate: (notification: SessionNotification) => {
       notificationLane = notificationLane.then(() => update(notification))
       return notificationLane
+    },
+    requestElicitation: async (params: Record<string, unknown>) => {
+      if (
+        !state.nativeId ||
+        (typeof params.sessionId === 'string' &&
+          params.sessionId !== state.nativeId) ||
+        !state.turn ||
+        state.closing ||
+        state.failed
+      )
+        return { action: 'cancel' }
+      const questions = normalizeElicitationQuestions(params)
+      if (!questions.length) return { action: 'cancel' }
+      if (state.preStagedQuestion) {
+        const staged = state.preStagedQuestion
+        state.preStagedQuestion = undefined
+        if (sameNormalizedQuestions(staged.questions, questions)) {
+          return buildElicitationResponse(
+            questions,
+            staged.response,
+            staged.questions,
+          )
+        }
+      }
+      const pending = askUserQuestion(
+        questions,
+        typeof params.message === 'string' && params.message.trim()
+          ? params.message.trim()
+          : undefined,
+        'elicitation',
+      )
+      if (!pending) return { action: 'cancel' }
+      const response = await pending.promise
+      if (!response) return { action: 'cancel' }
+      if (!pending.entry.fromBrain) {
+        state.handledElicitations.push({
+          questions,
+          answerText:
+            formatQuestionAnswersText(pending.entry.questions, response) ||
+            null,
+          wokeUp: state.inSettle,
+        })
+      }
+      return buildElicitationResponse(
+        questions,
+        response,
+        pending.entry.questions,
+      )
     },
     requestPermission: (request: RequestPermissionRequest) => {
       const parsed = RequestPermissionRequestSchema.safeParse(request)
@@ -599,13 +834,14 @@ async function createSession(
         .safeParse(record(request.toolCall?.rawInput))
       if (!input.success)
         return Promise.resolve({ outcome: { outcome: 'cancelled' as const } })
-      const chooser = isChooserRequest(request.options)
+      const detail = toolDetail(request.toolCall)
+      const kind = permissionKind(request, detail)
       const preapproved = isPreapprovedMcpTool(
         request.toolCall.title,
         input.data,
         config?.toolPolicy,
       )
-      if (!chooser && (state.metadata.fullAccess || preapproved)) {
+      if (kind !== 'question' && (state.metadata.fullAccess || preapproved)) {
         const allow = pickPermissionOption(request.options, 'allow')
         return Promise.resolve({
           outcome: allow
@@ -613,11 +849,9 @@ async function createSession(
             : { outcome: 'cancelled' as const },
         })
       }
-      const detail = toolDetail(request.toolCall)
-      const kind = permissionKind(request, detail)
       return new Promise<RequestPermissionResponse>((resolve) => {
         const permissionId = randomUUID()
-        permissions.set(permissionId, { request, resolve })
+        permissions.set(permissionId, { type: 'acp', request, resolve })
         emit({
           type: 'session.permission',
           sessionId: id,
@@ -678,6 +912,7 @@ async function createSession(
         clientCapabilities: {
           fs: { readTextFile: false, writeTextFile: false },
           terminal: false,
+          elicitation: { form: {} },
         },
       }),
     )
@@ -700,6 +935,7 @@ async function createSession(
       },
       timeline,
       permissions,
+      askUserQuestion,
       cancelPermissions,
       publishConfig,
       publishUsage,
@@ -713,12 +949,15 @@ async function createSession(
         }
       },
       hasChild(nativeId: string) {
-        return children.has(`${id}:child:${nativeId}`)
+        return children.has(childKey(nativeId))
       },
       isChildResumable(nativeId: string) {
-        return isResumable(`${id}:child:${nativeId}`)
+        return isResumable(childKey(nativeId))
       },
       syncKilledChildren,
+      rememberSubagents,
+      refreshSubagents,
+      canLinkChild,
       drain,
       waitForCommands,
       async replayTools() {
@@ -728,6 +967,7 @@ async function createSession(
           readSubagents(brainRoot, state.nativeId),
           readTranscriptRows(brainRoot, state.nativeId),
         ])
+        rememberSubagents(subagents)
         const projector = new BrainTranscriptProjector(id)
         projector.syncMetadata(inbox, subagents)
         projector.bindToolCallIds(state.turnToolCallIds)
@@ -769,9 +1009,11 @@ async function createSession(
           includeDaemons: true,
         }).catch(() => true))
       },
-      flush() {
+      async flush() {
         state.opening = false
-        for (const item of buffered.splice(0)) update(item)
+        for (const item of buffered.splice(0))
+          notificationLane = notificationLane.then(() => update(item))
+        await notificationLane
       },
       async interrupt(): Promise<void> {
         if (state.interrupting) return state.interrupting
@@ -1056,6 +1298,10 @@ async function promptSession(
   session.state.turnAbort = turnAbort
   session.state.turnHadContextUsage = false
   session.state.turnHadModelOutput = false
+  session.state.inSettle = false
+  session.state.handledElicitations = []
+  session.state.suppressContinuationAcp = false
+  session.state.preStagedQuestion = undefined
   session.state.turnToolCallIds = []
   session.state.wakeup.suppressEcho =
     session.state.wakeup.pendingReplay && expectsUserEcho
@@ -1108,6 +1354,7 @@ async function promptSession(
     let turnWokeUp = false
     let turnWakeupUsage: StepUsage | undefined
     if (status === 'completed') {
+      session.state.inSettle = true
       const settled = await settleBrainTurn(
         session.brainRoot,
         session.state.nativeId,
@@ -1115,6 +1362,7 @@ async function promptSession(
         session.emitItem,
         {
           signal: turnAbort.signal,
+          onSubagents: session.rememberSubagents,
           minStepIndex,
           acpToolCallIds: session.state.turnToolCallIds,
           emitForeground: suppressedForeground,
@@ -1122,6 +1370,11 @@ async function promptSession(
             session.timeline.isRunning(item.id) ||
             (item.detail.type === 'sub_agent' &&
               item.detail.childSessionId !== undefined &&
+              session.canLinkChild(
+                item.detail.childSessionId,
+                session.state.nativeId,
+                item.name,
+              ) &&
               // Unknown children open, interrupted ones resume.
               (!session.hasChild(item.detail.childSessionId) ||
                 session.isChildResumable(item.detail.childSessionId))),
@@ -1134,6 +1387,65 @@ async function promptSession(
             session.state.turnHadModelOutput || suppressedForeground ? 2000 : 0,
           stallTimeoutMs: session.stallTimeoutMs,
           isWaitingOnUser: () => session.permissions.size > 0,
+          onQuestion: async (pendingQuestion) => {
+            const handledIndex = session.state.handledElicitations.findIndex(
+              (entry) =>
+                entry.wokeUp === pendingQuestion.wokeUp &&
+                sameNormalizedQuestions(
+                  entry.questions,
+                  pendingQuestion.questions,
+                ),
+            )
+            if (handledIndex >= 0) {
+              const [handled] = session.state.handledElicitations.splice(
+                handledIndex,
+                1,
+              )
+              return {
+                status: pendingQuestion.wokeUp ? 'answered' : 'already_handled',
+                answerText: handled.answerText ?? undefined,
+              }
+            }
+            const pending = session.askUserQuestion(
+              pendingQuestion.questions,
+              pendingQuestion.questions[0]?.question,
+              'brain',
+            )
+            if (!pending) return { status: 'canceled' }
+            const response = await pending.promise
+            if (!response || turnAbort.signal.aborted) {
+              return { status: 'canceled' }
+            }
+            if (response.behavior === 'deny') {
+              await session.interrupt()
+              return { status: 'canceled' }
+            }
+            const answerText =
+              formatQuestionAnswersText(pending.entry.questions, response) ||
+              'Proceed'
+            if (pending.entry.fromElicitation) {
+              return { status: 'answered', answerText }
+            }
+            session.state.preStagedQuestion = {
+              questions: pendingQuestion.questions,
+              response,
+            }
+            session.state.suppressContinuationAcp = true
+            try {
+              const contResult = await session.transport.rpc.prompt({
+                sessionId: session.state.nativeId,
+                prompt: [{ type: 'text', text: answerText }],
+              })
+              await session.drain()
+              if (contResult.stopReason === 'cancelled') {
+                return { status: 'canceled' }
+              }
+            } finally {
+              session.state.suppressContinuationAcp = false
+              session.state.preStagedQuestion = undefined
+            }
+            return { status: 'answered', answerText }
+          },
         },
       )
       await session.syncKilledChildren()
@@ -1204,6 +1516,10 @@ async function promptSession(
     })
   } finally {
     session.state.wakeup.suppressEcho = false
+    session.state.inSettle = false
+    session.state.handledElicitations = []
+    session.state.suppressContinuationAcp = false
+    session.state.preStagedQuestion = undefined
     session.state.turnAbort = null
     session.state.turn = ''
     session.timeline.boundary()
