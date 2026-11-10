@@ -2,5 +2,16 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "constraints": {
+    "node": "24",
+    "npm": "11"
+  },
+  "packageRules": [
+    {
+      "description": "Keep @types/node on the oldest Node major in engines.node",
+      "matchPackageNames": ["@types/node"],
+      "allowedVersions": "<23"
+    }
   ]
 }
