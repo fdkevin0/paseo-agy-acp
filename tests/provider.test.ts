@@ -26,14 +26,27 @@ async function harness(env: Record<string, string> = {}) {
     },
   })
   const events: ProviderEvent[] = []
+  const opened = new Map<string, readonly string[]>()
+  const protocolErrors: string[] = []
   provider.onEvent((e) => {
     ProviderEventSchema.parse(e)
-    events.push(e)
+    if (e.type === 'session.opened') {
+      if (
+        e.parentSessionId &&
+        !opened.get(e.parentSessionId)?.includes('session.subsession')
+      )
+        protocolErrors.push(
+          `Parent lacks session.subsession: ${e.parentSessionId}`,
+        )
+      opened.set(e.sessionId, e.capabilities)
+    } else if (e.type === 'session.closed') opened.delete(e.sessionId)
+    events.push(structuredClone(e))
   })
   async function wait(predicate: (e: ProviderEvent) => boolean) {
     const deadline = Date.now() + 5000
     while (Date.now() < deadline) {
       const event = events.find(predicate)
+      assert.deepEqual(protocolErrors, [])
       if (event) return event
       await new Promise((resolve) => setTimeout(resolve, 10))
     }
@@ -1382,5 +1395,413 @@ test('recursive multi-level subagents link depth-2 grandchild under child sessio
   } finally {
     await h.provider.close()
     await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('messages recover only owned children and never create root, self or unknown sessions', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-message-ownership-'))
+  const root = '11111111-1111-4111-8111-111111111111'
+  const child = '22222222-2222-4222-8222-222222222222'
+  const grand = '33333333-3333-4333-8333-333333333333'
+  const sibling = '55555555-5555-4555-8555-555555555555'
+  const unknown = '44444444-4444-4444-8444-444444444444'
+  const brain = join(home, '.gemini/antigravity-cli/brain')
+  async function transcript(nativeId: string, recipients: string[]) {
+    const dir = join(brain, nativeId, '.system_generated/logs')
+    await mkdir(dir, { recursive: true })
+    await writeFile(
+      join(dir, 'transcript_full.jsonl'),
+      recipients
+        .flatMap((recipient, i) => [
+          {
+            step_index: i * 2,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            tool_calls: [
+              {
+                id: `message-${i}`,
+                name: 'send_message',
+                args: { Recipient: recipient, Message: 'report' },
+              },
+            ],
+          },
+          {
+            step_index: i * 2 + 1,
+            type: 'GENERIC',
+            status: 'DONE',
+            content: 'Message sent',
+          },
+        ])
+        .map((row) => JSON.stringify(row) + '\n')
+        .join(''),
+    )
+  }
+  await transcript(child, [root, child, unknown, grand, grand, sibling])
+  await transcript(grand, [root, child, grand, unknown, sibling])
+  await transcript(sibling, [grand])
+  const descriptors = join(brain, child, '.system_generated/subagents')
+  await mkdir(descriptors, { recursive: true })
+  await writeFile(
+    join(descriptors, `${grand}.json`),
+    JSON.stringify({ conversationId: grand }),
+  )
+  await writeFile(
+    join(descriptors, `${sibling}.json`),
+    JSON.stringify({ conversationId: sibling }),
+  )
+  const h = await harness({ HOME: home })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      config: h.config,
+      history: 'replay',
+      persistence: { version: 1, data: { sessionId: root } },
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's')
+    const opened = h.events.filter((e) => e.type === 'session.opened')
+    assert.deepEqual(
+      opened.map((e) => e.sessionId),
+      ['s', `s:child:${child}`, `s:child:${grand}`, `s:child:${sibling}`],
+    )
+    assert.equal(opened[2].parentSessionId, `s:child:${child}`)
+    assert.deepEqual(opened[1].capabilities, ['session.subsession'])
+    assert.deepEqual(opened[2].capabilities, ['session.subsession'])
+    for (const event of h.events) {
+      if (
+        event.type !== 'timeline.item' ||
+        event.item.type !== 'tool_call' ||
+        event.item.detail.type !== 'sub_agent'
+      )
+        continue
+      const target = event.item.detail.childSessionId
+      assert.ok(
+        target === undefined ||
+          opened.some(
+            (e) =>
+              e.sessionId === target && e.parentSessionId === event.sessionId,
+          ),
+        `Dangling child link: ${target}`,
+      )
+    }
+    for (const nativeId of [grand, sibling]) {
+      const messages = h.events.filter(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.sessionId === `s:child:${nativeId}` &&
+          e.item.type === 'tool_call' &&
+          e.item.name === 'send_message',
+      )
+      assert.ok(messages.length > 0)
+      for (const event of messages) {
+        assert.ok(
+          event.type === 'timeline.item' &&
+            event.item.type === 'tool_call' &&
+            event.item.detail.type === 'sub_agent',
+        )
+        assert.equal(event.item.detail.childSessionId, undefined)
+      }
+    }
+    await h.provider.send({
+      type: 'session.close',
+      requestId: 'close',
+      sessionId: 's',
+    })
+    await h.wait((e) => e.type === 'session.closed' && e.sessionId === 's')
+    assert.equal(h.events.filter((e) => e.type === 'session.closed').length, 4)
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+/** Open a full-access session so question cards prove they are never auto-approved. */
+async function questionSession(name: string) {
+  const home = await mkdtemp(join(tmpdir(), `agy-${name}-`))
+  const log = join(home, 'calls')
+  const h = await harness({
+    HOME: home,
+    AGY_TEST_LOG: log,
+    // Also logs `cancel`, which proves an interrupt did not relaunch agy.
+    AGY_TEST_LOG_LOAD: '1',
+    AGY_TEST_LOG_ELICITATION_CAP: '1',
+  })
+  await h.provider.send({
+    type: 'session.open',
+    requestId: 'open',
+    sessionId: 's',
+    config: { ...h.config, mode: 'full-access' },
+    history: 'skip',
+  })
+  await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's')
+  h.events.length = 0
+  const prompt = (text: string) =>
+    h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: text,
+        delivery: 'auto',
+        input: { type: 'message', content: [{ type: 'text', text }] },
+      },
+    })
+  const seen = new Set<string>()
+  /** Wait for the next unseen QuestionCard. */
+  const nextQuestion = async () => {
+    const e = await h.wait(
+      (e) => e.type === 'session.permission' && !seen.has(e.request.id),
+    )
+    assert.ok(e.type === 'session.permission')
+    seen.add(e.request.id)
+    return e.request
+  }
+  const answer = (id: string, answers: Record<string, string>) =>
+    h.provider.send({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: id,
+      response: { behavior: 'allow', updatedInput: { answers } },
+    })
+  const turn = (state: 'completed' | 'canceled') =>
+    h.wait((e) => e.type === 'session.turn' && e.state === state)
+  const assistantTexts = () =>
+    h.events.flatMap((e) =>
+      e.type === 'timeline.item' && e.item.type === 'assistant_message'
+        ? [e.item.text]
+        : [],
+    )
+  const questionCards = () =>
+    h.events.filter((e) => e.type === 'session.permission').length
+  const close = async () => {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+  return {
+    h,
+    log,
+    prompt,
+    nextQuestion,
+    answer,
+    turn,
+    assistantTexts,
+    questionCards,
+    close,
+  }
+}
+
+test('a foreground elicitation becomes a QuestionCard in full-access mode and returns schema values', async () => {
+  const q = await questionSession('elicitation')
+  try {
+    assert.ok(
+      (await readFile(q.log, 'utf8')).includes('cap:elicitation.form\n'),
+      'initialize must advertise elicitation.form',
+    )
+    await q.prompt('elicitation')
+    const card = await q.nextQuestion()
+    assert.equal(card.kind, 'question')
+    assert.equal(card.name, 'ask_question')
+    await q.answer(card.id, {
+      'Question 1': '(Recommended) Option 1',
+      'Question 2': 'Linux, x86_64, FreeBSD',
+    })
+    await q.turn('completed')
+    assert.ok(
+      q
+        .assistantTexts()
+        .includes(
+          'elicited:{"action":"accept","content":{"q1":"1","q2":["1"],"q2_other":"FreeBSD"}}',
+        ),
+    )
+  } finally {
+    await q.close()
+  }
+})
+
+test('an ask_question permission request is not auto-approved in full-access mode', async () => {
+  const q = await questionSession('ask-permission')
+  try {
+    await q.prompt('ask-permission-binary')
+    const card = await q.nextQuestion()
+    assert.equal(card.kind, 'question')
+    await q.h.provider.send({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: card.id,
+      response: { behavior: 'allow', selectedActionId: 'allow_once' },
+    })
+    await q.turn('completed')
+    assert.ok(
+      q
+        .assistantTexts()
+        .includes('ask-bin:{"outcome":"selected","optionId":"allow_once"}'),
+    )
+  } finally {
+    await q.close()
+  }
+})
+
+test('two elicitations in one turn ask once each and settle both unlogged cards', async () => {
+  const q = await questionSession('double-elicitation')
+  try {
+    await q.prompt('double-elicitation')
+    await q.answer((await q.nextQuestion()).id, { 'Question 1': 'Yes' })
+    await q.answer((await q.nextQuestion()).id, { 'Question 1': 'No' })
+    await q.turn('completed')
+    assert.equal(q.questionCards(), 2)
+    assert.equal(
+      q.h.events.filter(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'tool_call' &&
+          e.item.name === 'ask_question' &&
+          e.item.status === 'completed',
+      ).length,
+      2,
+    )
+  } finally {
+    await q.close()
+  }
+})
+
+test('a woken ask_question is answered once and its replayed elicitation reuses the answer', async () => {
+  const q = await questionSession('woken-question')
+  try {
+    await q.prompt('woken-question')
+    const card = await q.nextQuestion()
+    assert.equal(card.kind, 'question')
+    await q.answer(card.id, { 'Question 1': '(Recommended) Option 1' })
+    await q.turn('completed')
+    assert.equal(q.questionCards(), 1)
+    assert.deepEqual(q.assistantTexts(), [
+      'Waiting for background check...',
+      'Background check finished. Please select:',
+      'Completed woken question:{"action":"accept","content":{"q1":"1"}}',
+    ])
+  } finally {
+    await q.close()
+  }
+})
+
+test('an elicitation sent during a native background wakeup reuses the pending card without sending an extra prompt', async () => {
+  const q = await questionSession('woken-native-elicitation')
+  try {
+    await q.prompt('woken-native-elicitation')
+    const card = await q.nextQuestion()
+    assert.equal(card.kind, 'question')
+    // Wait until elicitation/create has arrived while Brain's QuestionCard is still open.
+    const deadline = Date.now() + 2000
+    while (!(await readFile(q.log, 'utf8')).includes('elicit\n')) {
+      assert.ok(
+        Date.now() < deadline,
+        'Timed out waiting for woken elicitation',
+      )
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal(q.questionCards(), 1)
+    await q.answer(card.id, { 'Question 1': '(Recommended) Option 1' })
+    await q.turn('completed')
+    assert.equal(q.questionCards(), 1)
+    assert.deepEqual(
+      (await readFile(q.log, 'utf8'))
+        .split('\n')
+        .filter((line) => line.startsWith('prompt:')),
+      ['prompt:woken-native-elicitation'],
+    )
+    assert.ok(
+      q
+        .assistantTexts()
+        .includes('Native woken:{"action":"accept","content":{"q1":"1"}}'),
+    )
+    assert.equal(
+      q.h.events.filter(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'tool_call' &&
+          e.item.name === 'ask_question' &&
+          e.item.status === 'completed',
+      ).length,
+      1,
+    )
+  } finally {
+    await q.close()
+  }
+})
+
+test('a different question during a woken continuation gets its own card', async () => {
+  const q = await questionSession('woken-mismatch')
+  try {
+    await q.prompt('woken-question')
+    await q.answer((await q.nextQuestion()).id, { 'Question 1': 'Option 2' })
+    await q.answer((await q.nextQuestion()).id, {
+      'Question 1': 'Custom follow-up answer',
+    })
+    await q.turn('completed')
+    assert.equal(q.questionCards(), 2)
+    assert.ok(
+      q
+        .assistantTexts()
+        .includes(
+          'Completed woken question:{"action":"accept","content":{"q1_other":"Custom follow-up answer"}}',
+        ),
+    )
+  } finally {
+    await q.close()
+  }
+})
+
+test('canceling a woken ask_question cancels the native turn without relaunching', async () => {
+  const q = await questionSession('woken-deny')
+  try {
+    await q.prompt('woken-question')
+    const card = await q.nextQuestion()
+    const before = await readFile(q.log, 'utf8')
+    await q.h.provider.send({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: card.id,
+      response: { behavior: 'deny' },
+    })
+    await q.turn('canceled')
+    assert.equal(
+      (await readFile(q.log, 'utf8')).slice(before.length),
+      'cancel\n',
+    )
+    assert.ok(
+      q.h.events.some(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'tool_call' &&
+          e.item.name === 'ask_question' &&
+          e.item.status === 'canceled',
+      ),
+    )
+  } finally {
+    await q.close()
+  }
+})
+
+test('interrupting a woken ask_question cancels without relaunching', async () => {
+  const q = await questionSession('woken-interrupt')
+  try {
+    await q.prompt('woken-question')
+    await q.nextQuestion()
+    const before = await readFile(q.log, 'utf8')
+    await q.h.provider.send({
+      type: 'session.interrupt',
+      requestId: 'interrupt',
+      sessionId: 's',
+    })
+    await q.h.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'interrupt',
+    )
+    await q.turn('canceled')
+    assert.equal(
+      (await readFile(q.log, 'utf8')).slice(before.length),
+      'cancel\n',
+    )
+  } finally {
+    await q.close()
   }
 })

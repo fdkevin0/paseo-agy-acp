@@ -1,0 +1,65 @@
+{
+  "foreground": {
+    "sessionId": "11111111-1111-4111-8111-111111111111",
+    "toolCallId": "call_16790478638406289801",
+    "mode": "form",
+    "message": "The agent has 2 questions.",
+    "requestedSchema": {
+      "type": "object",
+      "properties": {
+        "q1": {
+          "type": "string",
+          "title": "Which implementation path?",
+          "oneOf": [
+            { "const": "1", "title": "(Recommended) Option A: Direct fix" },
+            { "const": "2", "title": "Option B: Full refactor" }
+          ]
+        },
+        "q1_other": {
+          "type": "string",
+          "title": "Other",
+          "description": "Optional free-form answer to: Which implementation path?"
+        },
+        "q2": {
+          "type": "array",
+          "title": "Select target platforms",
+          "items": {
+            "anyOf": [
+              { "const": "1", "title": "Linux, x86_64" },
+              { "const": "2", "title": "macOS" }
+            ]
+          }
+        },
+        "q2_other": {
+          "type": "string",
+          "title": "Other",
+          "description": "Optional free-form answer to: Select target platforms"
+        }
+      }
+    }
+  },
+  "wokenReplay": {
+    "sessionId": "11111111-1111-4111-8111-111111111111",
+    "toolCallId": "call_3553125802912142422",
+    "mode": "form",
+    "message": "The agent has a question.",
+    "requestedSchema": {
+      "type": "object",
+      "properties": {
+        "q1": {
+          "type": "string",
+          "title": "Background check finished. Which option?",
+          "oneOf": [
+            { "const": "1", "title": "(Recommended) Option 1" },
+            { "const": "2", "title": "Option 2" }
+          ]
+        },
+        "q1_other": {
+          "type": "string",
+          "title": "Other",
+          "description": "Optional free-form answer to: Background check finished. Which option?"
+        }
+      }
+    }
+  }
+}

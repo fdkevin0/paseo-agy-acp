@@ -53,12 +53,18 @@ function killGroup(group: number) {
   }
 }
 
+export type AcpClient = Client & {
+  requestElicitation?: (
+    params: Record<string, unknown>,
+  ) => Promise<Record<string, unknown>>
+}
+
 /** Own one ACP process, bounded control requests, and shutdown of its tracked process groups. */
 export function connectAcp(
   launch: ProviderLaunch | undefined,
   cwd: string,
   env: Readonly<Record<string, string>>,
-  client: Client,
+  client: AcpClient,
   onExit: (error: Error) => void,
 ) {
   const child = spawnProcess(
@@ -107,6 +113,30 @@ export function connectAcp(
   const readable = stream.readable.pipeThrough(
     new TransformStream({
       async transform(message, controller) {
+        // agy's multi-select items (`items: { anyOf }` without `type: 'string'`) fail SDK 1.9's
+        // CreateElicitationRequest validation, so answer them here instead of via Client.createElicitation.
+        if (
+          'method' in message &&
+          message.method === 'elicitation/create' &&
+          'id' in message
+        ) {
+          const id = message.id
+          void (
+            stopping || !client.requestElicitation
+              ? Promise.resolve({ action: 'cancel' })
+              : client.requestElicitation(record(message.params))
+          )
+            .catch(() => ({ action: 'cancel' }))
+            .then((result) =>
+              writer.write({
+                jsonrpc: '2.0',
+                id,
+                result,
+              }),
+            )
+            .catch(() => undefined)
+          return
+        }
         if (
           'method' in message &&
           message.method === 'session/request_permission' &&

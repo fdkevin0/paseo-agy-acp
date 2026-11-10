@@ -1,11 +1,11 @@
 {
-  "name": "@fdkevin0/paseo-agy-acp",
+  "name": "@fdkevin/paseo-agy-acp",
   "version": "0.1.0",
   "lockfileVersion": 3,
   "requires": true,
   "packages": {
     "": {
-      "name": "@fdkevin0/paseo-agy-acp",
+      "name": "@fdkevin/paseo-agy-acp",
       "version": "0.1.0",
       "license": "MIT",
       "dependencies": {
