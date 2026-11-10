@@ -409,7 +409,10 @@ async function createSession(
     }
   }
   async function refreshSubagents() {
-    const subagents = await readSubagents(brainRoot, state.nativeId)
+    // Optional ownership metadata must not poison the serialized ACP notification lane.
+    const subagents = await readSubagents(brainRoot, state.nativeId).catch(
+      () => [],
+    )
     rememberSubagents(subagents)
     if (!state.loading) await syncKilledChildren(subagents)
   }

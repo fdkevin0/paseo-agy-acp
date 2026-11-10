@@ -1,11 +1,19 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, mkdir, writeFile } from 'node:fs/promises'
+import {
+  mkdtemp,
+  readFile,
+  rm,
+  mkdir,
+  writeFile,
+  symlink,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import type { ProviderEvent } from '@getpaseo/plugin/server/provider'
+import { readSubagents } from '../server/brain.ts'
 import { SessionManager } from '../server/session.ts'
 import { AgyUsageSource } from '../server/usage.ts'
 
@@ -419,3 +427,80 @@ for (const killedAtSpawn of [false, true]) {
     }
   })
 }
+
+test('ownership read failures do not poison subsequent ACP notifications', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-ownership-read-error-'))
+  const root = '11111111-1111-4111-8111-111111111111'
+  const child = '22222222-2222-4222-8222-222222222222'
+  const brain = join(home, '.gemini/antigravity-cli/brain')
+  const system = join(brain, root, '.system_generated')
+  const outside = join(home, 'outside')
+  await mkdir(system, { recursive: true })
+  await mkdir(outside)
+  await writeFile(
+    join(outside, `${child}.json`),
+    JSON.stringify({ conversationId: child }),
+  )
+  await symlink(outside, join(system, 'subagents'))
+  await assert.rejects(
+    readSubagents(brain, root),
+    /Brain artifact escapes its directory/,
+  )
+  const events: ProviderEvent[] = []
+  const m = new SessionManager({
+    launch: {
+      command: process.execPath,
+      args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+      env: { HOME: home, PATH: process.env.PATH ?? '' },
+    },
+    usage: new AgyUsageSource(),
+    capabilities: ['session.subsession'],
+    emit: (e) => events.push(structuredClone(e)),
+  })
+  const session = await m.start('s', home)
+  async function message() {
+    await session.transport.rpc.prompt({
+      sessionId: root,
+      prompt: [{ type: 'text', text: 'message-refresh-boundary' }],
+    })
+    await session.drain()
+    const event = events.findLast(
+      (e) => e.type === 'timeline.item' && e.item.type === 'tool_call',
+    )
+    assert.ok(
+      event?.type === 'timeline.item' &&
+        event.item.type === 'tool_call' &&
+        event.item.detail.type === 'sub_agent',
+    )
+    return event.item.detail.childSessionId
+  }
+  try {
+    session.state.nativeId = root
+    session.state.persisted = true
+    session.state.loading = false
+    await session.flush()
+    assert.equal(await message(), undefined)
+    assert.equal(
+      events.some((e) => e.type === 'session.opened'),
+      false,
+    )
+    await rm(join(system, 'subagents'))
+    await mkdir(join(system, 'subagents'))
+    await writeFile(
+      join(system, 'subagents', `${child}.json`),
+      JSON.stringify({ conversationId: child }),
+    )
+    assert.equal(await message(), `s:child:${child}`)
+    assert.equal(
+      events.filter(
+        (e) => e.type === 'timeline.item' && e.item.type === 'tool_call',
+      ).length,
+      2,
+    )
+    assert.equal(events.filter((e) => e.type === 'session.opened').length, 1)
+  } finally {
+    await session.close()
+    await m.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
