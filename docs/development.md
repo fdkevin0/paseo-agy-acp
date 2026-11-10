@@ -12,33 +12,47 @@ npm ci --ignore-scripts
 
 Paseo compiles the TypeScript plugin; no separate build output is required. Git/local plugin preparation installs production dependencies only, so rerun the command above if preparation removed development tools.
 
+## Protocol and identity primer
+
+- **ACP vs. Brain**: Foreground prompts, streaming deltas, config options and interactive tool approvals flow over JSON-RPC stdio (`agy acp`). Background tasks, scheduled timers, subagent conversations and post-RPC **Reactive Wakeup** steps execute asynchronously inside `agy` and are observed via local **Brain** files under `<appDataDir>/brain/<nativeId>/.system_generated/`.
+- **Session identities**:
+  - `sessionId`: Paseo's host-assigned session identifier (for example, `'s'`).
+  - `nativeId`: `agy`'s UUIDv4 conversation identifier on disk and over ACP.
+  - `<sessionId>:child:<nativeChildId>`: Provider-scoped read-only subsession identifier emitted via `session.opened` / `session.ready` for owned subagents (including multi-level grandchildren linked under their direct parent subsession ID).
+
 ## Request and session flow
 
 1. `index.server.ts` registers provider `agy` and a shared subscription usage source. The provider negotiates capabilities and creates a session manager for each connection.
-2. Catalog discovery opens a disposable ACP session; session listing needs no native session. Normal opens create or load a native session, apply requested configuration and wait for that session's live commands before publishing readiness. Command lists are never seeded from previous sessions.
+2. Catalog discovery opens a disposable ACP session (`session/new` + `session/close`) and caches the first successful catalog per working directory for that connection (up to 100 directories); session listing starts a temporary unprompted ACP runtime and calls `session/list` without creating a native session. Normal opens create (`session/new`), resume (`session/resume` on `history: 'skip'` when supported) or load (`session/load`) a native session, apply requested configuration and wait for that session's live commands before publishing readiness. Command lists are never seeded from previous sessions.
 3. Prompts go to agy over stdio. Notifications and permission requests must match the current native session and are ignored or canceled during shutdown. Valid notifications become timeline snapshots, permissions, configuration and usage events; agy owns tool execution.
-4. Permission responses resolve the matching native request. Child conversation IDs start read-only Brain transcript and lifecycle tracking. ACP and Brain tool snapshots share one identity via structured `.system_generated/` metadata (`sourceMetadata.tool.toolCall.id` and `spawnStepIndex`, with invocation-order fallback); canonical Brain results also fill missing ACP tool output during history replay. Pending ACP notifications are drained before the turn ends; Brain tracking keeps the turn open for native background work and Reactive Wakeup responses that outlive the ACP prompt response.
-5. Close cancels pending approvals and stops Brain polling. New unprompted sessions and catalog probes close natively, stop their process, and remove only their own temporary artifacts. Other closes stop the process while preserving imported and prompted conversations. Protocol failure also terminates the child; connection shutdown waits for all owned transports.
+4. Permission responses resolve the matching native request (or synthetic woken-turn `ask_question` continuation). Child conversation IDs start read-only Brain transcript and lifecycle tracking via `SubagentRegistry`. ACP and Brain tool snapshots share one identity via structured `.system_generated/` metadata (`sourceMetadata.tool.toolCall.id` and `spawnStepIndex`, with invocation-order fallback); canonical Brain results also fill missing ACP tool output during history replay. Pending ACP notifications are drained before the turn ends; Brain tracking keeps the turn open for native background work and Reactive Wakeup responses that outlive the ACP prompt response.
+5. Close cancels pending approvals and stops Brain polling (including closes arriving while `session.open` is still in flight). New unprompted sessions and catalog probes close natively, stop their process, and remove only their own temporary artifacts. Other closes stop the process while preserving imported and prompted conversations. Protocol failure also terminates the child; connection shutdown awaits all tracked operations and owned transports.
 6. Subscription queries independently invoke agy's local `/usage` command using observed account and tier metadata. They do not start a model turn.
 
 ## Source layout
 
-| File                                                                      | Responsibility                                                                         |
-| ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `index.server.ts`                                                         | Register the provider and shared usage source.                                         |
-| `server/provider.ts`                                                      | Provider contract, capability negotiation and cached catalog discovery.                |
-| `server/session.ts`                                                       | Session manager, notifications, prompts, commands and lifecycle.                       |
-| `server/permissions.ts`                                                   | Validate permission requests before queuing approvals.                                 |
-| `server/transport.ts`                                                     | ACP stdio process, metadata capture and control deadlines.                             |
-| `server/mapping.ts`                                                       | Timeline, configuration, attachment and context usage mapping.                         |
-| `server/brain.ts`                                                         | Incremental transcript reading, projection and background turn completion.             |
-| `server/preflight.ts`                                                     | Version checks, cache identity, data directories and scoped cleanup.                   |
-| `server/usage.ts`                                                         | Account discovery, bounded login-log reads and subscription quota windows.             |
-| `tests/mock-acp.ts`, `tests/mock-usage.ts`                                | Offline CLI substitutes.                                                               |
-| `tests/compat-acp.ts`, `tests/interrupt-acp.ts`, `tests/transport-acp.ts` | Native agy behavior models for Brain compatibility, interruption and process shutdown. |
-| `tests/*.test.ts`                                                         | Mapping, permissions, lifecycle, discovery and quota regression tests.                 |
-| `tests/workflows.test.ts`                                                 | Execute release workflow scripts against local command substitutes.                    |
-| `.github/workflows/`                                                      | CI checks and tagged npm/GitHub releases.                                              |
+| File                                                                      | Responsibility                                                                          |
+| ------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `index.server.ts`                                                         | Register the provider and shared usage source.                                          |
+| `server/common.ts`                                                        | Shared primitives (`record`, `cleanToolName`, `setBounded`, `formatErrorMessage`, env). |
+| `server/provider.ts`                                                      | Provider contract, capability negotiation, bounded catalog cache and pending tracking.  |
+| `server/session.ts`                                                       | Session manager, notifications, prompts, woken question continuations and lifecycle.    |
+| `server/subagents.ts`                                                     | Subagent ownership cache, multi-level subsession linking and child Brain watchers.      |
+| `server/questions.ts`                                                     | Normalize `elicitation/create` schemas and `ask_question` calls into `QuestionCard`s.   |
+| `server/permissions.ts`                                                   | Classify permission requests, MCP `toolPolicy` preapprovals and option selection.       |
+| `server/transport.ts`                                                     | ACP stdio process, `elicitation/create` interception, metadata capture and shutdown.    |
+| `server/mapping.ts`                                                       | Timeline state machine, configuration, attachment and context/token usage mapping.      |
+| `server/brain-io.ts`                                                      | Realpath-contained Brain file readers, `O_TRUNC` cursor detection and inbox/subagents.  |
+| `server/brain-projector.ts`                                               | Pure state machine projecting Brain transcript steps and inbox messages into cards.     |
+| `server/brain.ts`                                                         | Turn-settlement polling loop (`settleBrainTurn`) and child transcript watcher.          |
+| `server/preflight.ts`                                                     | Version checks, cache identity, data directory resolution and symlink-safe cleanup.     |
+| `server/usage.ts`                                                         | Account discovery, bounded login-log reads and subscription quota windows.              |
+| `tests/helpers.ts`                                                        | Shared provider event collector and test harness utilities.                             |
+| `tests/mock-acp.ts`, `tests/mock-usage.ts`                                | Offline CLI substitutes.                                                                |
+| `tests/compat-acp.ts`, `tests/interrupt-acp.ts`, `tests/transport-acp.ts` | Native agy behavior models for Brain compatibility, interruption and process shutdown.  |
+| `tests/index.test.ts`, `tests/*.test.ts`                                  | Entry-point, mapping, permissions, lifecycle, Brain, discovery and quota tests.         |
+| `tests/workflows.test.ts`                                                 | Execute release workflow scripts against local command substitutes.                     |
+| `.github/workflows/`                                                      | CI checks (`npm run verify`) and tagged npm/GitHub releases.                            |
 
 ## Verification
 
@@ -46,11 +60,10 @@ Paseo compiles the TypeScript plugin; no separate build output is required. Git/
 
 ```sh
 npm run format
-npm run format:check
-npm run check
-npm test
-npm pack --dry-run --ignore-scripts
+npm run verify
 ```
+
+`npm run verify` runs `npm run format:check`, `npm run check`, `npm test`, and `npm pack --dry-run --ignore-scripts`.
 
 `tests/compat-acp.ts` models observed native notifications: display titles, omitted tool output and transcript calls without IDs. `tests/interrupt-acp.ts` models background work that outlives ordinary cancellation, so regression tests verify process shutdown and restoration rather than trusting a canceled UI state. `tests/transport-acp.ts` starts a detached command that outlives ACP EOF, so shutdown tests verify process-group cleanup, including hosts without `ps`.
 

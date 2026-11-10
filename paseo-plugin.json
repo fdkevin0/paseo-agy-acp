@@ -8,7 +8,7 @@
   "translations": {
     "zh-CN": {
       "name": "Antigravity ACP",
-      "description": "通过原生 ACP 将 Antigravity 接入 Paseo，支持会话恢复与工具时间线"
+      "description": "通过原生 ACP 将 Antigravity 接入 Paseo，支持原生会话与丰富工具时间线"
     }
   },
   "build": [["npm", "ci", "--omit=dev", "--ignore-scripts"]]

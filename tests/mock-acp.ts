@@ -1194,6 +1194,21 @@ new AgentSideConnection((client) => {
         })
         return { stopReason: 'end_turn' as const }
       }
+      if (text === 'permission-deny') {
+        await client.requestPermission({
+          sessionId,
+          toolCall: {
+            toolCallId: 'unfinished',
+            title: 'run_command',
+            rawInput: { CommandLine: 'echo unfinished' },
+          },
+          options: [
+            { optionId: 'yes', name: 'Allow', kind: 'allow_once' },
+            { optionId: 'no', name: 'Deny', kind: 'reject_once' },
+          ],
+        })
+        return { stopReason: 'end_turn' as const }
+      }
       if (text === 'wait') {
         if (process.env.AGY_TEST_CANCEL_DELAY)
           await new Promise((resolve) => setTimeout(resolve, 100))

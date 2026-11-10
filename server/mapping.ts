@@ -17,19 +17,19 @@ import type {
   ProviderContent,
   ProviderUsage,
 } from '@getpaseo/plugin/server/provider'
-import { normalizeAskQuestionInput } from './permissions.ts'
+import {
+  cleanToolName,
+  isAskQuestionName,
+  sessionIdPattern,
+  record,
+  str,
+  num,
+  nonnegative,
+  text,
+} from './common.ts'
+import { normalizeAskQuestionInput } from './questions.ts'
 
 export const FULL_ACCESS_MODE_ID = 'full-access'
-
-/** Drop agy's `default_api:` namespace from native tool names. */
-export function cleanToolName(name: string): string {
-  return name.replace(/^default_api:/, '')
-}
-
-/** Whether a native tool name is agy's interactive question tool. */
-export function isAskQuestionName(name: string): boolean {
-  return /^ask_(?:question|user)$/i.test(cleanToolName(name))
-}
 
 const modeVisuals: Record<
   string,
@@ -45,21 +45,6 @@ const modeVisuals: Record<
   },
 }
 
-export const sessionIdPattern =
-  /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i
-
-/** Narrow opaque protocol payloads before reading vendor fields. */
-export function record(value: unknown): Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : {}
-}
-export function str(value: unknown): string | undefined {
-  return typeof value === 'string' ? value : undefined
-}
-function num(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
-}
 function joinChunks(
   chunks: readonly Record<string, unknown>[] | undefined,
   ...keys: string[]
@@ -75,6 +60,7 @@ function joinChunks(
     })
     .join('\n...\n')
 }
+
 const searchToolNames: ReadonlyArray<
   readonly [string, 'grep' | 'glob' | 'web_search']
 > = [
@@ -84,6 +70,19 @@ const searchToolNames: ReadonlyArray<
   ['search_web', 'web_search'],
   ['web_search', 'web_search'],
 ]
+
+function extractToolContentText(
+  tool: Partial<ToolCall> | ToolCallUpdate,
+): string | undefined {
+  const joined = tool.content
+    ?.map((c) =>
+      c.type === 'content' && c.content.type === 'text' ? c.content.text : '',
+    )
+    .filter(Boolean)
+    .join('\n')
+  return joined || undefined
+}
+
 function cleanReadOutput(output: string | undefined): {
   content: string | undefined
   startLine?: number
@@ -109,6 +108,7 @@ function cleanReadOutput(output: string | undefined): {
       : {}),
   }
 }
+
 /** Map native tool arguments and output to Paseo detail cards. */
 export function toolDetail(
   tool: Partial<ToolCall> | ToolCallUpdate,
@@ -117,15 +117,8 @@ export function toolDetail(
   const output =
     typeof tool.rawOutput === 'string'
       ? tool.rawOutput
-      : tool.content
-          ?.map((c) =>
-            c.type === 'content' && c.content.type === 'text'
-              ? c.content.text
-              : '',
-          )
-          .filter(Boolean)
-          .join('\n') ||
-        (tool.rawOutput != null ? JSON.stringify(tool.rawOutput) : undefined)
+      : (extractToolContentText(tool) ??
+        (tool.rawOutput != null ? JSON.stringify(tool.rawOutput) : undefined))
   const name = cleanToolName(tool.title ?? '')
   if (isAskQuestionName(name) || Array.isArray(input.questions)) {
     const questions = normalizeAskQuestionInput(input)
@@ -389,7 +382,26 @@ export function configState(response: SessionMetadata): ProviderConfigState {
 export function promptContent(content: ProviderContent): ContentBlock {
   if (content.type === 'image')
     return { type: 'image', data: content.data, mimeType: content.mimeType }
-  if (content.type === 'text') return { type: 'text', text: content.text }
+  if (content.type === 'text') {
+    const res =
+      'externalResource' in content ? content.externalResource : undefined
+    const title = 'title' in content ? text(content.title) : undefined
+    if (!res && !title) return { type: 'text', text: content.text }
+    const header = res
+      ? `${res.providerLabel} ${res.identifier}: ${res.title}`
+      : title
+    return {
+      type: 'text',
+      text: [
+        header,
+        res && title && title !== res.title ? title : undefined,
+        res?.url,
+        content.text,
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    }
+  }
   if (content.type === 'uploaded_file')
     return {
       type: 'text',
@@ -421,10 +433,6 @@ export function promptContent(content: ProviderContent): ContentBlock {
       .filter(Boolean)
       .join('\n'),
   }
-}
-
-function nonnegative(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0
 }
 
 /** Ignore malformed native usage; retain context size and USD cost when valid. */
@@ -577,13 +585,17 @@ export class Timeline {
   terminalize(
     status: 'completed' | 'canceled' | 'failed',
     error = 'Tool did not finish',
+    denied?: ReadonlySet<string>,
   ): ProviderTimelineItem[] {
-    const items = [...this.running.values()].map((item) =>
-      status === 'failed'
-        ? { ...item, status, error }
-        : { ...item, status, error: null },
-    )
+    const items = [...this.running.values()].map((item) => {
+      if (status === 'failed') return { ...item, status, error }
+      if (status === 'completed' && item.callId && denied?.has(item.callId)) {
+        return { ...item, status: 'canceled' as const, error: null }
+      }
+      return { ...item, status, error: null }
+    })
     this.running.clear()
+    this.tools.clear()
     return items
   }
   update(update: SessionUpdate): ProviderTimelineItem | undefined {
@@ -631,23 +643,35 @@ export class Timeline {
         name: cleanToolName(tool.title ?? old?.title ?? 'Tool'),
         detail: toolDetail(tool),
       }
+      const rawStatus = str((tool as { status?: unknown }).status)
       const item: Extract<ProviderTimelineItem, { type: 'tool_call' }> =
         tool.status === 'failed'
           ? {
               ...base,
               status: 'failed',
               error:
-                typeof tool.rawOutput === 'string'
+                (typeof tool.rawOutput === 'string' && tool.rawOutput.trim()
                   ? tool.rawOutput
-                  : tool.rawOutput != null
-                    ? JSON.stringify(tool.rawOutput)
-                    : 'Tool failed',
+                  : undefined) ??
+                extractToolContentText(tool) ??
+                (tool.rawOutput != null && tool.rawOutput !== ''
+                  ? JSON.stringify(tool.rawOutput)
+                  : 'Tool failed'),
             }
-          : {
-              ...base,
-              status: tool.status === 'completed' ? 'completed' : 'running',
-              error: null,
-            }
+          : rawStatus === 'cancelled' || rawStatus === 'canceled'
+            ? {
+                ...base,
+                status: 'canceled',
+                error: null,
+              }
+            : {
+                ...base,
+                status: tool.status === 'completed' ? 'completed' : 'running',
+                error: null,
+              }
+      if (item.status !== 'running') {
+        this.tools.delete(update.toolCallId)
+      }
       this.track(item)
       return item
     }

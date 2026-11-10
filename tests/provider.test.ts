@@ -4,15 +4,12 @@ import { mkdtemp, readFile, rm, mkdir, writeFile, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import {
-  ProviderEventSchema,
-  PROVIDER_CAPABILITIES,
-  type ProviderEvent,
-} from '@getpaseo/plugin/server/provider'
+import { PROVIDER_CAPABILITIES } from '@getpaseo/plugin/server/provider'
 import { AgyUsageSource } from '../server/usage.ts'
-import { record } from '../server/mapping.ts'
+import { record } from '../server/common.ts'
 import { dataDirectory } from '../server/preflight.ts'
 import { createProvider } from '../server/provider.ts'
+import { collectProviderEvents } from './helpers.ts'
 
 async function harness(env: Record<string, string> = {}) {
   const usage = new AgyUsageSource()
@@ -25,33 +22,7 @@ async function harness(env: Record<string, string> = {}) {
       env: { PATH: process.env.PATH ?? '', ...env },
     },
   })
-  const events: ProviderEvent[] = []
-  const opened = new Map<string, readonly string[]>()
-  const protocolErrors: string[] = []
-  provider.onEvent((e) => {
-    ProviderEventSchema.parse(e)
-    if (e.type === 'session.opened') {
-      if (
-        e.parentSessionId &&
-        !opened.get(e.parentSessionId)?.includes('session.subsession')
-      )
-        protocolErrors.push(
-          `Parent lacks session.subsession: ${e.parentSessionId}`,
-        )
-      opened.set(e.sessionId, e.capabilities)
-    } else if (e.type === 'session.closed') opened.delete(e.sessionId)
-    events.push(structuredClone(e))
-  })
-  async function wait(predicate: (e: ProviderEvent) => boolean) {
-    const deadline = Date.now() + 5000
-    while (Date.now() < deadline) {
-      const event = events.find(predicate)
-      assert.deepEqual(protocolErrors, [])
-      if (event) return event
-      await new Promise((resolve) => setTimeout(resolve, 10))
-    }
-    assert.fail(`Timed out: ${JSON.stringify(events)}`)
-  }
+  const { events, wait } = collectProviderEvents(provider)
   const config = {
     cwd: process.cwd(),
     env: {},
@@ -1803,5 +1774,180 @@ test('interrupting a woken ask_question cancels without relaunching', async () =
     )
   } finally {
     await q.close()
+  }
+})
+
+test(
+  'Full Access without a launch override preserves process.env and missing cwd reports a clear error',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'agy-default-launch-'))
+    const binDir = join(root, 'bin')
+    const envDump = join(root, 'env.json')
+    const mockPath = fileURLToPath(new URL('./mock-acp.ts', import.meta.url))
+    await mkdir(binDir, { recursive: true })
+    await writeFile(
+      join(binDir, 'agy'),
+      `#!/bin/sh\n"${process.execPath}" -e 'require("node:fs").writeFileSync(process.argv[1], JSON.stringify({ marker: process.env.AGY_TEST_MARKER, args: process.argv.slice(2) }))' "${envDump}" "$@"\nexec "${process.execPath}" "${mockPath}"\n`,
+      { mode: 0o755 },
+    )
+    const oldPath = process.env.PATH
+    const oldHome = process.env.HOME
+    const oldMarker = process.env.AGY_TEST_MARKER
+    process.env.PATH = `${binDir}:${oldPath ?? ''}`
+    process.env.HOME = root
+    process.env.AGY_TEST_MARKER = 'kept-from-process-env'
+    const provider = await createProvider(new AgyUsageSource()).connect({
+      versions: [1],
+      capabilities: PROVIDER_CAPABILITIES,
+    })
+    const { wait } = collectProviderEvents(provider)
+    try {
+      await provider.send({
+        type: 'session.open',
+        requestId: 'open-missing-cwd',
+        sessionId: 'missing-cwd',
+        history: 'skip',
+        config: {
+          cwd: join(root, 'does-not-exist'),
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: false,
+        },
+      })
+      const failed = await wait(
+        (e) =>
+          e.type === 'request.failed' && e.requestId === 'open-missing-cwd',
+      )
+      assert.ok(failed.type === 'request.failed')
+      assert.match(failed.error.message, /Working directory does not exist/)
+
+      await provider.send({
+        type: 'session.open',
+        requestId: 'open-full',
+        sessionId: 'full',
+        history: 'skip',
+        config: {
+          cwd: root,
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: false,
+          mode: 'full-access',
+        },
+      })
+      await wait((e) => e.type === 'session.ready' && e.sessionId === 'full')
+      const dumped = JSON.parse(await readFile(envDump, 'utf8'))
+      assert.equal(dumped.marker, 'kept-from-process-env')
+      assert.deepEqual(dumped.args, ['acp', '--dangerously-skip-permissions'])
+    } finally {
+      process.env.PATH = oldPath
+      process.env.HOME = oldHome
+      if (oldMarker === undefined) delete process.env.AGY_TEST_MARKER
+      else process.env.AGY_TEST_MARKER = oldMarker
+      await provider.close()
+      await rm(root, { recursive: true, force: true })
+    }
+  },
+)
+
+test('denied permission marks stranded tool card canceled and concurrent close cancels in-flight open', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-deny-and-close-race-'))
+  const log = join(home, 'calls')
+  const h = await harness({ HOME: home, AGY_TEST_LOG: log })
+  try {
+    await Promise.all([
+      h.provider.send({
+        type: 'session.open',
+        requestId: 'open-raced',
+        sessionId: 'raced',
+        config: { ...h.config, persist: false },
+        history: 'skip',
+      }),
+      h.provider.send({
+        type: 'session.close',
+        requestId: 'close-raced',
+        sessionId: 'raced',
+      }),
+    ])
+    await h.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'close-raced',
+    )
+    await h.wait(
+      (e) =>
+        (e.type === 'session.ready' && e.sessionId === 'raced') ||
+        (e.type === 'request.failed' && e.requestId === 'open-raced'),
+    )
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 'raced',
+      prompt: {
+        clientMessageId: 'after-close',
+        delivery: 'auto',
+        input: { type: 'message', content: [{ type: 'text', text: 'hello' }] },
+      },
+    })
+    const closedPrompt = await h.wait(
+      (e) =>
+        e.type === 'session.prompt_result' &&
+        e.clientMessageId === 'after-close',
+    )
+    assert.ok(
+      closedPrompt.type === 'session.prompt_result' &&
+        closedPrompt.result.type === 'failed',
+    )
+
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-s',
+      sessionId: 's',
+      config: h.config,
+      history: 'skip',
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's')
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'deny-msg',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'permission-deny' }],
+        },
+      },
+    })
+    const perm = await h.wait(
+      (e) => e.type === 'session.permission' && e.sessionId === 's',
+    )
+    assert.ok(perm.type === 'session.permission')
+    await h.provider.send({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: perm.request.id,
+      response: { behavior: 'deny' },
+    })
+    await h.wait(
+      (e) =>
+        e.type === 'session.turn' &&
+        e.sessionId === 's' &&
+        e.state === 'completed',
+    )
+    const toolItem = h.events.findLast(
+      (e) =>
+        e.type === 'timeline.item' &&
+        e.sessionId === 's' &&
+        e.item.type === 'tool_call' &&
+        e.item.callId === 'unfinished',
+    )
+    assert.ok(
+      toolItem?.type === 'timeline.item' && toolItem.item.type === 'tool_call',
+    )
+    assert.equal(toolItem.item.status, 'canceled')
+    assert.equal(toolItem.item.error, null)
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
   }
 })

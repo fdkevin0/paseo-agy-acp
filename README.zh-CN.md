@@ -83,11 +83,11 @@ paseo usage ls --json
 | 配置     | 原生模型、模式（`default`、`accept-edits`、`plan`）与 **Full Access** 全权限模式、按模型区分的思考等级选项及附加系统提示词。 |
 | 权限审批 | 原生审批选项（展示工具参数与详情卡片）、MCP `toolPolicy` 预批准，或 **Full Access** 模式下的免确认自动放行。                 |
 | 时间线   | 流式回复、推理过程、执行计划与丰富工具卡片。                                                                                 |
-| 上下文   | Token 计数、上下文窗口占用估算及已报告的美元费用。                                                                           |
+| 上下文   | Token 计数、上下文窗口占用及已报告的美元费用。                                                                               |
 | 订阅配额 | Gemini 与 Claude/GPT 模型组的 5 小时及每周配额窗口。                                                                         |
 | 子 Agent | 原生多层级子会话链接与只读 Brain 日志时间线卡片。                                                                            |
 
-暂不支持运行中追加指令（steering）、回退（rewind）、归档操作、结构化输出或 Artifacts 面板。子会话卡片不提供独立的会话控制。当 `agy` 未提供原生 `usage_update` 上下文通知时，上下文占用基于 `transcript_full.jsonl` 的单步 Token 计数计算（缺失时回退至回合计数）；当前 `agy` 的 print 模式不接受用于配额查询的自定义 ACP 目录参数。详见[参考文档](docs/reference.md)。
+暂不支持运行中追加指令（steering）、回退（rewind）、归档操作、结构化输出或 Artifacts 面板。子会话卡片不提供独立的会话控制。纯前台回合优先采用原生 `usage_update` 上下文通知；当未收到 `usage_update` 或回合进入 RPC 返回后的 Reactive Wakeup 阶段时，上下文占用基于 `transcript_full.jsonl` 的单步 Token 计数计算（缺失时回退至回合计数）。当前 `agy` 的 print 模式不接受用于配额查询的自定义 ACP 目录参数。详见[参考文档](docs/reference.md)。
 
 ## 更多信息
 

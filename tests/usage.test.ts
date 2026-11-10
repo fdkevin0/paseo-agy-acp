@@ -79,6 +79,21 @@ test('email discovery uses recent logs, the latest match and bounded tails', asy
       'applyAuthResult: email=acp@example.test, token=omitted\n',
     )
     assert.equal(await readLoggedEmail(dir), 'acp@example.test')
+
+    // 10 newer acp-server-*.log files without auth lines must not evict cli.log.
+    await writeFile(
+      join(dir, 'cli.log'),
+      'applyAuthResult: email=retained-cli@example.test\n',
+    )
+    await utimes(join(dir, 'cli.log'), 5, 5)
+    await rm(join(dir, 'log'), { recursive: true, force: true })
+    await mkdir(join(dir, 'log'))
+    for (let i = 0; i < 12; i++) {
+      const logFile = join(dir, `log/acp-server-${i}.log`)
+      await writeFile(logFile, 'ACP session started without auth banner\n')
+      await utimes(logFile, 100 + i, 100 + i)
+    }
+    assert.equal(await readLoggedEmail(dir), 'retained-cli@example.test')
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

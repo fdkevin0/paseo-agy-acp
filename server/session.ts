@@ -1,14 +1,16 @@
 import type { AgyUsageSource } from './usage.ts'
 import { z } from 'zod'
 import { randomUUID } from 'node:crypto'
+import { stat } from 'node:fs/promises'
 import { join } from 'node:path'
-import type {
-  RequestPermissionRequest,
-  RequestPermissionResponse,
-  SessionNotification,
-  NewSessionResponse,
-  ContentBlock,
-  McpServer,
+import {
+  PROTOCOL_VERSION,
+  type RequestPermissionRequest,
+  type RequestPermissionResponse,
+  type SessionNotification,
+  type NewSessionResponse,
+  type ContentBlock,
+  type McpServer,
 } from '@agentclientprotocol/sdk'
 import type {
   ProviderLaunch,
@@ -21,16 +23,18 @@ import type {
 } from '@getpaseo/plugin/server/provider'
 import {
   RequestPermissionRequestSchema,
-  buildElicitationResponse,
-  formatQuestionAnswersText,
   isPreapprovedMcpTool,
-  normalizeElicitationQuestions,
   permissionKind,
   pickPermissionOption,
+} from './permissions.ts'
+import {
+  buildElicitationResponse,
+  formatQuestionAnswersText,
+  normalizeElicitationQuestions,
   sameNormalizedQuestions,
   toQuestionPermissionInput,
   type NormalizedQuestion,
-} from './permissions.ts'
+} from './questions.ts'
 import {
   BrainTranscriptProjector,
   hasActiveBackgroundWork,
@@ -39,22 +43,26 @@ import {
   readTranscriptRows,
   readLastStepIndex,
   settleBrainTurn,
-  watchBrain,
-  type BrainWatchHandle,
-  type SubagentRecord,
 } from './brain.ts'
+import { SubagentRegistry, isSubagentMessage } from './subagents.ts'
 import { dataDirectory, removeSessionArtifacts } from './preflight.ts'
 import { connectAcp } from './transport.ts'
+import {
+  PACKAGE_VERSION,
+  definedProcessEnv,
+  formatErrorMessage,
+  record,
+  sessionIdPattern,
+  setBounded,
+} from './common.ts'
 import {
   configState,
   FULL_ACCESS_MODE_ID,
   Timeline,
-  record,
   toolDetail,
   promptContent,
   contextUsage,
   promptUsage,
-  sessionIdPattern,
   type SessionMetadata,
   type StepUsage,
 } from './mapping.ts'
@@ -90,9 +98,7 @@ interface SessionOptions {
 }
 
 const SKIP_PERMISSIONS_FLAG = '--dangerously-skip-permissions'
-
-const isSpawn = (name: string) => name.includes('invoke_subagent')
-const isMessage = (name: string) => name.includes('send_message')
+const TIER_CACHE_LIMIT = 100
 
 function effectiveLaunch(
   launch: ProviderLaunch | undefined,
@@ -105,7 +111,7 @@ function effectiveLaunch(
     : {
         command: launch?.command ?? 'agy',
         args: [...args, SKIP_PERMISSIONS_FLAG],
-        env: launch?.env ?? {},
+        env: launch?.env ?? definedProcessEnv(),
       }
 }
 
@@ -128,7 +134,7 @@ function sessionParams(cwd: string, config?: ProviderSessionConfig) {
 /** Own native runtimes, session identities and their cancellation across a provider connection. */
 export class SessionManager {
   private sessions = new Map<string, Session>()
-  private opening = new Set<string>()
+  private opening = new Map<string, Promise<Session>>()
   private transports = new Set<ReturnType<typeof connectAcp>>()
   private closed = false
   private options: SessionOptions
@@ -140,17 +146,15 @@ export class SessionManager {
     if (this.closed) throw new Error('Provider connection is closed')
     return createSession(id, cwd, config, this.options, this.transports)
   }
+
   async open(input: Open) {
     const { emit, capabilities } = this.options
     if (this.sessions.has(input.sessionId) || this.opening.has(input.sessionId))
       throw new Error('Session already open')
-    this.opening.add(input.sessionId)
+    const starting = this.start(input.sessionId, input.config.cwd, input.config)
+    this.opening.set(input.sessionId, starting)
     try {
-      const session = await this.start(
-        input.sessionId,
-        input.config.cwd,
-        input.config,
-      )
+      const session = await starting
       this.sessions.set(input.sessionId, session)
       try {
         const data = record(input.persistence?.data)
@@ -200,9 +204,15 @@ export class SessionManager {
           input.config.cwd,
         )
         if (session.transport.tier?.name)
-          this.options.usage.tiers.set(dir, session.transport.tier.name)
+          setBounded(
+            this.options.usage.tiers,
+            dir,
+            session.transport.tier.name,
+            TIER_CACHE_LIMIT,
+          )
         await session.drain()
-        if (this.closed) throw new Error('Provider connection is closed')
+        if (this.closed || session.state.closing || session.state.failed)
+          throw new Error('Session closed before open')
         session.state.opened = true
         emit({
           type: 'session.opened',
@@ -223,7 +233,16 @@ export class SessionManager {
         })
         await session.refreshSubagents()
         await session.flush()
-        if (input.persistence) await session.replayTools()
+        if (input.persistence) {
+          if (session.state.replay) {
+            await session.replayTools()
+          } else {
+            session.state.lastKnownStepIndex = await readLastStepIndex(
+              session.brainRoot,
+              session.state.nativeId,
+            ).catch(() => -1)
+          }
+        }
         session.state.turnToolCallIds = []
         await configureSession(session, input.config)
         await session.drain()
@@ -238,19 +257,41 @@ export class SessionManager {
           requestId: input.requestId,
         })
       } catch (error) {
+        const wasOpened = session.state.opened
+        const closedExternally = session.state.closedEmitted
         this.sessions.delete(input.sessionId)
         await session.close()
+        if (wasOpened && !closedExternally && !session.state.closedEmitted) {
+          session.state.closedEmitted = true
+          emit({ type: 'session.closed', sessionId: input.sessionId })
+        }
         throw error
       }
     } finally {
       this.opening.delete(input.sessionId)
     }
   }
+
   async handle(input: ProviderInput) {
     const { emit } = this.options
     if (input.type === 'session.open') return this.open(input)
     if (!('sessionId' in input))
       throw new Error(`Unsupported operation: ${input.type}`)
+    if (input.type === 'session.close') {
+      const session =
+        this.sessions.get(input.sessionId) ??
+        (await this.opening.get(input.sessionId)?.catch(() => undefined))
+      if (!session) throw new Error('Session is not open')
+      const wasOpened = session.state.opened
+      await session.close()
+      this.sessions.delete(session.id)
+      if (wasOpened && !session.state.closedEmitted) {
+        session.state.closedEmitted = true
+        emit({ type: 'session.closed', sessionId: session.id })
+      }
+      emit({ type: 'request.completed', requestId: input.requestId })
+      return
+    }
     const session = this.sessions.get(input.sessionId)
     if (!session) throw new Error('Session is not open')
     if (input.type === 'session.prompt')
@@ -265,6 +306,11 @@ export class SessionManager {
           input.response.behavior,
           input.response.selectedActionId,
         )
+        if (!option || option.kind.startsWith('reject')) {
+          session.state.deniedToolCallIds.add(
+            permission.request.toolCall.toolCallId,
+          )
+        }
         permission.resolve({
           outcome: option
             ? { outcome: 'selected', optionId: option.optionId }
@@ -294,15 +340,18 @@ export class SessionManager {
         canStop: await session.canStop(),
       })
       return
-    } else if (input.type === 'session.close') {
-      await session.close()
-      this.sessions.delete(session.id)
-      emit({ type: 'session.closed', sessionId: session.id })
     } else throw new Error(`Unsupported operation: ${input.type}`)
     emit({ type: 'request.completed', requestId: input.requestId })
   }
+
   async close() {
     this.closed = true
+    const pendingOpens = await Promise.all(
+      [...this.opening.values()].map((p) => p.catch(() => undefined)),
+    )
+    for (const s of pendingOpens) {
+      if (s) this.sessions.set(s.id, s)
+    }
     await Promise.all([...this.sessions.values()].map((s) => s.close()))
     await Promise.all([...this.transports].map((t) => t.close()))
     this.sessions.clear()
@@ -316,6 +365,10 @@ async function createSession(
   options: SessionOptions,
   transports: Set<ReturnType<typeof connectAcp>>,
 ) {
+  const cwdStat = await stat(cwd).catch(() => null)
+  if (!cwdStat?.isDirectory()) {
+    throw new Error(`Working directory does not exist: ${cwd}`)
+  }
   const { launch, capabilities, emit } = options
   const permissions = new Map<string, PendingPermission>()
   const timeline = new Timeline(id)
@@ -325,6 +378,8 @@ async function createSession(
     opened: false,
     persisted: false,
     closing: false,
+    silenced: false,
+    closedEmitted: false,
     skipPermissions: config?.mode === FULL_ACCESS_MODE_ID,
     turnHadContextUsage: false,
     turnHadModelOutput: false,
@@ -342,6 +397,7 @@ async function createSession(
         }
       | undefined,
     turnToolCallIds: [] as string[],
+    deniedToolCallIds: new Set<string>(),
     lastKnownStepIndex: -1,
     wakeup: {
       pendingReplay: false,
@@ -359,11 +415,19 @@ async function createSession(
     prompts: new Set<string>(),
   }
   const buffered: SessionNotification[] = []
-  const children = new Map<string, BrainWatchHandle>()
-  const childParents = new Map<string, string>()
-  const killedChildren = new Set<string>()
-  const resuming = new Set<string>()
+  const subagents = new SubagentRegistry({
+    sessionId: id,
+    cwd,
+    brainRoot,
+    capabilities,
+    emit,
+    getNativeId: () => state.nativeId,
+    isParentTurnActive: () => Boolean(state.turn),
+    isLoading: () => state.loading,
+    isUnavailable: () => state.closing || state.failed,
+  })
   let notificationLane = Promise.resolve()
+  let relaunching = Promise.resolve()
   let usage: ProviderUsage = {}
   let commandsReceived = false
   let emittedCommands: string | undefined
@@ -394,6 +458,7 @@ async function createSession(
     await notificationLane
   }
   function publishUsage(next: ProviderUsage) {
+    if (!state.opened || state.silenced) return
     usage = { ...usage, ...next }
     emit({
       type: 'session.usage',
@@ -406,181 +471,25 @@ async function createSession(
     status: 'completed' | 'canceled' | 'failed',
     error?: string,
   ) {
-    for (const item of timeline.terminalize(status, error))
+    if (state.silenced) return
+    for (const item of timeline.terminalize(
+      status,
+      error,
+      state.deniedToolCallIds,
+    )) {
       emit({ type: 'timeline.item', sessionId: id, item })
-  }
-  const childKey = (nativeId: string) => `${id}:child:${nativeId}`
-  async function syncKilledChildren(
-    subagents?: readonly SubagentRecord[],
-    parentNativeId = state.nativeId,
-  ) {
-    rememberSubagents(
-      subagents ??
-        (await readSubagents(brainRoot, parentNativeId).catch(() => [])),
-      parentNativeId,
-    )
-    // Include descendants discovered by their own watchers, not just this parent's descriptors.
-    await Promise.all(
-      [...killedChildren].map((childId) => children.get(childId)?.cancel()),
-    )
-  }
-  function rememberSubagents(
-    subagents: readonly SubagentRecord[],
-    parentNativeId = state.nativeId,
-  ) {
-    for (const sub of subagents) {
-      if (
-        sub.conversationId !== state.nativeId &&
-        sub.conversationId !== parentNativeId &&
-        !childParents.has(sub.conversationId)
-      )
-        childParents.set(sub.conversationId, parentNativeId)
-      if (sub.state === 'SUBAGENT_STATE_KILLED') {
-        const childId = childKey(sub.conversationId)
-        killedChildren.add(childId)
-        if (!state.loading) void children.get(childId)?.cancel()
-      }
-    }
-  }
-  async function refreshSubagents() {
-    // Optional ownership metadata must not poison the serialized ACP notification lane.
-    const subagents = await readSubagents(brainRoot, state.nativeId).catch(
-      () => [],
-    )
-    if (state.loading) rememberSubagents(subagents)
-    else await syncKilledChildren(subagents)
-  }
-  function watchChild(
-    nativeId: string,
-    childId: string,
-    resume?: ReturnType<BrainWatchHandle['resumePoint']>,
-  ) {
-    const child = watchBrain(
-      brainRoot,
-      nativeId,
-      childId,
-      (event) => {
-        if (event.type === 'timeline.item')
-          linkSubsession(childId, nativeId, event.item)
-        emit(event)
-      },
-      1000,
-      () => Boolean(state.turn),
-      resume,
-      (subagents) => rememberSubagents(subagents, nativeId),
-    )
-    children.set(childId, child)
-    void child.ready.then(() => {
-      if (killedChildren.has(childId)) return child.cancel()
-    })
-  }
-  /** A child stopped by interruption (not killed) can be woken by a message. */
-  function isResumable(childId: string) {
-    return (
-      !killedChildren.has(childId) &&
-      children.get(childId)?.isStopping() === true
-    )
-  }
-  /** Resume watching the same child session once its previous watcher has drained. */
-  function resumeChild(
-    nativeId: string,
-    childId: string,
-    existing: BrainWatchHandle,
-  ) {
-    if (resuming.has(childId)) return
-    resuming.add(childId)
-    void existing.cancel().then(() => {
-      resuming.delete(childId)
-      if (
-        state.closing ||
-        state.failed ||
-        killedChildren.has(childId) ||
-        children.get(childId) !== existing
-      )
-        return
-      watchChild(nativeId, childId, existing.resumePoint())
-    })
-  }
-  function canLinkChild(
-    nativeId: string,
-    parentNativeId: string,
-    name: string,
-  ) {
-    const childId = childKey(nativeId)
-    const spawn = isSpawn(name)
-    // Killed children are only linked for history, their own spawn call, or an already open session.
-    const killedAllowed =
-      state.loading ||
-      spawn ||
-      !killedChildren.has(childId) ||
-      children.has(childId)
-    // Only a recorded parent, or the spawning call of an unseen child, owns it.
-    const owned =
-      childParents.get(nativeId) === parentNativeId ||
-      (spawn && !childParents.has(nativeId))
-    return (
-      !state.closing &&
-      !state.failed &&
-      capabilities.includes('session.subsession') &&
-      sessionIdPattern.test(nativeId) &&
-      nativeId !== state.nativeId &&
-      killedAllowed &&
-      owned
-    )
-  }
-  /** Open or resume direct child sub-sessions for root or nested subagents. */
-  function linkSubsession(
-    parentSessionId: string,
-    parentNativeId: string,
-    item: ProviderTimelineItem,
-  ) {
-    if (item.type === 'tool_call' && item.detail.type === 'sub_agent') {
-      const nativeId = item.detail.childSessionId
-      delete item.detail.childSessionId
-      if (!nativeId || !canLinkChild(nativeId, parentNativeId, item.name))
-        return
-      childParents.set(nativeId, parentNativeId)
-      const childId = childKey(nativeId)
-      const existing = children.get(childId)
-      if (
-        existing &&
-        isResumable(childId) &&
-        !state.loading &&
-        isMessage(item.name)
-      ) {
-        resumeChild(nativeId, childId, existing)
-      } else if (!existing) {
-        emit({
-          type: 'session.opened',
-          sessionId: childId,
-          parentSessionId,
-          toolCallId: item.callId,
-          cwd,
-          capabilities: ['session.subsession'],
-          restoration: 'parent',
-          title: item.detail.subAgentType ?? 'Antigravity subagent',
-        })
-        watchChild(nativeId, childId)
-        emit({ type: 'session.ready', sessionId: childId })
-      }
-      item.detail.childSessionId = childId
-    }
-    if (
-      item.type === 'tool_call' &&
-      item.status === 'completed' &&
-      item.name.includes('manage_subagents')
-    ) {
-      void syncKilledChildren(undefined, parentNativeId)
     }
   }
   /** Brain-projected items are not yet known to the ACP timeline. */
   function emitItem(item: ProviderTimelineItem, timestamp?: string) {
+    if (state.silenced) return
     timeline.track(item)
     publishItem(item, timestamp)
   }
   /** Link child sessions and publish an item the timeline already tracks. */
   function publishItem(item: ProviderTimelineItem, timestamp?: string) {
-    linkSubsession(id, state.nativeId, item)
+    if (state.silenced) return
+    subagents.linkSubsession(id, state.nativeId, item)
     if (state.replay)
       emit({
         type: 'timeline.item',
@@ -610,7 +519,7 @@ async function createSession(
         argumentHint: c.input?.hint,
       }))
       const serialized = JSON.stringify(next)
-      if (state.opened && serialized !== emittedCommands) {
+      if (state.opened && !state.silenced && serialized !== emittedCommands) {
         emittedCommands = serialized
         emit({
           type: 'session.commands',
@@ -668,12 +577,12 @@ async function createSession(
         if (
           item.type === 'tool_call' &&
           item.detail.type === 'sub_agent' &&
-          isMessage(item.name)
+          isSubagentMessage(item.name)
         ) {
           // Terminalization may run while ownership is being read.
           const nativeId = item.detail.childSessionId
           delete item.detail.childSessionId
-          await refreshSubagents()
+          await subagents.refreshSubagents()
           // Do not restore a native ID that a later terminalization could publish.
           if (state.closing || state.failed) return
           if (nativeId !== undefined) item.detail.childSessionId = nativeId
@@ -683,6 +592,7 @@ async function createSession(
     }
   }
   function publishConfig() {
+    if (!state.opened || state.closing || state.silenced) return
     emit({
       type: 'session.config',
       sessionId: id,
@@ -691,13 +601,19 @@ async function createSession(
   }
   function cancelPermissions() {
     for (const [permissionId, p] of permissions) {
-      if (p.type === 'acp') p.resolve({ outcome: { outcome: 'cancelled' } })
-      else p.resolve(null)
-      emit({
-        type: 'session.permission_resolved',
-        sessionId: id,
-        permissionId,
-      })
+      if (p.type === 'acp') {
+        state.deniedToolCallIds.add(p.request.toolCall.toolCallId)
+        p.resolve({ outcome: { outcome: 'cancelled' } })
+      } else {
+        p.resolve(null)
+      }
+      if (state.opened && !state.silenced) {
+        emit({
+          type: 'session.permission_resolved',
+          sessionId: id,
+          permissionId,
+        })
+      }
     }
     permissions.clear()
   }
@@ -843,6 +759,7 @@ async function createSession(
       )
       if (kind !== 'question' && (state.metadata.fullAccess || preapproved)) {
         const allow = pickPermissionOption(request.options, 'allow')
+        if (!allow) state.deniedToolCallIds.add(request.toolCall.toolCallId)
         return Promise.resolve({
           outcome: allow
             ? { outcome: 'selected' as const, optionId: allow.optionId }
@@ -879,7 +796,7 @@ async function createSession(
     resolveCommands()
     cancelPermissions()
     terminalize('failed', error.message)
-    if (!state.opening && state.opened)
+    if (!state.opening && state.opened && !state.silenced)
       emit({
         type: 'session.runtime_failed',
         sessionId: id,
@@ -907,8 +824,8 @@ async function createSession(
   function initializeRuntime(transport: ReturnType<typeof connectAcp>) {
     return transport.request(
       transport.rpc.initialize({
-        protocolVersion: 1,
-        clientInfo: { name: 'paseo-agy-acp', version: '0.1.0' },
+        protocolVersion: PROTOCOL_VERSION,
+        clientInfo: { name: 'paseo-agy-acp', version: PACKAGE_VERSION },
         clientCapabilities: {
           fs: { readTextFile: false, writeTextFile: false },
           terminal: false,
@@ -920,6 +837,76 @@ async function createSession(
   let currentTransport = startRuntime(state.skipPermissions)
   try {
     let currentInitialized = await initializeRuntime(currentTransport)
+    async function doRelaunch(
+      skipPermissions: boolean,
+      force = false,
+    ): Promise<void> {
+      if (
+        state.closing ||
+        (!force &&
+          (state.skipPermissions === skipPermissions ||
+            !currentInitialized.agentCapabilities?.loadSession))
+      )
+        return
+      const prev = configState(state.metadata)
+      const nativeMode = configState({
+        ...state.metadata,
+        fullAccess: false,
+      }).mode
+      state.loading = true
+      state.replay = false
+      try {
+        await currentTransport.close()
+        if (state.closing) return
+        if (!currentInitialized.agentCapabilities?.loadSession)
+          throw new Error(
+            'agy cannot reload after interruption; reopen the session',
+          )
+        const next = startRuntime(skipPermissions)
+        currentTransport = next
+        currentInitialized = await initializeRuntime(next)
+        if (state.closing) return
+        state.skipPermissions = skipPermissions
+        state.metadata = {
+          ...(await next.request(
+            next.rpc.loadSession({
+              ...sessionParams(cwd, config),
+              sessionId: state.nativeId,
+            }),
+          )),
+          sessionId: state.nativeId,
+          models: next.models,
+          fullAccess: skipPermissions,
+        }
+        await drain()
+        if (state.closing) return
+        for (const [k, v] of [
+          ['model', prev.model],
+          ['thought_level', prev.thinkingOption],
+          ['mode', force ? nativeMode : undefined],
+        ] as const) {
+          await applyNativeConfigOption(
+            next,
+            state.nativeId,
+            state.metadata,
+            k,
+            v,
+          )
+        }
+      } catch (error) {
+        onExit(error instanceof Error ? error : new Error(String(error)))
+        throw error
+      } finally {
+        state.wakeup = {
+          pendingReplay: false,
+          suppressEcho: false,
+          carriedUsage: undefined,
+        }
+        state.turnToolCallIds = []
+        state.loading = false
+        state.replay = true
+      }
+    }
     return {
       id,
       cwd,
@@ -948,28 +935,25 @@ async function createSession(
           carriedUsage: undefined,
         }
       },
-      hasChild(nativeId: string) {
-        return children.has(childKey(nativeId))
-      },
-      isChildResumable(nativeId: string) {
-        return isResumable(childKey(nativeId))
-      },
-      syncKilledChildren,
-      rememberSubagents,
-      refreshSubagents,
-      canLinkChild,
+      hasChild: (nativeId: string) => subagents.hasChild(nativeId),
+      isChildResumable: (nativeId: string) =>
+        subagents.isChildResumable(nativeId),
+      syncKilledChildren: subagents.syncKilledChildren,
+      rememberSubagents: subagents.rememberSubagents,
+      refreshSubagents: subagents.refreshSubagents,
+      canLinkChild: subagents.canLinkChild,
       drain,
       waitForCommands,
       async replayTools() {
         if (!state.replay) return
-        const [inbox, subagents, rows] = await Promise.all([
+        const [inbox, subagentRecords, rows] = await Promise.all([
           readInboxState(brainRoot, state.nativeId),
           readSubagents(brainRoot, state.nativeId),
           readTranscriptRows(brainRoot, state.nativeId),
         ])
-        rememberSubagents(subagents)
+        subagents.rememberSubagents(subagentRecords)
         const projector = new BrainTranscriptProjector(id)
-        projector.syncMetadata(inbox, subagents)
+        projector.syncMetadata(inbox, subagentRecords)
         projector.bindToolCallIds(state.turnToolCallIds)
         for (const row of rows) {
           const stepIndex = Number(row.step_index)
@@ -980,19 +964,13 @@ async function createSession(
             state.lastKnownStepIndex = stepIndex
           for (const item of projector.project(row)) {
             if (item.type !== 'tool_call' || item.status === 'running') continue
-            await Promise.all(
-              [...children.values()].map((child) => child.ready),
-            )
+            await subagents.waitCurrentReady()
             emitItem(item)
           }
         }
         // A child opened by the last replayed tool must read its history before a historical kill cancels it.
-        let knownChildren = 0
-        while (knownChildren !== children.size) {
-          knownChildren = children.size
-          await Promise.all([...children.values()].map((child) => child.ready))
-        }
-        await syncKilledChildren(subagents)
+        await subagents.waitNestedReady()
+        await subagents.syncKilledChildren(subagentRecords)
       },
       async canStop(): Promise<boolean> {
         if (
@@ -1002,7 +980,7 @@ async function createSession(
           state.turn ||
           state.interrupting ||
           permissions.size > 0 ||
-          [...children.values()].some((child) => child.isRunning())
+          subagents.hasRunningChildren()
         )
           return false
         return !(await hasActiveBackgroundWork(brainRoot, state.nativeId, {
@@ -1020,29 +998,26 @@ async function createSession(
         state.turnAbort?.abort()
         cancelPermissions()
         // Children stay registered when canceled so they are neither reopened nor left unclosed.
-        const runningChildren = [...children.values()].filter((child) =>
-          child.isRunning(),
-        )
-        const canceling = runningChildren.map((child) => child.cancel())
+        const canceling = subagents.cancelRunning()
         // Native session/cancel leaves background tasks alive; stop their owner when background work is active.
         state.interrupting = (async () => {
           await Promise.all(canceling)
           const needsRelaunch =
-            runningChildren.length > 0 ||
+            canceling.length > 0 ||
             (await hasActiveBackgroundWork(brainRoot, state.nativeId).catch(
               () => true,
             ))
-          if (needsRelaunch)
-            await Promise.all([...children.values()].map((c) => c.cancel()))
+          if (needsRelaunch) await Promise.all(subagents.cancelAll())
           try {
             await currentTransport.request(
               currentTransport.rpc.cancel({ sessionId: state.nativeId }),
             )
           } catch (error) {
-            // A concurrent close already stops the runtime; its closed stream is not an interrupt failure.
-            if (!state.closing) throw error
+            // A concurrent close or forced relaunch replaces this runtime; its closed stream is not an interrupt failure.
+            if (!state.closing && !needsRelaunch) throw error
           } finally {
-            if (needsRelaunch) await this.relaunch(state.skipPermissions, true)
+            if (needsRelaunch && !state.closing)
+              await this.relaunch(state.skipPermissions, true)
           }
         })()
         try {
@@ -1051,81 +1026,36 @@ async function createSession(
           state.interrupting = null
         }
       },
-      async relaunch(skipPermissions: boolean, force = false): Promise<void> {
-        if (
-          !force &&
-          (state.skipPermissions === skipPermissions ||
-            !currentInitialized.agentCapabilities?.loadSession)
+      relaunch(skipPermissions: boolean, force = false): Promise<void> {
+        const run = relaunching.then(
+          () => doRelaunch(skipPermissions, force),
+          () => doRelaunch(skipPermissions, force),
         )
-          return
-        const prev = configState(state.metadata)
-        const nativeMode = configState({
-          ...state.metadata,
-          fullAccess: false,
-        }).mode
-        state.loading = true
-        state.replay = false
-        try {
-          await currentTransport.close()
-          if (state.closing) return
-          if (!currentInitialized.agentCapabilities?.loadSession)
-            throw new Error(
-              'agy cannot reload after interruption; reopen the session',
-            )
-          const next = startRuntime(skipPermissions)
-          currentTransport = next
-          currentInitialized = await initializeRuntime(next)
-          if (state.closing) return
-          state.skipPermissions = skipPermissions
-          state.metadata = {
-            ...(await next.request(
-              next.rpc.loadSession({
-                ...sessionParams(cwd, config),
-                sessionId: state.nativeId,
-              }),
-            )),
-            sessionId: state.nativeId,
-            models: next.models,
-            fullAccess: skipPermissions,
-          }
-          await drain()
-          if (state.closing) return
-          for (const [k, v] of [
-            ['model', prev.model],
-            ['thought_level', prev.thinkingOption],
-            ['mode', force ? nativeMode : undefined],
-          ] as const) {
-            await applyNativeConfigOption(
-              next,
-              state.nativeId,
-              state.metadata,
-              k,
-              v,
-            )
-          }
-        } catch (error) {
-          onExit(error instanceof Error ? error : new Error(String(error)))
-          throw error
-        } finally {
-          this.resetWakeup()
-          state.turnToolCallIds = []
-          state.loading = false
-          state.replay = true
-        }
+        relaunching = run.then(
+          () => undefined,
+          () => undefined,
+        )
+        return run
       },
       close(): Promise<void> {
         if (closing) return closing
         state.closing = true
+        const closingTurnId = state.turn
         state.turnAbort?.abort()
         resolveCommands()
         closing = (async () => {
           cancelPermissions()
-          for (const [childId, stop] of children) {
-            stop()
-            emit({ type: 'session.closed', sessionId: childId })
-          }
-          children.clear()
+          subagents.closeAll()
           terminalize('canceled')
+          if (state.opened && closingTurnId && !state.silenced) {
+            emit({
+              type: 'session.turn',
+              sessionId: id,
+              turnId: closingTurnId,
+              state: 'canceled',
+            })
+          }
+          state.silenced = true
           const disposable =
             !state.persisted &&
             (config?.persist === false || state.prompts.size === 0) &&
@@ -1303,6 +1233,7 @@ async function promptSession(
   session.state.suppressContinuationAcp = false
   session.state.preStagedQuestion = undefined
   session.state.turnToolCallIds = []
+  session.state.deniedToolCallIds.clear()
   session.state.wakeup.suppressEcho =
     session.state.wakeup.pendingReplay && expectsUserEcho
   session.state.wakeup.pendingReplay = false
@@ -1387,6 +1318,14 @@ async function promptSession(
             session.state.turnHadModelOutput || suppressedForeground ? 2000 : 0,
           stallTimeoutMs: session.stallTimeoutMs,
           isWaitingOnUser: () => session.permissions.size > 0,
+          onQuestionSettled: (questions, wokeUp) => {
+            const idx = session.state.handledElicitations.findIndex(
+              (entry) =>
+                entry.wokeUp === wokeUp &&
+                sameNormalizedQuestions(entry.questions, questions),
+            )
+            if (idx >= 0) session.state.handledElicitations.splice(idx, 1)
+          },
           onQuestion: async (pendingQuestion) => {
             const handledIndex = session.state.handledElicitations.findIndex(
               (entry) =>
@@ -1483,22 +1422,24 @@ async function promptSession(
     }
     await session.state.interrupting
     session.terminalize(status, turnError)
-    emit({
-      type: 'session.turn',
-      sessionId: session.id,
-      turnId,
-      state: status,
-      ...(status === 'failed' && turnError
-        ? { error: { message: turnError } }
-        : {}),
-    })
+    if (!session.state.silenced) {
+      emit({
+        type: 'session.turn',
+        sessionId: session.id,
+        turnId,
+        state: status,
+        ...(status === 'failed' && turnError
+          ? { error: { message: turnError } }
+          : {}),
+      })
+    }
   } catch (error) {
     await session.drain()
     const restartError = await session.state.interrupting?.then(
       () => undefined,
-      (error: unknown) => error,
+      (err: unknown) => err,
     )
-    error = restartError ?? error
+    const turnError = restartError ?? error
     const status =
       !restartError &&
       turnAbort.signal.aborted &&
@@ -1506,14 +1447,17 @@ async function promptSession(
       turnAbort.signal.reason.name === 'AbortError'
         ? 'canceled'
         : 'failed'
-    session.terminalize(status, String(error))
-    emit({
-      type: 'session.turn',
-      sessionId: session.id,
-      turnId,
-      state: status,
-      ...(status === 'failed' ? { error: { message: String(error) } } : {}),
-    })
+    const message = formatErrorMessage(turnError)
+    session.terminalize(status, message)
+    if (!session.state.silenced) {
+      emit({
+        type: 'session.turn',
+        sessionId: session.id,
+        turnId,
+        state: status,
+        ...(status === 'failed' ? { error: { message } } : {}),
+      })
+    }
   } finally {
     session.state.wakeup.suppressEcho = false
     session.state.inSettle = false

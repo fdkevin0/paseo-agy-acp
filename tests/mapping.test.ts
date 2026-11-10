@@ -322,6 +322,34 @@ test('attachments preserve file paths, issue context and review comments', () =>
       review.text.includes('test.ts:3') &&
       review.text.includes('Fix here'),
   )
+  const textAttachment = promptContent({
+    type: 'text',
+    mimeType: 'text/plain',
+    title: 'Sprint Notes',
+    text: 'Fix login timeout',
+    externalResource: {
+      provider: 'linear',
+      providerLabel: 'Linear',
+      resourceType: 'issue',
+      id: 'id-1',
+      identifier: 'ENG-42',
+      title: 'Auth timeout on slow network',
+      url: 'https://linear.app/team/issue/ENG-42',
+    },
+  })
+  assert.deepEqual(textAttachment, {
+    type: 'text',
+    text: [
+      'Linear ENG-42: Auth timeout on slow network',
+      'Sprint Notes',
+      'https://linear.app/team/issue/ENG-42',
+      'Fix login timeout',
+    ].join('\n'),
+  })
+  assert.deepEqual(promptContent({ type: 'text', text: 'plain message' }), {
+    type: 'text',
+    text: 'plain message',
+  })
 })
 
 test('native PascalCase tools retain paths, content, ranges and recipients', () => {
@@ -509,6 +537,44 @@ test('tool details enrich shell exit codes, clean read gutters, map plan artifac
   assert.ok(failed?.type === 'tool_call')
   assert.equal(failed.error, 'permission denied')
 
+  const failedContent = timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'err-2',
+    title: 'run_command',
+    status: 'failed',
+    rawInput: { CommandLine: 'bad2' },
+    content: [
+      { type: 'content', content: { type: 'text', text: 'stderr detail' } },
+    ],
+  })
+  assert.ok(failedContent?.type === 'tool_call')
+  assert.equal(failedContent.error, 'stderr detail')
+
+  const canceledTool = timeline.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'cancel-1',
+    title: 'run_command',
+    status: 'cancelled' as 'failed',
+  })
+  assert.ok(canceledTool?.type === 'tool_call')
+  assert.equal(canceledTool.status, 'canceled')
+  assert.equal(canceledTool.error, null)
+
+  timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'denied-1',
+    title: 'run_command',
+    status: 'in_progress',
+    rawInput: { CommandLine: 'rm -rf /' },
+  })
+  const [deniedSettled] = timeline.terminalize(
+    'completed',
+    undefined,
+    new Set(['denied-1']),
+  )
+  assert.ok(deniedSettled?.type === 'tool_call')
+  assert.equal(deniedSettled.status, 'canceled')
+
   const askRunning = timeline.update({
     sessionUpdate: 'tool_call',
     toolCallId: 'ask-1',
@@ -550,4 +616,29 @@ test('tool details enrich shell exit codes, clean read gutters, map plan artifac
       text: 'Which approach?\n  1. Option A\n  2. Option B\n\nAnswer:\nOption A',
     },
   )
+})
+
+test('timeline maps plan session updates into todo items', () => {
+  const t = new Timeline('sess-1')
+  const item = t.update({
+    sessionUpdate: 'plan',
+    entries: [
+      { content: 'Step 1: Explore', status: 'completed', priority: 'medium' },
+      {
+        content: 'Step 2: Implement',
+        status: 'in_progress',
+        priority: 'medium',
+      },
+      { content: 'Step 3: Verify', status: 'pending', priority: 'medium' },
+    ],
+  })
+  assert.deepEqual(item, {
+    type: 'todo',
+    id: 'sess-1:plan',
+    items: [
+      { text: 'Step 1: Explore', completed: true, status: 'completed' },
+      { text: 'Step 2: Implement', completed: false, status: 'in_progress' },
+      { text: 'Step 3: Verify', completed: false, status: 'pending' },
+    ],
+  })
 })

@@ -1,15 +1,17 @@
 /** Executable discovery and narrowly scoped cleanup of disposable catalog sessions. */
 import { createHash } from 'node:crypto'
+import { realpathSync } from 'node:fs'
 import { lstat, rm } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { execCommand } from '@getpaseo/plugin/server'
 import type {
   ProviderLaunch,
   ProviderStatus,
 } from '@getpaseo/plugin/server/provider'
-import { sessionIdPattern } from './mapping.ts'
+import { formatErrorMessage, sessionIdPattern, setBounded } from './common.ts'
 
+const STATUS_CACHE_LIMIT = 100
 const statusCache = new Map<string, number>()
 
 /** Verify that the configured executable supports the required ACP version. */
@@ -19,29 +21,31 @@ export async function providerStatus(
   const key = catalogCacheKey(launch)
   const cached = statusCache.get(key)
   if (cached && Date.now() - cached < 60_000) return { available: true }
+  const cmd = launch?.command ?? 'agy'
   try {
-    const { stdout, stderr } = await execCommand(
-      launch?.command ?? 'agy',
-      ['--version'],
-      {
-        env: launch?.env ?? process.env,
-        timeout: 5000,
-      },
-    )
-    const version = (stdout.trim() || stderr.trim()).match(
-      /\bv?(\d+)\.(\d+)\.(\d+)\b/,
+    const { stdout, stderr } = await execCommand(cmd, ['--version'], {
+      env: launch?.env ?? process.env,
+      timeout: 5000,
+    })
+    const version = `${stdout}\n${stderr}`.match(
+      /\bv?(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?\b/,
     )
     if (!version)
       return {
         available: false,
         diagnostic: 'Could not determine agy version; requires >=1.5.3.',
       }
-    const [major, minor, patch] = version.slice(1).map(Number)
-    if (
+    const major = Number(version[1])
+    const minor = Number(version[2])
+    const patch = Number(version[3])
+    const prerelease = version[4]
+    const supported =
       major > 1 ||
-      (major === 1 && (minor > 5 || (minor === 5 && patch >= 3)))
-    ) {
-      statusCache.set(key, Date.now())
+      (major === 1 &&
+        (minor > 5 ||
+          (minor === 5 && (patch > 3 || (patch === 3 && !prerelease)))))
+    if (supported) {
+      setBounded(statusCache, key, Date.now(), STATUS_CACHE_LIMIT)
       return { available: true }
     }
     return {
@@ -49,9 +53,10 @@ export async function providerStatus(
       diagnostic: `agy ${version[0]} is too old; requires >=1.5.3. Run agy update.`,
     }
   } catch (error) {
+    const target = cmd === 'agy' ? 'agy --version' : `agy (${cmd} --version)`
     return {
       available: false,
-      diagnostic: `Cannot run agy --version: ${String(error)}`,
+      diagnostic: `Cannot run ${target}: ${formatErrorMessage(error)}`,
     }
   }
 }
@@ -79,26 +84,38 @@ export function dataDirectory(
     let value = fallback
     for (let i = 0; i < args.length; i++) {
       for (const name of names) {
-        if (args[i] === name && args[i + 1]) value = args[i + 1]
-        else if (args[i].startsWith(`${name}=`))
-          value = args[i].slice(name.length + 1)
+        const next = args[i + 1]
+        if (args[i] === name && next && !next.startsWith('-')) value = next
+        else if (args[i].startsWith(`${name}=`)) {
+          const inline = args[i].slice(name.length + 1)
+          if (inline) value = inline
+        }
       }
     }
     return value
   }
-  const home = env.HOME ?? launch?.env.HOME ?? homedir()
+  let baseCwd = cwd
+  try {
+    baseCwd = realpathSync.native(cwd)
+  } catch {
+    /* Fall back to lexical cwd when the workspace path does not exist yet. */
+  }
+  const home = env.HOME ?? launch?.env?.HOME ?? homedir()
   const gemini = flag(['--gemini-dir', '--gemini_dir'], join(home, '.gemini'))
   const app = flag(['--app-data-dir', '--app_data_dir'], 'antigravity-cli')
-  return resolve(cwd, gemini, app)
+  return resolve(baseCwd, gemini, app)
+}
+
+function isMissingOrNonDir(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code
+  return code === 'ENOENT' || code === 'ENOTDIR'
 }
 
 async function realDirectory(path: string): Promise<boolean> {
-  const parent = dirname(path)
-  if (parent !== path && !(await realDirectory(parent))) return false
   try {
     return (await lstat(path)).isDirectory()
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    if (isMissingOrNonDir(error)) return false
     throw error
   }
 }
@@ -110,6 +127,7 @@ export async function removeSessionArtifacts(
 ): Promise<void> {
   if (!sessionIdPattern.test(sessionId))
     throw new Error('Unsafe catalog session ID')
+  if (!(await realDirectory(appData))) return
   for (const [directory, names] of [
     [
       join(appData, 'conversations'),
@@ -124,7 +142,7 @@ export async function removeSessionArtifacts(
       try {
         stat = await lstat(path)
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+        if (isMissingOrNonDir(error)) continue
         throw error
       }
       if (stat.isSymbolicLink())

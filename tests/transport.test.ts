@@ -143,3 +143,71 @@ test(
     }
   },
 )
+
+test('transport surfaces stderr on immediate startup failure and notifies onExit on request timeout', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-transport-errors-'))
+  try {
+    let crashError: Error | undefined
+    const crashing = connectAcp(
+      {
+        command: process.execPath,
+        args: [
+          '-e',
+          'process.stderr.write("OAuth token expired\\n"); process.exit(2)',
+        ],
+        env: { HOME: home, PATH: process.env.PATH ?? '' },
+      },
+      home,
+      {},
+      {
+        sessionUpdate: async () => {},
+        requestPermission: async () => ({
+          outcome: { outcome: 'cancelled' },
+        }),
+      },
+      (err) => {
+        crashError = err
+      },
+    )
+    await assert.rejects(
+      crashing.rpc.initialize({ protocolVersion: 1, clientCapabilities: {} }),
+    )
+    await delay(80)
+    assert.ok(crashError, 'expected onExit error from startup crash')
+    assert.match(crashError.message, /code 2/)
+    assert.match(crashError.message, /OAuth token expired/)
+    await crashing.close()
+
+    let timeoutExit: Error | undefined
+    const hung = connectAcp(
+      {
+        command: process.execPath,
+        args: ['-e', 'setInterval(() => {}, 1000)'],
+        env: { HOME: home, PATH: process.env.PATH ?? '' },
+      },
+      home,
+      {},
+      {
+        sessionUpdate: async () => {},
+        requestPermission: async () => ({
+          outcome: { outcome: 'cancelled' },
+        }),
+      },
+      (err) => {
+        timeoutExit = err
+      },
+      { requestTimeoutMs: 60 },
+    )
+    try {
+      await assert.rejects(
+        hung.request(new Promise(() => {})),
+        /ACP request timed out/,
+      )
+      assert.equal(timeoutExit?.message, 'ACP request timed out')
+    } finally {
+      await hung.close()
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})

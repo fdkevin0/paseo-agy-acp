@@ -7,10 +7,10 @@ import { fileURLToPath } from 'node:url'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
   PROVIDER_CAPABILITIES,
-  ProviderEventSchema,
   type ProviderEvent,
 } from '@getpaseo/plugin/server/provider'
 import { createProvider } from '../server/provider.ts'
+import { collectProviderEvents } from './helpers.ts'
 
 /** Connect a provider to interrupt-acp.ts and record its events. */
 async function connect(home: string, timeoutMs = 2000) {
@@ -23,18 +23,9 @@ async function connect(home: string, timeoutMs = 2000) {
       env: { HOME: home, PATH: process.env.PATH ?? '' },
     },
   })
-  const events: ProviderEvent[] = []
-  provider.onEvent((event) => {
-    ProviderEventSchema.parse(event)
-    events.push(event)
-  })
-  async function until(predicate: (event: ProviderEvent) => boolean) {
-    const deadline = Date.now() + timeoutMs
-    while (!events.some(predicate)) {
-      assert.ok(Date.now() < deadline, JSON.stringify(events))
-      await delay(5)
-    }
-  }
+  const { events, wait } = collectProviderEvents(provider)
+  const until = (predicate: (event: ProviderEvent) => boolean) =>
+    wait(predicate, timeoutMs)
   /** Runtime start and exit records written by interrupt-acp.ts. */
   const log = async () =>
     (await readFile(join(home, 'runtime.jsonl'), 'utf8'))
@@ -185,7 +176,7 @@ for (const mode of ['plan', 'full-access']) {
 
 test('closing during interruption cannot start a replacement runtime after session.closed', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-interrupt-close-'))
-  const { provider, events, until, log } = await connect(home)
+  const { provider, until, log } = await connect(home)
   try {
     await provider.send({
       type: 'session.open',
@@ -279,7 +270,7 @@ test('closing during interruption cannot start a replacement runtime after sessi
 
 test('interrupt without active background work uses native session/cancel fast path without relaunching', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-interrupt-fast-'))
-  const { provider, events, until } = await connect(home)
+  const { provider, until } = await connect(home)
   try {
     await provider.send({
       type: 'session.open',
