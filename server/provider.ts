@@ -139,7 +139,7 @@ async function probeCatalog(
     const dir = usage.remember(launch, {}, cwd)
     if (session.transport.tier?.name)
       usage.tiers.set(dir, session.transport.tier.name)
-    session.flush()
+    await session.flush()
     await session.waitForCommands(100)
     const config = configState({
       ...response,

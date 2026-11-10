@@ -29,7 +29,7 @@ type PendingTool = {
   stepIndex: number
 }
 
-type SubagentRecord = {
+export type SubagentRecord = {
   conversationId: string
   /** Native lifecycle state; only SUBAGENT_STATE_ALIVE counts as active work. */
   state: string
@@ -1100,7 +1100,9 @@ export async function settleBrainTurn(
     stallTimeoutMs = 120_000,
     wokenStallTimeoutMs = 15 * 60_000,
     isWaitingOnUser,
+    onSubagents,
   }: {
+    onSubagents?: (subagents: readonly SubagentRecord[]) => void
     signal?: AbortSignal
     minStepIndex?: number
     pollIntervalMs?: number
@@ -1175,6 +1177,7 @@ export async function settleBrainTurn(
       return finish('canceled')
     }
     const { inbox, subagents } = await node.pollMetadata(root)
+    onSubagents?.(subagents)
     const nextFingerprint = `${inbox.messages.length}:${inbox.readIds.size}:${subagents
       .map((s) => `${s.conversationId}=${s.state}`)
       .join(',')}`
@@ -1319,6 +1322,7 @@ export function watchBrain(
   isParentTurnActive?: () => boolean,
   /** Resume an existing child session: earlier steps are only projected, and turn IDs continue. */
   resume?: { afterStep: number; turnSeq: number },
+  onSubagents?: (subagents: readonly SubagentRecord[]) => void,
 ): BrainWatchHandle {
   if (!sessionIdPattern.test(nativeId))
     throw new Error('Invalid Brain session ID')
@@ -1360,6 +1364,7 @@ export function watchBrain(
   async function pollOnce() {
     try {
       const { inbox, subagents } = await node.pollMetadata(root)
+      onSubagents?.(subagents)
       const { rows, reset } = await node.reader.read(root, nativeId)
       if (reset) {
         dedupe.prune(rows)

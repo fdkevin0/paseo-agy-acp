@@ -26,14 +26,27 @@ async function harness(env: Record<string, string> = {}) {
     },
   })
   const events: ProviderEvent[] = []
+  const opened = new Map<string, readonly string[]>()
+  const protocolErrors: string[] = []
   provider.onEvent((e) => {
     ProviderEventSchema.parse(e)
-    events.push(e)
+    if (e.type === 'session.opened') {
+      if (
+        e.parentSessionId &&
+        !opened.get(e.parentSessionId)?.includes('session.subsession')
+      )
+        protocolErrors.push(
+          `Parent lacks session.subsession: ${e.parentSessionId}`,
+        )
+      opened.set(e.sessionId, e.capabilities)
+    } else if (e.type === 'session.closed') opened.delete(e.sessionId)
+    events.push(structuredClone(e))
   })
   async function wait(predicate: (e: ProviderEvent) => boolean) {
     const deadline = Date.now() + 5000
     while (Date.now() < deadline) {
       const event = events.find(predicate)
+      assert.deepEqual(protocolErrors, [])
       if (event) return event
       await new Promise((resolve) => setTimeout(resolve, 10))
     }
@@ -1379,6 +1392,124 @@ test('recursive multi-level subagents link depth-2 grandchild under child sessio
     assert.ok(ephOpened?.type === 'session.opened')
     assert.equal(ephOpened.persistence, undefined)
     assert.equal(ephOpened.title, 'Ephemeral Task')
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('messages recover only owned children and never create root, self or unknown sessions', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-message-ownership-'))
+  const root = '11111111-1111-4111-8111-111111111111'
+  const child = '22222222-2222-4222-8222-222222222222'
+  const grand = '33333333-3333-4333-8333-333333333333'
+  const sibling = '55555555-5555-4555-8555-555555555555'
+  const unknown = '44444444-4444-4444-8444-444444444444'
+  const brain = join(home, '.gemini/antigravity-cli/brain')
+  async function transcript(nativeId: string, recipients: string[]) {
+    const dir = join(brain, nativeId, '.system_generated/logs')
+    await mkdir(dir, { recursive: true })
+    await writeFile(
+      join(dir, 'transcript_full.jsonl'),
+      recipients
+        .flatMap((recipient, i) => [
+          {
+            step_index: i * 2,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            tool_calls: [
+              {
+                id: `message-${i}`,
+                name: 'send_message',
+                args: { Recipient: recipient, Message: 'report' },
+              },
+            ],
+          },
+          {
+            step_index: i * 2 + 1,
+            type: 'GENERIC',
+            status: 'DONE',
+            content: 'Message sent',
+          },
+        ])
+        .map((row) => JSON.stringify(row) + '\n')
+        .join(''),
+    )
+  }
+  await transcript(child, [root, child, unknown, grand, grand, sibling])
+  await transcript(grand, [root, child, grand, unknown, sibling])
+  await transcript(sibling, [grand])
+  const descriptors = join(brain, child, '.system_generated/subagents')
+  await mkdir(descriptors, { recursive: true })
+  await writeFile(
+    join(descriptors, `${grand}.json`),
+    JSON.stringify({ conversationId: grand }),
+  )
+  await writeFile(
+    join(descriptors, `${sibling}.json`),
+    JSON.stringify({ conversationId: sibling }),
+  )
+  const h = await harness({ HOME: home })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      config: h.config,
+      history: 'replay',
+      persistence: { version: 1, data: { sessionId: root } },
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's')
+    const opened = h.events.filter((e) => e.type === 'session.opened')
+    assert.deepEqual(
+      opened.map((e) => e.sessionId),
+      ['s', `s:child:${child}`, `s:child:${grand}`, `s:child:${sibling}`],
+    )
+    assert.equal(opened[2].parentSessionId, `s:child:${child}`)
+    assert.deepEqual(opened[1].capabilities, ['session.subsession'])
+    assert.deepEqual(opened[2].capabilities, ['session.subsession'])
+    for (const event of h.events) {
+      if (
+        event.type !== 'timeline.item' ||
+        event.item.type !== 'tool_call' ||
+        event.item.detail.type !== 'sub_agent'
+      )
+        continue
+      const target = event.item.detail.childSessionId
+      assert.ok(
+        target === undefined ||
+          opened.some(
+            (e) =>
+              e.sessionId === target && e.parentSessionId === event.sessionId,
+          ),
+        `Dangling child link: ${target}`,
+      )
+    }
+    for (const nativeId of [grand, sibling]) {
+      const messages = h.events.filter(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.sessionId === `s:child:${nativeId}` &&
+          e.item.type === 'tool_call' &&
+          e.item.name === 'send_message',
+      )
+      assert.ok(messages.length > 0)
+      for (const event of messages) {
+        assert.ok(
+          event.type === 'timeline.item' &&
+            event.item.type === 'tool_call' &&
+            event.item.detail.type === 'sub_agent',
+        )
+        assert.equal(event.item.detail.childSessionId, undefined)
+      }
+    }
+    await h.provider.send({
+      type: 'session.close',
+      requestId: 'close',
+      sessionId: 's',
+    })
+    await h.wait((e) => e.type === 'session.closed' && e.sessionId === 's')
+    assert.equal(h.events.filter((e) => e.type === 'session.closed').length, 4)
   } finally {
     await h.provider.close()
     await rm(home, { recursive: true, force: true })
