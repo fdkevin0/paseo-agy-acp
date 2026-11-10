@@ -2,5 +2,37 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "timezone": "Asia/Shanghai",
+  "schedule": ["before 9am on monday"],
+  "minimumReleaseAge": "3 days",
+  "constraints": {
+    "node": "24",
+    "npm": "11"
+  },
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 9am on the first day of the month"]
+  },
+  "packageRules": [
+    {
+      "description": "Keep @types/node on the oldest Node major in engines.node",
+      "matchPackageNames": ["@types/node"],
+      "allowedVersions": "<23"
+    },
+    {
+      "description": "Group non-major devDependency updates and merge them when CI passes",
+      "matchDepTypes": ["devDependencies"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "non-major dev dependencies",
+      "automerge": true
+    },
+    {
+      "description": "Group non-major GitHub Actions updates and merge them when CI passes",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch", "digest"],
+      "groupName": "non-major GitHub Actions",
+      "automerge": true
+    }
   ]
 }
