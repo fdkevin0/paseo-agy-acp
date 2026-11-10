@@ -89,135 +89,146 @@ test('isPreapprovedMcpTool matches exact direct and lazy MCP grants only', () =>
   assert.equal(isPreapprovedMcpTool('mcp__rea__open', {}, undefined), false)
 })
 
-test('normalizeElicitationQuestions and buildElicitationResponse translate single-select, multi-select, custom Other, freeform and decline', () => {
-  const questions = normalizeElicitationQuestions({
-    message: 'The agent has a question.',
-    requestedSchema: {
-      type: 'object',
-      properties: {
-        q1: {
+// Shaped like agy's ask_question form: `qN` choices plus an optional free-form `qN_other`.
+const agyForm = {
+  message: 'The agent has a question.',
+  requestedSchema: {
+    type: 'object',
+    properties: {
+      q1: {
+        type: 'string',
+        title: 'Which implementation path?',
+        oneOf: [
+          { const: '0', title: '(Recommended) Option A: Direct fix' },
+          { const: '1', title: 'Option B: Full refactor' },
+        ],
+      },
+      q1_other: {
+        type: 'string',
+        title: 'Other',
+        description: 'Optional free-form answer to: Which implementation path?',
+      },
+      q2: {
+        type: 'array',
+        title: 'Select target platforms',
+        items: {
           type: 'string',
-          title: 'Which implementation path?',
           oneOf: [
-            { const: '0', title: '(Recommended) Option A: Direct fix' },
-            { const: '1', title: 'Option B: Full refactor' },
+            { const: 'linux', title: 'Linux, x86_64' },
+            { const: 'mac', title: 'macOS' },
           ],
         },
-        q1_other: {
-          type: 'string',
-          title: 'Other',
-          description:
-            'Optional free-form answer to: Which implementation path?',
-        },
-        q2: {
-          type: 'array',
-          title: 'Select target platforms',
-          items: {
-            type: 'string',
-            oneOf: [
-              { const: 'linux', title: 'Linux, x86_64' },
-              { const: 'mac', title: 'macOS' },
-            ],
-          },
-        },
-        q2_other: {
-          type: 'string',
-          title: 'Other',
-        },
-        q3_other: {
-          type: 'string',
-          title: 'Any extra notes?',
-        },
       },
+      q2_other: { type: 'string', title: 'Other' },
+      q3_other: { type: 'string', title: 'Any extra notes?' },
     },
-  })
-  assert.equal(questions.length, 3)
-  assert.deepEqual(toQuestionPermissionInput(questions), {
-    questions: [
-      {
-        id: 'q1',
-        header: 'Question 1',
-        question: 'Which implementation path?',
-        options: [
-          { label: '(Recommended) Option A: Direct fix' },
-          { label: 'Option B: Full refactor' },
-        ],
-        multiSelect: false,
-        allowOther: true,
-        isOther: true,
-      },
-      {
-        id: 'q2',
-        header: 'Question 2',
-        question: 'Select target platforms',
-        options: [{ label: 'Linux, x86_64' }, { label: 'macOS' }],
-        multiSelect: true,
-        allowOther: true,
-        isOther: true,
-      },
-      {
-        id: 'q3',
-        header: 'Question 3',
-        question: 'Any extra notes?',
-        options: [],
-        multiSelect: false,
-        allowOther: true,
-        isOther: true,
-      },
-    ],
-  })
+  },
+}
 
-  // Selected option on q1 + multi-select with comma in label and custom text on q2 + freeform on q3
-  const accepted = buildElicitationResponse(questions, {
-    behavior: 'allow',
-    updatedInput: {
-      answers: {
-        'Question 1': '(Recommended) Option A: Direct fix',
-        'Question 2': 'Linux, x86_64, Windows ARM64',
-        'Question 3': 'Keep tests fast',
-      },
+test('elicitation forms become Paseo QuestionCard input', () => {
+  assert.deepEqual(
+    toQuestionPermissionInput(normalizeElicitationQuestions(agyForm)),
+    {
+      questions: [
+        {
+          header: 'Question 1',
+          question: 'Which implementation path?',
+          options: [
+            { label: '(Recommended) Option A: Direct fix' },
+            { label: 'Option B: Full refactor' },
+          ],
+          multiSelect: false,
+          allowOther: true,
+        },
+        {
+          header: 'Question 2',
+          question: 'Select target platforms',
+          options: [{ label: 'Linux, x86_64' }, { label: 'macOS' }],
+          multiSelect: true,
+          allowOther: true,
+        },
+        {
+          header: 'Question 3',
+          question: 'Any extra notes?',
+          options: [],
+          multiSelect: false,
+          allowOther: true,
+        },
+      ],
     },
-  })
-  assert.deepEqual(accepted, {
-    action: 'accept',
-    content: {
-      q1: '0',
-      q2: ['linux'],
-      q2_other: 'Windows ARM64',
-      q3_other: 'Keep tests fast',
-    },
-  })
-
-  // Custom "Other" text on single-select q1 must go to q1_other (never q1)
-  const customSingle = buildElicitationResponse(questions.slice(0, 1), {
-    behavior: 'allow',
-    updatedInput: {
-      answers: {
-        'Question 1': 'Custom hybrid approach',
-      },
-    },
-  })
-  assert.deepEqual(customSingle, {
-    action: 'accept',
-    content: {
-      q1_other: 'Custom hybrid approach',
-    },
-  })
-  assert.equal(
-    formatQuestionAnswersText(questions.slice(0, 1), {
-      behavior: 'allow',
-      updatedInput: { answers: { 'Question 1': '0' } },
-    }),
-    '(Recommended) Option A: Direct fix',
   )
+  assert.deepEqual(
+    normalizeElicitationQuestions({ message: '  Continue?  ' }).map(
+      (q) => q.question,
+    ),
+    ['Continue?'],
+  )
+  assert.deepEqual(normalizeElicitationQuestions({}), [])
+})
 
-  // Decline maps to { action: 'decline' }
+test('QuestionCard answers map back to schema values and Other fields', () => {
+  const questions = normalizeElicitationQuestions(agyForm)
+  // Paseo answers by header; multi-select joins labels and custom text with ", ".
+  assert.deepEqual(
+    buildElicitationResponse(questions, {
+      behavior: 'allow',
+      updatedInput: {
+        answers: {
+          'Question 1': '(Recommended) Option A: Direct fix',
+          'Question 2': 'Linux, x86_64, Windows ARM64',
+          'Question 3': 'Keep tests fast',
+        },
+      },
+    }),
+    {
+      action: 'accept',
+      content: {
+        q1: '0',
+        q2: ['linux'],
+        q2_other: 'Windows ARM64',
+        q3_other: 'Keep tests fast',
+      },
+    },
+  )
+  assert.deepEqual(
+    buildElicitationResponse(questions, {
+      behavior: 'allow',
+      updatedInput: { answers: { 'Question 1': 'Custom hybrid approach' } },
+    }),
+    { action: 'accept', content: { q1_other: 'Custom hybrid approach' } },
+  )
   assert.deepEqual(buildElicitationResponse(questions, { behavior: 'deny' }), {
     action: 'decline',
   })
+})
 
-  // Raw ask_question tool input normalization
-  const fromRaw = normalizeAskQuestionInput({
+test('answer text keeps labels and prefixes questions only when there are several', () => {
+  const questions = normalizeElicitationQuestions(agyForm)
+  const response = {
+    behavior: 'allow' as const,
+    updatedInput: {
+      answers: {
+        'Question 1': 'Option B: Full refactor',
+        'Question 2': 'Linux, x86_64, macOS',
+      },
+    },
+  }
+  assert.equal(
+    formatQuestionAnswersText(questions.slice(0, 1), response),
+    'Option B: Full refactor',
+  )
+  assert.equal(
+    formatQuestionAnswersText(questions, response),
+    'Which implementation path?\nAnswer: Option B: Full refactor\n\nSelect target platforms\nAnswer: Linux, x86_64, macOS',
+  )
+  assert.equal(
+    formatQuestionAnswersText(questions, { behavior: 'deny' }),
+    'Declined',
+  )
+})
+
+test('raw ask_question arguments normalize like agy writes them', () => {
+  const [question] = normalizeAskQuestionInput({
     questions: [
       {
         question: 'Proceed with deployment?',
@@ -226,161 +237,101 @@ test('normalizeElicitationQuestions and buildElicitationResponse translate singl
       },
     ],
   })
-  assert.equal(fromRaw.length, 1)
-  assert.equal(fromRaw[0].id, 'q1')
-  assert.deepEqual(fromRaw[0].options, [
-    { id: '0', label: '(Recommended) Yes' },
-    { id: '1', label: 'No' },
+  assert.deepEqual(question, {
+    id: 'q1',
+    header: 'Question 1',
+    question: 'Proceed with deployment?',
+    options: [
+      { id: '0', label: '(Recommended) Yes' },
+      { id: '1', label: 'No' },
+    ],
+    multiSelect: false,
+    allowOther: true,
+  })
+  assert.deepEqual(normalizeAskQuestionInput({ question: 'Name?' }), [
+    {
+      id: 'q1',
+      header: 'Question 1',
+      question: 'Name?',
+      options: [],
+      multiSelect: false,
+      allowOther: true,
+    },
   ])
-  const schemaSame = normalizeElicitationQuestions({
-    requestedSchema: {
-      type: 'object',
-      properties: {
-        q1: {
-          type: 'string',
-          title: 'Proceed with deployment?',
-          oneOf: [
-            { const: 'yes_id', title: '(Recommended) Yes' },
-            { const: 'no_id', title: 'No' },
-          ],
-        },
-      },
-    },
-  })
-  const schemaDiff = normalizeElicitationQuestions({
-    requestedSchema: {
-      type: 'object',
-      properties: {
-        q1: {
-          type: 'string',
-          title: 'Different question?',
-          oneOf: [
-            { const: 'yes_id', title: '(Recommended) Yes' },
-            { const: 'no_id', title: 'No' },
-          ],
-        },
-      },
-    },
-  })
-  assert.equal(sameNormalizedQuestions(fromRaw, schemaSame), true)
-  assert.equal(sameNormalizedQuestions(fromRaw, schemaDiff), false)
+})
 
-  // Multi-question conversion when raw tool questions have custom header/id and elicitation uses generic Question 1/q1
-  const rawMulti = normalizeAskQuestionInput({
+test('a replayed schema is matched by question and labels, and answered from the card that asked it', () => {
+  const asked = normalizeAskQuestionInput({
     questions: [
       {
-        id: 'env_id',
         header: 'Environment',
         question: 'Select environment',
-        options: [
-          { id: 'opt_prod', label: 'Production' },
-          { id: 'opt_stage', label: 'Staging' },
-        ],
+        options: ['Production', 'Staging'],
       },
       {
-        id: 'region_id',
         header: 'Region',
         question: 'Select regions',
         is_multi_select: true,
-        options: [
-          { id: 'opt_us', label: 'US East' },
-          { id: 'opt_eu', label: 'EU West' },
-        ],
+        options: ['US East', 'EU West'],
       },
     ],
   })
-  const schemaMulti = normalizeElicitationQuestions({
-    requestedSchema: {
-      type: 'object',
-      properties: {
-        q1: {
-          type: 'string',
-          title: 'Select environment',
-          oneOf: [
-            { const: '0', title: 'Production' },
-            { const: '1', title: 'Staging' },
-          ],
-        },
-        q2: {
-          type: 'array',
-          title: 'Select regions',
-          items: {
+  const replay = (title: string, labels: string[]) =>
+    normalizeElicitationQuestions({
+      requestedSchema: {
+        type: 'object',
+        properties: {
+          q1: {
             type: 'string',
-            oneOf: [
-              { const: 'us_const', title: 'US East' },
-              { const: 'eu_const', title: 'EU West' },
-            ],
+            title,
+            oneOf: labels.map((label, i) => ({
+              const: `env_${i}`,
+              title: label,
+            })),
+          },
+          q2: {
+            type: 'array',
+            title: 'Select regions',
+            items: {
+              type: 'string',
+              oneOf: [
+                { const: 'us', title: 'US East' },
+                { const: 'eu', title: 'EU West' },
+              ],
+            },
           },
         },
       },
-    },
-  })
-  assert.equal(sameNormalizedQuestions(rawMulti, schemaMulti), true)
+    })
+  const replayed = replay('Select environment', ['Production', 'Staging'])
+  assert.equal(sameNormalizedQuestions(asked, replayed), true)
+  assert.equal(
+    sameNormalizedQuestions(
+      asked,
+      replay('Different?', ['Production', 'Staging']),
+    ),
+    false,
+  )
+  assert.equal(
+    sameNormalizedQuestions(
+      asked,
+      replay('Select environment', ['Production', 'Dev']),
+    ),
+    false,
+  )
+  assert.equal(sameNormalizedQuestions([], []), false)
+  // The card used the raw headers, so answers are read by them and mapped to the replayed schema's values.
   assert.deepEqual(
     buildElicitationResponse(
-      schemaMulti,
+      replayed,
       {
         behavior: 'allow',
         updatedInput: {
-          answers: {
-            Environment: 'Production',
-            Region: 'US East, EU West',
-          },
+          answers: { Environment: 'Staging', Region: 'US East, EU West' },
         },
       },
-      rawMulti,
+      asked,
     ),
-    {
-      action: 'accept',
-      content: {
-        q1: '0',
-        q2: ['us_const', 'eu_const'],
-      },
-    },
-  )
-  assert.deepEqual(
-    buildElicitationResponse(
-      schemaMulti,
-      {
-        behavior: 'allow',
-        updatedInput: {
-          answers: {
-            env_id: 'opt_stage',
-            region_id: ['opt_eu'],
-          },
-        },
-      },
-      rawMulti,
-    ),
-    {
-      action: 'accept',
-      content: {
-        q1: '1',
-        q2: ['eu_const'],
-      },
-    },
-  )
-  assert.equal(
-    formatQuestionAnswersText(rawMulti, {
-      behavior: 'allow',
-      updatedInput: {
-        answers: {
-          env_id: 'opt_prod',
-          region_id: ['opt_us', 'opt_eu'],
-        },
-      },
-    }),
-    'Select environment\nAnswer: Production\n\nSelect regions\nAnswer: US East, EU West',
-  )
-  assert.equal(
-    formatQuestionAnswersText(rawMulti.slice(1), {
-      behavior: 'allow',
-      updatedInput: {
-        answers: {
-          region_id: 'opt_us, opt_eu',
-        },
-      },
-    }),
-    'US East, EU West',
+    { action: 'accept', content: { q1: 'env_1', q2: ['us', 'eu'] } },
   )
 })

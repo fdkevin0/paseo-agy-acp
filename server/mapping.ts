@@ -21,6 +21,16 @@ import { normalizeAskQuestionInput } from './permissions.ts'
 
 export const FULL_ACCESS_MODE_ID = 'full-access'
 
+/** Drop agy's `default_api:` namespace from native tool names. */
+export function cleanToolName(name: string): string {
+  return name.replace(/^default_api:/, '')
+}
+
+/** Whether a native tool name is agy's interactive question tool. */
+export function isAskQuestionName(name: string): boolean {
+  return /^ask_(?:question|user)$/i.test(cleanToolName(name))
+}
+
 const modeVisuals: Record<
   string,
   Pick<ProviderMode, 'icon' | 'colorTier' | 'isUnattended'>
@@ -116,12 +126,8 @@ export function toolDetail(
           .filter(Boolean)
           .join('\n') ||
         (tool.rawOutput != null ? JSON.stringify(tool.rawOutput) : undefined)
-  const name = (tool.title ?? '').replace(/^default_api:/, '')
-  if (
-    name === 'ask_question' ||
-    name === 'ask_user' ||
-    Array.isArray(input.questions)
-  ) {
+  const name = cleanToolName(tool.title ?? '')
+  if (isAskQuestionName(name) || Array.isArray(input.questions)) {
     const questions = normalizeAskQuestionInput(input)
     if (questions.length > 0) {
       const formatted = questions
@@ -622,7 +628,7 @@ export class Timeline {
         type: 'tool_call' as const,
         id: `${this.prefix}:tool:${tool.toolCallId}`,
         callId: tool.toolCallId,
-        name: (tool.title ?? old?.title ?? 'Tool').replace(/^default_api:/, ''),
+        name: cleanToolName(tool.title ?? old?.title ?? 'Tool'),
         detail: toolDetail(tool),
       }
       const item: Extract<ProviderTimelineItem, { type: 'tool_call' }> =

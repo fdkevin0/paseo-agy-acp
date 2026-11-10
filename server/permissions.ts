@@ -3,7 +3,7 @@ import type {
   ProviderToolCallDetail,
   ProviderToolPolicy,
 } from '@getpaseo/plugin/server/provider'
-import { str } from './mapping.ts'
+import { cleanToolName, isAskQuestionName, record, str } from './mapping.ts'
 
 /** Validate the permission fields consumed by the bridge before creating pending work. */
 export const RequestPermissionRequestSchema = z.object({
@@ -73,11 +73,8 @@ export function permissionKind(
   },
   detail: ProviderToolCallDetail,
 ): 'question' | 'mode' | 'plan' | 'tool' {
-  const title = (request.toolCall.title ?? '').replace(/^default_api:/, '')
-  if (
-    isChooserRequest(request.options) ||
-    /^ask_(?:question|user)$/i.test(title)
-  )
+  const title = cleanToolName(request.toolCall.title ?? '')
+  if (isChooserRequest(request.options) || isAskQuestionName(title))
     return 'question'
   if (
     request.toolCall.kind === 'switch_mode' ||
@@ -114,13 +111,16 @@ export function isPreapprovedMcpTool(
 }
 
 export interface NormalizedQuestionOption {
+  /** Value agy expects back for this option (the schema `const`). */
   id: string
   label: string
   description?: string
 }
 
 export interface NormalizedQuestion {
+  /** agy's schema property key; custom text goes to `${id}_other`. */
   id: string
+  /** Paseo's QuestionCard keys each answer by header. */
   header: string
   question: string
   options: NormalizedQuestionOption[]
@@ -128,21 +128,31 @@ export interface NormalizedQuestion {
   allowOther: boolean
 }
 
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined
+type QuestionResponse = {
+  behavior: 'allow' | 'deny'
+  updatedInput?: Record<string, unknown>
+}
+
+function text(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
+function withDescription(
+  option: { id: string; label: string },
+  description: unknown,
+): NormalizedQuestionOption {
+  const value = text(description)
+  return value ? { ...option, description: value } : option
 }
 
 /** Parse agy's `elicitation/create` requestedSchema into normalized Paseo questions. */
 export function normalizeElicitationQuestions(
   params: Record<string, unknown>,
 ): NormalizedQuestion[] {
-  const schema = asRecord(params.requestedSchema)
-  const properties = asRecord(schema?.properties)
-  if (!properties) {
-    const message =
-      typeof params.message === 'string' ? params.message.trim() : ''
+  const properties = record(record(params.requestedSchema).properties)
+  const keys = Object.keys(properties)
+  if (keys.length === 0) {
+    const message = text(params.message)
     return message
       ? [
           {
@@ -156,157 +166,94 @@ export function normalizeElicitationQuestions(
         ]
       : []
   }
-
-  const baseKeys: string[] = []
-  for (const key of Object.keys(properties)) {
-    const base = key.endsWith('_other') ? key.slice(0, -6) : key
-    if (base && !baseKeys.includes(base)) baseKeys.push(base)
-  }
-
-  const questions: NormalizedQuestion[] = []
-  for (const [idx, baseKey] of baseKeys.entries()) {
-    const prop = asRecord(properties[baseKey])
-    const otherProp = asRecord(properties[`${baseKey}_other`])
-    if (!prop && !otherProp) continue
-    const header = `Question ${idx + 1}`
-    if (prop) {
-      const multiSelect = prop.type === 'array'
-      const items = asRecord(prop.items)
-      const rawChoices = multiSelect
-        ? Array.isArray(items?.oneOf)
-          ? items.oneOf
-          : []
-        : Array.isArray(prop.oneOf)
-          ? prop.oneOf
-          : []
-      const options: NormalizedQuestionOption[] = rawChoices.flatMap(
-        (choice, optIdx) => {
-          const rec = asRecord(choice)
-          if (!rec) return []
-          const id =
-            rec.const !== undefined && rec.const !== null
-              ? String(rec.const)
-              : String(optIdx)
-          const label =
-            typeof rec.title === 'string' && rec.title ? rec.title : id
-          const description =
-            typeof rec.description === 'string' && rec.description
-              ? rec.description
-              : undefined
-          return [{ id, label, ...(description ? { description } : {}) }]
-        },
+  // agy pairs each question `qN` with an optional free-form `qN_other` field.
+  const ids = [...new Set(keys.map((key) => key.replace(/_other$/, '')))]
+  return ids.filter(Boolean).map((id, index) => {
+    const prop = record(properties[id])
+    const other = record(properties[`${id}_other`])
+    const multiSelect = prop.type === 'array'
+    const choices = multiSelect ? record(prop.items).oneOf : prop.oneOf
+    const options = (Array.isArray(choices) ? choices : []).map((choice, i) => {
+      const c = record(choice)
+      const value = c.const == null ? String(i) : String(c.const)
+      return withDescription(
+        { id: value, label: text(c.title) ?? value },
+        c.description,
       )
-      const question =
-        typeof prop.title === 'string' && prop.title
-          ? prop.title
-          : typeof prop.description === 'string' && prop.description
-            ? prop.description
-            : header
-      questions.push({
-        id: baseKey,
+    })
+    const header = `Question ${index + 1}`
+    const otherTitle = text(other.title)
+    return {
+      id,
+      header,
+      question:
+        text(prop.title) ??
+        text(prop.description) ??
+        (otherTitle !== 'Other' ? otherTitle : undefined) ??
+        text(other.description)?.replace(
+          /^Optional free-form answer to:\s*/i,
+          '',
+        ) ??
         header,
-        question,
-        options,
-        multiSelect,
-        allowOther: Boolean(otherProp),
-      })
-    } else if (otherProp) {
-      const question =
-        typeof otherProp.title === 'string' &&
-        otherProp.title &&
-        otherProp.title !== 'Other'
-          ? otherProp.title
-          : typeof otherProp.description === 'string' && otherProp.description
-            ? otherProp.description.replace(
-                /^Optional free-form answer to:\s*/i,
-                '',
-              )
-            : header
-      questions.push({
-        id: baseKey,
-        header,
-        question,
-        options: [],
-        multiSelect: false,
-        allowOther: true,
-      })
+      options,
+      multiSelect,
+      allowOther: `${id}_other` in properties,
     }
-  }
-  return questions
+  })
 }
 
 /** Parse raw `ask_question` tool arguments into normalized Paseo questions. */
 export function normalizeAskQuestionInput(
   rawInput: Record<string, unknown>,
 ): NormalizedQuestion[] {
-  const rawQuestions = Array.isArray(rawInput.questions)
+  const items = Array.isArray(rawInput.questions)
     ? rawInput.questions
-    : typeof rawInput.question === 'string'
+    : text(rawInput.question)
       ? [rawInput]
       : []
-  return rawQuestions.flatMap((item, idx) => {
-    const rec = asRecord(item)
-    if (!rec) return []
-    const id =
-      typeof rec.id === 'string' && rec.id.trim()
-        ? rec.id.trim()
-        : `q${idx + 1}`
-    const header =
-      typeof rec.header === 'string' && rec.header.trim()
-        ? rec.header.trim()
-        : `Question ${idx + 1}`
-    const question =
-      typeof rec.question === 'string' && rec.question.trim()
-        ? rec.question.trim()
-        : header
-    const rawOptions = Array.isArray(rec.options) ? rec.options : []
-    const options: NormalizedQuestionOption[] = rawOptions.flatMap(
-      (opt, optIdx) => {
-        if (typeof opt === 'string') {
-          const text = opt.trim()
-          return text ? [{ id: String(optIdx), label: text }] : []
-        }
-        const optRec = asRecord(opt)
-        if (!optRec) return []
-        const optId =
-          typeof optRec.id === 'string' && optRec.id
-            ? optRec.id
-            : typeof optRec.const === 'string' && optRec.const
-              ? optRec.const
-              : String(optIdx)
+  return items.flatMap((item, index) => {
+    if (!item || typeof item !== 'object') return []
+    const q = record(item)
+    const header = text(q.header) ?? `Question ${index + 1}`
+    const options = (Array.isArray(q.options) ? q.options : []).flatMap(
+      (option, i) => {
+        const o = record(option)
         const label =
-          typeof optRec.label === 'string' && optRec.label
-            ? optRec.label
-            : typeof optRec.title === 'string' && optRec.title
-              ? optRec.title
-              : optId
-        const description =
-          typeof optRec.description === 'string' && optRec.description
-            ? optRec.description
-            : undefined
-        return [{ id: optId, label, ...(description ? { description } : {}) }]
+          typeof option === 'string'
+            ? text(option)
+            : (text(o.label) ?? text(o.title))
+        return label
+          ? [withDescription({ id: String(i), label }, o.description)]
+          : []
       },
     )
-    const multiSelect = Boolean(rec.is_multi_select ?? rec.multiSelect)
-    const allowOther = rec.allowOther !== false && rec.isOther !== false
-    return [{ id, header, question, options, multiSelect, allowOther }]
+    return [
+      {
+        id: text(q.id) ?? `q${index + 1}`,
+        header,
+        question: text(q.question) ?? header,
+        options,
+        multiSelect: Boolean(q.is_multi_select ?? q.multiSelect),
+        allowOther: q.allowOther !== false,
+      },
+    ]
   })
 }
 
 /** Build the `input` payload expected by Paseo's QuestionCard UI. */
-export function toQuestionPermissionInput(questions: NormalizedQuestion[]) {
+export function toQuestionPermissionInput(
+  questions: readonly NormalizedQuestion[],
+) {
   return {
     questions: questions.map((q) => ({
-      id: q.id,
       header: q.header,
       question: q.question,
-      options: q.options.map((o) => ({
-        label: o.label,
-        ...(o.description ? { description: o.description } : {}),
+      options: q.options.map(({ label, description }) => ({
+        label,
+        ...(description ? { description } : {}),
       })),
       multiSelect: q.multiSelect,
       allowOther: q.allowOther,
-      isOther: q.allowOther,
     })),
   }
 }
@@ -356,200 +303,58 @@ export function splitMultiSelectAnswer(
   }
 }
 
-function lookupRawAnswer(
-  q: NormalizedQuestion,
-  idx: number,
-  questions: readonly NormalizedQuestion[],
-  answers: Record<string, unknown> | undefined,
-  selectedActionId?: string,
-  source?: NormalizedQuestion,
-): unknown {
-  if (answers) {
-    const candidateKeys = [
-      q.header,
-      q.question,
-      q.id,
-      source?.header,
-      source?.question,
-      source?.id,
-      `Question ${idx + 1}`,
-      `q${idx + 1}`,
-    ]
-    for (const key of candidateKeys) {
-      if (key && answers[key] !== undefined) return answers[key]
-    }
-    if (questions.length === 1) {
-      const values = Object.values(answers)
-      if (values.length === 1) return values[0]
-    }
-  }
-  return selectedActionId
-}
-
-function matchQuestionOption(
-  q: NormalizedQuestion,
-  value: string,
-  source?: NormalizedQuestion,
-): NormalizedQuestionOption | undefined {
-  const trimmed = value.trim()
-  const direct = q.options.find(
-    (o) =>
-      o.label === value ||
-      o.id === value ||
-      o.label.trim() === trimmed ||
-      o.id === trimmed,
-  )
-  if (direct) return direct
-  if (source && source.options.length === q.options.length) {
-    const sourceIndex = source.options.findIndex(
-      (o) =>
-        o.label === value ||
-        o.id === value ||
-        o.label.trim() === trimmed ||
-        o.id === trimmed,
-    )
-    if (sourceIndex >= 0) return q.options[sourceIndex]
-  }
-  return undefined
+/** Paseo's QuestionCard answers by header with one string; multi-select labels are comma-joined. */
+function answerFor(response: QuestionResponse, header: string) {
+  return text(record(record(response.updatedInput).answers)[header])
 }
 
 /**
- * Convert Paseo's `session.permission` response into agy's `elicitation/create`
- * result (`{ action: 'accept', content }` or `{ action: 'decline' }`).
+ * Convert Paseo's QuestionCard response into agy's `elicitation/create` result.
+ * `asked` are the questions the card showed, when a replayed schema is answered from an earlier card.
  */
 export function buildElicitationResponse(
-  questions: NormalizedQuestion[],
-  response: {
-    behavior: 'allow' | 'deny'
-    selectedActionId?: string
-    updatedInput?: Record<string, unknown>
-  },
-  sourceQuestions?: readonly NormalizedQuestion[],
-): {
-  action: 'accept' | 'decline' | 'cancel'
-  content?: Record<string, unknown>
-} {
+  questions: readonly NormalizedQuestion[],
+  response: QuestionResponse,
+  asked: readonly NormalizedQuestion[] = questions,
+): { action: 'accept' | 'decline'; content?: Record<string, unknown> } {
   if (response.behavior === 'deny') return { action: 'decline' }
-  const updated = asRecord(response.updatedInput)
-  const answers = asRecord(updated?.answers)
   const content: Record<string, unknown> = {}
-
-  for (const [idx, q] of questions.entries()) {
-    const source = sourceQuestions?.[idx]
-    const key = q.id
-    const otherKey = `${q.id}_other`
-    const raw = lookupRawAnswer(
-      q,
-      idx,
-      questions,
-      answers,
-      response.selectedActionId,
-      source,
-    )
-    if (q.options.length === 0) {
-      if (typeof raw === 'string' && raw.trim()) {
-        content[otherKey] = raw.trim()
-      }
-      continue
-    }
+  questions.forEach((q, index) => {
+    const answer = answerFor(response, asked[index]?.header ?? q.header)
+    if (!answer) return
+    const byLabel = (label: string) => q.options.find((o) => o.label === label)
     if (!q.multiSelect) {
-      if (typeof raw === 'string' && raw.trim()) {
-        const trimmed = raw.trim()
-        const matched = matchQuestionOption(q, raw, source)
-        if (matched) content[key] = matched.id
-        else content[otherKey] = trimmed
-      }
-      continue
+      const option = byLabel(answer)
+      if (option) content[q.id] = option.id
+      else content[`${q.id}_other`] = answer
+      return
     }
-    const selectedIds: string[] = []
-    const customParts: string[] = []
-    if (Array.isArray(raw)) {
-      for (const entry of raw) {
-        if (typeof entry !== 'string' || !entry.trim()) continue
-        const trimmed = entry.trim()
-        const matched = matchQuestionOption(q, entry, source)
-        if (matched) selectedIds.push(matched.id)
-        else customParts.push(trimmed)
-      }
-    } else if (typeof raw === 'string' && raw.trim()) {
-      const { selected, custom } = splitMultiSelectAnswer(
-        raw,
-        q.options.map((o) => o.label),
-      )
-      for (const label of selected) {
-        const matched = matchQuestionOption(q, label, source)
-        if (matched) selectedIds.push(matched.id)
-      }
-      if (custom?.trim()) {
-        const byId = matchQuestionOption(q, custom.trim(), source)
-        if (byId && selectedIds.length === 0) selectedIds.push(byId.id)
-        else customParts.push(custom.trim())
-      }
-    }
-    if (selectedIds.length > 0) content[key] = selectedIds
-    if (customParts.length > 0) content[otherKey] = customParts.join(', ')
-  }
-
+    const { selected, custom } = splitMultiSelectAnswer(
+      answer,
+      q.options.map((o) => o.label),
+    )
+    const ids = selected.flatMap((label) => byLabel(label)?.id ?? [])
+    if (ids.length > 0) content[q.id] = ids
+    if (custom) content[`${q.id}_other`] = custom
+  })
   return { action: 'accept', content }
 }
 
 /** Format the user's question response into human-readable text. */
 export function formatQuestionAnswersText(
-  questions: NormalizedQuestion[],
-  response: {
-    behavior: 'allow' | 'deny'
-    selectedActionId?: string
-    updatedInput?: Record<string, unknown>
-  },
+  questions: readonly NormalizedQuestion[],
+  response: QuestionResponse,
 ): string {
   if (response.behavior === 'deny') return 'Declined'
-  const updated = asRecord(response.updatedInput)
-  const answers = asRecord(updated?.answers)
-  const lines: string[] = []
-  for (const [idx, q] of questions.entries()) {
-    const raw = lookupRawAnswer(
-      q,
-      idx,
-      questions,
-      answers,
-      response.selectedActionId,
-    )
-    let display = ''
-    if (Array.isArray(raw)) {
-      display = raw
-        .map((entry) => String(entry).trim())
-        .filter(Boolean)
-        .map((entry) => matchQuestionOption(q, entry)?.label ?? entry)
-        .join(', ')
-    } else if (typeof raw === 'string' && raw.trim()) {
-      const trimmed = raw.trim()
-      const single = matchQuestionOption(q, trimmed)
-      if (single) {
-        display = single.label
-      } else if (q.multiSelect) {
-        const { selected, custom } = splitMultiSelectAnswer(
-          trimmed,
-          q.options.map((o) => o.label),
-        )
-        const parts = [...selected]
-        if (custom?.trim()) {
-          for (const token of custom.split(', ')) {
-            const t = token.trim()
-            if (!t) continue
-            parts.push(matchQuestionOption(q, t)?.label ?? t)
-          }
-        }
-        display = parts.length > 0 ? parts.join(', ') : trimmed
-      } else {
-        display = trimmed
-      }
-    }
-    if (!display) continue
-    lines.push(
-      questions.length === 1 ? display : `${q.question}\nAnswer: ${display}`,
-    )
-  }
-  return lines.join('\n\n')
+  return questions
+    .flatMap((q) => {
+      const answer = answerFor(response, q.header)
+      if (!answer) return []
+      return [
+        questions.length === 1 ? answer : `${q.question}\nAnswer: ${answer}`,
+      ]
+    })
+    .join('\n\n')
 }
 
 /** Verify that a replayed elicitation/create schema asks the exact same questions and options. */

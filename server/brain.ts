@@ -10,6 +10,8 @@ import { createHash } from 'node:crypto'
 import { join, sep } from 'node:path'
 import {
   Timeline,
+  cleanToolName,
+  isAskQuestionName,
   record,
   toolDetail,
   sessionIdPattern,
@@ -25,7 +27,7 @@ import {
   type NormalizedQuestion,
 } from './permissions.ts'
 
-export type PendingTool = {
+type PendingTool = {
   id: string
   callId: string
   name: string
@@ -45,7 +47,7 @@ export type PendingQuestion = {
 
 export type QuestionOutcome =
   | { status: 'answered' | 'already_handled'; answerText?: string }
-  | { status: 'declined' | 'canceled' }
+  | { status: 'canceled' }
 
 export type SubagentRecord = {
   conversationId: string
@@ -111,18 +113,15 @@ function terminalToolStatus(
   return 'completed'
 }
 
-function isAskQuestionToolCall(value: unknown): boolean {
-  const name = String(record(value).name ?? '').replace(/^default_api:/, '')
-  return name === 'ask_question' || name === 'ask_user'
-}
-
 function isCompletePlannerResponse(step: Record<string, unknown> | undefined) {
   return (
     step?.type === 'PLANNER_RESPONSE' &&
     step.status === 'DONE' &&
     (!Array.isArray(step.tool_calls) ||
       step.tool_calls.length === 0 ||
-      step.tool_calls.every(isAskQuestionToolCall))
+      step.tool_calls.every((call) =>
+        isAskQuestionName(String(record(call).name ?? '')),
+      ))
   )
 }
 
@@ -448,13 +447,6 @@ export class BrainTranscriptProjector {
     return this.daemons.size > 0
   }
 
-  peekPendingQuestion() {
-    const next = this.pending.find((p) => !p.questionConsumed)
-    return next?.isQuestion
-      ? { tool: next, questions: next.questions ?? [] }
-      : undefined
-  }
-
   consumePendingQuestion() {
     const next = this.pending.find((p) => !p.questionConsumed)
     if (!next?.isQuestion) return undefined
@@ -602,6 +594,7 @@ export class BrainTranscriptProjector {
         return []
       }
       case 'CHECKPOINT':
+        // A checkpoint takes a step index between a response and its GENERIC rows; shift expected rows past it.
         for (const p of this.pending) {
           if (p.stepIndex >= stepIndex) p.stepIndex++
         }
@@ -694,19 +687,14 @@ export class BrainTranscriptProjector {
               this.stepCallIds.get(genericStep) ??
               acpId ??
               `tool-${stepIndex}-${index}`
-            const cleanName = String(tool.name ?? 'Tool').replace(
-              /^default_api:/,
-              '',
-            )
-            const isQuestion =
-              cleanName === 'ask_question' || cleanName === 'ask_user'
+            const cleanName = cleanToolName(String(tool.name ?? 'Tool'))
             const pending: PendingTool = {
               id: `${this.sessionId}:tool:${callId}`,
               callId,
               name: cleanName,
               args,
               stepIndex: genericStep,
-              ...(isQuestion
+              ...(isAskQuestionName(cleanName)
                 ? {
                     isQuestion: true,
                     questions: normalizeAskQuestionInput(args),
@@ -1364,72 +1352,43 @@ export async function settleBrainTurn(
     if (node.lastStep?.type === 'ERROR_MESSAGE')
       return finish('failed', stepErrorMessage(node.lastStep, 'Turn failed'))
     let continuedQuestion = false
-    while (onQuestion ? true : !node.projector.hasPending()) {
-      const pendingQuestion = node.projector.consumePendingQuestion()
-      if (!pendingQuestion) break
-      if (onQuestion) {
-        const outcome = await onQuestion({
-          ...pendingQuestion,
-          wokeUp: node.wokeUp,
-        })
-        if (signal?.aborted || outcome.status === 'canceled') {
-          onItem(
-            node.projector.completePendingQuestion(
-              pendingQuestion.tool,
-              null,
-              'canceled',
-            ),
-          )
-          return finish('canceled')
-        }
-        if (outcome.status === 'answered') {
-          onItem(
-            node.projector.completePendingQuestion(
-              pendingQuestion.tool,
-              outcome.answerText ?? '',
-              'completed',
-            ),
-          )
-          node.markQuestionContinuation()
-          lastActivity = Date.now()
-          continuedQuestion = true
-          break
-        }
-        if (outcome.status === 'declined') {
-          onItem(
-            node.projector.completePendingQuestion(
-              pendingQuestion.tool,
-              'Declined',
-              'completed',
-            ),
-          )
-        }
-        if (outcome.status === 'already_handled') {
-          const completed = node.projector.completePendingQuestion(
-            pendingQuestion.tool,
-            outcome.answerText ?? null,
-            'completed',
-          )
-          if (
-            node.wokeUp ||
-            emitForeground ||
-            (completed.type === 'tool_call' &&
-              (shouldEmitPreWakeupTool
-                ? shouldEmitPreWakeupTool(completed)
-                : true))
-          ) {
-            onItem(completed)
-          }
-        }
-      } else if (node.wokeUp || emitForeground) {
+    // A question at the head of the pending queue blocks agy until it is answered.
+    // Without a handler (direct callers and tests) it is closed as already handled.
+    while (true) {
+      const question = node.projector.consumePendingQuestion()
+      if (!question) break
+      const outcome: QuestionOutcome = onQuestion
+        ? await onQuestion({ ...question, wokeUp: node.wokeUp })
+        : { status: 'already_handled' }
+      if (signal?.aborted || outcome.status === 'canceled') {
         onItem(
           node.projector.completePendingQuestion(
-            pendingQuestion.tool,
+            question.tool,
             null,
-            'completed',
+            'canceled',
           ),
         )
+        return finish('canceled')
       }
+      const completed = node.projector.completePendingQuestion(
+        question.tool,
+        outcome.answerText ?? null,
+      )
+      if (outcome.status === 'answered') {
+        onItem(completed)
+        node.markQuestionContinuation()
+        lastActivity = Date.now()
+        continuedQuestion = true
+        break
+      }
+      // Answered through elicitation/create: only surface the card where its tool call is shown.
+      if (
+        node.wokeUp ||
+        emitForeground ||
+        (completed.type === 'tool_call' &&
+          shouldEmitPreWakeupTool?.(completed) !== false)
+      )
+        onItem(completed)
       node.markQuestionSettled()
     }
     if (continuedQuestion) continue

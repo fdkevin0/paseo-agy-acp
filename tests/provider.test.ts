@@ -1516,307 +1516,214 @@ test('messages recover only owned children and never create root, self or unknow
   }
 })
 
-test('elicitation/create and post-RPC woken ask_question emit QuestionCard permissions even in full-access mode and interrupt without relaunch', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'agy-elicitation-'))
+/** Open a full-access session so question cards prove they are never auto-approved. */
+async function questionSession(name: string) {
+  const home = await mkdtemp(join(tmpdir(), `agy-${name}-`))
   const log = join(home, 'calls')
   const h = await harness({
     HOME: home,
     AGY_TEST_LOG: log,
+    // Also logs `cancel`, which proves an interrupt did not relaunch agy.
     AGY_TEST_LOG_LOAD: '1',
     AGY_TEST_LOG_ELICITATION_CAP: '1',
   })
-  try {
-    await h.provider.send({
-      type: 'session.open',
-      requestId: 'open',
-      sessionId: 's',
-      config: { ...h.config, mode: 'full-access' },
-      history: 'skip',
-    })
-    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's')
-    assert.ok(
-      (await readFile(log, 'utf8')).includes('cap:elicitation.form\n'),
-      'initialize must advertise elicitation.form capability',
-    )
-
-    // 1. Foreground elicitation/create in full-access mode is never auto-approved
-    h.events.length = 0
-    await h.provider.send({
+  await h.provider.send({
+    type: 'session.open',
+    requestId: 'open',
+    sessionId: 's',
+    config: { ...h.config, mode: 'full-access' },
+    history: 'skip',
+  })
+  await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's')
+  h.events.length = 0
+  const prompt = (text: string) =>
+    h.provider.send({
       type: 'session.prompt',
       sessionId: 's',
       prompt: {
-        clientMessageId: 'fg-elicit',
+        clientMessageId: text,
         delivery: 'auto',
-        input: {
-          type: 'message',
-          content: [{ type: 'text', text: 'elicitation' }],
-        },
+        input: { type: 'message', content: [{ type: 'text', text }] },
       },
     })
-    const fgPerm = await h.wait((e) => e.type === 'session.permission')
-    assert.ok(fgPerm.type === 'session.permission')
-    assert.equal(fgPerm.request.kind, 'question')
-    assert.equal(fgPerm.request.name, 'ask_question')
-    await h.provider.send({
+  const seen = new Set<string>()
+  /** Wait for the next unseen QuestionCard. */
+  const nextQuestion = async () => {
+    const e = await h.wait(
+      (e) => e.type === 'session.permission' && !seen.has(e.request.id),
+    )
+    assert.ok(e.type === 'session.permission')
+    seen.add(e.request.id)
+    return e.request
+  }
+  const answer = (id: string, answers: Record<string, string>) =>
+    h.provider.send({
       type: 'session.permission',
       sessionId: 's',
-      permissionId: fgPerm.request.id,
-      response: {
-        behavior: 'allow',
-        updatedInput: {
-          answers: {
-            'Question 1': '(Recommended) Option 1',
-            'Question 2': 'Linux, x86_64, FreeBSD',
-          },
-        },
-      },
+      permissionId: id,
+      response: { behavior: 'allow', updatedInput: { answers } },
     })
-    await h.wait((e) => e.type === 'session.turn' && e.state === 'completed')
-    assert.ok(
-      h.events.some(
-        (e) =>
-          e.type === 'timeline.item' &&
-          e.item.type === 'assistant_message' &&
-          e.item.text ===
-            'elicited:{"action":"accept","content":{"q1":"0","q2":["linux"],"q2_other":"FreeBSD"}}',
-      ),
-    )
-
-    // 1b. Binary session/request_permission with ask_question title is also excluded from full-access auto-approval
-    h.events.length = 0
-    await h.provider.send({
-      type: 'session.prompt',
-      sessionId: 's',
-      prompt: {
-        clientMessageId: 'fg-ask-bin',
-        delivery: 'auto',
-        input: {
-          type: 'message',
-          content: [{ type: 'text', text: 'ask-permission-binary' }],
-        },
-      },
-    })
-    const binPerm = await h.wait((e) => e.type === 'session.permission')
-    assert.ok(binPerm.type === 'session.permission')
-    assert.equal(binPerm.request.kind, 'question')
-    await h.provider.send({
-      type: 'session.permission',
-      sessionId: 's',
-      permissionId: binPerm.request.id,
-      response: { behavior: 'allow', selectedActionId: 'allow_once' },
-    })
-    await h.wait((e) => e.type === 'session.turn' && e.state === 'completed')
-    assert.ok(
-      h.events.some(
-        (e) =>
-          e.type === 'timeline.item' &&
-          e.item.type === 'assistant_message' &&
-          e.item.text ===
-            'ask-bin:{"outcome":"selected","optionId":"allow_once"}',
-      ),
-    )
-
-    // 1c. Two elicitation/create calls in a single foreground turn with unlogged GENERIC rows do not re-prompt and complete both running cards
-    h.events.length = 0
-    await h.provider.send({
-      type: 'session.prompt',
-      sessionId: 's',
-      prompt: {
-        clientMessageId: 'fg-double-elicit',
-        delivery: 'auto',
-        input: {
-          type: 'message',
-          content: [{ type: 'text', text: 'double-elicitation' }],
-        },
-      },
-    })
-    const dblPerm1 = await h.wait((e) => e.type === 'session.permission')
-    assert.ok(dblPerm1.type === 'session.permission')
-    await h.provider.send({
-      type: 'session.permission',
-      sessionId: 's',
-      permissionId: dblPerm1.request.id,
-      response: {
-        behavior: 'allow',
-        updatedInput: { answers: { 'Question 1': 'Yes' } },
-      },
-    })
-    const dblPerm2 = await h.wait(
-      (e) =>
-        e.type === 'session.permission' && e.request.id !== dblPerm1.request.id,
-    )
-    assert.ok(dblPerm2.type === 'session.permission')
-    await h.provider.send({
-      type: 'session.permission',
-      sessionId: 's',
-      permissionId: dblPerm2.request.id,
-      response: {
-        behavior: 'allow',
-        updatedInput: { answers: { 'Question 1': 'No' } },
-      },
-    })
-    await h.wait((e) => e.type === 'session.turn' && e.state === 'completed')
-    assert.equal(
-      h.events.filter((e) => e.type === 'session.permission').length,
-      2,
-      'two foreground elicitation/create calls must emit exactly two QuestionCard permissions',
-    )
-    const dblCompletedTools = h.events.filter(
-      (e) =>
-        e.type === 'timeline.item' &&
-        e.item.type === 'tool_call' &&
-        e.item.name === 'ask_question' &&
-        e.item.status === 'completed',
-    )
-    assert.equal(
-      dblCompletedTools.length,
-      2,
-      'already_handled foreground questions without ACP completion or GENERIC rows must settle as completed',
-    )
-
-    // 2. Post-RPC Reactive Wakeup ask_question bridges QuestionCard, continues turn, and suppresses duplicate replay
-    h.events.length = 0
-    await h.provider.send({
-      type: 'session.prompt',
-      sessionId: 's',
-      prompt: {
-        clientMessageId: 'woken-q-1',
-        delivery: 'auto',
-        input: {
-          type: 'message',
-          content: [{ type: 'text', text: 'woken-question' }],
-        },
-      },
-    })
-    const wokenPerm = await h.wait((e) => e.type === 'session.permission')
-    assert.ok(wokenPerm.type === 'session.permission')
-    assert.equal(wokenPerm.request.kind, 'question')
-    await h.provider.send({
-      type: 'session.permission',
-      sessionId: 's',
-      permissionId: wokenPerm.request.id,
-      response: {
-        behavior: 'allow',
-        updatedInput: {
-          answers: {
-            'Question 1': '(Recommended) Option 1',
-          },
-        },
-      },
-    })
-    await h.wait((e) => e.type === 'session.turn' && e.state === 'completed')
-    assert.equal(
-      h.events.filter((e) => e.type === 'session.permission').length,
-      1,
-      'replayed elicitation/create during continuation must be auto-resolved by preStagedElicitation',
-    )
-    const assistantTexts = h.events.flatMap((e) =>
+  const turn = (state: 'completed' | 'canceled') =>
+    h.wait((e) => e.type === 'session.turn' && e.state === state)
+  const assistantTexts = () =>
+    h.events.flatMap((e) =>
       e.type === 'timeline.item' && e.item.type === 'assistant_message'
         ? [e.item.text]
         : [],
     )
-    assert.deepEqual(assistantTexts, [
+  const questionCards = () =>
+    h.events.filter((e) => e.type === 'session.permission').length
+  const close = async () => {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+  return {
+    h,
+    log,
+    prompt,
+    nextQuestion,
+    answer,
+    turn,
+    assistantTexts,
+    questionCards,
+    close,
+  }
+}
+
+test('a foreground elicitation becomes a QuestionCard in full-access mode and returns schema values', async () => {
+  const q = await questionSession('elicitation')
+  try {
+    assert.ok(
+      (await readFile(q.log, 'utf8')).includes('cap:elicitation.form\n'),
+      'initialize must advertise elicitation.form',
+    )
+    await q.prompt('elicitation')
+    const card = await q.nextQuestion()
+    assert.equal(card.kind, 'question')
+    assert.equal(card.name, 'ask_question')
+    await q.answer(card.id, {
+      'Question 1': '(Recommended) Option 1',
+      'Question 2': 'Linux, x86_64, FreeBSD',
+    })
+    await q.turn('completed')
+    assert.ok(
+      q
+        .assistantTexts()
+        .includes(
+          'elicited:{"action":"accept","content":{"q1":"0","q2":["linux"],"q2_other":"FreeBSD"}}',
+        ),
+    )
+  } finally {
+    await q.close()
+  }
+})
+
+test('an ask_question permission request is not auto-approved in full-access mode', async () => {
+  const q = await questionSession('ask-permission')
+  try {
+    await q.prompt('ask-permission-binary')
+    const card = await q.nextQuestion()
+    assert.equal(card.kind, 'question')
+    await q.h.provider.send({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: card.id,
+      response: { behavior: 'allow', selectedActionId: 'allow_once' },
+    })
+    await q.turn('completed')
+    assert.ok(
+      q
+        .assistantTexts()
+        .includes('ask-bin:{"outcome":"selected","optionId":"allow_once"}'),
+    )
+  } finally {
+    await q.close()
+  }
+})
+
+test('two elicitations in one turn ask once each and settle both unlogged cards', async () => {
+  const q = await questionSession('double-elicitation')
+  try {
+    await q.prompt('double-elicitation')
+    await q.answer((await q.nextQuestion()).id, { 'Question 1': 'Yes' })
+    await q.answer((await q.nextQuestion()).id, { 'Question 1': 'No' })
+    await q.turn('completed')
+    assert.equal(q.questionCards(), 2)
+    assert.equal(
+      q.h.events.filter(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'tool_call' &&
+          e.item.name === 'ask_question' &&
+          e.item.status === 'completed',
+      ).length,
+      2,
+    )
+  } finally {
+    await q.close()
+  }
+})
+
+test('a woken ask_question is answered once and its replayed elicitation reuses the answer', async () => {
+  const q = await questionSession('woken-question')
+  try {
+    await q.prompt('woken-question')
+    const card = await q.nextQuestion()
+    assert.equal(card.kind, 'question')
+    await q.answer(card.id, { 'Question 1': '(Recommended) Option 1' })
+    await q.turn('completed')
+    assert.equal(q.questionCards(), 1)
+    assert.deepEqual(q.assistantTexts(), [
       'Waiting for background check...',
       'Background check finished. Please select:',
       'Completed woken question:{"action":"accept","content":{"q1":"schema_0"}}',
     ])
+  } finally {
+    await q.close()
+  }
+})
 
-    // 3. A different elicitation/create question during continuation is NOT auto-answered with the old answer
-    h.events.length = 0
-    await h.provider.send({
-      type: 'session.prompt',
-      sessionId: 's',
-      prompt: {
-        clientMessageId: 'woken-q-mismatch',
-        delivery: 'auto',
-        input: {
-          type: 'message',
-          content: [{ type: 'text', text: 'woken-question' }],
-        },
-      },
+test('a different question during a woken continuation gets its own card', async () => {
+  const q = await questionSession('woken-mismatch')
+  try {
+    await q.prompt('woken-question')
+    await q.answer((await q.nextQuestion()).id, { 'Question 1': 'Option 2' })
+    await q.answer((await q.nextQuestion()).id, {
+      'Question 1': 'Custom follow-up answer',
     })
-    const firstPerm = await h.wait((e) => e.type === 'session.permission')
-    assert.ok(firstPerm.type === 'session.permission')
-    await h.provider.send({
-      type: 'session.permission',
-      sessionId: 's',
-      permissionId: firstPerm.request.id,
-      response: {
-        behavior: 'allow',
-        updatedInput: {
-          answers: {
-            'Question 1': 'Option 2',
-          },
-        },
-      },
-    })
-    const secondPerm = await h.wait(
-      (e) =>
-        e.type === 'session.permission' &&
-        e.request.id !== firstPerm.request.id,
-    )
-    assert.ok(secondPerm.type === 'session.permission')
-    await h.provider.send({
-      type: 'session.permission',
-      sessionId: 's',
-      permissionId: secondPerm.request.id,
-      response: {
-        behavior: 'allow',
-        updatedInput: {
-          answers: {
-            'Question 1': 'Custom follow-up answer',
-          },
-        },
-      },
-    })
-    await h.wait((e) => e.type === 'session.turn' && e.state === 'completed')
-    assert.equal(
-      h.events.filter((e) => e.type === 'session.permission').length,
-      2,
-      'new elicitation/create during woken continuation must not re-prompt a third time when projected by Brain',
-    )
+    await q.turn('completed')
+    assert.equal(q.questionCards(), 2)
     assert.ok(
-      h.events.some(
-        (e) =>
-          e.type === 'timeline.item' &&
-          e.item.type === 'assistant_message' &&
-          e.item.text ===
-            'Completed woken question:{"action":"accept","content":{"q1_other":"Custom follow-up answer"}}',
-      ),
+      q
+        .assistantTexts()
+        .includes(
+          'Completed woken question:{"action":"accept","content":{"q1_other":"Custom follow-up answer"}}',
+        ),
     )
+  } finally {
+    await q.close()
+  }
+})
 
-    // 4. Denying (Cancel) a woken ask_question cancels the native session and ends tool/turn as canceled
-    h.events.length = 0
-    await h.provider.send({
-      type: 'session.prompt',
-      sessionId: 's',
-      prompt: {
-        clientMessageId: 'woken-q-deny',
-        delivery: 'auto',
-        input: {
-          type: 'message',
-          content: [{ type: 'text', text: 'woken-question' }],
-        },
-      },
-    })
-    const denyPerm = await h.wait((e) => e.type === 'session.permission')
-    assert.ok(denyPerm.type === 'session.permission')
-    const logBeforeDeny = await readFile(log, 'utf8')
-    await h.provider.send({
+test('canceling a woken ask_question cancels the native turn without relaunching', async () => {
+  const q = await questionSession('woken-deny')
+  try {
+    await q.prompt('woken-question')
+    const card = await q.nextQuestion()
+    const before = await readFile(q.log, 'utf8')
+    await q.h.provider.send({
       type: 'session.permission',
       sessionId: 's',
-      permissionId: denyPerm.request.id,
+      permissionId: card.id,
       response: { behavior: 'deny' },
     })
-    await h.wait((e) => e.type === 'session.turn' && e.state === 'canceled')
-    const logAfterDeny = await readFile(log, 'utf8')
+    await q.turn('canceled')
     assert.equal(
-      logAfterDeny.slice(logBeforeDeny.length),
+      (await readFile(q.log, 'utf8')).slice(before.length),
       'cancel\n',
-      'denying a woken ask_question must cancel the native session without relaunching',
     )
     assert.ok(
-      h.events.some(
+      q.h.events.some(
         (e) =>
           e.type === 'timeline.item' &&
           e.item.type === 'tool_call' &&
@@ -1824,40 +1731,31 @@ test('elicitation/create and post-RPC woken ask_question emit QuestionCard permi
           e.item.status === 'canceled',
       ),
     )
+  } finally {
+    await q.close()
+  }
+})
 
-    // 5. Interrupting a woken ask_question uses the fast cancel path without relaunching
-    h.events.length = 0
-    await h.provider.send({
-      type: 'session.prompt',
-      sessionId: 's',
-      prompt: {
-        clientMessageId: 'woken-q-interrupt',
-        delivery: 'auto',
-        input: {
-          type: 'message',
-          content: [{ type: 'text', text: 'woken-question' }],
-        },
-      },
-    })
-    await h.wait((e) => e.type === 'session.permission')
-    const logBeforeInterrupt = await readFile(log, 'utf8')
-    await h.provider.send({
+test('interrupting a woken ask_question cancels without relaunching', async () => {
+  const q = await questionSession('woken-interrupt')
+  try {
+    await q.prompt('woken-question')
+    await q.nextQuestion()
+    const before = await readFile(q.log, 'utf8')
+    await q.h.provider.send({
       type: 'session.interrupt',
-      requestId: 'int-woken-q',
+      requestId: 'interrupt',
       sessionId: 's',
     })
-    await h.wait(
-      (e) => e.type === 'request.completed' && e.requestId === 'int-woken-q',
+    await q.h.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'interrupt',
     )
-    await h.wait((e) => e.type === 'session.turn' && e.state === 'canceled')
-    const logAfterInterrupt = await readFile(log, 'utf8')
+    await q.turn('canceled')
     assert.equal(
-      logAfterInterrupt.slice(logBeforeInterrupt.length),
+      (await readFile(q.log, 'utf8')).slice(before.length),
       'cancel\n',
-      'interrupting a woken ask_question must not relaunch the runtime',
     )
   } finally {
-    await h.provider.close()
-    await rm(home, { recursive: true, force: true })
+    await q.close()
   }
 })

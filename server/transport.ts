@@ -113,6 +113,8 @@ export function connectAcp(
   const readable = stream.readable.pipeThrough(
     new TransformStream({
       async transform(message, controller) {
+        // agy's question forms (array items with oneOf, no `mode`) fail SDK 1.9's
+        // CreateElicitationRequest validation, so answer them here instead of via Client.createElicitation.
         if (
           'method' in message &&
           message.method === 'elicitation/create' &&

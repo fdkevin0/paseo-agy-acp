@@ -40,6 +40,8 @@ const configOptions = [
 const canceled = new Set<string>()
 const cancels = new Map<string, () => void>()
 let wokenStepBase = 0
+/** Sessions waiting on a woken ask_question, keyed to their transcript step base. */
+const wokenQuestions = new Map<string, number>()
 const readWokenMsgIds: Record<string, boolean> = {}
 if (process.argv.includes('--dangerously-skip-permissions'))
   log('flag:--dangerously-skip-permissions')
@@ -80,6 +82,11 @@ stream.writable = new WritableStream({
   },
 })
 new AgentSideConnection((client) => {
+  // agy's question forms (array items with oneOf, no `mode`) are not SDK-typed elicitation requests.
+  const elicit = (params: Record<string, unknown>) =>
+    client.createElicitation(
+      params as unknown as Parameters<typeof client.createElicitation>[0],
+    )
   async function staleEvents(sessionId: string) {
     for (const update of [
       {
@@ -329,8 +336,7 @@ new AgentSideConnection((client) => {
       if (
         text !== 'background' &&
         text !== 'woken-question' &&
-        text !== '(Recommended) Option 1' &&
-        text !== 'Option 2'
+        !wokenQuestions.has(sessionId)
       ) {
         await client.sessionUpdate({
           sessionId,
@@ -549,13 +555,7 @@ new AgentSideConnection((client) => {
             },
           },
         })
-        const response = await (
-          client as unknown as {
-            createElicitation: (
-              params: Record<string, unknown>,
-            ) => Promise<Record<string, unknown>>
-          }
-        ).createElicitation({
+        const response = await elicit({
           message: 'The agent has a question.',
           requestedSchema: {
             type: 'object',
@@ -644,13 +644,6 @@ new AgentSideConnection((client) => {
             },
           })
         }
-        const elicit = (
-          client as unknown as {
-            createElicitation: (
-              params: Record<string, unknown>,
-            ) => Promise<Record<string, unknown>>
-          }
-        ).createElicitation.bind(client)
         const r1 = await elicit({
           message: 'Question 1',
           requestedSchema: {
@@ -773,6 +766,7 @@ new AgentSideConnection((client) => {
       if (text === 'woken-question') {
         const base = wokenStepBase
         wokenStepBase += 20
+        wokenQuestions.set(sessionId, base)
         const sys = join(
           process.env.HOME ?? '/tmp',
           '.gemini/antigravity-cli/brain',
@@ -897,8 +891,11 @@ new AgentSideConnection((client) => {
         }, 50)
         return { stopReason: 'end_turn' as const }
       }
-      if (text === '(Recommended) Option 1' || text === 'Option 2') {
-        const base = wokenStepBase - 20
+      const wokenBase = wokenQuestions.get(sessionId)
+      if (wokenBase !== undefined) {
+        // The prompt is the answer to the woken ask_question.
+        wokenQuestions.delete(sessionId)
+        const base = wokenBase
         const logs = join(
           process.env.HOME ?? '/tmp',
           '.gemini/antigravity-cli/brain',
@@ -908,13 +905,7 @@ new AgentSideConnection((client) => {
         const file = join(logs, 'transcript_full.jsonl')
         // For Option 1, replay the matching question (with schema-specific const ID);
         // for Option 2, ask a different question to verify preStagedQuestion does not mis-answer it.
-        const replayed = await (
-          client as unknown as {
-            createElicitation: (
-              params: Record<string, unknown>,
-            ) => Promise<Record<string, unknown>>
-          }
-        ).createElicitation({
+        const replayed = await elicit({
           message: 'The agent has a question.',
           requestedSchema: {
             type: 'object',
