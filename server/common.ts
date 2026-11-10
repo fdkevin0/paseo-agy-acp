@@ -1,8 +1,8 @@
 /** Shared primitives, type guards, bounded caches, and formatting helpers. */
 
-import pkg from '../package.json' with { type: 'json' }
-
-export const PACKAGE_VERSION: string = pkg.version
+// Paseo's server bundler forbids importing root files outside client/, server/, or shared/;
+// tests/index.test.ts enforces parity with package.json#version.
+export const PACKAGE_VERSION = '0.1.0'
 
 export const sessionIdPattern =
   /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i

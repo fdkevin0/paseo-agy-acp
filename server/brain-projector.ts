@@ -15,6 +15,7 @@ import {
   TranscriptReader,
   countRowMessages,
   isCompletePlannerResponse,
+  isPermissionDeniedGeneric,
   isRestartNotice,
   readInboxState,
   readSubagents,
@@ -109,6 +110,14 @@ export class BrainTranscriptProjector {
 
   hasPending(): boolean {
     return this.pending.some((p) => !p.isQuestion)
+  }
+
+  hasDeniedPending(denied: ReadonlySet<string>): boolean {
+    return denied.size > 0 && this.pending.some((p) => denied.has(p.callId))
+  }
+
+  clearPending() {
+    this.pending = []
   }
 
   hasBackground(): boolean {
@@ -439,6 +448,7 @@ export class BrainNode {
   wokeUp = false
   continuingQuestion = false
   questionSettled = false
+  abortedByDenial = false
   /** Last step seen when a question was answered; agy's reply must come after it. */
   answeredQuestionStep = -1
   lastStep?: Record<string, unknown>
@@ -485,7 +495,16 @@ export class BrainNode {
     this.wokeUp = false
     this.continuingQuestion = false
     this.questionSettled = false
+    this.abortedByDenial = false
     this.answeredQuestionStep = -1
+  }
+
+  settleAbortedDenial(denied?: ReadonlySet<string>) {
+    if (!this.wokeUp && denied && this.projector.hasDeniedPending(denied)) {
+      this.projector.clearPending()
+      this.abortedByDenial = true
+      this.foregroundIdleReached = true
+    }
   }
 
   markQuestionContinuation() {
@@ -511,6 +530,7 @@ export class BrainNode {
   /** Fold one transcript row into wakeup phase, message accounting, projection and the last step. */
   ingest(row: Record<string, unknown>): ProviderTimelineItem[] {
     this.questionSettled = false
+    this.abortedByDenial = false
     if (row.type === 'USER_INPUT' || isRestartNotice(row))
       this.turnStartStep = Number(row.step_index)
     // A restart notice or a question-continuation USER_INPUT does not end a woken turn:
@@ -563,7 +583,10 @@ export class BrainNode {
       !this.projector.hasBackground() &&
       // An answered question's own ask-only response is not agy's reply to the answer.
       Number(this.lastStep?.step_index ?? -1) > this.answeredQuestionStep &&
-      (isCompletePlannerResponse(this.lastStep) || this.questionSettled)
+      (isCompletePlannerResponse(this.lastStep) ||
+        this.questionSettled ||
+        (!this.wokeUp &&
+          (this.abortedByDenial || isPermissionDeniedGeneric(this.lastStep))))
     )
   }
 }

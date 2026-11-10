@@ -642,3 +642,51 @@ test('timeline maps plan session updates into todo items', () => {
     ],
   })
 })
+
+test('write_file with kind:edit and diff maps to Write card and denied failed update becomes canceled', () => {
+  const t = new Timeline('sess-live')
+  const writeItem = t.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'call_write',
+    name: 'write_file',
+    title: 'File ../../../../tmp/hello.txt',
+    kind: 'edit',
+    status: 'completed',
+    content: [{ type: 'diff', path: '/tmp/hello.txt', newText: 'HELLO\n' }],
+    locations: [{ path: '/tmp/hello.txt' }],
+    rawInput: { Path: '/tmp/hello.txt', Content: 'HELLO' },
+    rawOutput: {},
+  } as unknown as Parameters<Timeline['update']>[0])
+  assert.ok(writeItem?.type === 'tool_call')
+  assert.equal(writeItem.name, 'write_file')
+  assert.deepEqual(writeItem.detail, {
+    type: 'write',
+    filePath: '/tmp/hello.txt',
+    content: 'HELLO',
+  })
+
+  const denied = new Set(['call_deny'])
+  t.update(
+    {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'call_deny',
+      title: 'echo LIVE_DENY_99',
+      kind: 'execute',
+      status: 'in_progress',
+      rawInput: { CommandLine: 'echo LIVE_DENY_99' },
+    },
+    denied,
+  )
+  const deniedDone = t.update(
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'call_deny',
+      status: 'failed',
+      rawOutput: { output: '' },
+    },
+    denied,
+  )
+  assert.ok(deniedDone?.type === 'tool_call')
+  assert.equal(deniedDone.status, 'canceled')
+  assert.equal(deniedDone.error, null)
+})

@@ -169,6 +169,7 @@ export async function settleBrainTurn(
     minStepIndex = -1,
     pollIntervalMs = 200,
     acpToolCallIds = [],
+    deniedToolCallIds,
     shouldEmitPreWakeupTool,
     emitForeground = false,
     onStep,
@@ -185,6 +186,7 @@ export async function settleBrainTurn(
     minStepIndex?: number
     pollIntervalMs?: number
     acpToolCallIds?: readonly string[]
+    deniedToolCallIds?: ReadonlySet<string>
     shouldEmitPreWakeupTool?: (
       item: Extract<ProviderTimelineItem, { type: 'tool_call' }>,
     ) => boolean
@@ -352,6 +354,7 @@ export async function settleBrainTurn(
     }
     if (node.lastStep?.type === 'ERROR_MESSAGE')
       return finish('failed', stepErrorMessage(node.lastStep, 'Turn failed'))
+    node.settleAbortedDenial(deniedToolCallIds)
     let continuedQuestion = false
     // A question at the head of the pending queue blocks agy until it is answered.
     // Without a handler (direct callers and tests) it is closed as already handled.

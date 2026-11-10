@@ -572,7 +572,7 @@ async function createSession(
       )
         state.turnHadModelOutput = true
       // Timeline.update already tracks the ACP item.
-      const item = timeline.update(u)
+      const item = timeline.update(u, state.deniedToolCallIds)
       if (item) {
         if (
           item.type === 'tool_call' &&
@@ -1296,6 +1296,7 @@ async function promptSession(
           onSubagents: session.rememberSubagents,
           minStepIndex,
           acpToolCallIds: session.state.turnToolCallIds,
+          deniedToolCallIds: session.state.deniedToolCallIds,
           emitForeground: suppressedForeground,
           shouldEmitPreWakeupTool: (item) =>
             session.timeline.isRunning(item.id) ||

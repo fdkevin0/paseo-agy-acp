@@ -109,6 +109,17 @@ function cleanReadOutput(output: string | undefined): {
   }
 }
 
+function nonEmptyRawOutput(rawOutput: unknown): string | undefined {
+  if (typeof rawOutput === 'string')
+    return rawOutput.trim() ? rawOutput : undefined
+  if (rawOutput == null || rawOutput === '') return undefined
+  const obj = record(rawOutput)
+  const keys = Object.keys(obj)
+  if (keys.length === 0) return undefined
+  if (keys.length === 1 && obj.output === '') return undefined
+  return JSON.stringify(rawOutput)
+}
+
 /** Map native tool arguments and output to Paseo detail cards. */
 export function toolDetail(
   tool: Partial<ToolCall> | ToolCallUpdate,
@@ -117,10 +128,10 @@ export function toolDetail(
   const output =
     typeof tool.rawOutput === 'string'
       ? tool.rawOutput
-      : (extractToolContentText(tool) ??
-        (tool.rawOutput != null ? JSON.stringify(tool.rawOutput) : undefined))
-  const name = cleanToolName(tool.title ?? '')
-  if (isAskQuestionName(name) || Array.isArray(input.questions)) {
+      : (extractToolContentText(tool) ?? nonEmptyRawOutput(tool.rawOutput))
+  const rawName = cleanToolName(str(record(tool).name) ?? tool.title ?? '')
+  const name = rawName.toLowerCase()
+  if (isAskQuestionName(rawName) || Array.isArray(input.questions)) {
     const questions = normalizeAskQuestionInput(input)
     if (questions.length > 0) {
       const formatted = questions
@@ -133,7 +144,7 @@ export function toolDetail(
         .join('\n\n')
       return {
         type: 'plain_text',
-        label: name || 'ask_question',
+        label: rawName || 'ask_question',
         text: output ? `${formatted}\n\nAnswer:\n${output}` : formatted,
       }
     }
@@ -200,10 +211,28 @@ export function toolDetail(
       : undefined
   if (planText) return { type: 'plan', text: planText }
   const diff = tool.content?.find((c) => c.type === 'diff')
-  if (diff?.type === 'diff')
+  const writeContent = str(input.Content ?? input.CodeContent ?? input.content)
+  const hasEditTarget =
+    input.Target !== undefined ||
+    input.TargetContent !== undefined ||
+    input.old_string !== undefined ||
+    Array.isArray(input.ReplacementChunks) ||
+    diff?.oldText != null
+  if (
+    (filePath || (diff?.type === 'diff' && diff.path)) &&
+    (/write/.test(name) || (writeContent !== undefined && !hasEditTarget))
+  ) {
+    return {
+      type: 'write',
+      filePath: (filePath ?? diff?.path)!,
+      content:
+        writeContent ?? (diff?.type === 'diff' ? diff.newText : undefined),
+    }
+  }
+  if (diff?.type === 'diff' && (diff.path || filePath))
     return {
       type: 'edit',
-      filePath: diff.path,
+      filePath: (diff.path || filePath)!,
       oldString: diff.oldText ?? '',
       newString: diff.newText,
     }
@@ -598,7 +627,10 @@ export class Timeline {
     this.tools.clear()
     return items
   }
-  update(update: SessionUpdate): ProviderTimelineItem | undefined {
+  update(
+    update: SessionUpdate,
+    denied?: ReadonlySet<string>,
+  ): ProviderTimelineItem | undefined {
     if (
       update.sessionUpdate === 'user_message_chunk' ||
       update.sessionUpdate === 'agent_message_chunk' ||
@@ -640,35 +672,47 @@ export class Timeline {
         type: 'tool_call' as const,
         id: `${this.prefix}:tool:${tool.toolCallId}`,
         callId: tool.toolCallId,
-        name: cleanToolName(tool.title ?? old?.title ?? 'Tool'),
+        name: cleanToolName(
+          str(record(tool).name) ??
+            tool.title ??
+            str(record(old).name) ??
+            old?.title ??
+            'Tool',
+        ),
         detail: toolDetail(tool),
       }
       const rawStatus = str((tool as { status?: unknown }).status)
+      const isDenied = denied?.has(tool.toolCallId) === true
       const item: Extract<ProviderTimelineItem, { type: 'tool_call' }> =
-        tool.status === 'failed'
+        isDenied &&
+        (tool.status === 'failed' ||
+          rawStatus === 'cancelled' ||
+          rawStatus === 'canceled')
           ? {
               ...base,
-              status: 'failed',
-              error:
-                (typeof tool.rawOutput === 'string' && tool.rawOutput.trim()
-                  ? tool.rawOutput
-                  : undefined) ??
-                extractToolContentText(tool) ??
-                (tool.rawOutput != null && tool.rawOutput !== ''
-                  ? JSON.stringify(tool.rawOutput)
-                  : 'Tool failed'),
+              status: 'canceled',
+              error: null,
             }
-          : rawStatus === 'cancelled' || rawStatus === 'canceled'
+          : tool.status === 'failed'
             ? {
                 ...base,
-                status: 'canceled',
-                error: null,
+                status: 'failed',
+                error:
+                  extractToolContentText(tool) ??
+                  nonEmptyRawOutput(tool.rawOutput) ??
+                  'Tool failed',
               }
-            : {
-                ...base,
-                status: tool.status === 'completed' ? 'completed' : 'running',
-                error: null,
-              }
+            : rawStatus === 'cancelled' || rawStatus === 'canceled'
+              ? {
+                  ...base,
+                  status: 'canceled',
+                  error: null,
+                }
+              : {
+                  ...base,
+                  status: tool.status === 'completed' ? 'completed' : 'running',
+                  error: null,
+                }
       if (item.status !== 'running') {
         this.tools.delete(update.toolCallId)
       }

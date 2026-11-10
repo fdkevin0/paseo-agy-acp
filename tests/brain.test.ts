@@ -2611,3 +2611,60 @@ test('readInboxState and readSubagents reject symlinked leaf files', async () =>
     await f.close()
   }
 })
+
+test('foreground turn aborted by user permission denial settles immediately without stalling', async () => {
+  const f = await fixture()
+  try {
+    await f.put(parent, [
+      { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'echo 1' },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ name: 'run_command', args: { CommandLine: 'echo 1' } }],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'ERROR',
+        content:
+          'Encountered error in step execution: permission check failed for unsandboxed "echo 1": user denied permission to execute',
+      },
+    ])
+    const items: ProviderTimelineItem[] = []
+    const started = Date.now()
+    const result = await alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+        pollIntervalMs: 5,
+        stallTimeoutMs: 5000,
+      }),
+    )
+    assert.equal(result.status, 'completed')
+    assert.ok(Date.now() - started < 1000)
+
+    // agy 1.5.5 returns end_turn without flushing the GENERIC row when permission is denied.
+    const unlogged = parent.replace(/^1/, '2')
+    await f.put(unlogged, [
+      { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'echo 2' },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ name: 'run_command', args: { CommandLine: 'echo 2' } }],
+      },
+    ])
+    const t2 = Date.now()
+    const result2 = await alive(
+      settleBrainTurn(f.root, unlogged, 'p', () => {}, {
+        pollIntervalMs: 5,
+        stallTimeoutMs: 5000,
+        acpToolCallIds: ['call_denied_1'],
+        deniedToolCallIds: new Set(['call_denied_1']),
+      }),
+    )
+    assert.equal(result2.status, 'completed')
+    assert.ok(Date.now() - t2 < 1000)
+  } finally {
+    await f.close()
+  }
+})
