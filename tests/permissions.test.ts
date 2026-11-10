@@ -360,4 +360,27 @@ test('normalizeElicitationQuestions and buildElicitationResponse translate singl
       },
     },
   )
+  assert.equal(
+    formatQuestionAnswersText(rawMulti, {
+      behavior: 'allow',
+      updatedInput: {
+        answers: {
+          env_id: 'opt_prod',
+          region_id: ['opt_us', 'opt_eu'],
+        },
+      },
+    }),
+    'Select environment\nAnswer: Production\n\nSelect regions\nAnswer: US East, EU West',
+  )
+  assert.equal(
+    formatQuestionAnswersText(rawMulti.slice(1), {
+      behavior: 'allow',
+      updatedInput: {
+        answers: {
+          region_id: 'opt_us, opt_eu',
+        },
+      },
+    }),
+    'US East, EU West',
+  )
 })

@@ -514,14 +514,37 @@ export function formatQuestionAnswersText(
       answers,
       response.selectedActionId,
     )
-    const text = Array.isArray(raw)
-      ? raw.map(String).join(', ').trim()
-      : typeof raw === 'string'
-        ? raw.trim()
-        : ''
-    if (!text) continue
-    const byId = q.options.find((o) => o.id === text)
-    const display = byId ? byId.label : text
+    let display = ''
+    if (Array.isArray(raw)) {
+      display = raw
+        .map((entry) => String(entry).trim())
+        .filter(Boolean)
+        .map((entry) => matchQuestionOption(q, entry)?.label ?? entry)
+        .join(', ')
+    } else if (typeof raw === 'string' && raw.trim()) {
+      const trimmed = raw.trim()
+      const single = matchQuestionOption(q, trimmed)
+      if (single) {
+        display = single.label
+      } else if (q.multiSelect) {
+        const { selected, custom } = splitMultiSelectAnswer(
+          trimmed,
+          q.options.map((o) => o.label),
+        )
+        const parts = [...selected]
+        if (custom?.trim()) {
+          for (const token of custom.split(', ')) {
+            const t = token.trim()
+            if (!t) continue
+            parts.push(matchQuestionOption(q, t)?.label ?? t)
+          }
+        }
+        display = parts.length > 0 ? parts.join(', ') : trimmed
+      } else {
+        display = trimmed
+      }
+    }
+    if (!display) continue
     lines.push(
       questions.length === 1 ? display : `${q.question}\nAnswer: ${display}`,
     )

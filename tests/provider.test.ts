@@ -1451,6 +1451,98 @@ test('elicitation/create and post-RPC woken ask_question emit QuestionCard permi
       ),
     )
 
+    // 1b. Binary session/request_permission with ask_question title is also excluded from full-access auto-approval
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'fg-ask-bin',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'ask-permission-binary' }],
+        },
+      },
+    })
+    const binPerm = await h.wait((e) => e.type === 'session.permission')
+    assert.ok(binPerm.type === 'session.permission')
+    assert.equal(binPerm.request.kind, 'question')
+    await h.provider.send({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: binPerm.request.id,
+      response: { behavior: 'allow', selectedActionId: 'allow_once' },
+    })
+    await h.wait((e) => e.type === 'session.turn' && e.state === 'completed')
+    assert.ok(
+      h.events.some(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'assistant_message' &&
+          e.item.text ===
+            'ask-bin:{"outcome":"selected","optionId":"allow_once"}',
+      ),
+    )
+
+    // 1c. Two elicitation/create calls in a single foreground turn with unlogged GENERIC rows do not re-prompt and complete both running cards
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'fg-double-elicit',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'double-elicitation' }],
+        },
+      },
+    })
+    const dblPerm1 = await h.wait((e) => e.type === 'session.permission')
+    assert.ok(dblPerm1.type === 'session.permission')
+    await h.provider.send({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: dblPerm1.request.id,
+      response: {
+        behavior: 'allow',
+        updatedInput: { answers: { 'Question 1': 'Yes' } },
+      },
+    })
+    const dblPerm2 = await h.wait(
+      (e) =>
+        e.type === 'session.permission' && e.request.id !== dblPerm1.request.id,
+    )
+    assert.ok(dblPerm2.type === 'session.permission')
+    await h.provider.send({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: dblPerm2.request.id,
+      response: {
+        behavior: 'allow',
+        updatedInput: { answers: { 'Question 1': 'No' } },
+      },
+    })
+    await h.wait((e) => e.type === 'session.turn' && e.state === 'completed')
+    assert.equal(
+      h.events.filter((e) => e.type === 'session.permission').length,
+      2,
+      'two foreground elicitation/create calls must emit exactly two QuestionCard permissions',
+    )
+    const dblCompletedTools = h.events.filter(
+      (e) =>
+        e.type === 'timeline.item' &&
+        e.item.type === 'tool_call' &&
+        e.item.name === 'ask_question' &&
+        e.item.status === 'completed',
+    )
+    assert.equal(
+      dblCompletedTools.length,
+      2,
+      'already_handled foreground questions without ACP completion or GENERIC rows must settle as completed',
+    )
+
     // 2. Post-RPC Reactive Wakeup ask_question bridges QuestionCard, continues turn, and suppresses duplicate replay
     h.events.length = 0
     await h.provider.send({
@@ -1547,6 +1639,11 @@ test('elicitation/create and post-RPC woken ask_question emit QuestionCard permi
       },
     })
     await h.wait((e) => e.type === 'session.turn' && e.state === 'completed')
+    assert.equal(
+      h.events.filter((e) => e.type === 'session.permission').length,
+      2,
+      'new elicitation/create during woken continuation must not re-prompt a third time when projected by Brain',
+    )
     assert.ok(
       h.events.some(
         (e) =>

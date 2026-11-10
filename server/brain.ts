@@ -44,8 +44,8 @@ export type PendingQuestion = {
 }
 
 export type QuestionOutcome =
-  | { status: 'answered'; answerText?: string }
-  | { status: 'declined' | 'already_handled' | 'canceled' }
+  | { status: 'answered' | 'already_handled'; answerText?: string }
+  | { status: 'declined' | 'canceled' }
 
 type SubagentRecord = {
   conversationId: string
@@ -1400,6 +1400,23 @@ export async function settleBrainTurn(
               'completed',
             ),
           )
+        }
+        if (outcome.status === 'already_handled') {
+          const completed = node.projector.completePendingQuestion(
+            pendingQuestion.tool,
+            outcome.answerText ?? null,
+            'completed',
+          )
+          if (
+            node.wokeUp ||
+            emitForeground ||
+            (completed.type === 'tool_call' &&
+              (shouldEmitPreWakeupTool
+                ? shouldEmitPreWakeupTool(completed)
+                : true))
+          ) {
+            onItem(completed)
+          }
         }
       } else if (node.wokeUp || emitForeground) {
         onItem(

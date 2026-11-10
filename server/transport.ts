@@ -201,8 +201,8 @@ export function connectAcp(
       }
       const timer = setTimeout(() => {
         void stop().catch(() => undefined)
-      }, 100)
-      const force = setTimeout(() => child.kill('SIGKILL'), 1000)
+      }, 500)
+      const force = setTimeout(() => child.kill('SIGKILL'), 2000)
       let deadline: NodeJS.Timeout | undefined
       try {
         await Promise.race([

@@ -40,6 +40,7 @@ const configOptions = [
 const canceled = new Set<string>()
 const cancels = new Map<string, () => void>()
 let wokenStepBase = 0
+const readWokenMsgIds: Record<string, boolean> = {}
 if (process.argv.includes('--dangerously-skip-permissions'))
   log('flag:--dangerously-skip-permissions')
 const stream = ndJsonStream(
@@ -593,6 +594,166 @@ new AgentSideConnection((client) => {
         })
         return { stopReason: 'end_turn' as const }
       }
+      if (text === 'double-elicitation') {
+        const base = wokenStepBase
+        wokenStepBase += 20
+        const logs = join(
+          process.env.HOME ?? '/tmp',
+          '.gemini/antigravity-cli/brain',
+          sessionId,
+          '.system_generated/logs',
+        )
+        mkdirSync(logs, { recursive: true })
+        const file = join(logs, 'transcript_full.jsonl')
+        for (const [idx, title] of [
+          'First question?',
+          'Second question?',
+        ].entries()) {
+          await client.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: `ask-dbl-${base}-${idx}`,
+              title: 'default_api:ask_question',
+              status: 'in_progress',
+              rawInput: {
+                questions: [
+                  {
+                    question: title,
+                    options: ['Yes', 'No'],
+                    is_multi_select: false,
+                  },
+                ],
+              },
+            },
+          })
+        }
+        const elicit = (
+          client as unknown as {
+            createElicitation: (
+              params: Record<string, unknown>,
+            ) => Promise<Record<string, unknown>>
+          }
+        ).createElicitation.bind(client)
+        const r1 = await elicit({
+          message: 'Question 1',
+          requestedSchema: {
+            type: 'object',
+            properties: {
+              q1: {
+                type: 'string',
+                title: 'First question?',
+                oneOf: [
+                  { const: '0', title: 'Yes' },
+                  { const: '1', title: 'No' },
+                ],
+              },
+            },
+          },
+        })
+        const r2 = await elicit({
+          message: 'Question 2',
+          requestedSchema: {
+            type: 'object',
+            properties: {
+              q1: {
+                type: 'string',
+                title: 'Second question?',
+                oneOf: [
+                  { const: '0', title: 'Yes' },
+                  { const: '1', title: 'No' },
+                ],
+              },
+            },
+          },
+        })
+        // Intentionally omit tool_call_update(completed) and GENERIC rows to verify
+        // handledElicitations matches both questions without re-prompting and completes both running cards.
+        appendFileSync(
+          file,
+          [
+            {
+              step_index: base + 1,
+              type: 'USER_INPUT',
+              content: '<USER_REQUEST>double-elicitation</USER_REQUEST>',
+            },
+            {
+              step_index: base + 2,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: `double:${JSON.stringify([r1, r2])}`,
+              tool_calls: [
+                {
+                  id: `ask-dbl-${base}-0`,
+                  name: 'default_api:ask_question',
+                  args: {
+                    questions: [
+                      {
+                        question: 'First question?',
+                        options: ['Yes', 'No'],
+                        is_multi_select: false,
+                      },
+                    ],
+                  },
+                },
+                {
+                  id: `ask-dbl-${base}-1`,
+                  name: 'default_api:ask_question',
+                  args: {
+                    questions: [
+                      {
+                        question: 'Second question?',
+                        options: ['Yes', 'No'],
+                        is_multi_select: false,
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          ]
+            .map((r) => JSON.stringify(r) + '\n')
+            .join(''),
+        )
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: `double:${JSON.stringify([r1, r2])}`,
+            },
+          },
+        })
+        return { stopReason: 'end_turn' as const }
+      }
+      if (text === 'ask-permission-binary') {
+        const decision = await client.requestPermission({
+          sessionId,
+          toolCall: {
+            toolCallId: 'ask-bin',
+            title: 'default_api:ask_question',
+            rawInput: {
+              questions: [{ question: 'Proceed?', options: ['Yes', 'No'] }],
+            },
+          },
+          options: [
+            { optionId: 'allow_once', name: 'Yes', kind: 'allow_once' },
+            { optionId: 'reject_once', name: 'No', kind: 'reject_once' },
+          ],
+        })
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: `ask-bin:${JSON.stringify(decision.outcome)}`,
+            },
+          },
+        })
+        return { stopReason: 'end_turn' as const }
+      }
       if (text === 'woken-question') {
         const base = wokenStepBase
         wokenStepBase += 20
@@ -679,14 +840,10 @@ new AgentSideConnection((client) => {
               timestamp: now,
             }),
           )
+          readWokenMsgIds[msgId] = true
           writeFileSync(
             join(messagesDir, 'read.json'),
-            JSON.stringify({
-              'msg-q-0': true,
-              'msg-q-20': true,
-              'msg-q-40': true,
-              'msg-q-60': true,
-            }),
+            JSON.stringify(readWokenMsgIds),
           )
           appendFileSync(
             file,
@@ -799,12 +956,38 @@ new AgentSideConnection((client) => {
               type: 'USER_INPUT',
               content: `<USER_REQUEST>${text}</USER_REQUEST>`,
             },
-            {
-              step_index: base + 9,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              content: `Completed woken question:${JSON.stringify(replayed)}`,
-            },
+            ...(text === 'Option 2'
+              ? [
+                  {
+                    step_index: base + 9,
+                    type: 'PLANNER_RESPONSE',
+                    status: 'DONE',
+                    content: `Completed woken question:${JSON.stringify(replayed)}`,
+                    tool_calls: [
+                      {
+                        id: `woken-followup-${base}`,
+                        name: 'default_api:ask_question',
+                        args: {
+                          questions: [
+                            {
+                              question: 'Different follow-up question?',
+                              options: ['(Recommended) Option 1', 'Option 2'],
+                              is_multi_select: false,
+                            },
+                          ],
+                        },
+                      },
+                    ],
+                  },
+                ]
+              : [
+                  {
+                    step_index: base + 9,
+                    type: 'PLANNER_RESPONSE',
+                    status: 'DONE',
+                    content: `Completed woken question:${JSON.stringify(replayed)}`,
+                  },
+                ]),
           ]
             .map((r) => JSON.stringify(r) + '\n')
             .join(''),

@@ -23,7 +23,6 @@ import {
   RequestPermissionRequestSchema,
   buildElicitationResponse,
   formatQuestionAnswersText,
-  isChooserRequest,
   isPreapprovedMcpTool,
   normalizeElicitationQuestions,
   permissionKind,
@@ -320,7 +319,11 @@ async function createSession(
     skipPermissions: config?.mode === FULL_ACCESS_MODE_ID,
     turnHadContextUsage: false,
     turnHadModelOutput: false,
-    turnHandledElicitation: false,
+    handledElicitations: [] as Array<{
+      questions: NormalizedQuestion[]
+      answerText: string | null
+      duringContinuation: boolean
+    }>,
     suppressContinuationAcp: false,
     preStagedQuestion: undefined as
       | {
@@ -684,6 +687,13 @@ async function createSession(
         const staged = state.preStagedQuestion
         state.preStagedQuestion = undefined
         if (sameNormalizedQuestions(staged.questions, questions)) {
+          state.handledElicitations.push({
+            questions,
+            answerText:
+              formatQuestionAnswersText(staged.questions, staged.response) ||
+              null,
+            duringContinuation: state.suppressContinuationAcp,
+          })
           return buildElicitationResponse(
             questions,
             staged.response,
@@ -691,7 +701,6 @@ async function createSession(
           )
         }
       }
-      state.turnHandledElicitation = true
       const response = await askUserQuestion(
         questions,
         typeof params.message === 'string' && params.message.trim()
@@ -699,6 +708,11 @@ async function createSession(
           : undefined,
       )
       if (!response) return { action: 'cancel' }
+      state.handledElicitations.push({
+        questions,
+        answerText: formatQuestionAnswersText(questions, response) || null,
+        duringContinuation: state.suppressContinuationAcp,
+      })
       return buildElicitationResponse(questions, response)
     },
     requestPermission: (request: RequestPermissionRequest) => {
@@ -717,13 +731,14 @@ async function createSession(
         .safeParse(record(request.toolCall?.rawInput))
       if (!input.success)
         return Promise.resolve({ outcome: { outcome: 'cancelled' as const } })
-      const chooser = isChooserRequest(request.options)
+      const detail = toolDetail(request.toolCall)
+      const kind = permissionKind(request, detail)
       const preapproved = isPreapprovedMcpTool(
         request.toolCall.title,
         input.data,
         config?.toolPolicy,
       )
-      if (!chooser && (state.metadata.fullAccess || preapproved)) {
+      if (kind !== 'question' && (state.metadata.fullAccess || preapproved)) {
         const allow = pickPermissionOption(request.options, 'allow')
         return Promise.resolve({
           outcome: allow
@@ -731,8 +746,6 @@ async function createSession(
             : { outcome: 'cancelled' as const },
         })
       }
-      const detail = toolDetail(request.toolCall)
-      const kind = permissionKind(request, detail)
       return new Promise<RequestPermissionResponse>((resolve) => {
         const permissionId = randomUUID()
         permissions.set(permissionId, { type: 'acp', request, resolve })
@@ -1176,7 +1189,7 @@ async function promptSession(
   session.state.turnAbort = turnAbort
   session.state.turnHadContextUsage = false
   session.state.turnHadModelOutput = false
-  session.state.turnHandledElicitation = false
+  session.state.handledElicitations = []
   session.state.suppressContinuationAcp = false
   session.state.preStagedQuestion = undefined
   session.state.turnToolCallIds = []
@@ -1258,12 +1271,23 @@ async function promptSession(
           stallTimeoutMs: session.stallTimeoutMs,
           isWaitingOnUser: () => session.permissions.size > 0,
           onQuestion: async (pendingQuestion) => {
-            if (
-              !pendingQuestion.wokeUp &&
-              session.state.turnHandledElicitation
-            ) {
-              session.state.turnHandledElicitation = false
-              return { status: 'already_handled' }
+            const handledIndex = session.state.handledElicitations.findIndex(
+              (entry) =>
+                entry.duringContinuation === pendingQuestion.wokeUp &&
+                sameNormalizedQuestions(
+                  entry.questions,
+                  pendingQuestion.questions,
+                ),
+            )
+            if (handledIndex >= 0) {
+              const [handled] = session.state.handledElicitations.splice(
+                handledIndex,
+                1,
+              )
+              return {
+                status: 'already_handled',
+                answerText: handled.answerText ?? undefined,
+              }
             }
             const response = await session.askUserQuestion(
               pendingQuestion.questions,
@@ -1369,7 +1393,7 @@ async function promptSession(
     })
   } finally {
     session.state.wakeup.suppressEcho = false
-    session.state.turnHandledElicitation = false
+    session.state.handledElicitations = []
     session.state.suppressContinuationAcp = false
     session.state.preStagedQuestion = undefined
     session.state.turnAbort = null
