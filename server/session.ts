@@ -324,10 +324,11 @@ async function createSession(
     skipPermissions: config?.mode === FULL_ACCESS_MODE_ID,
     turnHadContextUsage: false,
     turnHadModelOutput: false,
+    inSettle: false,
     handledElicitations: [] as Array<{
       questions: NormalizedQuestion[]
       answerText: string | null
-      duringContinuation: boolean
+      wokeUp: boolean
     }>,
     suppressContinuationAcp: false,
     preStagedQuestion: undefined as
@@ -764,7 +765,7 @@ async function createSession(
             answerText:
               formatQuestionAnswersText(staged.questions, staged.response) ||
               null,
-            duringContinuation: state.suppressContinuationAcp,
+            wokeUp: state.inSettle,
           })
           return buildElicitationResponse(
             questions,
@@ -783,7 +784,7 @@ async function createSession(
       state.handledElicitations.push({
         questions,
         answerText: formatQuestionAnswersText(questions, response) || null,
-        duringContinuation: state.suppressContinuationAcp,
+        wokeUp: state.inSettle,
       })
       return buildElicitationResponse(questions, response)
     },
@@ -1267,6 +1268,7 @@ async function promptSession(
   session.state.turnAbort = turnAbort
   session.state.turnHadContextUsage = false
   session.state.turnHadModelOutput = false
+  session.state.inSettle = false
   session.state.handledElicitations = []
   session.state.suppressContinuationAcp = false
   session.state.preStagedQuestion = undefined
@@ -1322,6 +1324,7 @@ async function promptSession(
     let turnWokeUp = false
     let turnWakeupUsage: StepUsage | undefined
     if (status === 'completed') {
+      session.state.inSettle = true
       const settled = await settleBrainTurn(
         session.brainRoot,
         session.state.nativeId,
@@ -1357,7 +1360,7 @@ async function promptSession(
           onQuestion: async (pendingQuestion) => {
             const handledIndex = session.state.handledElicitations.findIndex(
               (entry) =>
-                entry.duringContinuation === pendingQuestion.wokeUp &&
+                entry.wokeUp === pendingQuestion.wokeUp &&
                 sameNormalizedQuestions(
                   entry.questions,
                   pendingQuestion.questions,
@@ -1477,6 +1480,7 @@ async function promptSession(
     })
   } finally {
     session.state.wakeup.suppressEcho = false
+    session.state.inSettle = false
     session.state.handledElicitations = []
     session.state.suppressContinuationAcp = false
     session.state.preStagedQuestion = undefined

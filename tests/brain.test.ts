@@ -2181,35 +2181,23 @@ test('daemon schedule does not block foreground settlement or trigger interrupt 
   }
 })
 
+const loadWokenQuestionFixture = async (): Promise<Row[]> =>
+  (
+    await readFile(
+      new URL('./fixtures/woken-question-transcript.jsonl', import.meta.url),
+      'utf8',
+    )
+  )
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line) as Row)
+
 test('a woken ask_question is not background work and closes without a question handler', async () => {
   const f = await fixture()
   try {
-    await f.put(parent, [
-      ...invoke(child),
-      message(5, child, 'Subagent finished'),
-      {
-        step_index: 6,
-        type: 'PLANNER_RESPONSE',
-        status: 'DONE',
-        content: 'Subagent finished. Please choose:',
-        tool_calls: [
-          {
-            id: 'ask-woken',
-            name: 'default_api:ask_question',
-            args: {
-              questions: [
-                {
-                  question: 'Which option?',
-                  options: ['(Recommended) Option 1', 'Option 2'],
-                  is_multi_select: false,
-                },
-              ],
-            },
-          },
-        ],
-      },
-    ])
-    await f.put(child, [message(0, parent, 'work'), done(1, 'Child done')])
+    const rows = await loadWokenQuestionFixture()
+    // Steps 0..5: background run_command wakes the session, and step 5 calls ask_question with no GENERIC row yet.
+    await f.put(parent, rows.slice(0, 6))
 
     // Waiting on user question in a woken turn is NOT active background work (must not relaunch on interrupt)
     assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
@@ -2229,7 +2217,6 @@ test('a woken ask_question is not background work and closes without a question 
       directItems.some(
         (i) =>
           i.type === 'tool_call' &&
-          i.callId === 'ask-woken' &&
           i.name === 'ask_question' &&
           i.status === 'completed',
       ),
@@ -2242,34 +2229,10 @@ test('a woken ask_question is not background work and closes without a question 
 test('answering a woken ask_question continues the turn and records the answer', async () => {
   const f = await fixture()
   try {
-    await f.put(parent, [
-      ...invoke(child),
-      message(5, child, 'Subagent finished'),
-      {
-        step_index: 6,
-        type: 'PLANNER_RESPONSE',
-        status: 'DONE',
-        content: 'Subagent finished. Please choose:',
-        tool_calls: [
-          {
-            id: 'ask-woken',
-            name: 'default_api:ask_question',
-            args: {
-              questions: [
-                {
-                  question: 'Which option?',
-                  options: ['(Recommended) Option 1', 'Option 2'],
-                  is_multi_select: false,
-                },
-              ],
-            },
-          },
-        ],
-      },
-    ])
-    await f.put(child, [message(0, parent, 'work'), done(1, 'Child done')])
+    const rows = await loadWokenQuestionFixture()
+    await f.put(parent, rows.slice(0, 6))
 
-    // With onQuestion answering and appending a continuation USER_INPUT + PLANNER_RESPONSE, settleBrainTurn continues and emits the final reply
+    // With onQuestion answering and appending agy's continuation GENERIC + USER_INPUT + PLANNER_RESPONSE (steps 6..8), settleBrainTurn continues and emits the final reply
     const contItems: ProviderTimelineItem[] = []
     const cont = await settleBrainTurn(
       f.root,
@@ -2283,18 +2246,11 @@ test('answering a woken ask_question continues the turn and records the answer',
         onQuestion: async (q) => {
           assert.equal(q.wokeUp, true)
           assert.equal(q.questions.length, 1)
-          assert.equal(q.questions[0].question, 'Which option?')
-          await appendFile(
-            f.path(parent),
-            encode([
-              {
-                step_index: 8,
-                type: 'USER_INPUT',
-                content: '<USER_REQUEST>(Recommended) Option 1</USER_REQUEST>',
-              },
-              done(9, 'Executed Option 1.'),
-            ]),
+          assert.equal(
+            q.questions[0].question,
+            'Background check finished. Which option?',
           )
+          await appendFile(f.path(parent), encode(rows.slice(6)))
           return {
             status: 'answered',
             answerText: '(Recommended) Option 1',
@@ -2307,7 +2263,7 @@ test('answering a woken ask_question continues the turn and records the answer',
     const completedAsk = contItems.findLast(
       (i) =>
         i.type === 'tool_call' &&
-        i.callId === 'ask-woken' &&
+        i.name === 'ask_question' &&
         i.status === 'completed',
     )
     assert.ok(
@@ -2319,7 +2275,7 @@ test('answering a woken ask_question continues the turn and records the answer',
       contItems.flatMap((i) =>
         i.type === 'assistant_message' ? [i.text] : [],
       ),
-      ['Subagent finished. Please choose:', 'Executed Option 1.'],
+      ['Done: (Recommended) Option 1'],
     )
   } finally {
     await f.close()

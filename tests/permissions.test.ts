@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import elicitationFixtures from './fixtures/elicitation-form.json' with { type: 'json' }
 import {
   buildElicitationResponse,
   formatQuestionAnswersText,
@@ -89,41 +90,7 @@ test('isPreapprovedMcpTool matches exact direct and lazy MCP grants only', () =>
   assert.equal(isPreapprovedMcpTool('mcp__rea__open', {}, undefined), false)
 })
 
-// Shaped like agy's ask_question form: `qN` choices plus an optional free-form `qN_other`.
-const agyForm = {
-  message: 'The agent has a question.',
-  requestedSchema: {
-    type: 'object',
-    properties: {
-      q1: {
-        type: 'string',
-        title: 'Which implementation path?',
-        oneOf: [
-          { const: '0', title: '(Recommended) Option A: Direct fix' },
-          { const: '1', title: 'Option B: Full refactor' },
-        ],
-      },
-      q1_other: {
-        type: 'string',
-        title: 'Other',
-        description: 'Optional free-form answer to: Which implementation path?',
-      },
-      q2: {
-        type: 'array',
-        title: 'Select target platforms',
-        items: {
-          type: 'string',
-          oneOf: [
-            { const: 'linux', title: 'Linux, x86_64' },
-            { const: 'mac', title: 'macOS' },
-          ],
-        },
-      },
-      q2_other: { type: 'string', title: 'Other' },
-      q3_other: { type: 'string', title: 'Any extra notes?' },
-    },
-  },
-}
+const agyForm = elicitationFixtures.foreground
 
 test('elicitation forms become Paseo QuestionCard input', () => {
   assert.deepEqual(
@@ -147,8 +114,24 @@ test('elicitation forms become Paseo QuestionCard input', () => {
           multiSelect: true,
           allowOther: true,
         },
+      ],
+    },
+  )
+  assert.deepEqual(
+    toQuestionPermissionInput(
+      normalizeElicitationQuestions({
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            q1_other: { type: 'string', title: 'Any extra notes?' },
+          },
+        },
+      }),
+    ),
+    {
+      questions: [
         {
-          header: 'Question 3',
+          header: 'Question 1',
           question: 'Any extra notes?',
           options: [],
           multiSelect: false,
@@ -176,17 +159,15 @@ test('QuestionCard answers map back to schema values and Other fields', () => {
         answers: {
           'Question 1': '(Recommended) Option A: Direct fix',
           'Question 2': 'Linux, x86_64, Windows ARM64',
-          'Question 3': 'Keep tests fast',
         },
       },
     }),
     {
       action: 'accept',
       content: {
-        q1: '0',
-        q2: ['linux'],
+        q1: '1',
+        q2: ['1'],
         q2_other: 'Windows ARM64',
-        q3_other: 'Keep tests fast',
       },
     },
   )
@@ -227,7 +208,7 @@ test('answer text keeps labels and prefixes questions only when there are severa
   )
 })
 
-test('raw ask_question arguments normalize like agy writes them', () => {
+test('raw ask_question arguments normalize like agy writes them and disambiguate duplicate headers', () => {
   const [question] = normalizeAskQuestionInput({
     questions: [
       {
@@ -258,80 +239,108 @@ test('raw ask_question arguments normalize like agy writes them', () => {
       allowOther: true,
     },
   ])
+
+  const dupHeaders = normalizeAskQuestionInput({
+    questions: [
+      {
+        header: 'Target',
+        question: 'Primary target?',
+        options: ['Linux', 'macOS'],
+      },
+      {
+        header: 'Target',
+        question: 'Fallback target?',
+        options: ['Linux', 'Windows'],
+      },
+    ],
+  })
+  assert.deepEqual(
+    dupHeaders.map((q) => q.header),
+    ['Target', 'Target (2)'],
+  )
+  const dupResponse = {
+    behavior: 'allow' as const,
+    updatedInput: {
+      answers: {
+        Target: 'Linux',
+        'Target (2)': 'Windows',
+      },
+    },
+  }
+  assert.deepEqual(buildElicitationResponse(dupHeaders, dupResponse), {
+    action: 'accept',
+    content: { q1: '0', q2: '1' },
+  })
+  assert.equal(
+    formatQuestionAnswersText(dupHeaders, dupResponse),
+    'Primary target?\nAnswer: Linux\n\nFallback target?\nAnswer: Windows',
+  )
 })
 
 test('a replayed schema is matched by question and labels, and answered from the card that asked it', () => {
+  const wokenAsked = normalizeAskQuestionInput({
+    questions: [
+      {
+        header: 'Choice',
+        question: 'Background check finished. Which option?',
+        options: ['(Recommended) Option 1', 'Option 2'],
+        is_multi_select: false,
+      },
+    ],
+  })
+  const wokenReplayed = normalizeElicitationQuestions(
+    elicitationFixtures.wokenReplay,
+  )
+  assert.equal(sameNormalizedQuestions(wokenAsked, wokenReplayed), true)
+  assert.deepEqual(
+    buildElicitationResponse(
+      wokenReplayed,
+      {
+        behavior: 'allow',
+        updatedInput: { answers: { Choice: '(Recommended) Option 1' } },
+      },
+      wokenAsked,
+    ),
+    { action: 'accept', content: { q1: '1' } },
+  )
+
   const asked = normalizeAskQuestionInput({
     questions: [
       {
         header: 'Environment',
-        question: 'Select environment',
-        options: ['Production', 'Staging'],
+        question: 'Which implementation path?',
+        options: [
+          '(Recommended) Option A: Direct fix',
+          'Option B: Full refactor',
+        ],
       },
       {
-        header: 'Region',
-        question: 'Select regions',
+        header: 'Platform',
+        question: 'Select target platforms',
         is_multi_select: true,
-        options: ['US East', 'EU West'],
+        options: ['Linux, x86_64', 'macOS'],
       },
     ],
   })
-  const replay = (title: string, labels: string[]) =>
-    normalizeElicitationQuestions({
-      requestedSchema: {
-        type: 'object',
-        properties: {
-          q1: {
-            type: 'string',
-            title,
-            oneOf: labels.map((label, i) => ({
-              const: `env_${i}`,
-              title: label,
-            })),
-          },
-          q2: {
-            type: 'array',
-            title: 'Select regions',
-            items: {
-              type: 'string',
-              oneOf: [
-                { const: 'us', title: 'US East' },
-                { const: 'eu', title: 'EU West' },
-              ],
-            },
-          },
-        },
-      },
-    })
-  const replayed = replay('Select environment', ['Production', 'Staging'])
+  const replayed = normalizeElicitationQuestions(agyForm)
   assert.equal(sameNormalizedQuestions(asked, replayed), true)
-  assert.equal(
-    sameNormalizedQuestions(
-      asked,
-      replay('Different?', ['Production', 'Staging']),
-    ),
-    false,
-  )
-  assert.equal(
-    sameNormalizedQuestions(
-      asked,
-      replay('Select environment', ['Production', 'Dev']),
-    ),
-    false,
-  )
+  assert.equal(sameNormalizedQuestions(asked, wokenReplayed), false)
   assert.equal(sameNormalizedQuestions([], []), false)
-  // The card used the raw headers, so answers are read by them and mapped to the replayed schema's values.
+  // The card used the raw headers, so answers are read by them and mapped to the replayed schema's 1-based const values.
   assert.deepEqual(
     buildElicitationResponse(
       replayed,
       {
         behavior: 'allow',
         updatedInput: {
-          answers: { Environment: 'Staging', Region: 'US East, EU West' },
+          answers: {
+            Environment: 'Option B: Full refactor',
+            Platform: 'Linux, x86_64, macOS',
+          },
         },
       },
       asked,
     ),
-    { action: 'accept', content: { q1: 'env_1', q2: ['us', 'eu'] } },
+    { action: 'accept', content: { q1: '2', q2: ['1', '2'] } },
   )
 })

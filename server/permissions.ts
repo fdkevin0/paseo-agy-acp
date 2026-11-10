@@ -172,7 +172,10 @@ export function normalizeElicitationQuestions(
     const prop = record(properties[id])
     const other = record(properties[`${id}_other`])
     const multiSelect = prop.type === 'array'
-    const choices = multiSelect ? record(prop.items).oneOf : prop.oneOf
+    const items = record(prop.items)
+    const choices = multiSelect
+      ? (items.anyOf ?? items.oneOf)
+      : (prop.oneOf ?? prop.anyOf)
     const options = (Array.isArray(choices) ? choices : []).map((choice, i) => {
       const c = record(choice)
       const value = c.const == null ? String(i) : String(c.const)
@@ -211,10 +214,15 @@ export function normalizeAskQuestionInput(
     : text(rawInput.question)
       ? [rawInput]
       : []
+  const usedHeaders = new Set<string>()
   return items.flatMap((item, index) => {
     if (!item || typeof item !== 'object') return []
     const q = record(item)
-    const header = text(q.header) ?? `Question ${index + 1}`
+    const baseHeader = text(q.header) ?? `Question ${index + 1}`
+    const header = usedHeaders.has(baseHeader)
+      ? `${baseHeader} (${index + 1})`
+      : baseHeader
+    usedHeaders.add(header)
     const options = (Array.isArray(q.options) ? q.options : []).flatMap(
       (option, i) => {
         const o = record(option)

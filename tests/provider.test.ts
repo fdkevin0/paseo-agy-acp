@@ -1610,7 +1610,7 @@ test('a foreground elicitation becomes a QuestionCard in full-access mode and re
       q
         .assistantTexts()
         .includes(
-          'elicited:{"action":"accept","content":{"q1":"0","q2":["linux"],"q2_other":"FreeBSD"}}',
+          'elicited:{"action":"accept","content":{"q1":"1","q2":["1"],"q2_other":"FreeBSD"}}',
         ),
     )
   } finally {
@@ -1676,8 +1676,37 @@ test('a woken ask_question is answered once and its replayed elicitation reuses 
     assert.deepEqual(q.assistantTexts(), [
       'Waiting for background check...',
       'Background check finished. Please select:',
-      'Completed woken question:{"action":"accept","content":{"q1":"schema_0"}}',
+      'Completed woken question:{"action":"accept","content":{"q1":"1"}}',
     ])
+  } finally {
+    await q.close()
+  }
+})
+
+test('an elicitation sent during a native background wakeup does not pop a duplicate card', async () => {
+  const q = await questionSession('woken-native-elicitation')
+  try {
+    await q.prompt('woken-native-elicitation')
+    const card = await q.nextQuestion()
+    assert.equal(card.kind, 'question')
+    await q.answer(card.id, { 'Question 1': '(Recommended) Option 1' })
+    await q.turn('completed')
+    assert.equal(q.questionCards(), 1)
+    assert.ok(
+      q
+        .assistantTexts()
+        .includes('Native woken:{"action":"accept","content":{"q1":"1"}}'),
+    )
+    assert.equal(
+      q.h.events.filter(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'tool_call' &&
+          e.item.name === 'ask_question' &&
+          e.item.status === 'completed',
+      ).length,
+      1,
+    )
   } finally {
     await q.close()
   }

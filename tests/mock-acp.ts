@@ -564,28 +564,29 @@ new AgentSideConnection((client) => {
                 type: 'string',
                 title: 'Which approach?',
                 oneOf: [
-                  { const: '0', title: '(Recommended) Option 1' },
-                  { const: '1', title: 'Option 2' },
+                  { const: '1', title: '(Recommended) Option 1' },
+                  { const: '2', title: 'Option 2' },
                 ],
               },
               q1_other: {
                 type: 'string',
                 title: 'Other',
+                description: 'Optional free-form answer to: Which approach?',
               },
               q2: {
                 type: 'array',
                 title: 'Which platforms?',
                 items: {
-                  type: 'string',
-                  oneOf: [
-                    { const: 'linux', title: 'Linux, x86_64' },
-                    { const: 'mac', title: 'macOS' },
+                  anyOf: [
+                    { const: '1', title: 'Linux, x86_64' },
+                    { const: '2', title: 'macOS' },
                   ],
                 },
               },
               q2_other: {
                 type: 'string',
                 title: 'Other',
+                description: 'Optional free-form answer to: Which platforms?',
               },
             },
           },
@@ -763,6 +764,133 @@ new AgentSideConnection((client) => {
         })
         return { stopReason: 'end_turn' as const }
       }
+      if (text === 'woken-native-elicitation') {
+        const base = wokenStepBase
+        wokenStepBase += 20
+        const sys = join(
+          process.env.HOME ?? '/tmp',
+          '.gemini/antigravity-cli/brain',
+          sessionId,
+          '.system_generated',
+        )
+        const logs = join(sys, 'logs')
+        const messagesDir = join(sys, 'messages')
+        mkdirSync(logs, { recursive: true })
+        mkdirSync(messagesDir, { recursive: true })
+        const file = join(logs, 'transcript_full.jsonl')
+        const taskId = `${sessionId}/task-woken-native-${base}`
+        const msgId = `msg-native-${base}`
+        appendFileSync(
+          file,
+          [
+            {
+              step_index: base + 1,
+              type: 'USER_INPUT',
+              content: '<USER_REQUEST>woken-native-elicitation</USER_REQUEST>',
+            },
+            {
+              step_index: base + 2,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'Starting background check...',
+              tool_calls: [
+                {
+                  id: `bg-native-${base}`,
+                  name: 'run_command',
+                  args: { CommandLine: 'check-env' },
+                },
+              ],
+            },
+            {
+              step_index: base + 3,
+              type: 'GENERIC',
+              status: 'RUNNING',
+              content: `Tool is running as a background task with task id: ${taskId}\n`,
+            },
+            {
+              step_index: base + 4,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'Waiting for background check...',
+            },
+          ]
+            .map((r) => JSON.stringify(r) + '\n')
+            .join(''),
+        )
+        setTimeout(() => {
+          void (async () => {
+            const now = new Date().toISOString()
+            writeFileSync(
+              join(messagesDir, `${msgId}.json`),
+              JSON.stringify({
+                id: msgId,
+                sender: taskId,
+                recipient: sessionId,
+                priority: 'MESSAGE_PRIORITY_HIGH',
+                content: `Task id "${taskId}" finished with result:\nCommand exited with code 0.\n\nCommand output:\nready\nLog: file:///tmp/task-native.log`,
+                timestamp: now,
+              }),
+            )
+            readWokenMsgIds[msgId] = true
+            writeFileSync(
+              join(messagesDir, 'read.json'),
+              JSON.stringify(readWokenMsgIds),
+            )
+            // Send elicitation/create during background wakeup (after initial rpc.prompt returned, suppressContinuationAcp=false).
+            const response = await elicit({
+              message: 'The agent has a question.',
+              requestedSchema: {
+                type: 'object',
+                properties: {
+                  q1: {
+                    type: 'string',
+                    title: 'Which option?',
+                    oneOf: [
+                      { const: '1', title: '(Recommended) Option 1' },
+                      { const: '2', title: 'Option 2' },
+                    ],
+                  },
+                },
+              },
+            })
+            // Write the woken ask_question without a GENERIC row so settleBrainTurn encounters it as pendingQuestion(wokeUp=true).
+            appendFileSync(
+              file,
+              [
+                {
+                  step_index: base + 5,
+                  type: 'SYSTEM_MESSAGE',
+                  content: `<SYSTEM_MESSAGE>\n[Message] timestamp=${now} sender=${taskId} priority=MESSAGE_PRIORITY_HIGH content=Task id "${taskId}" finished with result:\nCommand exited with code 0.\n\nCommand output:\nready\nLog: file:///tmp/task-native.log\n</SYSTEM_MESSAGE>`,
+                },
+                {
+                  step_index: base + 6,
+                  type: 'PLANNER_RESPONSE',
+                  status: 'DONE',
+                  content: `Native woken:${JSON.stringify(response)}`,
+                  tool_calls: [
+                    {
+                      id: `woken-native-ask-${base}`,
+                      name: 'default_api:ask_question',
+                      args: {
+                        questions: [
+                          {
+                            question: 'Which option?',
+                            options: ['(Recommended) Option 1', 'Option 2'],
+                            is_multi_select: false,
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              ]
+                .map((r) => JSON.stringify(r) + '\n')
+                .join(''),
+            )
+          })()
+        }, 50)
+        return { stopReason: 'end_turn' as const }
+      }
       if (text === 'woken-question') {
         const base = wokenStepBase
         wokenStepBase += 20
@@ -903,7 +1031,7 @@ new AgentSideConnection((client) => {
           '.system_generated/logs',
         )
         const file = join(logs, 'transcript_full.jsonl')
-        // For Option 1, replay the matching question (with schema-specific const ID);
+        // For Option 1, replay the matching question (with real agy's 1-based const IDs);
         // for Option 2, ask a different question to verify preStagedQuestion does not mis-answer it.
         const replayed = await elicit({
           message: 'The agent has a question.',
@@ -917,13 +1045,14 @@ new AgentSideConnection((client) => {
                     ? 'Different follow-up question?'
                     : 'Which option?',
                 oneOf: [
-                  { const: 'schema_0', title: '(Recommended) Option 1' },
-                  { const: 'schema_1', title: 'Option 2' },
+                  { const: '1', title: '(Recommended) Option 1' },
+                  { const: '2', title: 'Option 2' },
                 ],
               },
               q1_other: {
                 type: 'string',
                 title: 'Other',
+                description: 'Optional free-form answer to: Which option?',
               },
             },
           },
@@ -958,6 +1087,12 @@ new AgentSideConnection((client) => {
         appendFileSync(
           file,
           [
+            {
+              step_index: base + 7,
+              type: 'GENERIC',
+              status: 'DONE',
+              content: `Created At: 2026-11-10T18:59:59+08:00\nCompleted At: 2026-11-10T19:00:05+08:00\nA1: ${text}`,
+            },
             {
               step_index: base + 8,
               type: 'USER_INPUT',
