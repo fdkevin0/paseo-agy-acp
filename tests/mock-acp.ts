@@ -83,10 +83,12 @@ stream.writable = new WritableStream({
 })
 new AgentSideConnection((client) => {
   // agy's question forms (array items with oneOf, no `mode`) are not SDK-typed elicitation requests.
-  const elicit = (params: Record<string, unknown>) =>
-    client.createElicitation(
+  const elicit = (params: Record<string, unknown>) => {
+    if (process.env.AGY_TEST_LOG_ELICITATION_CAP) log('elicit')
+    return client.createElicitation(
       params as unknown as Parameters<typeof client.createElicitation>[0],
     )
+  }
   async function staleEvents(sessionId: string) {
     for (const update of [
       {
@@ -229,6 +231,7 @@ new AgentSideConnection((client) => {
     },
     async prompt({ sessionId, prompt }) {
       const text = prompt.map((c) => (c.type === 'text' ? c.text : '')).join('')
+      if (process.env.AGY_TEST_LOG_ELICITATION_CAP) log(`prompt:${text}`)
       if (text === 'message-refresh-boundary') {
         await client.sessionUpdate({
           sessionId,
@@ -780,6 +783,24 @@ new AgentSideConnection((client) => {
         const file = join(logs, 'transcript_full.jsonl')
         const taskId = `${sessionId}/task-woken-native-${base}`
         const msgId = `msg-native-${base}`
+        const now = new Date().toISOString()
+        writeFileSync(
+          join(messagesDir, `${msgId}.json`),
+          JSON.stringify({
+            id: msgId,
+            sender: taskId,
+            recipient: sessionId,
+            priority: 'MESSAGE_PRIORITY_HIGH',
+            content: `Task id "${taskId}" finished with result:\nCommand exited with code 0.\n\nCommand output:\nready\nLog: file:///tmp/task-native.log`,
+            timestamp: now,
+          }),
+        )
+        readWokenMsgIds[msgId] = true
+        writeFileSync(
+          join(messagesDir, 'read.json'),
+          JSON.stringify(readWokenMsgIds),
+        )
+        // Write PLANNER_RESPONSE (ask_question without GENERIC) first so Brain's onQuestion pops the card before elicitation arrives.
         appendFileSync(
           file,
           [
@@ -813,30 +834,39 @@ new AgentSideConnection((client) => {
               status: 'DONE',
               content: 'Waiting for background check...',
             },
+            {
+              step_index: base + 5,
+              type: 'SYSTEM_MESSAGE',
+              content: `<SYSTEM_MESSAGE>\n[Message] timestamp=${now} sender=${taskId} priority=MESSAGE_PRIORITY_HIGH content=Task id "${taskId}" finished with result:\nCommand exited with code 0.\n\nCommand output:\nready\nLog: file:///tmp/task-native.log\n</SYSTEM_MESSAGE>`,
+            },
+            {
+              step_index: base + 6,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'Background check finished. Please select:',
+              tool_calls: [
+                {
+                  id: `woken-native-ask-${base}`,
+                  name: 'default_api:ask_question',
+                  args: {
+                    questions: [
+                      {
+                        question: 'Which option?',
+                        options: ['(Recommended) Option 1', 'Option 2'],
+                        is_multi_select: false,
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
           ]
             .map((r) => JSON.stringify(r) + '\n')
             .join(''),
         )
         setTimeout(() => {
           void (async () => {
-            const now = new Date().toISOString()
-            writeFileSync(
-              join(messagesDir, `${msgId}.json`),
-              JSON.stringify({
-                id: msgId,
-                sender: taskId,
-                recipient: sessionId,
-                priority: 'MESSAGE_PRIORITY_HIGH',
-                content: `Task id "${taskId}" finished with result:\nCommand exited with code 0.\n\nCommand output:\nready\nLog: file:///tmp/task-native.log`,
-                timestamp: now,
-              }),
-            )
-            readWokenMsgIds[msgId] = true
-            writeFileSync(
-              join(messagesDir, 'read.json'),
-              JSON.stringify(readWokenMsgIds),
-            )
-            // Send elicitation/create during background wakeup (after initial rpc.prompt returned, suppressContinuationAcp=false).
+            // Send elicitation/create after Brain's onQuestion has already popped the card.
             const response = await elicit({
               message: 'The agent has a question.',
               requestedSchema: {
@@ -853,42 +883,28 @@ new AgentSideConnection((client) => {
                 },
               },
             })
-            // Write the woken ask_question without a GENERIC row so settleBrainTurn encounters it as pendingQuestion(wokeUp=true).
             appendFileSync(
               file,
               [
                 {
-                  step_index: base + 5,
-                  type: 'SYSTEM_MESSAGE',
-                  content: `<SYSTEM_MESSAGE>\n[Message] timestamp=${now} sender=${taskId} priority=MESSAGE_PRIORITY_HIGH content=Task id "${taskId}" finished with result:\nCommand exited with code 0.\n\nCommand output:\nready\nLog: file:///tmp/task-native.log\n</SYSTEM_MESSAGE>`,
+                  step_index: base + 7,
+                  type: 'GENERIC',
+                  status: 'DONE',
+                  content:
+                    'Created At: 2026-11-10T18:59:59+08:00\nCompleted At: 2026-11-10T19:00:05+08:00\nA1: (Recommended) Option 1',
                 },
                 {
-                  step_index: base + 6,
+                  step_index: base + 8,
                   type: 'PLANNER_RESPONSE',
                   status: 'DONE',
                   content: `Native woken:${JSON.stringify(response)}`,
-                  tool_calls: [
-                    {
-                      id: `woken-native-ask-${base}`,
-                      name: 'default_api:ask_question',
-                      args: {
-                        questions: [
-                          {
-                            question: 'Which option?',
-                            options: ['(Recommended) Option 1', 'Option 2'],
-                            is_multi_select: false,
-                          },
-                        ],
-                      },
-                    },
-                  ],
                 },
               ]
                 .map((r) => JSON.stringify(r) + '\n')
                 .join(''),
             )
           })()
-        }, 50)
+        }, 30)
         return { stopReason: 'end_turn' as const }
       }
       if (text === 'woken-question') {

@@ -2232,7 +2232,7 @@ test('answering a woken ask_question continues the turn and records the answer',
     const rows = await loadWokenQuestionFixture()
     await f.put(parent, rows.slice(0, 6))
 
-    // With onQuestion answering and appending agy's continuation GENERIC + USER_INPUT + PLANNER_RESPONSE (steps 6..8), settleBrainTurn continues and emits the final reply
+    // With onQuestion answering and appending agy's GENERIC + PLANNER_RESPONSE (steps 6..7), settleBrainTurn continues and emits the final reply
     const contItems: ProviderTimelineItem[] = []
     const cont = await settleBrainTurn(
       f.root,

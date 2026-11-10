@@ -1683,15 +1683,32 @@ test('a woken ask_question is answered once and its replayed elicitation reuses 
   }
 })
 
-test('an elicitation sent during a native background wakeup does not pop a duplicate card', async () => {
+test('an elicitation sent during a native background wakeup reuses the pending card without sending an extra prompt', async () => {
   const q = await questionSession('woken-native-elicitation')
   try {
     await q.prompt('woken-native-elicitation')
     const card = await q.nextQuestion()
     assert.equal(card.kind, 'question')
+    // Wait until elicitation/create has arrived while Brain's QuestionCard is still open.
+    const deadline = Date.now() + 2000
+    while (!(await readFile(q.log, 'utf8')).includes('elicit\n')) {
+      assert.ok(
+        Date.now() < deadline,
+        'Timed out waiting for woken elicitation',
+      )
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal(q.questionCards(), 1)
     await q.answer(card.id, { 'Question 1': '(Recommended) Option 1' })
     await q.turn('completed')
     assert.equal(q.questionCards(), 1)
+    assert.deepEqual(
+      (await readFile(q.log, 'utf8'))
+        .split('\n')
+        .filter((line) => line.startsWith('prompt:')),
+      ['prompt:woken-native-elicitation'],
+    )
     assert.ok(
       q
         .assistantTexts()

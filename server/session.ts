@@ -65,17 +65,21 @@ type PermissionResponseInput = Extract<
   ProviderInput,
   { type: 'session.permission' }
 >['response']
+type PendingQuestionPermission = {
+  type: 'question'
+  questions: NormalizedQuestion[]
+  promise: Promise<PermissionResponseInput | null>
+  resolve: (r: PermissionResponseInput | null) => void
+  fromElicitation: boolean
+  fromBrain: boolean
+}
 type PendingPermission =
   | {
       type: 'acp'
       request: RequestPermissionRequest
       resolve: (r: RequestPermissionResponse) => void
     }
-  | {
-      type: 'question'
-      questions: NormalizedQuestion[]
-      resolve: (r: PermissionResponseInput | null) => void
-    }
+  | PendingQuestionPermission
 type Session = Awaited<ReturnType<typeof createSession>>
 interface SessionOptions {
   usage: AgyUsageSource
@@ -700,7 +704,11 @@ async function createSession(
   function askUserQuestion(
     questions: NormalizedQuestion[],
     title?: string,
-  ): Promise<PermissionResponseInput | null> {
+    source: 'elicitation' | 'brain' = 'elicitation',
+  ): {
+    promise: Promise<PermissionResponseInput | null>
+    entry: PendingQuestionPermission
+  } | null {
     if (
       !questions.length ||
       !state.nativeId ||
@@ -708,36 +716,54 @@ async function createSession(
       state.closing ||
       state.failed
     )
-      return Promise.resolve(null)
+      return null
+    for (const p of permissions.values()) {
+      if (
+        p.type === 'question' &&
+        (source === 'elicitation' ? !p.fromElicitation : !p.fromBrain) &&
+        sameNormalizedQuestions(p.questions, questions)
+      ) {
+        if (source === 'elicitation') p.fromElicitation = true
+        else p.fromBrain = true
+        return { promise: p.promise, entry: p }
+      }
+    }
     const input = toQuestionPermissionInput(questions)
     const detail = toolDetail({
       title: 'ask_question',
       rawInput: input,
     })
-    return new Promise<PermissionResponseInput | null>((resolve) => {
-      const permissionId = randomUUID()
-      permissions.set(permissionId, {
-        type: 'question',
-        questions,
-        resolve,
-      })
-      emit({
-        type: 'session.permission',
-        sessionId: id,
-        request: {
-          id: permissionId,
-          name: 'ask_question',
-          kind: 'question',
-          title: title ?? questions[0]?.question ?? 'Question',
-          input,
-          detail,
-          actions: [
-            { id: 'allow', label: 'Submit', behavior: 'allow' },
-            { id: 'deny', label: 'Cancel', behavior: 'deny' },
-          ],
-        },
-      })
+    let resolve!: (r: PermissionResponseInput | null) => void
+    const promise = new Promise<PermissionResponseInput | null>((res) => {
+      resolve = res
     })
+    const entry: PendingQuestionPermission = {
+      type: 'question',
+      questions,
+      promise,
+      resolve,
+      fromElicitation: source === 'elicitation',
+      fromBrain: source === 'brain',
+    }
+    const permissionId = randomUUID()
+    permissions.set(permissionId, entry)
+    emit({
+      type: 'session.permission',
+      sessionId: id,
+      request: {
+        id: permissionId,
+        name: 'ask_question',
+        kind: 'question',
+        title: title ?? questions[0]?.question ?? 'Question',
+        input,
+        detail,
+        actions: [
+          { id: 'allow', label: 'Submit', behavior: 'allow' },
+          { id: 'deny', label: 'Cancel', behavior: 'deny' },
+        ],
+      },
+    })
+    return { promise, entry }
   }
   const client = {
     sessionUpdate: (notification: SessionNotification) => {
@@ -760,13 +786,6 @@ async function createSession(
         const staged = state.preStagedQuestion
         state.preStagedQuestion = undefined
         if (sameNormalizedQuestions(staged.questions, questions)) {
-          state.handledElicitations.push({
-            questions,
-            answerText:
-              formatQuestionAnswersText(staged.questions, staged.response) ||
-              null,
-            wokeUp: state.inSettle,
-          })
           return buildElicitationResponse(
             questions,
             staged.response,
@@ -774,19 +793,30 @@ async function createSession(
           )
         }
       }
-      const response = await askUserQuestion(
+      const pending = askUserQuestion(
         questions,
         typeof params.message === 'string' && params.message.trim()
           ? params.message.trim()
           : undefined,
+        'elicitation',
       )
+      if (!pending) return { action: 'cancel' }
+      const response = await pending.promise
       if (!response) return { action: 'cancel' }
-      state.handledElicitations.push({
+      if (!pending.entry.fromBrain) {
+        state.handledElicitations.push({
+          questions,
+          answerText:
+            formatQuestionAnswersText(pending.entry.questions, response) ||
+            null,
+          wokeUp: state.inSettle,
+        })
+      }
+      return buildElicitationResponse(
         questions,
-        answerText: formatQuestionAnswersText(questions, response) || null,
-        wokeUp: state.inSettle,
-      })
-      return buildElicitationResponse(questions, response)
+        response,
+        pending.entry.questions,
+      )
     },
     requestPermission: (request: RequestPermissionRequest) => {
       const parsed = RequestPermissionRequestSchema.safeParse(request)
@@ -1372,14 +1402,17 @@ async function promptSession(
                 1,
               )
               return {
-                status: 'already_handled',
+                status: pendingQuestion.wokeUp ? 'answered' : 'already_handled',
                 answerText: handled.answerText ?? undefined,
               }
             }
-            const response = await session.askUserQuestion(
+            const pending = session.askUserQuestion(
               pendingQuestion.questions,
               pendingQuestion.questions[0]?.question,
+              'brain',
             )
+            if (!pending) return { status: 'canceled' }
+            const response = await pending.promise
             if (!response || turnAbort.signal.aborted) {
               return { status: 'canceled' }
             }
@@ -1388,8 +1421,11 @@ async function promptSession(
               return { status: 'canceled' }
             }
             const answerText =
-              formatQuestionAnswersText(pendingQuestion.questions, response) ||
+              formatQuestionAnswersText(pending.entry.questions, response) ||
               'Proceed'
+            if (pending.entry.fromElicitation) {
+              return { status: 'answered', answerText }
+            }
             session.state.preStagedQuestion = {
               questions: pendingQuestion.questions,
               response,
