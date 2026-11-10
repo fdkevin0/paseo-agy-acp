@@ -1,5 +1,11 @@
 import { AgentSideConnection, ndJsonStream } from '@agentclientprotocol/sdk'
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs'
 import { join } from 'node:path'
 import { Readable, Writable } from 'node:stream'
 
@@ -168,6 +174,25 @@ new AgentSideConnection(
         status: 'completed',
       })
     }
+    async function observedMessage() {
+      const deadline = Date.now() + 3000
+      while (!existsSync(join(process.env.HOME!, 'message-observed'))) {
+        if (Date.now() > deadline)
+          throw new Error('Message was not published during prompt')
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      }
+    }
+    function seedMessageChild() {
+      writeSubagent(
+        nativeId,
+        childId,
+        scenario.endsWith('killed')
+          ? 'SUBAGENT_STATE_KILLED'
+          : 'SUBAGENT_STATE_ALIVE',
+        2,
+      )
+      transcript(childId, [childInit(nativeId), done(1)])
+    }
     function commands() {
       setTimeout(
         () =>
@@ -202,6 +227,8 @@ new AgentSideConnection(
       },
       async newSession() {
         // Existing ownership lets the cancel scenarios exercise send_message on an old child.
+        if (scenario === 'owned-message' || scenario === 'owned-message-killed')
+          seedMessageChild()
         if (scenario.startsWith('kill')) {
           writeSubagent(nativeId, childId, 'SUBAGENT_STATE_ALIVE', 2)
           transcript(nativeId, [
@@ -218,6 +245,16 @@ new AgentSideConnection(
         return { sessionId: nativeId }
       },
       async loadSession() {
+        if (scenario === 'owned-message' || scenario === 'history-message') {
+          seedMessageChild()
+          if (scenario === 'history-message')
+            await tool('call_345678901', 'Run send_message', {
+              Recipient: childId,
+              Message: 'continue',
+            })
+          commands()
+          return {}
+        }
         await update({
           sessionUpdate: 'user_message_chunk',
           content: { type: 'text', text: 'old question' },
@@ -326,6 +363,42 @@ new AgentSideConnection(
               true,
             )
           }, 100)
+        } else if (scenario === 'spawn-kill') {
+          const input = { Prompt: 'work', Role: 'Child' }
+          writeSubagent(nativeId, childId, 'SUBAGENT_STATE_KILLED', 2)
+          transcript(childId, [
+            childInit(nativeId),
+            done(1, 'Saved before kill'),
+            call(2, 'run_command', { CommandLine: 'work' }),
+          ])
+          transcript(nativeId, [
+            user(0),
+            call(1, 'invoke_subagent', input),
+            result(2, JSON.stringify({ conversationId: childId })),
+            call(3, 'manage_subagents', { Action: 'kill_all' }),
+            result(4, 'Killed'),
+            done(5),
+          ])
+          await tool('call_234567890', 'Run invoke_subagent', input)
+        } else if (scenario.includes('message')) {
+          if (scenario === 'owned-message-late') seedMessageChild()
+          const input = {
+            Recipient:
+              scenario === 'root-message'
+                ? nativeId
+                : scenario === 'unknown-message'
+                  ? '44444444-4444-4444-8444-444444444444'
+                  : childId,
+            Message: 'continue',
+          }
+          transcript(nativeId, [
+            user(0),
+            call(1, 'send_message', input),
+            result(2, 'Message sent'),
+            done(3),
+          ])
+          await tool('call_345678901', 'Run send_message', input)
+          await observedMessage()
         } else if (scenario === 'child') {
           await invoke()
         } else {
@@ -334,7 +407,6 @@ new AgentSideConnection(
             scenario === 'kill-all'
               ? { Action: 'kill_all' }
               : { Action: 'kill', ConversationIds: [childId] }
-          writeSubagent(nativeId, childId, 'SUBAGENT_STATE_KILLED', 2)
           transcript(childId, [
             childInit(nativeId),
             call(1, 'run_command', { CommandLine: 'work' }),
@@ -352,6 +424,8 @@ new AgentSideConnection(
             true,
           )
           await tool('call_345678901', 'Run send_message', input)
+          await observedMessage()
+          writeSubagent(nativeId, childId, 'SUBAGENT_STATE_KILLED', 2)
           await tool('call_456789012', 'Run manage_subagents', action)
         }
         return { stopReason: 'end_turn' }

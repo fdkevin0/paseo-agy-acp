@@ -222,6 +222,22 @@ new AgentSideConnection((client) => {
     },
     async prompt({ sessionId, prompt }) {
       const text = prompt.map((c) => (c.type === 'text' ? c.text : '')).join('')
+      if (text === 'message-refresh-boundary') {
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'message-refresh',
+            title: 'send_message',
+            status: 'in_progress',
+            rawInput: {
+              Recipient: '22222222-2222-4222-8222-222222222222',
+              Message: 'continue',
+            },
+          },
+        })
+        return { stopReason: 'end_turn' }
+      }
       if (text === 'must-not-run-after-interrupt') {
         log('unexpected-prompt')
         return { stopReason: 'end_turn' as const }
