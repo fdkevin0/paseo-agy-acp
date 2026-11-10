@@ -36,6 +36,7 @@ import {
   settleBrainTurn,
   watchBrain,
   type BrainWatchHandle,
+  type SubagentRecord,
 } from './brain.ts'
 import { dataDirectory, removeSessionArtifacts } from './preflight.ts'
 import { connectAcp } from './transport.ts'
@@ -65,6 +66,9 @@ interface SessionOptions {
 }
 
 const SKIP_PERMISSIONS_FLAG = '--dangerously-skip-permissions'
+
+const isSpawn = (name: string) => name.includes('invoke_subagent')
+const isMessage = (name: string) => name.includes('send_message')
 
 function effectiveLaunch(
   launch: ProviderLaunch | undefined,
@@ -370,28 +374,23 @@ async function createSession(
     for (const item of timeline.terminalize(status, error))
       emit({ type: 'timeline.item', sessionId: id, item })
   }
+  const childKey = (nativeId: string) => `${id}:child:${nativeId}`
   async function syncKilledChildren(
-    subagents?: Awaited<ReturnType<typeof readSubagents>>,
+    subagents?: readonly SubagentRecord[],
     parentNativeId = state.nativeId,
   ) {
-    const list =
+    rememberSubagents(
       subagents ??
-      (await readSubagents(brainRoot, parentNativeId).catch(() => []))
-    const cancels: Promise<void>[] = []
-    for (const sub of list)
-      if (sub.state === 'SUBAGENT_STATE_KILLED') {
-        const childId = `${id}:child:${sub.conversationId}`
-        killedChildren.add(childId)
-      }
+        (await readSubagents(brainRoot, parentNativeId).catch(() => [])),
+      parentNativeId,
+    )
     // Include descendants discovered by their own watchers, not just this parent's descriptors.
-    for (const childId of killedChildren) {
-      const child = children.get(childId)
-      if (child) cancels.push(child.cancel())
-    }
-    await Promise.all(cancels)
+    await Promise.all(
+      [...killedChildren].map((childId) => children.get(childId)?.cancel()),
+    )
   }
   function rememberSubagents(
-    subagents: readonly Awaited<ReturnType<typeof readSubagents>>[number][],
+    subagents: readonly SubagentRecord[],
     parentNativeId = state.nativeId,
   ) {
     for (const sub of subagents) {
@@ -402,7 +401,7 @@ async function createSession(
       )
         childParents.set(sub.conversationId, parentNativeId)
       if (sub.state === 'SUBAGENT_STATE_KILLED') {
-        const childId = `${id}:child:${sub.conversationId}`
+        const childId = childKey(sub.conversationId)
         killedChildren.add(childId)
         if (!state.loading) void children.get(childId)?.cancel()
       }
@@ -413,8 +412,8 @@ async function createSession(
     const subagents = await readSubagents(brainRoot, state.nativeId).catch(
       () => [],
     )
-    rememberSubagents(subagents)
-    if (!state.loading) await syncKilledChildren(subagents)
+    if (state.loading) rememberSubagents(subagents)
+    else await syncKilledChildren(subagents)
   }
   function watchChild(
     nativeId: string,
@@ -472,19 +471,26 @@ async function createSession(
     parentNativeId: string,
     name: string,
   ) {
+    const childId = childKey(nativeId)
+    const spawn = isSpawn(name)
+    // Killed children are only linked for history, their own spawn call, or an already open session.
+    const killedAllowed =
+      state.loading ||
+      spawn ||
+      !killedChildren.has(childId) ||
+      children.has(childId)
+    // Only a recorded parent, or the spawning call of an unseen child, owns it.
+    const owned =
+      childParents.get(nativeId) === parentNativeId ||
+      (spawn && !childParents.has(nativeId))
     return (
       !state.closing &&
       !state.failed &&
       capabilities.includes('session.subsession') &&
       sessionIdPattern.test(nativeId) &&
       nativeId !== state.nativeId &&
-      nativeId !== parentNativeId &&
-      (state.loading ||
-        name.includes('invoke_subagent') ||
-        !killedChildren.has(`${id}:child:${nativeId}`) ||
-        children.has(`${id}:child:${nativeId}`)) &&
-      (childParents.get(nativeId) === parentNativeId ||
-        (name.includes('invoke_subagent') && !childParents.has(nativeId)))
+      killedAllowed &&
+      owned
     )
   }
   /** Open or resume direct child sub-sessions for root or nested subagents. */
@@ -499,13 +505,13 @@ async function createSession(
       if (!nativeId || !canLinkChild(nativeId, parentNativeId, item.name))
         return
       childParents.set(nativeId, parentNativeId)
-      const childId = `${id}:child:${nativeId}`
+      const childId = childKey(nativeId)
       const existing = children.get(childId)
       if (
         existing &&
         isResumable(childId) &&
         !state.loading &&
-        item.name.includes('send_message')
+        isMessage(item.name)
       ) {
         resumeChild(nativeId, childId, existing)
       } else if (!existing) {
@@ -612,16 +618,16 @@ async function createSession(
         if (
           item.type === 'tool_call' &&
           item.detail.type === 'sub_agent' &&
-          item.name.includes('send_message')
+          isMessage(item.name)
         ) {
           // Terminalization may run while ownership is being read.
           const nativeId = item.detail.childSessionId
           delete item.detail.childSessionId
           await refreshSubagents()
+          // Do not restore a native ID that a later terminalization could publish.
           if (state.closing || state.failed) return
           if (nativeId !== undefined) item.detail.childSessionId = nativeId
         }
-        if (state.closing || state.failed) return
         publishItem(item)
       }
     }
@@ -779,10 +785,10 @@ async function createSession(
         }
       },
       hasChild(nativeId: string) {
-        return children.has(`${id}:child:${nativeId}`)
+        return children.has(childKey(nativeId))
       },
       isChildResumable(nativeId: string) {
-        return isResumable(`${id}:child:${nativeId}`)
+        return isResumable(childKey(nativeId))
       },
       syncKilledChildren,
       rememberSubagents,

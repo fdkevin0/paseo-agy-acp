@@ -29,7 +29,7 @@ type PendingTool = {
   stepIndex: number
 }
 
-type SubagentRecord = {
+export type SubagentRecord = {
   conversationId: string
   /** Native lifecycle state; only SUBAGENT_STATE_ALIVE counts as active work. */
   state: string
