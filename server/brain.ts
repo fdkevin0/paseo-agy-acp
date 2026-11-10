@@ -928,6 +928,8 @@ class BrainNode {
   wokeUp = false
   continuingQuestion = false
   questionSettled = false
+  /** Last step seen when a question was answered; agy's reply must come after it. */
+  answeredQuestionStep = -1
   lastStep?: Record<string, unknown>
   readonly nativeId: string
   readonly sessionId: string
@@ -954,12 +956,14 @@ class BrainNode {
     this.wokeUp = false
     this.continuingQuestion = false
     this.questionSettled = false
+    this.answeredQuestionStep = -1
   }
 
   markQuestionContinuation() {
     this.continuingQuestion = true
     this.questionSettled = false
     this.wokeUp = true
+    this.answeredQuestionStep = Number(this.lastStep?.step_index ?? -1)
   }
 
   markQuestionSettled() {
@@ -1028,6 +1032,8 @@ class BrainNode {
       !this.hasUnprocessedMessages(inbox) &&
       !this.projector.hasPending() &&
       !this.projector.hasBackground() &&
+      // An answered question's own ask-only response is not agy's reply to the answer.
+      Number(this.lastStep?.step_index ?? -1) > this.answeredQuestionStep &&
       (isCompletePlannerResponse(this.lastStep) || this.questionSettled)
     )
   }

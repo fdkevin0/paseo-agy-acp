@@ -1137,6 +1137,19 @@ new AgentSideConnection((client) => {
                       },
                     ],
                   },
+                  // agy logs the answered follow-up and replies to it.
+                  {
+                    step_index: base + 10,
+                    type: 'GENERIC',
+                    status: 'DONE',
+                    content: `A1: ${JSON.stringify(replayed)}`,
+                  },
+                  {
+                    step_index: base + 11,
+                    type: 'PLANNER_RESPONSE',
+                    status: 'DONE',
+                    content: 'Follow-up done',
+                  },
                 ]
               : [
                   {

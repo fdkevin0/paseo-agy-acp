@@ -2282,6 +2282,39 @@ test('answering a woken ask_question continues the turn and records the answer',
   }
 })
 
+test('a woken question answered through elicitation waits for agy to reply to the answer', async () => {
+  const f = await fixture()
+  try {
+    const rows = await loadWokenQuestionFixture()
+    await f.put(parent, rows.slice(0, 6))
+    const items: ProviderTimelineItem[] = []
+    const settled = await alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+        minStepIndex: -1,
+        pollIntervalMs: 5,
+        stallTimeoutMs: 1000,
+        onQuestion: async () => {
+          // agy logs the tool result and its reply only after the elicitation response, so later than this return.
+          setTimeout(() => {
+            void appendFile(
+              f.path(parent),
+              encode([rows[6], done(7, 'Done: (Recommended) Option 1')]),
+            )
+          }, 60)
+          return { status: 'answered', answerText: '(Recommended) Option 1' }
+        },
+      }),
+    )
+    assert.equal(settled.status, 'completed')
+    assert.deepEqual(
+      items.flatMap((i) => (i.type === 'assistant_message' ? [i.text] : [])),
+      ['Done: (Recommended) Option 1'],
+    )
+  } finally {
+    await f.close()
+  }
+})
+
 test('ask_question results stay attributed by step next to sibling tool calls', () => {
   // Mixed [ask_question, run_command] in one PLANNER_RESPONSE preserves FIFO/step attribution
   const p1 = new BrainTranscriptProjector('s')
