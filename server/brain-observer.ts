@@ -76,7 +76,11 @@ export class BrainTurnObservation {
     'foreground'
   wokeUp = false
   missing = false
-  error?: unknown
+  private readError?: unknown
+  private failure?: unknown
+  get error(): unknown {
+    return this.failure ?? this.readError
+  }
   lastStepIndex = -1
   historicalMessages = 0
   revision = 0
@@ -161,9 +165,10 @@ export class BrainTurnObservation {
   /** Calls share a pass in flight; no concurrent reads or folds. */
   poll(): Promise<void> {
     if (this.phase === 'disposed') return Promise.resolve()
+    if (this.failure !== undefined) return Promise.reject(this.failure)
     this.inflight ??= this.read()
       .catch((error) => {
-        this.error = error
+        if (error !== this.readError) this.failure = error
         throw error
       })
       .finally(() => {
@@ -178,10 +183,21 @@ export class BrainTurnObservation {
       read = await this.reader.read(this.root, this.nativeId)
       this.missing = false
     } catch (error) {
-      if (!isMissing(error)) throw error
+      if (!isMissing(error)) {
+        // Only reader I/O can recover; a partially applied fold/callback cannot be replayed safely.
+        if (
+          error &&
+          typeof error === 'object' &&
+          'code' in error &&
+          typeof error.code === 'string'
+        )
+          this.readError = error
+        throw error
+      }
       this.missing = true
       read = { rows: [], reset: false }
     }
+    this.readError = undefined
     if (this.isDisposed()) return
     if (read.reset) {
       this.buffered.clear()
@@ -266,10 +282,15 @@ export class BrainTurnObservation {
       })
       this.bufferReset = false
       this.bufferSnapshot = undefined
-    })().finally(() => {
-      this.inflight = undefined
-      this.notify()
-    })
+    })()
+      .catch((error) => {
+        this.failure = error
+        throw error
+      })
+      .finally(() => {
+        this.inflight = undefined
+        this.notify()
+      })
     await this.inflight
   }
   /** Stop actions immediately; final drain happens only after the driver's observable barriers. */

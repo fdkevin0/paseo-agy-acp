@@ -1146,3 +1146,246 @@ test(
     assert.equal(h.events.length, count)
   },
 )
+
+test(
+  'a recovered reader fault cannot poison a real pending question continuation',
+  { timeout: 5000 },
+  async (t) => {
+    const h = await harness(t),
+      entered = deferred<void>(),
+      continued = deferred<Result>()
+    let calls = 0
+    const args = { questions: [{ question: 'Choose', options: ['A', 'B'] }] }
+    t.mock.method(h.session.transport.rpc, 'prompt', async () => {
+      if (++calls === 1) {
+        await h.write([
+          user(1),
+          model(2, 10, 'waiting'),
+          {
+            step_index: 3,
+            type: 'SYSTEM_MESSAGE',
+            content:
+              '[Message] sender=system priority=MESSAGE_PRIORITY_HIGH content=wake',
+          },
+          {
+            step_index: 4,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            tool_calls: [{ id: 'ask', name: 'ask_question', args }],
+          },
+        ])
+        return { stopReason: 'end_turn' as const }
+      }
+      entered.resolve()
+      return continued.promise
+    })
+    const running = h.prompt()
+    await h.wait(() => h.events.some((e) => e.type === 'session.permission'))
+    const question = h.events.find((e) => e.type === 'session.permission')
+    assert.ok(question?.type === 'session.permission')
+    const obs = h.session.state.observation!,
+      read = obs.reader.read.bind(obs.reader)
+    let failed = false
+    const busy = Object.assign(new Error('synthetic transient EBUSY'), {
+      code: 'EBUSY',
+    })
+    t.mock.method(
+      obs.reader,
+      'read',
+      async (...args: Parameters<typeof read>) => {
+        if (!failed) {
+          failed = true
+          throw busy
+        }
+        return read(...args)
+      },
+    )
+    await assert.rejects(obs.poll(), /synthetic transient EBUSY/)
+    await obs.poll()
+    await h.manager.handle({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: question.request.id,
+      response: {
+        behavior: 'allow',
+        updatedInput: { answers: { Choose: 'A' } },
+      },
+    })
+    const phase = await Promise.race([
+      entered.promise.then(() => 'entered'),
+      running.then(() => 'finished'),
+    ])
+    assert.equal(phase, 'entered')
+    await h.append([user(5), model(6, 40, 'answer')])
+    await obs.poll()
+    continued.resolve({ stopReason: 'end_turn' })
+    await running
+    assert.deepEqual(h.turns(), ['completed'])
+  },
+)
+
+async function pendingBrainQuestion(t: TestContext) {
+  const h = await harness(t),
+    entered = deferred<void>(),
+    continued = deferred<Result>()
+  let calls = 0
+  const args = { questions: [{ question: 'Choose', options: ['A', 'B'] }] }
+  t.mock.method(h.session.transport.rpc, 'prompt', async () => {
+    if (++calls === 1) {
+      await h.write([
+        user(1),
+        model(2, 10, 'waiting'),
+        {
+          step_index: 3,
+          type: 'SYSTEM_MESSAGE',
+          content:
+            '[Message] sender=system priority=MESSAGE_PRIORITY_HIGH content=wake',
+        },
+        {
+          step_index: 4,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [{ id: 'ask', name: 'ask_question', args }],
+        },
+      ])
+      return { stopReason: 'end_turn' as const }
+    }
+    entered.resolve()
+    return continued.promise
+  })
+  const running = h.prompt()
+  await h.wait(() =>
+    h.events.some((event) => event.type === 'session.permission'),
+  )
+  const question = h.events.find((event) => event.type === 'session.permission')
+  assert.ok(question?.type === 'session.permission')
+  await h.session.state.observation!.poll()
+  const answer = () =>
+    h.manager.handle({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: question.request.id,
+      response: {
+        behavior: 'allow',
+        updatedInput: { answers: { Choose: 'A' } },
+      },
+    })
+  return { ...h, running, entered, continued, answer, calls: () => calls }
+}
+
+for (const mode of ['failure', 'cancel', 'close'] as const)
+  test(
+    `an unresolved reader I/O fault preserves ${mode} question termination`,
+    { timeout: 5000 },
+    async (t) => {
+      const h = await pendingBrainQuestion(t),
+        obs = h.session.state.observation!
+      let reads = 0
+      t.mock.method(obs.reader, 'read', async () => {
+        throw Object.assign(new Error(`unavailable reader ${++reads}`), {
+          code: 'EBUSY',
+        })
+      })
+      await assert.rejects(obs.poll(), /unavailable reader 1/)
+      await assert.rejects(obs.poll(), /unavailable reader 2/)
+      assert.match(String(obs.error), /unavailable reader 2/)
+      if (mode === 'failure') await h.answer()
+      else if (mode === 'close') await h.manager.close()
+      else {
+        h.session.state.turnAbort!.abort()
+        h.session.cancelPermissions()
+      }
+      await h.running
+      assert.deepEqual(h.turns(), [mode === 'failure' ? 'failed' : 'canceled'])
+      assert.equal(
+        h.calls(),
+        1,
+        'no continuation RPC starts while the reader is still failing',
+      )
+      if (mode === 'failure') {
+        const terminal = h.events.findLast(
+          (event) => event.type === 'session.turn' && event.state === 'failed',
+        )
+        assert.ok(
+          terminal?.type === 'session.turn' && terminal.state === 'failed',
+        )
+        assert.match(terminal.error?.message ?? '', /unavailable reader/)
+      }
+      const count = h.events.length
+      await obs.poll()
+      assert.equal(h.events.length, count)
+    },
+  )
+
+test(
+  'reader recovery cannot erase an actual Brain terminal failure',
+  { timeout: 5000 },
+  async (t) => {
+    const h = await harness(t),
+      held = await h.hold(),
+      obs = held.observation
+    await obs.poll()
+    const read = obs.reader.read.bind(obs.reader)
+    let fault = true
+    t.mock.method(
+      obs.reader,
+      'read',
+      async (...args: Parameters<typeof read>) => {
+        if (fault) {
+          fault = false
+          throw Object.assign(new Error('temporary I/O'), { code: 'EBUSY' })
+        }
+        return read(...args)
+      },
+    )
+    await assert.rejects(obs.poll(), /temporary I\/O/)
+    await h.write([
+      user(1),
+      {
+        step_index: 2,
+        type: 'ERROR_MESSAGE',
+        content: 'actual native model failure',
+      },
+    ])
+    await obs.poll()
+    assert.equal(obs.error, undefined)
+    held.done.resolve({ stopReason: 'end_turn' })
+    await held.running
+    assert.deepEqual(h.turns(), ['failed'])
+    const terminal = h.events.findLast(
+      (event) => event.type === 'session.turn' && event.state === 'failed',
+    )
+    assert.ok(terminal?.type === 'session.turn' && terminal.state === 'failed')
+    assert.match(terminal.error?.message ?? '', /actual native model failure/)
+  },
+)
+
+test(
+  'cancel convergence timeout relaunches the real mock transport and clears continuation flags',
+  { timeout: 5000 },
+  async (t) => {
+    const h = await pendingBrainQuestion(t)
+    await h.answer()
+    await h.entered.promise
+    const oldTransport = h.session.transport
+    const request = oldTransport.request.bind(oldTransport)
+    t.mock.method(
+      oldTransport,
+      'request',
+      async (...args: Parameters<typeof request>) => {
+        if (args[1]?.fatalOnTimeout === false)
+          throw new Error('synthetic convergence timeout')
+        return request(...args)
+      },
+    )
+    h.session.state.turnAbort!.abort()
+    await h.running
+    assert.notEqual(h.session.transport, oldTransport)
+    assert.equal(h.session.state.suppressContinuationAcp, false)
+    assert.equal(h.session.state.inSettle, false)
+    assert.equal(h.session.state.turnAbort, null)
+    assert.equal(h.session.state.turn, '')
+    assert.deepEqual(h.turns(), ['canceled'])
+    h.continued.resolve({ stopReason: 'cancelled' })
+  },
+)

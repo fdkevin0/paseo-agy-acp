@@ -141,3 +141,43 @@ test('superseded terminal emissions inherit each pending identity source, includ
     )
   }
 })
+
+for (const output of [
+  null,
+  { content: [{ type: 'text', text: 'real tool content' }], nested: null },
+])
+  test(`deferred Brain JSON ${output === null ? 'null' : 'content'} remains data across late ACP identity`, () => {
+    const p = new BrainTranscriptProjector('s'),
+      ids: string[] = []
+    p.bindToolCallIds(ids)
+    p.resolveToolIdentities(true)
+    assert.deepEqual(
+      p.project({
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ name: 'Vendor.custom', args: { nested: null } }],
+      }),
+      [],
+    )
+    assert.deepEqual(
+      p.project({
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: output,
+      }),
+      [],
+    )
+    ids.push('late-acp-id')
+    const items = p.resolveToolIdentities(true)
+    assert.equal(items.length, 2)
+    const item = items.at(-1)
+    assert.ok(item?.type === 'tool_call' && item.detail.type === 'unknown')
+    assert.equal(item.callId, 'late-acp-id')
+    assert.equal(item.status, 'completed')
+    assert.deepEqual(item.detail.input, { nested: null })
+    assert.deepEqual(item.detail.output, output)
+    assert.equal(p.nativeToolIdentitySource(item), undefined)
+    assert.deepEqual(p.resolveToolIdentities(false), [])
+  })
