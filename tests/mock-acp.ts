@@ -170,6 +170,39 @@ new AgentSideConnection((client) => {
       if (append) log(`load:${append}`)
       else if (process.env.AGY_TEST_LOG_LOAD) log('load')
       sendCommands(sessionId)
+      if (process.env.AGY_TEST_CHECKPOINT_HISTORY) {
+        const rows = readFileSync(
+          join(
+            process.env.HOME!,
+            '.gemini/antigravity-cli/brain',
+            sessionId,
+            '.system_generated/logs/transcript_full.jsonl',
+          ),
+          'utf8',
+        )
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line))
+        for (const row of rows) {
+          if (
+            (row.type === 'USER_INPUT' || row.type === 'PLANNER_RESPONSE') &&
+            typeof row.content === 'string' &&
+            row.content
+          ) {
+            await client.sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate:
+                  row.type === 'USER_INPUT'
+                    ? 'user_message_chunk'
+                    : 'agent_message_chunk',
+                content: { type: 'text', text: row.content },
+              },
+            })
+          }
+        }
+        return { configOptions }
+      }
       await client.sessionUpdate({
         sessionId,
         update: {

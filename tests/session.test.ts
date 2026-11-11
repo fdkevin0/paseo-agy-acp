@@ -1166,7 +1166,11 @@ test('native compaction has stable live/history identity, command-only visibilit
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-      env: { HOME: home, PATH: process.env.PATH ?? '' },
+      env: {
+        HOME: home,
+        PATH: process.env.PATH ?? '',
+        AGY_TEST_CHECKPOINT_HISTORY: '1',
+      },
     },
     usage: new AgyUsageSource(),
     capabilities: ['prompt.message', 'prompt.command'],

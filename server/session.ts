@@ -8,6 +8,7 @@ import {
   type RequestPermissionRequest,
   type RequestPermissionResponse,
   type SessionNotification,
+  type ToolCall,
   type NewSessionResponse,
   type ContentBlock,
   type McpServer,
@@ -45,6 +46,7 @@ import {
   settleBrainTurn,
 } from './brain.ts'
 import { readLatestStepUsage } from './brain-io.ts'
+import { mergeCompactionHistory, type HistoryEntry } from './history.ts'
 import { SubagentRegistry, isSubagentMessage } from './subagents.ts'
 import { dataDirectory, removeSessionArtifacts } from './preflight.ts'
 import { connectAcp } from './transport.ts'
@@ -53,6 +55,7 @@ import {
   definedProcessEnv,
   formatErrorMessage,
   record,
+  str,
   sessionIdPattern,
   setBounded,
 } from './common.ts'
@@ -422,6 +425,10 @@ async function createSession(
     prompts: new Set<string>(),
   }
   const buffered: SessionNotification[] = []
+  let collectingHistory = true
+  const acpHistory: HistoryEntry[] = []
+  const acpToolResults = new Set<string>()
+  const acpToolSnapshots = new Map<string, Readonly<ToolCall>>()
   const subagents = new SubagentRegistry({
     sessionId: id,
     cwd,
@@ -618,7 +625,31 @@ async function createSession(
           if (state.closing || state.failed) return
           if (nativeId !== undefined) item.detail.childSessionId = nativeId
         }
-        publishItem(item)
+        if (
+          state.loading &&
+          state.persisted &&
+          state.replay &&
+          collectingHistory
+        ) {
+          if (
+            item.type === 'tool_call' &&
+            (u.sessionUpdate === 'tool_call' ||
+              u.sessionUpdate === 'tool_call_update')
+          ) {
+            if (
+              (u.rawOutput !== undefined &&
+                (u.rawOutput !== null || item.status !== 'running')) ||
+              u.content != null
+            )
+              acpToolResults.add(item.callId)
+            const snapshot = timeline.toolCallSnapshot(item.callId)
+            if (snapshot) acpToolSnapshots.set(item.callId, snapshot)
+            acpHistory.push({
+              item,
+              resultProvided: acpToolResults.has(item.callId),
+            })
+          } else acpHistory.push({ item })
+        } else publishItem(item)
       }
     }
   }
@@ -1028,26 +1059,70 @@ async function createSession(
         const projector = new BrainTranscriptProjector(id)
         projector.syncMetadata(inbox, subagentRecords)
         projector.bindToolCallIds(state.turnToolCallIds)
+        const brainHistory: HistoryEntry[] = []
+        const hasCompletedCheckpoint = rows.some(
+          (row) =>
+            row.type === 'CHECKPOINT' &&
+            row.status === 'DONE' &&
+            Number.isInteger(row.step_index),
+        )
+        const nativeCallIds = new Set(inbox.stepCallIds.values())
+        for (const sub of subagentRecords)
+          if (sub.spawnCallId) nativeCallIds.add(sub.spawnCallId)
         for (const row of rows) {
+          if (Array.isArray(row.tool_calls))
+            for (const value of row.tool_calls) {
+              const callId = str(record(value).id)
+              if (callId) nativeCallIds.add(callId)
+            }
           const stepIndex = Number(row.step_index)
           if (
             Number.isInteger(stepIndex) &&
             stepIndex > state.lastKnownStepIndex
           )
             state.lastKnownStepIndex = stepIndex
-          for (const item of projector.project(row)) {
+          for (const projected of projector.project(row)) {
+            let item = projected
             if (
-              item.type !== 'compaction' &&
-              (item.type !== 'tool_call' || item.status === 'running')
-            )
-              continue
-            await subagents.waitCurrentReady()
-            emitItem(
+              hasCompletedCheckpoint &&
+              item.type === 'tool_call' &&
+              row.type === 'GENERIC' &&
+              !acpToolResults.has(item.callId)
+            ) {
+              const snapshot = acpToolSnapshots.get(item.callId)
+              if (snapshot) {
+                const detail = toolDetail({
+                  ...snapshot,
+                  rawOutput: row.content ?? row.error ?? null,
+                })
+                if (
+                  detail.type === 'sub_agent' &&
+                  item.detail.type === 'sub_agent'
+                )
+                  detail.childSessionId ??= item.detail.childSessionId
+                item = { ...item, detail }
+              }
+            }
+            brainHistory.push({
               item,
-              typeof row.created_at === 'string' ? row.created_at : undefined,
-            )
+              ...(typeof row.created_at === 'string'
+                ? { timestamp: row.created_at }
+                : {}),
+            })
           }
         }
+        await drain()
+        collectingHistory = false
+        for (const { item, timestamp } of mergeCompactionHistory(
+          acpHistory.splice(0),
+          brainHistory,
+          nativeCallIds,
+        )) {
+          await subagents.waitCurrentReady()
+          emitItem(item, timestamp)
+        }
+        acpToolResults.clear()
+        acpToolSnapshots.clear()
         // A child opened by the last replayed tool must read its history before a historical kill cancels it.
         await subagents.waitNestedReady()
         await subagents.syncKilledChildren(subagentRecords)
