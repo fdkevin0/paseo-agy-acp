@@ -1093,7 +1093,7 @@ async function createSession(
               !acpResultProvided(item.callId)
             ) {
               const snapshot = acpToolSnapshots.get(item.callId)
-              if (snapshot) {
+              if (snapshot?.rawInput != null) {
                 const detail = toolDetail({
                   ...snapshot,
                   rawOutput: row.content ?? row.error ?? null,

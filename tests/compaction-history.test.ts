@@ -904,7 +904,11 @@ test('a new full ACP snapshot resets both result channels instead of inheriting 
     .map(({ item }) => item)
     .findLast((item) => item.type === 'tool_call')
   assert.ok(item?.type === 'tool_call' && item.detail.type === 'unknown')
-  assert.deepEqual(item.detail.input, null)
+  assert.deepEqual(
+    item.detail.input,
+    {},
+    'missing ACP input retains actual Brain args, not the prior ACP snapshot',
+  )
   assert.equal(item.detail.output, 'read')
 })
 
@@ -1018,4 +1022,166 @@ test('null-result history recovery remains intact when the next turn cancels aft
       .findLast((item) => item.type === 'tool_call'),
     restored,
   )
+})
+
+test('missing or null ACP input retains real Brain read parameters during result recovery', async (t) => {
+  const nativeRows = rows.map((row) =>
+    row.type === 'PLANNER_RESPONSE' && 'tool_calls' in row
+      ? {
+          ...row,
+          tool_calls: [
+            {
+              id: read.toolCallId,
+              name: 'read_file',
+              args: { Path: '/brain', StartLine: 9 },
+            },
+          ],
+        }
+      : row.type === 'GENERIC'
+        ? { ...row, content: 'Brain recovered' }
+        : row,
+  )
+  for (const input of [{}, { rawInput: null }])
+    for (const status of ['completed', 'failed'] as const)
+      await t.test(`${JSON.stringify(input)} ${status}`, async () => {
+        const packet = zSessionUpdate.parse({
+          sessionUpdate: 'tool_call',
+          toolCallId: read.toolCallId,
+          title: 'read_file',
+          status,
+          rawOutput: null,
+          ...input,
+        })
+        const events = await replay(nativeRows, [
+          text('BEFORE'),
+          packet,
+          text('AFTER'),
+        ])
+        const item = timeline(events)
+          .map(({ item }) => item)
+          .findLast((item) => item.type === 'tool_call')
+        assert.ok(item?.type === 'tool_call' && item.detail.type === 'read')
+        assert.equal(item.detail.filePath, '/brain')
+        assert.equal(item.detail.offset, 9)
+        assert.equal(item.detail.content, 'Brain recovered')
+        assert.equal(item.callId, read.toolCallId)
+        assert.equal(item.id, `s:tool:${read.toolCallId}`)
+        assert.equal(item.status, status)
+        assert.equal(item.error, status === 'failed' ? 'Tool failed' : null)
+      })
+})
+
+test('recovered unknown details select actual non-null ACP input, otherwise real Brain JSON including null', async (t) => {
+  const brainInput = { from: 'Brain', nested: null }
+  const cases: {
+    name: string
+    packet: object
+    brain: unknown
+    expected: unknown
+  }[] = [
+    {
+      name: 'missing ACP',
+      packet: {},
+      brain: brainInput,
+      expected: brainInput,
+    },
+    {
+      name: 'null ACP',
+      packet: { rawInput: null },
+      brain: brainInput,
+      expected: brainInput,
+    },
+    { name: 'actual Brain null', packet: {}, brain: null, expected: null },
+    ...[false, 0, '', [], {}, { nested: null }].map((value) => ({
+      name: `supplied ${JSON.stringify(value)}`,
+      packet: { rawInput: value },
+      brain: brainInput,
+      expected: value,
+    })),
+  ]
+  for (const entry of cases)
+    await t.test(entry.name, async () => {
+      const nativeRows = rows.map((row) =>
+        row.type === 'PLANNER_RESPONSE' && 'tool_calls' in row
+          ? {
+              ...row,
+              tool_calls: [
+                {
+                  id: read.toolCallId,
+                  name: 'Vendor.custom',
+                  args: entry.brain,
+                },
+              ],
+            }
+          : row.type === 'GENERIC'
+            ? { ...row, content: null }
+            : row,
+      )
+      const packet = zSessionUpdate.parse({
+        sessionUpdate: 'tool_call',
+        toolCallId: read.toolCallId,
+        title: 'Vendor.custom',
+        status: 'completed',
+        rawOutput: null,
+        ...entry.packet,
+      })
+      const events = await replay(nativeRows, [
+        text('BEFORE'),
+        packet,
+        text('AFTER'),
+      ])
+      const item = timeline(events)
+        .map(({ item }) => item)
+        .findLast((item) => item.type === 'tool_call')
+      assert.ok(item?.type === 'tool_call' && item.detail.type === 'unknown')
+      assert.deepEqual(item.detail.input, entry.expected)
+      assert.equal(
+        item.detail.output,
+        null,
+        'actual Brain JSON null is result data, not an ACP patch',
+      )
+      assert.equal(item.status, 'completed')
+    })
+})
+
+test('missing ACP input never permits recovered Brain detail to replace a supplied ACP result or error', async (t) => {
+  for (const status of ['completed', 'failed'] as const)
+    await t.test(status, async () => {
+      const output = status === 'failed' ? 'ACP failure' : false
+      const nativeRows = rows.map((row) =>
+        row.type === 'PLANNER_RESPONSE' && 'tool_calls' in row
+          ? {
+              ...row,
+              tool_calls: [
+                {
+                  id: read.toolCallId,
+                  name: 'Vendor.custom',
+                  args: { from: 'Brain' },
+                },
+              ],
+            }
+          : row,
+      )
+      const packet = zSessionUpdate.parse({
+        sessionUpdate: 'tool_call',
+        toolCallId: read.toolCallId,
+        title: 'Vendor.custom',
+        status,
+        rawInput: null,
+        rawOutput: output,
+      })
+      const events = await replay(nativeRows, [
+        text('BEFORE'),
+        packet,
+        text('AFTER'),
+      ])
+      const item = timeline(events)
+        .map(({ item }) => item)
+        .findLast((item) => item.type === 'tool_call')
+      assert.ok(item?.type === 'tool_call' && item.detail.type === 'unknown')
+      assert.equal(item.detail.input, null)
+      assert.equal(item.detail.output, output)
+      assert.equal(item.status, status)
+      assert.equal(item.error, status === 'failed' ? 'ACP failure' : null)
+    })
 })
