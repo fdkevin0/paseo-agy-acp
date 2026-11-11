@@ -1,16 +1,17 @@
+import type { NativeToolIdentitySource } from './brain-projector.ts'
 import type { ProviderTimelineItem } from '@getpaseo/plugin/server/provider'
 
 export interface HistoryEntry {
   item: ProviderTimelineItem
   timestamp?: string
   resultProvided?: boolean
+  nativeToolIdentitySource?: NativeToolIdentitySource
 }
 
 /** Place checkpoints only in gaps proved by native call IDs or unique complete text. */
 export function mergeCompactionHistory(
   acp: readonly HistoryEntry[],
   brain: readonly HistoryEntry[],
-  nativeCallIds: ReadonlySet<string>,
 ): HistoryEntry[] {
   if (!brain.some(({ item }) => item.type === 'compaction'))
     return [
@@ -22,9 +23,12 @@ export function mergeCompactionHistory(
   const textIds = new Map<string, number>()
   for (const { item } of acp)
     if ('text' in item) textIds.set(item.id, (textIds.get(item.id) ?? 0) + 1)
-  function key(item: ProviderTimelineItem): string | undefined {
+  function key(
+    { item, nativeToolIdentitySource }: HistoryEntry,
+    source: 'acp' | 'brain',
+  ): string | undefined {
     if (item.type === 'tool_call')
-      return nativeCallIds.has(item.callId)
+      return source === 'acp' || nativeToolIdentitySource !== undefined
         ? JSON.stringify([
             'tool',
             item.callId,
@@ -41,22 +45,24 @@ export function mergeCompactionHistory(
   }
   function positions(
     entries: readonly HistoryEntry[],
-    rejectFragments: boolean,
+    source: 'acp' | 'brain',
   ) {
     const result = new Map<string, number | null>()
-    entries.forEach(({ item }, index) => {
-      if (rejectFragments && 'text' in item && (textIds.get(item.id) ?? 0) > 1)
+    entries.forEach((entry, index) => {
+      const { item } = entry
+      if (source === 'acp' && 'text' in item && (textIds.get(item.id) ?? 0) > 1)
         return
-      const identity = key(item)
+      const identity = key(entry, source)
       if (identity !== undefined)
         result.set(identity, result.has(identity) ? null : index)
     })
     return result
   }
-  const acpPositions = positions(acp, true)
-  const brainPositions = positions(brain, false)
-  const candidates = brain.flatMap(({ item }, index) => {
-    const identity = key(item)
+  const acpPositions = positions(acp, 'acp')
+  const brainPositions = positions(brain, 'brain')
+  const candidates = brain.flatMap((entry, index) => {
+    const { item } = entry
+    const identity = key(entry, 'brain')
     const position =
       identity === undefined ? undefined : acpPositions.get(identity)
     return position != null && brainPositions.get(identity!) === index

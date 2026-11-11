@@ -21,6 +21,10 @@ test('checkpoint completion is semantic, not a summary revision or regressed sta
   assert.equal(dedupe.fresh(checkpoint('summary A')), true)
   assert.equal(dedupe.fresh(checkpoint('summary B')), false)
   assert.equal(
+    dedupe.fresh({ ...checkpoint('summary B'), status: 'CANCELED' }),
+    false,
+  )
+  assert.equal(
     dedupe.fresh({ ...checkpoint('summary B'), status: 'RUNNING' }),
     false,
   )

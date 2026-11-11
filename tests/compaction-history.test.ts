@@ -61,6 +61,7 @@ async function replay(
   updates: object[],
   history: 'replay' | 'skip' = 'replay',
   childRows?: object[],
+  metadata: readonly { stepIndex: number; callId: string }[] = [],
 ) {
   const home = await mkdtemp(join(tmpdir(), 'agy-compaction-history-'))
   const root = join(home, '.gemini/antigravity-cli/brain')
@@ -86,6 +87,36 @@ async function replay(
         spawnStepIndex: 4,
       }),
     )
+  }
+  if (metadata.length) {
+    const dir = join(root, native, '.system_generated/messages')
+    await mkdir(dir, { recursive: true })
+    const read: Record<string, boolean> = {}
+    for (const [index, entry] of metadata.entries()) {
+      const id = `metadata-${index}`
+      read[id] = true
+      await writeFile(
+        join(dir, `${id}.json`),
+        JSON.stringify({
+          id,
+          sender: 'user',
+          recipient: native,
+          content: 'fixture',
+          sourceMetadata: {
+            tool: {
+              conversationId: native,
+              stepIndex: entry.stepIndex,
+              toolCall: {
+                id: entry.callId,
+                name: 'read_file',
+                argumentsJson: '{}',
+              },
+            },
+          },
+        }),
+      )
+    }
+    await writeFile(join(dir, 'read.json'), JSON.stringify(read))
   }
   const events: ProviderEvent[] = []
   const manager = new SessionManager({
@@ -447,4 +478,260 @@ test('missing ACP results recover from Brain without losing ACP parameters', asy
   assert.equal(recovered.detail.offset, 7)
   assert.equal(recovered.detail.content, 'read')
   assert.equal(recovered.callId, 'read-example')
+})
+
+test('a positional alias never gains native provenance from a later raw or metadata ID', async () => {
+  const tool = (step_index: number, id?: string) => ({
+    step_index,
+    type: 'PLANNER_RESPONSE',
+    status: 'DONE',
+    tool_calls: [
+      { ...(id ? { id } : {}), name: 'read_file', args: { Path: '/brain' } },
+    ],
+  })
+  const result = {
+    step_index: 1,
+    type: 'GENERIC',
+    status: 'DONE',
+    content: 'anonymous result',
+  }
+  const acp = {
+    ...read,
+    toolCallId: 'b',
+    rawInput: { Path: '/acp' },
+    rawOutput: 'ACP result',
+  }
+  for (const laterIdentity of ['tool_id', 'step_metadata'] as const) {
+    const nativeRows = [
+      tool(0),
+      result,
+      checkpoint(2),
+      tool(3, laterIdentity === 'tool_id' ? 'b' : undefined),
+    ]
+    const events = await replay(
+      nativeRows,
+      [acp],
+      'replay',
+      undefined,
+      laterIdentity === 'step_metadata' ? [{ stepIndex: 4, callId: 'b' }] : [],
+    )
+    const items = timeline(events).map(({ item }) => item)
+    assert.equal(items.filter((item) => item.type === 'compaction').length, 0)
+    assert.equal(items.filter((item) => item.type === 'notification').length, 1)
+    const actual = items.find((item) => item.type === 'tool_call')!
+    assert.ok(actual.type === 'tool_call' && actual.detail.type === 'read')
+    assert.equal(actual.detail.content, 'ACP result')
+  }
+  const control = await replay(
+    [tool(0, 'a'), result, checkpoint(2), tool(3, 'b')],
+    [acp],
+  )
+  assert.equal(
+    timeline(control).filter(({ item }) => item.type === 'compaction').length,
+    0,
+  )
+  assert.equal(
+    timeline(control).filter(({ item }) => item.type === 'notification').length,
+    1,
+  )
+})
+
+test('native provenance survives terminal projection and accepts exact step metadata and native synthetic-looking IDs', async () => {
+  for (const source of ['tool_id', 'step_metadata'] as const) {
+    const id = 'tool-0-0'
+    const nativeRows = [
+      {
+        step_index: 0,
+        type: 'PLANNER_RESPONSE',
+        tool_calls: [
+          {
+            ...(source === 'tool_id' ? { id } : {}),
+            name: 'read_file',
+            args: { Path: '/brain' },
+          },
+        ],
+      },
+      { step_index: 1, type: 'GENERIC', status: 'DONE', content: 'result' },
+      checkpoint(2),
+    ]
+    const events = await replay(
+      nativeRows,
+      [{ ...read, toolCallId: id }],
+      'replay',
+      undefined,
+      source === 'step_metadata' ? [{ stepIndex: 1, callId: id }] : [],
+    )
+    assert.deepEqual(labels(events), ['tool_call', 'compaction'])
+  }
+})
+
+test('running empty content through multiple updates cannot suppress a missing Brain result', async () => {
+  const nativeRows = [
+    response(0, 'BEFORE'),
+    checkpoint(1),
+    {
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      tool_calls: [{ id: 'b', name: 'read_file', args: { Path: '/brain' } }],
+    },
+    {
+      step_index: 3,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: 'Brain recovered',
+    },
+    response(4, 'AFTER'),
+  ]
+  for (const content of [undefined, []]) {
+    const events = await replay(nativeRows, [
+      text('BEFORE'),
+      {
+        ...read,
+        toolCallId: 'b',
+        status: 'in_progress',
+        rawInput: { Path: '/acp', StartLine: 7 },
+        rawOutput: undefined,
+        ...(content ? { content } : {}),
+      },
+      ...(content
+        ? [{ sessionUpdate: 'tool_call_update', toolCallId: 'b', content: [] }]
+        : []),
+      {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'b',
+        status: 'completed',
+      },
+      text('AFTER'),
+    ])
+    const recovered = timeline(events)
+      .map(({ item }) => item)
+      .find(
+        (item) =>
+          item.type === 'tool_call' &&
+          item.status === 'completed' &&
+          item.detail.type === 'read' &&
+          item.detail.content === 'Brain recovered',
+      )
+    assert.ok(
+      recovered?.type === 'tool_call' && recovered.detail.type === 'read',
+    )
+    assert.equal(recovered.detail.filePath, '/acp')
+    assert.equal(recovered.detail.offset, 7)
+  }
+})
+
+test('result channel replacements track running placeholders independently from explicit terminal values', async () => {
+  const nativeRows = [
+    response(0, 'BEFORE'),
+    checkpoint(1),
+    {
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      tool_calls: [{ id: 'b', name: 'read_file', args: { Path: '/brain' } }],
+    },
+    {
+      step_index: 3,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: 'Brain recovered',
+    },
+    response(4, 'AFTER'),
+  ]
+  const update = (fields: object) => ({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'b',
+    ...fields,
+  })
+  const start = {
+    ...read,
+    toolCallId: 'b',
+    status: 'in_progress',
+    rawInput: { Path: '/acp', StartLine: 7 },
+    rawOutput: undefined,
+    content: [],
+  }
+  const cases = [
+    {
+      middle: [
+        update({
+          content: [
+            {
+              type: 'content',
+              content: { type: 'text', text: 'temporary progress' },
+            },
+          ],
+        }),
+        update({ content: [] }),
+      ],
+      final: {},
+      expected: 'Brain recovered',
+    },
+    {
+      middle: [
+        update({ rawOutput: 'temporary raw' }),
+        update({ rawOutput: null }),
+      ],
+      final: {},
+      expected: 'Brain recovered',
+    },
+    {
+      middle: [update({ rawOutput: 'ACP raw' }), update({ content: [] })],
+      final: {},
+      expected: 'ACP raw',
+    },
+    { middle: [], final: { content: [] }, expected: undefined },
+    { middle: [], final: { rawOutput: null }, expected: undefined },
+    {
+      middle: [],
+      final: { status: 'failed', rawOutput: null },
+      expected: undefined,
+    },
+    {
+      middle: [],
+      final: { status: 'failed', rawOutput: 'ACP error' },
+      expected: 'ACP error',
+    },
+    { middle: [], final: { rawOutput: '' }, expected: '' },
+    { middle: [], final: { rawOutput: 'ACP final' }, expected: 'ACP final' },
+    {
+      middle: [],
+      final: { rawOutput: { structuredContent: { valid: true } } },
+      expected: JSON.stringify({ structuredContent: { valid: true } }),
+    },
+    {
+      middle: [],
+      final: {
+        content: [
+          {
+            type: 'content',
+            content: { type: 'text', text: 'ACP final content' },
+          },
+        ],
+      },
+      expected: 'ACP final content',
+    },
+  ]
+  for (const { middle, final, expected } of cases) {
+    const events = await replay(nativeRows, [
+      text('BEFORE'),
+      start,
+      ...middle,
+      update({ status: 'completed', ...final }),
+      text('AFTER'),
+    ])
+    const completed = timeline(events)
+      .map(({ item }) => item)
+      .filter((item) => item.type === 'tool_call' && item.status !== 'running')
+      .at(-1)
+    assert.ok(
+      completed?.type === 'tool_call' && completed.detail.type === 'read',
+    )
+    assert.equal(
+      completed.status,
+      'status' in final ? final.status : 'completed',
+    )
+    assert.equal(completed.detail.filePath, '/acp')
+    assert.equal(completed.detail.offset, 7)
+    assert.equal(completed.detail.content, expected)
+  }
 })

@@ -55,7 +55,6 @@ import {
   definedProcessEnv,
   formatErrorMessage,
   record,
-  str,
   sessionIdPattern,
   setBounded,
 } from './common.ts'
@@ -427,8 +426,15 @@ async function createSession(
   const buffered: SessionNotification[] = []
   let collectingHistory = true
   const acpHistory: HistoryEntry[] = []
-  const acpToolResults = new Set<string>()
+  const acpToolResults = new Map<
+    string,
+    { rawOutput: boolean; content: boolean }
+  >()
   const acpToolSnapshots = new Map<string, Readonly<ToolCall>>()
+  function acpResultProvided(callId: string): boolean {
+    const result = acpToolResults.get(callId)
+    return result?.rawOutput === true || result?.content === true
+  }
   const subagents = new SubagentRegistry({
     sessionId: id,
     cwd,
@@ -636,17 +642,24 @@ async function createSession(
             (u.sessionUpdate === 'tool_call' ||
               u.sessionUpdate === 'tool_call_update')
           ) {
-            if (
-              (u.rawOutput !== undefined &&
-                (u.rawOutput !== null || item.status !== 'running')) ||
-              u.content != null
-            )
-              acpToolResults.add(item.callId)
+            const result =
+              u.sessionUpdate === 'tool_call'
+                ? { rawOutput: false, content: false }
+                : (acpToolResults.get(item.callId) ?? {
+                    rawOutput: false,
+                    content: false,
+                  })
+            if (u.rawOutput !== undefined)
+              result.rawOutput =
+                item.status !== 'running' || u.rawOutput !== null
+            if (u.content != null)
+              result.content = item.status !== 'running' || u.content.length > 0
+            acpToolResults.set(item.callId, result)
             const snapshot = timeline.toolCallSnapshot(item.callId)
             if (snapshot) acpToolSnapshots.set(item.callId, snapshot)
             acpHistory.push({
               item,
-              resultProvided: acpToolResults.has(item.callId),
+              resultProvided: acpResultProvided(item.callId),
             })
           } else acpHistory.push({ item })
         } else publishItem(item)
@@ -1066,15 +1079,7 @@ async function createSession(
             row.status === 'DONE' &&
             Number.isInteger(row.step_index),
         )
-        const nativeCallIds = new Set(inbox.stepCallIds.values())
-        for (const sub of subagentRecords)
-          if (sub.spawnCallId) nativeCallIds.add(sub.spawnCallId)
         for (const row of rows) {
-          if (Array.isArray(row.tool_calls))
-            for (const value of row.tool_calls) {
-              const callId = str(record(value).id)
-              if (callId) nativeCallIds.add(callId)
-            }
           const stepIndex = Number(row.step_index)
           if (
             Number.isInteger(stepIndex) &&
@@ -1087,7 +1092,7 @@ async function createSession(
               hasCompletedCheckpoint &&
               item.type === 'tool_call' &&
               row.type === 'GENERIC' &&
-              !acpToolResults.has(item.callId)
+              !acpResultProvided(item.callId)
             ) {
               const snapshot = acpToolSnapshots.get(item.callId)
               if (snapshot) {
@@ -1105,6 +1110,8 @@ async function createSession(
             }
             brainHistory.push({
               item,
+              nativeToolIdentitySource:
+                projector.nativeToolIdentitySource(projected),
               ...(typeof row.created_at === 'string'
                 ? { timestamp: row.created_at }
                 : {}),
@@ -1116,7 +1123,6 @@ async function createSession(
         for (const { item, timestamp } of mergeCompactionHistory(
           acpHistory.splice(0),
           brainHistory,
-          nativeCallIds,
         )) {
           await subagents.waitCurrentReady()
           emitItem(item, timestamp)
