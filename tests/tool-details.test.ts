@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
+import { zSessionUpdate } from '../node_modules/@agentclientprotocol/sdk/dist/schema/zod.gen.js'
 import { BrainTranscriptProjector } from '../server/brain.ts'
 import { Timeline, toolDetail } from '../server/mapping.ts'
 
@@ -159,7 +160,7 @@ test('one ACP call merges start/update/completion without losing input or identi
   assert.deepEqual(late.detail, completed.detail)
 })
 
-test('explicit raw null clears a previous value while omitted raw fields retain it', () => {
+test('ACP raw null and omitted fields retain previously reported values', () => {
   const timeline = new Timeline('session-example')
   timeline.update({
     sessionUpdate: 'tool_call',
@@ -168,15 +169,18 @@ test('explicit raw null clears a previous value while omitted raw fields retain 
     rawInput: fixture.input,
     rawOutput: fixture.output,
   })
-  const cleared = timeline.update({
+  const retained = timeline.update({
     sessionUpdate: 'tool_call_update',
     toolCallId: 'call-example',
     rawInput: null,
     rawOutput: null,
     status: 'completed',
   })
-  assert.ok(cleared?.type === 'tool_call')
-  assert.deepEqual(cleared.detail, unknownDetail(null, null))
+  assert.ok(retained?.type === 'tool_call')
+  assert.deepEqual(
+    retained.detail,
+    unknownDetail(fixture.input, fixture.output),
+  )
 })
 
 test('live ACP and Brain history agree on final structured details and bound call identity', () => {
@@ -341,7 +345,7 @@ test('completion content replaces an earlier running null placeholder without lo
   assert.deepEqual(late.detail, completed.detail)
 })
 
-test('completion content does not override explicit null or existing structured raw output', () => {
+test('completion content fills absent raw output but does not replace existing raw data', () => {
   const content = [
     {
       type: 'content' as const,
@@ -349,9 +353,9 @@ test('completion content does not override explicit null or existing structured 
     },
   ]
   for (const [oldStatus, oldOutput, incoming, expected] of [
-    ['in_progress', null, { rawOutput: null }, null],
+    ['in_progress', null, { rawOutput: null }, content],
     ['in_progress', fixture.output, {}, fixture.output],
-    ['completed', null, {}, null],
+    ['completed', null, {}, content],
     ['in_progress', null, { rawOutput: fixture.output }, fixture.output],
   ] as const) {
     const timeline = new Timeline('session-example')
@@ -373,4 +377,189 @@ test('completion content does not override explicit null or existing structured 
     assert.ok(completed?.type === 'tool_call')
     assert.deepEqual(completed.detail, unknownDetail(fixture.input, expected))
   }
+})
+
+test('native kind lookup ignores prototype keys and retains explicit identities', () => {
+  for (const title of ['constructor', '__proto__', 'toString', 'custom_read']) {
+    const rawInput = { path: '/example', offset: 7 }
+    const rawOutput = 'retained result'
+    assert.deepEqual(toolDetail({ title, kind: 'read', rawInput, rawOutput }), {
+      type: 'read',
+      filePath: '/example',
+      content: rawOutput,
+      offset: 7,
+      limit: undefined,
+    })
+    assert.deepEqual(
+      toolDetail({ name: title, title, kind: 'read', rawInput, rawOutput }),
+      unknownDetail(rawInput, rawOutput),
+    )
+    const timeline = new Timeline('prototype-key')
+    const item = timeline.update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'stable-call',
+      name: title,
+      title,
+      rawInput,
+      rawOutput,
+    })
+    assert.ok(item?.type === 'tool_call')
+    assert.equal(item.name, title)
+    assert.equal(item.callId, 'stable-call')
+    assert.deepEqual(item.detail, unknownDetail(rawInput, rawOutput))
+  }
+  assert.equal(
+    toolDetail({
+      name: 'read_file',
+      kind: 'other',
+      rawInput: { path: '/native' },
+    }).type,
+    'read',
+  )
+})
+
+test('ACP v1 raw channels merge null and omission independently across live and replay', () => {
+  const content = [
+    {
+      type: 'content' as const,
+      content: { type: 'text' as const, text: 'result' },
+    },
+  ]
+  const values = [false, 0, '', [], {}, { nested: null }, [null], 'null']
+  for (const title of ['run_command', 'read_file', fixture.name]) {
+    const initialInput =
+      title === 'run_command'
+        ? { command: 'echo kept' }
+        : { path: '/kept', nested: null }
+    for (const initialNull of [false, true]) {
+      for (const status of ['completed', 'failed'] as const) {
+        const updates = [
+          {
+            sessionUpdate: 'tool_call' as const,
+            toolCallId: 'stable',
+            title,
+            status: 'in_progress' as const,
+            ...(initialNull ? { rawInput: null, rawOutput: null } : {}),
+          },
+          {
+            sessionUpdate: 'tool_call_update' as const,
+            toolCallId: 'stable',
+            rawInput: initialInput,
+            content,
+          },
+          {
+            sessionUpdate: 'tool_call_update' as const,
+            toolCallId: 'stable',
+            rawInput: null,
+            rawOutput: null,
+            status,
+          },
+        ]
+        for (const replay of [false, true]) {
+          const timeline = new Timeline('raw-v1')
+          for (const update of updates) {
+            const item = timeline.update(
+              zSessionUpdate.parse(
+                replay ? JSON.parse(JSON.stringify(update)) : update,
+              ),
+            )
+            assert.ok(item?.type === 'tool_call')
+            assert.equal(item.callId, 'stable')
+          }
+          const retained = timeline.update(
+            zSessionUpdate.parse({
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'stable',
+              rawInput: null,
+            }),
+          )
+          assert.ok(retained?.type === 'tool_call')
+          assert.equal(retained.status, status)
+          assert.deepEqual(
+            retained.detail,
+            toolDetail({ title, rawInput: initialInput, content }),
+          )
+        }
+      }
+    }
+  }
+  for (const channel of ['rawInput', 'rawOutput'] as const) {
+    const timeline = new Timeline('raw-values')
+    timeline.update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'stable',
+      title: fixture.name,
+    })
+    for (const value of values) {
+      const replaced = timeline.update(
+        zSessionUpdate.parse({
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'stable',
+          [channel]: value,
+        }),
+      )
+      assert.ok(
+        replaced?.type === 'tool_call' && replaced.detail.type === 'unknown',
+      )
+      assert.deepEqual(
+        replaced.detail[channel === 'rawInput' ? 'input' : 'output'],
+        value,
+      )
+      for (const update of [{}, { [channel]: null }]) {
+        const retained = timeline.update(
+          zSessionUpdate.parse({
+            sessionUpdate: 'tool_call_update',
+            toolCallId: 'stable',
+            ...update,
+          }),
+        )
+        assert.ok(retained?.type === 'tool_call')
+        assert.deepEqual(retained.detail, replaced.detail)
+      }
+    }
+  }
+})
+
+test('ACP top-level null permits content replacement without altering direct Brain JSON null', () => {
+  const timeline = new Timeline('content-v1')
+  timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'stable',
+    title: fixture.name,
+    rawInput: fixture.input,
+    rawOutput: null,
+  })
+  for (const content of [
+    [],
+    [
+      {
+        type: 'content' as const,
+        content: { type: 'text' as const, text: 'actual' },
+      },
+    ],
+    [],
+  ]) {
+    const item = timeline.update(
+      zSessionUpdate.parse({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'stable',
+        rawInput: null,
+        rawOutput: null,
+        content,
+      }),
+    )
+    assert.ok(item?.type === 'tool_call')
+    assert.deepEqual(item.detail, unknownDetail(fixture.input, content))
+  }
+  assert.deepEqual(
+    toolDetail({
+      title: fixture.name,
+      rawInput: { nested: null },
+      rawOutput: null,
+      content: [
+        { type: 'content', content: { type: 'text', text: 'presentation' } },
+      ],
+    }),
+    unknownDetail({ nested: null }, null),
+  )
 })

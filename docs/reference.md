@@ -43,6 +43,10 @@ The connection negotiates these capabilities with Paseo and validates incoming o
 
 ## Attachments and tool cards
 
+Dedicated cards require a known native tool identity or a trusted ACP kind hint; common argument keys alone do not classify an unknown MCP tool. Unknown cards retain JSON input and output separately, including nested null values, and preserve the original tool identity and case.
+
+The current connection uses ACP v1. Per the [tool-call raw-value contract](https://agentclientprotocol.com/protocol/v1/tool-calls), top-level `rawInput` / `rawOutput` null and omission both mean no supplied value on an initial call and leave the previous value unchanged on an update. Non-null values replace the corresponding channel, including `false`, `0`, `""`, `[]`, and `{}`. Content keeps its independent collection replacement behavior; when no raw output has been supplied, the unknown card preserves ACP content blocks. This ACP merge rule does not change nested JSON null or a directly recorded Brain result of null. Previously treating an ACP update's null as a clear instruction was incorrect.
+
 Non-image attachments become text containing supplied paths, titles, external resource links (`title` + `url`), bodies or review comments. Uploaded files are referenced by daemon-side path; the plugin does not silently read arbitrary file contents. agy can use its own file tools subject to native permissions.
 
 | Native arguments or content                                | Paseo card                                             |
@@ -55,7 +59,7 @@ Non-image attachments become text containing supplied paths, titles, external re
 | Query / pattern                                            | Search card.                                           |
 | `invoke_subagent` / `send_message`                         | Subagent description, result and child link.           |
 | `ask_question`                                             | Plain-text formatted question options and answer.      |
-| Unrecognized tool                                          | Plain text preserving input/output.                    |
+| Unrecognized tool                                          | Structured `unknown.input` / `unknown.output`.         |
 
 Partial ACP tool updates are merged into full snapshots using stable item IDs. Denied tool permissions mark stranded tool cards `canceled` instead of `completed`; other running tools receive a completed, canceled or failed terminal snapshot before the turn ends. Missing failure detail gets a non-empty diagnostic.
 
