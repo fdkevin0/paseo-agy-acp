@@ -124,6 +124,31 @@ function nonEmptyRawOutput(rawOutput: unknown): string | undefined {
 /** Map native tool arguments and output to Paseo detail cards. */
 const canonicalWriteToolPattern =
   /^(?:write_file|write_to_file|create_file|fs\/write_text_file|write_text_file)$/i
+// Native identities and ACP kinds declare semantics; argument keys do not.
+const nativeToolKinds: Record<string, ToolCall['kind']> = {
+  invoke_subagent: 'other',
+  send_message: 'other',
+  ask_question: 'other',
+  ask_user: 'other',
+  run_command: 'execute',
+  read_file: 'read',
+  view_file: 'read',
+  write_file: 'edit',
+  write_to_file: 'edit',
+  create_file: 'edit',
+  'fs/write_text_file': 'edit',
+  write_text_file: 'edit',
+  edit_file: 'edit',
+  replace_file_content: 'edit',
+  multi_replace_file_content: 'edit',
+  read_url_content: 'fetch',
+  grep_search: 'search',
+  find_by_name: 'search',
+  glob: 'search',
+  search_web: 'search',
+  web_search: 'search',
+}
+const jsonValueSchema = z.json()
 const TOOL_SNAPSHOT_LIMIT = 1024
 
 function isTerminalToolStatus(status: unknown): boolean {
@@ -145,8 +170,18 @@ export function toolDetail(
       : (extractToolContentText(tool) ?? nonEmptyRawOutput(tool.rawOutput))
   const explicitRawName = str(record(tool).name)
   const rawName = cleanToolName(explicitRawName ?? tool.title ?? '')
-  const name = rawName.toLowerCase()
-  if (isAskQuestionName(rawName) || Array.isArray(input.questions)) {
+  // Legacy ACP titles use `Run <native identity>` when no raw name is sent.
+  const legacyName = rawName.startsWith('Run ')
+    ? rawName.slice(4).toLowerCase()
+    : ''
+  const name =
+    explicitRawName === undefined && Object.hasOwn(nativeToolKinds, legacyName)
+      ? legacyName
+      : rawName.toLowerCase()
+  const kind =
+    nativeToolKinds[name] ??
+    (explicitRawName === undefined ? tool.kind : undefined)
+  if (isAskQuestionName(name)) {
     const questions = normalizeAskQuestionInput(input)
     if (questions.length > 0) {
       const formatted = questions
@@ -173,7 +208,7 @@ export function toolDetail(
         input.path,
     ) ?? tool.locations?.[0]?.path
   const command = str(input.CommandLine ?? input.command)
-  if (command) {
+  if (kind === 'execute' && command) {
     const exitMatch = output?.match(/Command exited with code (\d+)/)
     const exitCode =
       num(record(tool.rawOutput).exitCode) ??
@@ -187,9 +222,9 @@ export function toolDetail(
     }
   }
   const url = str(input.Url ?? input.url)
-  if ((name === 'read_url_content' || tool.kind === 'fetch') && url)
+  if (kind === 'fetch' && url)
     return { type: 'fetch', url, ...(output ? { result: output } : {}) }
-  if (name.includes('invoke_subagent') || name.includes('send_message')) {
+  if (name === 'invoke_subagent' || name === 'send_message') {
     const data = record(tool.rawOutput)
     const childSessionId =
       str(data.conversationId ?? data.conversation_id) ??
@@ -221,7 +256,7 @@ export function toolDetail(
     }
   }
   const planText =
-    record(input.ArtifactMetadata).RequestFeedback === true
+    kind === 'edit' && record(input.ArtifactMetadata).RequestFeedback === true
       ? str(input.Content ?? input.CodeContent ?? input.Replacement)
       : undefined
   if (planText) return { type: 'plan', text: planText }
@@ -236,15 +271,10 @@ export function toolDetail(
     input.OldString !== undefined ||
     Array.isArray(input.ReplacementChunks) ||
     diff?.oldText != null
-  const isCanonicalWrite =
-    !rawName.startsWith('mcp__') &&
-    !rawName.includes(':') &&
-    canonicalWriteToolPattern.test(rawName)
+  const isCanonicalWrite = canonicalWriteToolPattern.test(name)
   const isUnnamedWriteFallback =
     explicitRawName === undefined &&
-    !rawName.startsWith('mcp__') &&
-    !rawName.includes(':') &&
-    tool.kind !== 'read' &&
+    kind === 'edit' &&
     !hasEditTarget &&
     (nativeWriteContent !== undefined ||
       (diff?.type === 'diff' &&
@@ -263,7 +293,11 @@ export function toolDetail(
         writeContent ?? (diff?.type === 'diff' ? diff.newText : undefined),
     }
   }
-  if (diff?.type === 'diff' && (diff.path || filePath))
+  if (
+    diff?.type === 'diff' &&
+    (kind === 'edit' || !rawName) &&
+    (diff.path || filePath)
+  )
     return {
       type: 'edit',
       filePath: (diff.path || filePath)!,
@@ -277,12 +311,7 @@ export function toolDetail(
       input.pattern ??
       input.SearchDirectory,
   )
-  if (
-    query &&
-    tool.kind !== 'read' &&
-    tool.kind !== 'edit' &&
-    !/^(read|view|write|edit|replace|multi_replace)/.test(name)
-  ) {
+  if (query && kind === 'search') {
     const toolName = searchToolNames.find(([pat]) => name.includes(pat))?.[1]
     const filePaths = tool.locations
       ?.map((l) => l.path)
@@ -302,7 +331,7 @@ export function toolDetail(
         filePath,
         content: writeContent,
       }
-    if (tool.kind === 'edit' || /edit|replace/.test(name)) {
+    if (kind === 'edit') {
       const chunks = Array.isArray(input.ReplacementChunks)
         ? input.ReplacementChunks.map(record)
         : undefined
@@ -327,10 +356,7 @@ export function toolDetail(
           ) ?? joinChunks(chunks, 'ReplacementContent', 'Replacement'),
       }
     }
-    if (
-      !rawName.startsWith('mcp__') ||
-      /(?:^|_)(?:read|view|cat)(?:_|$)/i.test(name)
-    ) {
+    if (kind === 'read') {
       const cleaned = cleanReadOutput(output)
       const start = num(input.StartLine) ?? cleaned.startLine
       const end = num(input.EndLine) ?? cleaned.endLine
@@ -354,9 +380,11 @@ export function toolDetail(
     }
   }
   return {
-    type: 'plain_text',
-    label: name,
-    text: output ?? JSON.stringify(tool.rawInput ?? {}),
+    type: 'unknown',
+    input: jsonValueSchema.parse(tool.rawInput ?? null),
+    output: jsonValueSchema.parse(
+      tool.rawOutput !== undefined ? tool.rawOutput : (tool.content ?? null),
+    ),
   }
 }
 
@@ -745,7 +773,11 @@ export class Timeline {
       const tool = {
         ...old,
         ...Object.fromEntries(
-          Object.entries(update).filter(([, v]) => v != null),
+          Object.entries(update).filter(
+            ([key, value]) =>
+              value != null ||
+              ((key === 'rawInput' || key === 'rawOutput') && value === null),
+          ),
         ),
         ...(preserveStatus ? { status: old!.status } : {}),
       } as ToolCall

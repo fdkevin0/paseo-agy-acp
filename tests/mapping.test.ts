@@ -776,14 +776,14 @@ test('write card classification ignores paths or non-write tools containing "wri
       title: 'mcp__git__rewrite_history',
       rawInput: { path: '/repo/file.ts', content: 'note' },
     }).type,
-    'plain_text',
+    'unknown',
   )
   assert.equal(
     toolDetail({
       title: 'save_memory',
       rawInput: { content: 'remember me' },
     }).type,
-    'plain_text',
+    'unknown',
   )
   assert.equal(
     toolDetail({

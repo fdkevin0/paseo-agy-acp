@@ -28,6 +28,7 @@ export type PendingTool = {
   callId: string
   name: string
   args: Record<string, unknown>
+  rawInput: unknown
   stepIndex: number
   isQuestion?: boolean
   questions?: NormalizedQuestion[]
@@ -191,7 +192,7 @@ export class BrainTranscriptProjector {
       name: pending.name,
       detail: toolDetail({
         title: pending.name,
-        rawInput: pending.args,
+        rawInput: pending.rawInput,
         rawOutput: output,
       }),
     }
@@ -397,6 +398,7 @@ export class BrainTranscriptProjector {
               callId,
               name: cleanName,
               args,
+              rawInput: tool.args,
               stepIndex: genericStep,
               ...(isAskQuestionName(cleanName)
                 ? {
@@ -413,7 +415,7 @@ export class BrainTranscriptProjector {
               name: pending.name,
               detail: toolDetail({
                 title: pending.name,
-                rawInput: args,
+                rawInput: tool.args,
                 rawOutput: null,
               }),
               status: 'running',
