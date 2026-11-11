@@ -43,13 +43,18 @@ export class ModelUsageObserver {
       const usage = extractStepUsage(row)
       if (usage) this.candidate = { stepIndex, usage }
     }
-    if (snapshotStepIndices) this.replacing = false
+    if (snapshotStepIndices) {
+      this.replacing = false
+      if (!this.candidate) {
+        this.latest = undefined
+        this.latestStepIndex = -1
+        this.published = undefined
+      }
+    }
     const candidate = this.candidate
     if (
       !candidate ||
-      (this.replacing &&
-        this.published &&
-        candidate.stepIndex < this.published.stepIndex)
+      (this.replacing && candidate.stepIndex < this.latestStepIndex)
     )
       return
     this.latest = candidate.usage
@@ -99,7 +104,7 @@ export class BrainTurnObservation {
   private consumer?: (read: BrainRead) => Promise<void>
   private buffered = new Map<number, Row>()
   private bufferReset = false
-  private bufferSnapshot?: ReadonlySet<number>
+  private bufferSnapshot?: Set<number>
   private checkpoints = new StepDedupe()
   private drainingRead = false
   private mayPublish() {
@@ -206,7 +211,10 @@ export class BrainTurnObservation {
     else {
       for (const row of eligible) this.buffered.set(Number(row.step_index), row)
       if (read.snapshotStepIndices)
-        this.bufferSnapshot = read.snapshotStepIndices
+        this.bufferSnapshot = new Set(read.snapshotStepIndices)
+      if (this.bufferSnapshot)
+        for (const row of read.rows)
+          this.bufferSnapshot.add(Number(row.step_index))
     }
     if (this.isDisposed()) return
     const observed = this.drainingRead
@@ -219,6 +227,8 @@ export class BrainTurnObservation {
         }
       : next
     this.usage.observe(observed)
+    if (read.snapshotStepIndices)
+      this.checkpoints.prune(read.snapshotStepIndices)
     if (!this.mayPublish()) return
     if (this.drainingRead)
       this.callbacks.onBoundary?.(
@@ -226,8 +236,6 @@ export class BrainTurnObservation {
         Boolean(this.bufferSnapshot),
       )
     // Completed checkpoints have immutable identities, even when their summaries are rewritten.
-    if (observed.snapshotStepIndices)
-      this.checkpoints.prune(observed.snapshotStepIndices)
     for (const row of observed.rows)
       if (
         row.type === 'CHECKPOINT' &&

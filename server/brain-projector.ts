@@ -41,7 +41,12 @@ export type PendingTool = {
   questionConsumed?: boolean
   acpIndex?: number
   fallbackId?: string
-  deferredResult?: Record<string, unknown>
+  genericSeen?: boolean
+  deferredCompletion?: {
+    output: unknown
+    status: 'completed' | 'failed' | 'canceled'
+    text: string
+  }
   questionCompleted?: boolean
 }
 
@@ -288,7 +293,18 @@ export class BrainTranscriptProjector {
         : (row.content ?? row.error ?? null)
     const status = terminalToolStatus(row.status)
     this.lastErrorCallId = status === 'failed' ? pending.callId : undefined
-    return [this.finishTool(pending, rawOutput, status, text)]
+    return this.finishOrDefer(pending, rawOutput, status, text)
+  }
+  private finishOrDefer(
+    pending: PendingTool,
+    output: unknown,
+    status: 'completed' | 'failed' | 'canceled',
+    text: string,
+  ): ProviderTimelineItem[] {
+    const item = this.finishTool(pending, output, status, text)
+    if (pending.callId) return [item]
+    pending.deferredCompletion = { output, status, text }
+    return []
   }
   private startTool(pending: PendingTool): ProviderTimelineItem {
     const item: ProviderTimelineItem = {
@@ -325,22 +341,24 @@ export class BrainTranscriptProjector {
       pending.id = `${this.sessionId}:tool:${callId}`
       const retired = this.retired.includes(pending)
       if (retired) this.retired = this.retired.filter((p) => p !== pending)
-      if (pending.deferredResult) {
+      if (pending.deferredCompletion) {
         this.pending = this.pending.filter((p) => p !== pending)
+        const { output, status, text } = pending.deferredCompletion
+        if (status === 'failed') this.lastErrorCallId = callId
         items.push(
           this.startTool(pending),
-          ...this.completeGeneric(pending, pending.deferredResult),
+          this.finishTool(pending, output, status, text),
         )
       } else
         items.push(
-          retired
+          retired && !pending.genericSeen
             ? this.finishTool(pending, null, 'canceled', '')
             : this.startTool(pending),
         )
     }
     return items
   }
-  project(value: unknown): ProviderTimelineItem[] {
+  project(value: unknown, continuingQuestion = false): ProviderTimelineItem[] {
     const row = record(value)
     if (!Number.isInteger(row.step_index)) return []
     const stepIndex = Number(row.step_index)
@@ -351,7 +369,7 @@ export class BrainTranscriptProjector {
         this.pending = []
         this.retired = []
         this.lastErrorCallId = undefined
-        this.touchedSubagents.clear()
+        if (!continuingQuestion) this.touchedSubagents.clear()
         return text ? [{ type: 'user_message', id, text }] : []
       case 'SYSTEM_MESSAGE': {
         this.lastErrorCallId = undefined
@@ -393,7 +411,7 @@ export class BrainTranscriptProjector {
               this.background.delete(taskId)
               if (sender !== taskId) {
                 canceledSchedules.push(
-                  this.finishTool(task, null, 'canceled', ''),
+                  ...this.finishOrDefer(task, null, 'canceled', ''),
                 )
               }
             }
@@ -411,7 +429,9 @@ export class BrainTranscriptProjector {
                 : outcome === 'was canceled'
                   ? 'canceled'
                   : 'completed'
-            completed.push(this.finishTool(pending, output, status, output))
+            completed.push(
+              ...this.finishOrDefer(pending, output, status, output),
+            )
           }
           if (completed.length > 0 || taskResults.length > 0) return completed
         }
@@ -467,9 +487,8 @@ export class BrainTranscriptProjector {
         const [pending] = this.pending.splice(matchIndex, 1)
         if (!pending || pending.questionCompleted) return []
         if (!pending.callId && this.deferAnonymous) {
-          pending.deferredResult = row
-          this.pending.splice(Math.max(matchIndex, 0), 0, pending)
-          return []
+          pending.genericSeen = true
+          this.retired.push(pending)
         }
         return this.completeGeneric(pending, row)
       }
@@ -673,6 +692,8 @@ export class BrainNode {
       this.turnStartStep = Number(row.step_index)
     // A restart notice or a question-continuation USER_INPUT does not end a woken turn:
     // the rows after it are still Brain's to project.
+    const continuingQuestion =
+      row.type === 'USER_INPUT' && this.continuingQuestion
     if (row.type === 'USER_INPUT') {
       if (this.continuingQuestion) this.continuingQuestion = false
       else this.resetPhase()
@@ -713,7 +734,7 @@ export class BrainNode {
       this.retryError = undefined
     }
     this.consumedMessages += countRowMessages(row)
-    const items = this.projector.project(row)
+    const items = this.projector.project(row, continuingQuestion)
     if (row.type !== 'CHECKPOINT') this.lastStep = row
     if (row.type === 'PLANNER_RESPONSE') this.seenPlannerResponse = true
     if (

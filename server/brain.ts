@@ -299,9 +299,24 @@ export async function settleBrainTurn(
   // Once anchored, a rewrite caught mid-O_TRUNC (empty or partial file) is not "no turn".
   let anchored = false
   let preamble: Record<string, unknown>[] = []
+  let appliedHistoricalMessages = 0
+  const continuations: {
+    afterStep: number
+    acpIndex: number
+    userStep?: number
+  }[] = []
+  const beginContinuation = () => {
+    const boundary = {
+      afterStep: Number(node.lastStep?.step_index ?? -1),
+      acpIndex: acpToolCallIds.length,
+    }
+    continuations.push(boundary)
+    node.markQuestionContinuation()
+    node.projector.bindToolCallIds(acpToolCallIds, boundary.acpIndex)
+    stream.wokeUp = true
+  }
   let lastStepIndex = -1
   const dedupe = new StepDedupe()
-  let lastStepUsage: StepUsage | undefined
   const wakeupSteps = new Map<number, StepUsage>()
   let inbox!: InboxState
   let subagents: SubagentRecord[] = []
@@ -311,7 +326,7 @@ export async function settleBrainTurn(
   ) => ({
     status,
     ...(error !== undefined ? { error } : {}),
-    lastStepUsage,
+    lastStepUsage: stream.usage.latest,
     ...(node.wokeUp ? { wokeUp: true as const } : {}),
     ...(wakeupSteps.size
       ? {
@@ -367,11 +382,14 @@ export async function settleBrainTurn(
     if (read.reset) {
       initial = true
       preamble = []
-      const wasWoken = node.wokeUp || stream.wokeUp
       node.reset(inbox, subagents)
-      if (wasWoken) node.markQuestionContinuation()
-      node.consumedMessages = stream.historicalMessages
+      appliedHistoricalMessages = 0
     }
+    const historicalDelta =
+      stream.historicalMessages - appliedHistoricalMessages
+    node.consumedMessages += historicalDelta
+    appliedHistoricalMessages = stream.historicalMessages
+    if (historicalDelta) foldVersion++
     if (rows.length || read.reset) foldVersion++
     if (rows.length) lastActivity = Date.now()
     let slice = rows
@@ -379,7 +397,7 @@ export async function settleBrainTurn(
       // Keep rows already consumed by the cursor until this turn's USER_INPUT is visible.
       preamble.push(...rows)
       let start = -1
-      for (let i = preamble.length - 1; i >= 0; i--) {
+      for (let i = 0; i < preamble.length; i++) {
         if (
           preamble[i].type === 'USER_INPUT' &&
           Number(preamble[i].step_index) > minStepIndex
@@ -400,13 +418,25 @@ export async function settleBrainTurn(
     }
     for (const row of slice) {
       const stepIndex = Number(row.step_index)
+      if (row.type === 'USER_INPUT') {
+        const boundary = continuations.find(
+          (entry) =>
+            entry.userStep === stepIndex ||
+            (entry.userStep === undefined && stepIndex > entry.afterStep),
+        )
+        if (boundary) {
+          boundary.userStep = stepIndex
+          node.markQuestionContinuation()
+          node.projector.bindToolCallIds(acpToolCallIds, boundary.acpIndex)
+        }
+      }
       const items = node.ingest(row)
-      stream.wokeUp = node.wokeUp
+      stream.wokeUp ||= node.wokeUp
       const usage = extractStepUsage(row)
       if (usage) {
-        lastStepUsage = usage
         if (node.wokeUp && row.status === 'DONE')
           wakeupSteps.set(stepIndex, usage)
+        else wakeupSteps.delete(stepIndex)
       }
       if (Number.isInteger(stepIndex) && stepIndex > lastStepIndex) {
         lastStepIndex = stepIndex
@@ -510,11 +540,7 @@ export async function settleBrainTurn(
                       answerText,
                     ),
                   )
-                  node.markQuestionContinuation()
-                  node.projector.bindToolCallIds(
-                    acpToolCallIds,
-                    acpToolCallIds.length,
-                  )
+                  beginContinuation()
                 },
               })
             : { status: 'already_handled' }
@@ -540,7 +566,7 @@ export async function settleBrainTurn(
         )
         if (outcome.status === 'answered') {
           onItem(completed)
-          node.markQuestionContinuation()
+          beginContinuation()
           lastActivity = Date.now()
           continuedQuestion = true
           break
