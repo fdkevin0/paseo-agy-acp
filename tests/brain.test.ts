@@ -3068,3 +3068,32 @@ test('a busy sibling cannot hide another child retry timeout', async () => {
     await f.close()
   }
 })
+
+test('an explicit error status is never classified as a retry warning', () => {
+  const projector = new BrainTranscriptProjector('retry')
+  assert.equal(
+    projector.project({ ...interrupted(1), status: 'ERROR' })[0].type,
+    'error',
+  )
+})
+
+test('cancellation observed while ingesting wins over a terminal failure', async () => {
+  const f = await fixture()
+  const controller = new AbortController()
+  try {
+    await f.put(parent, [
+      { step_index: 1, type: 'USER_INPUT', content: 'work' },
+      interrupted(2),
+      { step_index: 3, type: 'ERROR_MESSAGE', content: 'final failure' },
+    ])
+    const result = await alive(
+      settleBrainTurn(f.root, parent, 'p', () => {}, {
+        signal: controller.signal,
+        onStep: () => controller.abort(),
+      }),
+    )
+    assert.equal(result.status, 'canceled')
+  } finally {
+    await f.close()
+  }
+})
