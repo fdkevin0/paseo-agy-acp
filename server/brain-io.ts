@@ -151,12 +151,15 @@ export function extractStepUsage(
   const cacheWrite = nonnegative(row.cache_write_tokens)
     ? row.cache_write_tokens
     : undefined
+  const cachedRead = nonnegative(row.cache_read_tokens)
+    ? row.cache_read_tokens
+    : 0
+  if ((input ?? 0) + (output ?? 0) + cachedRead + (cacheWrite ?? 0) === 0)
+    return undefined
   return {
     inputTokens: input ?? 0,
     outputTokens: output ?? 0,
-    cachedReadTokens: nonnegative(row.cache_read_tokens)
-      ? row.cache_read_tokens
-      : 0,
+    cachedReadTokens: cachedRead,
     ...(cacheWrite !== undefined ? { cachedWriteTokens: cacheWrite } : {}),
   }
 }
@@ -554,42 +557,72 @@ export async function readTranscriptRows(
   }
 }
 
-/** Step index of the newest transcript row; reads only the file tail since rows are appended in step order. */
-export async function readLastStepIndex(
-  root: string,
-  nativeId: string,
-): Promise<number> {
-  if (!sessionIdPattern.test(nativeId)) return -1
+/** Walk complete JSONL records backwards without parsing unrelated history or splitting UTF-8. */
+async function* readTranscriptTail(root: string, nativeId: string) {
+  if (!sessionIdPattern.test(nativeId)) return
   let file
   try {
     file = await open(await resolveTranscriptPath(root, nativeId), 'r')
   } catch (error) {
-    if (isMissing(error)) return -1
+    if (isMissing(error)) return
     throw error
   }
   try {
-    const { size } = await file.stat()
-    for (let window = 64 * 1024; ; window *= 4) {
-      const length = Math.min(size, window)
-      const buffer = Buffer.alloc(length)
-      const { bytesRead } = await file.read(buffer, 0, length, size - length)
-      const lines = buffer.subarray(0, bytesRead).toString('utf8').split('\n')
-      // The first line may be cut by the window unless it starts the file.
-      const complete = length < size ? lines.slice(1) : lines
-      for (let i = complete.length - 1; i >= 0; i--) {
-        if (!complete[i].trim()) continue
-        try {
-          const step = Number(record(JSON.parse(complete[i])).step_index)
-          if (Number.isInteger(step)) return step
-        } catch {
-          /* A torn trailing write; look at the previous record. */
+    let end = (await file.stat()).size
+    let prefix = Buffer.alloc(0)
+    let trailing = true
+    while (end > 0) {
+      const start = Math.max(0, end - 64 * 1024)
+      const chunk = Buffer.alloc(end - start)
+      const { bytesRead } = await file.read(chunk, 0, chunk.length, start)
+      const bytes = Buffer.concat([chunk.subarray(0, bytesRead), prefix])
+      let lineEnd = bytes.length
+      for (
+        let i = bytes.lastIndexOf(10);
+        i >= 0;
+        i = bytes.lastIndexOf(10, i - 1)
+      ) {
+        const line = bytes.subarray(i + 1, lineEnd)
+        lineEnd = i
+        if (line.length > 8 * 1024 * 1024)
+          throw new Error('Brain JSONL line exceeds 8 MiB')
+        if (trailing) trailing = false
+        else if (line.length) {
+          try {
+            yield record(JSON.parse(line.toString('utf8')))
+          } catch (error) {
+            if (!(error instanceof SyntaxError)) throw error
+          }
         }
+        if (i === 0) break
       }
-      if (length >= size) return -1
+      prefix = Buffer.from(bytes.subarray(0, lineEnd))
+      if (prefix.length > 8 * 1024 * 1024)
+        throw new Error('Brain JSONL line exceeds 8 MiB')
+      end = start
+    }
+    if (!trailing && prefix.length) {
+      try {
+        yield record(JSON.parse(prefix.toString('utf8')))
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error
+      }
     }
   } finally {
     await file.close()
   }
+}
+
+/** Step index of the newest complete transcript row. */
+export async function readLastStepIndex(
+  root: string,
+  nativeId: string,
+): Promise<number> {
+  for await (const row of readTranscriptTail(root, nativeId)) {
+    const step = Number(row.step_index)
+    if (Number.isInteger(step)) return step
+  }
+  return -1
 }
 
 /** Remembers each step's delivered shape, so a rewrite re-delivers only changed steps. */
@@ -623,21 +656,20 @@ export class StepDedupe {
   }
 }
 
-/** Latest reliable model snapshot after the caller's turn boundary, never cumulative usage. */
+/** Latest positive model snapshot and observed turn boundary; cumulative usage is never context. */
 export async function readLatestStepUsage(
   root: string,
   nativeId: string,
   minStepIndex = -1,
-): Promise<StepUsage | undefined> {
-  const rows = await readTranscriptRows(root, nativeId)
-  for (let i = rows.length - 1; i >= 0; i--) {
-    const row = rows[i]
-    if (
-      !Number.isInteger(row.step_index) ||
-      Number(row.step_index) <= minStepIndex
-    )
-      continue
-    const usage = extractStepUsage(row)
-    if (usage) return usage
+): Promise<{ lastStepUsage?: StepUsage; lastStepIndex: number }> {
+  let lastStepIndex = -1
+  for await (const row of readTranscriptTail(root, nativeId)) {
+    if (!Number.isInteger(row.step_index)) continue
+    const step = Number(row.step_index)
+    lastStepIndex = Math.max(lastStepIndex, step)
+    if (step <= minStepIndex) break
+    const lastStepUsage = extractStepUsage(row)
+    if (lastStepUsage) return { lastStepUsage, lastStepIndex }
   }
+  return { lastStepIndex }
 }

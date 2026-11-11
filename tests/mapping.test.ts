@@ -93,6 +93,16 @@ test('unfinished tools terminalize once on every terminal state', () => {
 
 test('usage rejects invalid context, ignores foreign currency, and computes lastStep occupancy', () => {
   assert.equal(contextUsage({ size: 0, used: 10 }), undefined)
+  assert.deepEqual(contextUsage({ size: 100, used: 0 }), {
+    contextWindowUsedTokens: 0,
+    contextWindowMaxTokens: 100,
+  })
+  assert.equal(
+    promptUsage(null, {
+      lastStep: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0 },
+    }).contextWindowUsedTokens,
+    undefined,
+  )
   assert.equal(contextUsage({ size: 100, used: -1 }), undefined)
   assert.equal(contextUsage({ size: Infinity, used: 1 }), undefined)
   assert.deepEqual(

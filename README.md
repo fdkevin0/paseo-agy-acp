@@ -87,7 +87,7 @@ Existing agents keep their original provider; they are not migrated. Remove the 
 | Subscription  | Gemini and Claude/GPT 5-hour and weekly quota windows.                                                                                    |
 | Subagents     | Native multi-level child links and read-only Brain transcript cards.                                                                      |
 
-Steering, rewind, archive operations, structured output and Artifacts panels are unsupported. Child cards do not provide independent session control. Valid native `usage_update` notifications received during a turn take precedence. Otherwise, context occupancy uses the latest reliable model step in `transcript_full.jsonl`; without a snapshot, it stays unchanged or unknown. Cumulative prompt counters remain separate from context occupancy. Current agy print mode rejects custom ACP directory flags for quota queries. See [reference limitations](docs/reference.md) for details.
+Steering, rewind, archive operations, structured output and Artifacts panels are unsupported. Child cards do not provide independent session control. Valid native `usage_update` notifications take precedence during the foreground phase. Later Reactive Wakeup model snapshots can refresh occupancy while retaining the same model's known native capacity. Without a reliable snapshot, context stays unchanged or unknown. Cumulative prompt counters remain separate from context occupancy. Current agy print mode rejects custom ACP directory flags for quota queries. See [reference limitations](docs/reference.md) for details.
 
 ## More information
 
