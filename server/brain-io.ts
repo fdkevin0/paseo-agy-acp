@@ -445,7 +445,7 @@ export class TranscriptReader {
   private identity = ''
   private offset = 0
   private remainder = ''
-  private resetPending = false
+  private snapshotStepIndices?: Set<number>
   private head = Buffer.alloc(0)
   private tail = Buffer.alloc(0)
 
@@ -453,6 +453,7 @@ export class TranscriptReader {
     this.identity = identity
     this.offset = 0
     this.remainder = ''
+    this.snapshotStepIndices = new Set()
     this.head = Buffer.alloc(0)
     this.tail = Buffer.alloc(0)
   }
@@ -477,7 +478,15 @@ export class TranscriptReader {
         : Buffer.concat([this.tail, chunk]).subarray(-REWRITE_PROBE_BYTES)
   }
 
-  async read(root: string, nativeId: string) {
+  async read(
+    root: string,
+    nativeId: string,
+  ): Promise<{
+    rows: Record<string, unknown>[]
+    reset: boolean
+    /** Complete replacement identities, separate from immediately deliverable records. */
+    snapshotStepIndices?: ReadonlySet<number>
+  }> {
     const path = await resolveTranscriptPath(root, nativeId)
     const file = await open(path, 'r')
     const rows: Record<string, unknown>[] = []
@@ -491,7 +500,6 @@ export class TranscriptReader {
         !(await this.matches(file, this.tail, this.offset - this.tail.length))
       if (reset) {
         this.clearCursor(identity)
-        this.resetPending = true
       }
       const startedAtZero = this.offset === 0 && this.remainder === ''
       try {
@@ -534,20 +542,20 @@ export class TranscriptReader {
             !(await this.matches(file, this.head, 0).catch(() => false))
           if (racedRewrite) {
             this.clearCursor()
-            this.resetPending = true
             return { rows: [], reset: true }
           }
         }
         throw error
       }
-      // shortcut: observed JSONL has no commit marker; use complete nonempty reads until agy exposes one.
-      if (this.resetPending && this.remainder.length > 0) {
-        this.clearCursor()
-        return { rows: [], reset: true }
-      }
-      const replayReset = this.resetPending
-      if (rows.length > 0) this.resetPending = false
-      return { rows, reset: replayReset }
+      for (const row of rows)
+        this.snapshotStepIndices?.add(Number(row.step_index))
+      // shortcut: observed JSONL has no commit marker; only a nonempty newline-complete snapshot authorizes pruning.
+      const snapshotStepIndices =
+        this.remainder.length === 0 && this.snapshotStepIndices?.size
+          ? this.snapshotStepIndices
+          : undefined
+      if (snapshotStepIndices) this.snapshotStepIndices = undefined
+      return { rows, reset, snapshotStepIndices }
     } finally {
       await file.close()
     }
@@ -639,12 +647,11 @@ export async function readLastStepIndex(
 export class StepDedupe {
   private seen = new Map<number, string>()
 
-  prune(rows: readonly Record<string, unknown>[]) {
+  prune(stepIndices: ReadonlySet<number>) {
     // An empty read can be the O_TRUNC window, not evidence that delivered steps were deleted.
-    if (rows.length === 0) return
-    const keep = new Set(rows.map((r) => Number(r.step_index)))
+    if (stepIndices.size === 0) return
     for (const step of this.seen.keys())
-      if (!keep.has(step)) this.seen.delete(step)
+      if (!stepIndices.has(step)) this.seen.delete(step)
   }
 
   /** Whether this row is new or changed since its step was last seen. */

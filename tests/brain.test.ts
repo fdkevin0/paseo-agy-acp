@@ -2023,6 +2023,78 @@ test(
   },
 )
 
+test(
+  'cancel drains a complete rewritten prefix once even when the next record is partial',
+  { timeout: 5000 },
+  async () => {
+    const f = await fixture()
+    const events: ProviderEvent[] = []
+    let handle: BrainWatchHandle | undefined
+    let polls = 0
+    try {
+      const rows = [
+        { step_index: 0, type: 'USER_INPUT', content: 'work' },
+        {
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          status: 'RUNNING',
+          content: 'old',
+        },
+      ]
+      await f.put(child, rows)
+      handle = watchBrain(
+        f.root,
+        child,
+        'c',
+        (e) => events.push(e),
+        5,
+        undefined,
+        undefined,
+        () => {
+          polls++
+        },
+      )
+      await handle.ready
+      const file = await open(f.path(child), 'r+')
+      try {
+        await file.truncate(0)
+        const target = polls + 2
+        await until(() => polls >= target)
+        await file.write(
+          encode([
+            ...rows,
+            {
+              step_index: 2,
+              type: 'PLANNER_RESPONSE',
+              status: 'RUNNING',
+              content: 'NEW COMPLETE ROW',
+            },
+          ]) + '{"step_index":3',
+          0,
+        )
+        await handle.cancel()
+      } finally {
+        await file.close()
+      }
+      assert.deepEqual(
+        events.flatMap((e) =>
+          e.type === 'timeline.item' && e.item.type === 'assistant_message'
+            ? [e.item.text]
+            : [],
+        ),
+        ['old', 'NEW COMPLETE ROW'],
+      )
+      assert.deepEqual(
+        events.flatMap((e) => (e.type === 'session.turn' ? [e.state] : [])),
+        ['started', 'canceled'],
+      )
+    } finally {
+      handle?.()
+      await f.close()
+    }
+  },
+)
+
 test('a rewrite observed mid-O_TRUNC does not end an anchored turn', async () => {
   const f = await fixture()
   const abort = new AbortController()
