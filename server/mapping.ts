@@ -178,9 +178,11 @@ export function toolDetail(
     explicitRawName === undefined && Object.hasOwn(nativeToolKinds, legacyName)
       ? legacyName
       : rawName.toLowerCase()
-  const kind =
-    nativeToolKinds[name] ??
-    (explicitRawName === undefined ? tool.kind : undefined)
+  const kind = Object.hasOwn(nativeToolKinds, name)
+    ? nativeToolKinds[name]
+    : explicitRawName === undefined
+      ? tool.kind
+      : undefined
   if (isAskQuestionName(name)) {
     const questions = normalizeAskQuestionInput(input)
     if (questions.length > 0) {
@@ -771,24 +773,12 @@ export class Timeline {
         !isTerminalToolStatus(incomingStatus)
       const tool = {
         ...old,
+        // ACP v1 raw input/output null is equivalent to omission, not a clear.
         ...Object.fromEntries(
-          Object.entries(update).filter(
-            ([key, value]) =>
-              value != null ||
-              ((key === 'rawInput' || key === 'rawOutput') && value === null),
-          ),
+          Object.entries(update).filter(([, value]) => value != null),
         ),
         ...(preserveStatus ? { status: old!.status } : {}),
       } as ToolCall
-      // New content supersedes a running null placeholder, not an explicit result.
-      if (
-        old?.rawOutput === null &&
-        !isTerminalToolStatus(oldStatus) &&
-        update.rawOutput === undefined &&
-        update.content != null
-      ) {
-        delete tool.rawOutput
-      }
       setBounded(this.tools, update.toolCallId, tool, TOOL_SNAPSHOT_LIMIT)
       const base = {
         type: 'tool_call' as const,
