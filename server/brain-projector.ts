@@ -15,6 +15,8 @@ import {
   TranscriptReader,
   countRowMessages,
   isCompletePlannerResponse,
+  isStreamInterruption,
+  STREAM_RETRY_TIMEOUT_MS,
   isRestartNotice,
   readInboxState,
   readSubagents,
@@ -302,6 +304,7 @@ export class BrainTranscriptProjector {
         }
         return []
       case 'ERROR_MESSAGE':
+        if (isStreamInterruption(row)) return []
         this.pending = []
         this.lastErrorCallId = undefined
         this.background.clear()
@@ -461,6 +464,8 @@ export class BrainNode {
   /** Last step seen when a question was answered; agy's reply must come after it. */
   answeredQuestionStep = -1
   lastStep?: Record<string, unknown>
+  private retrySince?: number
+  private retryError?: string
   readonly nativeId: string
   readonly sessionId: string
   private onQuestionSettled?: (
@@ -499,6 +504,8 @@ export class BrainNode {
 
   /** Forget the wakeup phase: a new USER_INPUT, a transcript rewrite or (for hasActiveBackgroundWork) a runtime restart. */
   resetPhase() {
+    this.retrySince = undefined
+    this.retryError = undefined
     this.seenPlannerResponse = false
     this.foregroundIdleReached = false
     this.wokeUp = false
@@ -541,7 +548,10 @@ export class BrainNode {
   }
 
   /** Fold one transcript row into wakeup phase, message accounting, projection and the last step. */
-  ingest(row: Record<string, unknown>): ProviderTimelineItem[] {
+  ingest(
+    row: Record<string, unknown>,
+    observedAt = Date.now(),
+  ): ProviderTimelineItem[] {
     this.questionSettled = false
     this.abortedByDenial = false
     if (row.type === 'USER_INPUT' || isRestartNotice(row))
@@ -557,6 +567,22 @@ export class BrainNode {
       this.foregroundIdleReached
     )
       this.wokeUp = true
+    if (isStreamInterruption(row)) {
+      const createdAt = Date.parse(String(row.created_at ?? ''))
+      this.retrySince ??= Number.isFinite(createdAt)
+        ? Math.min(createdAt, observedAt)
+        : observedAt
+      this.retryError = stepErrorMessage(row)
+    } else if (
+      row.type === 'ERROR_MESSAGE' ||
+      isRestartNotice(row) ||
+      (row.type === 'PLANNER_RESPONSE' &&
+        (isCompletePlannerResponse(row) ||
+          (Array.isArray(row.tool_calls) && row.tool_calls.length > 0)))
+    ) {
+      this.retrySince = undefined
+      this.retryError = undefined
+    }
     this.consumedMessages += countRowMessages(row)
     const items = this.projector.project(row)
     if (row.type !== 'CHECKPOINT') this.lastStep = row
@@ -568,6 +594,24 @@ export class BrainNode {
     )
       this.foregroundIdleReached = true
     return items
+  }
+
+  retryPending(): boolean {
+    return this.retrySince !== undefined
+  }
+
+  failure(timeoutMs = STREAM_RETRY_TIMEOUT_MS): string | undefined {
+    if (
+      this.retrySince !== undefined &&
+      Date.now() - this.retrySince >= timeoutMs
+    )
+      return `${this.retryError} Retry did not recover within ${Math.round(timeoutMs / 1000)}s.`
+    if (
+      this.lastStep?.type === 'ERROR_MESSAGE' &&
+      !isStreamInterruption(this.lastStep)
+    )
+      return stepErrorMessage(this.lastStep)
+    return undefined
   }
 
   hasUnprocessedMessages(inbox: InboxState): boolean {
@@ -591,6 +635,7 @@ export class BrainNode {
 
   isSettled(inbox: InboxState): boolean {
     return (
+      !this.retryPending() &&
       !this.hasUnprocessedMessages(inbox) &&
       !this.projector.hasPending() &&
       !this.projector.hasBackground() &&
