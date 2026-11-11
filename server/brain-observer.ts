@@ -224,6 +224,8 @@ export class BrainTurnObservation {
         Boolean(this.bufferSnapshot),
       )
     // Completed checkpoints have immutable identities, even when their summaries are rewritten.
+    if (observed.snapshotStepIndices)
+      this.checkpoints.prune(observed.snapshotStepIndices)
     for (const row of observed.rows)
       if (
         row.type === 'CHECKPOINT' &&
