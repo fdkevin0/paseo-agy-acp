@@ -374,3 +374,42 @@ test('completion content does not override explicit null or existing structured 
     assert.deepEqual(completed.detail, unknownDetail(fixture.input, expected))
   }
 })
+
+test('native kind lookup ignores prototype keys and retains explicit identities', () => {
+  for (const title of ['constructor', '__proto__', 'toString', 'custom_read']) {
+    const rawInput = { path: '/example', offset: 7 }
+    const rawOutput = 'retained result'
+    assert.deepEqual(toolDetail({ title, kind: 'read', rawInput, rawOutput }), {
+      type: 'read',
+      filePath: '/example',
+      content: rawOutput,
+      offset: 7,
+      limit: undefined,
+    })
+    assert.deepEqual(
+      toolDetail({ name: title, title, kind: 'read', rawInput, rawOutput }),
+      unknownDetail(rawInput, rawOutput),
+    )
+    const timeline = new Timeline('prototype-key')
+    const item = timeline.update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'stable-call',
+      name: title,
+      title,
+      rawInput,
+      rawOutput,
+    })
+    assert.ok(item?.type === 'tool_call')
+    assert.equal(item.name, title)
+    assert.equal(item.callId, 'stable-call')
+    assert.deepEqual(item.detail, unknownDetail(rawInput, rawOutput))
+  }
+  assert.equal(
+    toolDetail({
+      name: 'read_file',
+      kind: 'other',
+      rawInput: { path: '/native' },
+    }).type,
+    'read',
+  )
+})
