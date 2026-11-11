@@ -562,6 +562,7 @@ export function promptUsage(
   options?: {
     model?: string
     preserveContext?: boolean
+    contextWindowMaxTokens?: number
     lastStep?: StepUsage
     carriedWakeup?: StepUsage
     wakeup?: StepUsage
@@ -598,12 +599,6 @@ export function promptUsage(
     options?.wakeup?.cachedReadTokens,
     options?.lastStep?.cachedReadTokens,
   )
-  const cacheWrite = field(
-    raw.cachedWriteTokens,
-    carried?.cachedWriteTokens,
-    options?.wakeup?.cachedWriteTokens,
-    options?.lastStep?.cachedWriteTokens,
-  )
   const output = field(
     raw.outputTokens,
     carried?.outputTokens,
@@ -617,16 +612,17 @@ export function promptUsage(
       step.cachedReadTokens +
       (step.cachedWriteTokens ?? 0) +
       step.outputTokens
-    : input + cacheRead + cacheWrite + output ||
-      (nonnegative(raw.totalTokens) ? raw.totalTokens : 0)
+    : undefined
   return {
     inputTokens: input,
     outputTokens: output,
     cachedInputTokens: cacheRead,
-    ...(!options?.preserveContext
+    ...(used !== undefined && used > 0 && !options?.preserveContext
       ? {
           contextWindowUsedTokens: used,
-          contextWindowMaxTokens: contextWindowForModel(options?.model),
+          contextWindowMaxTokens:
+            options?.contextWindowMaxTokens ??
+            contextWindowForModel(options?.model),
         }
       : {}),
   }

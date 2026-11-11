@@ -554,7 +554,7 @@ test('close removes only new unprompted session artifacts and retains imported s
   }
 })
 
-test('context fallback computes prompt usage and prompted sessions remain resumable', async () => {
+test('missing transcript leaves context unknown and prompted sessions remain resumable', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-context-'))
   const log = join(home, 'calls')
   const h = await harness({
@@ -584,8 +584,8 @@ test('context fallback computes prompt usage and prompted sessions remain resuma
     await h.wait((e) => e.type === 'session.turn' && e.state === 'completed')
     const usage = h.events.findLast((e) => e.type === 'session.usage')
     assert.ok(usage?.type === 'session.usage')
-    assert.equal(usage.usage.contextWindowUsedTokens, 19)
-    assert.equal(usage.usage.contextWindowMaxTokens, 256_000)
+    assert.equal(usage.usage.contextWindowUsedTokens, undefined)
+    assert.equal(usage.usage.contextWindowMaxTokens, undefined)
     await h.provider.send({
       type: 'session.close',
       requestId: 'close',

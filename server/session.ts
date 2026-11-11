@@ -44,6 +44,7 @@ import {
   readLastStepIndex,
   settleBrainTurn,
 } from './brain.ts'
+import { readLatestStepUsage } from './brain-io.ts'
 import { SubagentRegistry, isSubagentMessage } from './subagents.ts'
 import { dataDirectory, removeSessionArtifacts } from './preflight.ts'
 import { connectAcp } from './transport.ts'
@@ -57,6 +58,7 @@ import {
 } from './common.ts'
 import {
   configState,
+  addStepUsage,
   FULL_ACCESS_MODE_ID,
   Timeline,
   toolDetail,
@@ -246,6 +248,7 @@ export class SessionManager {
         session.state.turnToolCallIds = []
         await configureSession(session, input.config)
         await session.drain()
+        if (input.persistence) await session.restoreUsage()
         session.state.loading = false
         session.state.replay = true
         session.flushDeferredUsage()
@@ -431,6 +434,7 @@ async function createSession(
   })
   let notificationLane = Promise.resolve()
   let relaunching = Promise.resolve()
+  const nativeWindowSizes = new Map<string | undefined, number>()
   let usage: ProviderUsage = {}
   let deferredUsage = false
   let commandsReceived = false
@@ -548,6 +552,12 @@ async function createSession(
       if (state.wakeup.suppressEcho || state.suppressContinuationAcp) return
       const next = contextUsage(u)
       if (!next) return
+      setBounded(
+        nativeWindowSizes,
+        configState(state.metadata).model,
+        u.size,
+        100,
+      )
       if (!state.loading || state.replay) {
         if (state.turn) state.turnHadContextUsage = true
         publishUsage(next)
@@ -978,6 +988,32 @@ async function createSession(
       canLinkChild: subagents.canLinkChild,
       drain,
       waitForCommands,
+      get contextWindowMaxTokens() {
+        return nativeWindowSizes.get(configState(state.metadata).model)
+      },
+      publishStepContext(lastStep: StepUsage) {
+        const { contextWindowUsedTokens, contextWindowMaxTokens } = promptUsage(
+          null,
+          {
+            model: configState(state.metadata).model,
+            contextWindowMaxTokens: nativeWindowSizes.get(
+              configState(state.metadata).model,
+            ),
+            lastStep,
+          },
+        )
+        if (contextWindowUsedTokens !== undefined)
+          publishUsage({ contextWindowUsedTokens, contextWindowMaxTokens })
+      },
+      async restoreUsage() {
+        if (usage?.contextWindowUsedTokens !== undefined) return
+        const snapshot = await readLatestStepUsage(
+          brainRoot,
+          state.nativeId,
+        ).catch(() => undefined)
+        if (snapshot?.lastStepUsage)
+          this.publishStepContext(snapshot.lastStepUsage)
+      },
       async replayTools() {
         if (!state.replay) return
         const [inbox, subagentRecords, rows] = await Promise.all([
@@ -1346,12 +1382,14 @@ async function promptSession(
     turnId,
     state: 'started',
   })
+  const nativeId = session.state.nativeId
+  let minStepIndex: number | undefined
   try {
     const readStep = await readLastStepIndex(
       session.brainRoot,
       session.state.nativeId,
     ).catch(() => -1)
-    const minStepIndex = Math.max(session.state.lastKnownStepIndex, readStep)
+    minStepIndex = Math.max(session.state.lastKnownStepIndex, readStep)
     session.state.lastKnownStepIndex = minStepIndex
     turnAbort.signal.throwIfAborted()
     const result = await session.transport.rpc.prompt({
@@ -1487,24 +1525,52 @@ async function promptSession(
         await session.interrupt().catch(() => undefined)
       }
     }
+    await session.state.interrupting
+    await session.drain()
+    if (!lastStep || status === 'canceled' || turnAbort.signal.aborted) {
+      const snapshot = await readLatestStepUsage(
+        session.brainRoot,
+        nativeId,
+        minStepIndex,
+      ).catch(() => undefined)
+      if (snapshot) {
+        session.state.lastKnownStepIndex = Math.max(
+          session.state.lastKnownStepIndex,
+          snapshot.lastStepIndex,
+        )
+        lastStep = snapshot.lastStepUsage ?? lastStep
+      }
+    }
+    if (turnAbort.signal.aborted) {
+      if (
+        turnAbort.signal.reason instanceof Error &&
+        turnAbort.signal.reason.name === 'AbortError'
+      ) {
+        // Stall failures cancel the runtime for cleanup without changing their terminal status.
+        if (status !== 'failed') status = 'canceled'
+      } else turnAbort.signal.throwIfAborted()
+    }
+    const preserveContext = session.state.turnHadContextUsage && !turnWokeUp
     if (result.usage || turnWakeupUsage) {
       const carriedWakeup = result.usage
         ? session.state.wakeup.carriedUsage
         : undefined
-      session.state.wakeup.carriedUsage = turnWakeupUsage
+      session.state.wakeup.carriedUsage = result.usage
+        ? turnWakeupUsage
+        : addStepUsage(session.state.wakeup.carriedUsage, turnWakeupUsage!)
       session.publishUsage(
         promptUsage(result.usage, {
           model: configState(session.state.metadata).model,
-          preserveContext: session.state.turnHadContextUsage && !turnWokeUp,
+          contextWindowMaxTokens: session.contextWindowMaxTokens,
+          preserveContext,
           lastStep,
           carriedWakeup,
           wakeup: turnWakeupUsage,
         }),
       )
-    } else if (turnWokeUp) {
-      session.state.wakeup.carriedUsage = undefined
+    } else if (lastStep && !preserveContext) {
+      session.publishStepContext(lastStep)
     }
-    await session.state.interrupting
     session.terminalize(status, turnError)
     if (!session.state.silenced) {
       emit({
@@ -1518,11 +1584,26 @@ async function promptSession(
       })
     }
   } catch (error) {
-    await session.drain()
     const restartError = await session.state.interrupting?.then(
       () => undefined,
       (err: unknown) => err,
     )
+    await session.drain()
+    if (minStepIndex !== undefined) {
+      const snapshot = await readLatestStepUsage(
+        session.brainRoot,
+        nativeId,
+        minStepIndex,
+      ).catch(() => undefined)
+      if (snapshot) {
+        session.state.lastKnownStepIndex = Math.max(
+          session.state.lastKnownStepIndex,
+          snapshot.lastStepIndex,
+        )
+        if (snapshot.lastStepUsage && !session.state.turnHadContextUsage)
+          session.publishStepContext(snapshot.lastStepUsage)
+      }
+    }
     const turnError = restartError ?? error
     const status =
       !restartError &&
