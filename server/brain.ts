@@ -384,6 +384,7 @@ export async function settleBrainTurn(
         }
       }
     }
+    if (signal?.aborted) continue
     const failure = node.failure(stallTimeoutMs)
     if (failure)
       return {
@@ -445,6 +446,7 @@ export async function settleBrainTurn(
       new Set(),
       stallTimeoutMs,
     )
+    if (signal?.aborted) continue
     if (childStatus.error)
       return {
         ...finish('failed', childStatus.error),

@@ -114,18 +114,20 @@ export function stepErrorMessage(
   return fallback
 }
 
-/** Only this observed upstream warning is retryable; unknown errors remain failures. */
+// shortcut: Brain exposes no retry outcome; replace this exact observed warning match when upstream supplies one.
 export function isStreamInterruption(
   step: Record<string, unknown> | undefined,
 ): boolean {
   return (
     step?.type === 'ERROR_MESSAGE' &&
+    step.status === 'DONE' &&
     /^(?:Error: )?The stream was interrupted\. Please continue the task you were working on\.$/.test(
       stepErrorMessage(step),
     )
   )
 }
 
+// Bound warnings without a recovery event; this is a local policy, not an upstream retry deadline.
 export const STREAM_RETRY_TIMEOUT_MS = 120_000
 
 export function extractStepUsage(
