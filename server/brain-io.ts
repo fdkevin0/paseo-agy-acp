@@ -658,6 +658,14 @@ export class StepDedupe {
   /** Whether this row is new or changed since its step was last seen. */
   fresh(row: Record<string, unknown>): boolean {
     const step = Number(row.step_index)
+    // A completed checkpoint's summary/status revisions are not another completion.
+    if (row.type === 'CHECKPOINT') {
+      if (this.seen.get(step) === 'checkpoint:completed') return false
+      if (row.status === 'DONE') {
+        this.seen.set(step, 'checkpoint:completed')
+        return true
+      }
+    }
     // Store a digest, not the payload: long-lived watchers would otherwise retain every step's full text.
     const signature = createHash('sha1')
       .update(
