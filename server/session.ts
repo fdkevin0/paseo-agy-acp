@@ -649,9 +649,7 @@ async function createSession(
                     rawOutput: false,
                     content: false,
                   })
-            if (u.rawOutput !== undefined)
-              result.rawOutput =
-                item.status !== 'running' || u.rawOutput !== null
+            if (u.rawOutput != null) result.rawOutput = true
             if (u.content != null)
               result.content = item.status !== 'running' || u.content.length > 0
             acpToolResults.set(item.callId, result)
