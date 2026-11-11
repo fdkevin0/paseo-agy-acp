@@ -2592,7 +2592,7 @@ test('ask_question results stay attributed by step next to sibling tool calls', 
         { id: 'cmd', name: 'run_command', args: { CommandLine: 'echo hi' } },
       ],
     },
-    { step_index: 2, type: 'CHECKPOINT' },
+    { step_index: 2, type: 'CHECKPOINT', status: 'DONE' },
     { step_index: 3, type: 'GENERIC', status: 'DONE', content: 'User chose A' },
     { step_index: 4, type: 'GENERIC', status: 'DONE', content: 'hi' },
   ].flatMap((row) => p3.project(row))
@@ -3503,5 +3503,288 @@ test('cancel wins after multiple exhausted warnings are ingested', async () => {
     assert.equal(result.error, undefined)
   } finally {
     await f.close()
+  }
+})
+
+async function checkpointFixture(): Promise<Row> {
+  return JSON.parse(
+    await readFile(
+      new URL('./fixtures/checkpoint.sanitized.jsonl', import.meta.url),
+      'utf8',
+    ),
+  )
+}
+
+test('completed checkpoint uses native compaction without guessing trigger or token counts and keeps tool offsets', async () => {
+  const checkpoint = await checkpointFixture()
+  const projector = new BrainTranscriptProjector('p')
+  projector.project({
+    step_index: 92,
+    type: 'PLANNER_RESPONSE',
+    tool_calls: [
+      { id: 'a', name: 'run_command', args: {} },
+      { id: 'b', name: 'view_file', args: {} },
+    ],
+  })
+  assert.deepEqual(projector.project(checkpoint), [
+    { type: 'compaction', id: 'p:step:93:compaction', status: 'completed' },
+  ])
+  const a = projector.project({
+    step_index: 94,
+    type: 'GENERIC',
+    status: 'DONE',
+    content: 'first',
+  })[0]
+  const b = projector.project({
+    step_index: 95,
+    type: 'GENERIC',
+    status: 'DONE',
+    content: 'second',
+  })[0]
+  assert.ok(
+    a.type === 'tool_call' && a.callId === 'a' && a.status === 'completed',
+  )
+  assert.ok(
+    b.type === 'tool_call' && b.callId === 'b' && b.status === 'completed',
+  )
+  for (const status of [undefined, 'RUNNING', 'CANCELED', 'ERROR']) {
+    assert.deepEqual(
+      new BrainTranscriptProjector('p').project({ ...checkpoint, status }),
+      [],
+    )
+  }
+})
+
+test('foreground and wakeup project checkpoints without using checkpoint tokens as model usage', async () => {
+  for (const wakeup of [false, true]) {
+    const f = await fixture()
+    try {
+      const checkpoint = { ...(await checkpointFixture()), step_index: 4 }
+      await f.put(parent, [
+        { step_index: 1, type: 'USER_INPUT', content: 'work' },
+        { ...done(2, 'waiting'), input_tokens: 100, output_tokens: 5 },
+        ...(wakeup ? [message(3, 'system', 'continue')] : []),
+        checkpoint,
+        { ...done(5), input_tokens: 10, output_tokens: 2 },
+      ])
+      const items: ProviderTimelineItem[] = []
+      const result = await alive(
+        settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+          pollIntervalMs: 5,
+        }),
+      )
+      assert.equal(result.status, 'completed')
+      assert.deepEqual(
+        items.filter((item) => item.type === 'compaction'),
+        [
+          {
+            type: 'compaction',
+            id: 'p:step:4:compaction',
+            status: 'completed',
+          },
+        ],
+      )
+      assert.equal(result.lastStepUsage?.inputTokens, 10)
+      assert.equal(result.lastStepUsage?.outputTokens, 2)
+      assert.equal(result.wakeupUsage?.inputTokens, wakeup ? 10 : undefined)
+      assert.equal(result.wakeupUsage?.outputTokens, wakeup ? 2 : undefined)
+    } finally {
+      await f.close()
+    }
+  }
+})
+
+test('a command-only checkpoint is visible without inventing a model response or usage', async () => {
+  const f = await fixture()
+  try {
+    await f.put(parent, [await checkpointFixture()])
+    const items: ProviderTimelineItem[] = []
+    const result = await alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+        minStepIndex: 92,
+      }),
+    )
+    assert.equal(result.status, 'completed')
+    assert.equal(result.lastStepUsage, undefined)
+    assert.deepEqual(items, [
+      { type: 'compaction', id: 'p:step:93:compaction', status: 'completed' },
+    ])
+    const old: ProviderTimelineItem[] = []
+    await alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => old.push(item), {
+        minStepIndex: 93,
+      }),
+    )
+    assert.deepEqual(old, [])
+  } finally {
+    await f.close()
+  }
+})
+
+test('child compaction stays on child timeline, survives cancellation drain, and is deduplicated across an empty rewrite', async () => {
+  const f = await fixture()
+  let handle: BrainWatchHandle | undefined
+  try {
+    const checkpoint = { ...(await checkpointFixture()), step_index: 2 }
+    const rows = [
+      message(0, parent, 'work'),
+      { step_index: 1, type: 'PLANNER_RESPONSE', thinking: 'working' },
+      checkpoint,
+    ]
+    await f.put(child, rows)
+    const events: ProviderEvent[] = []
+    handle = watchBrain(
+      f.root,
+      child,
+      'child',
+      (event) => events.push(event),
+      5,
+    )
+    await handle.ready
+    assert.equal(handle.isRunning(), true)
+    const compactions = () =>
+      events.flatMap((event) =>
+        event.type === 'timeline.item' && event.item.type === 'compaction'
+          ? [event]
+          : [],
+      )
+    assert.equal(compactions().length, 1)
+    assert.equal(compactions()[0].sessionId, 'child')
+    await f.rewrite(
+      child,
+      [...rows, { step_index: 3, type: 'CHECKPOINT', status: 'RUNNING' }],
+      async () => {
+        await delay(50)
+      },
+    )
+    await delay(25)
+    await handle.cancel()
+    assert.equal(compactions().length, 1)
+    assert.ok(
+      events.some(
+        (event) => event.type === 'session.turn' && event.state === 'canceled',
+      ),
+    )
+    assert.equal(
+      events.some(
+        (event) => event.type === 'session.turn' && event.state === 'completed',
+      ),
+      false,
+    )
+    assert.deepEqual(compactions()[0].item, {
+      type: 'compaction',
+      id: 'child:step:2:compaction',
+      status: 'completed',
+    })
+  } finally {
+    handle?.()
+    await f.close()
+  }
+})
+
+test('a late child checkpoint keeps the completed child terminal and retains native ownership', async () => {
+  const f = await fixture()
+  let handle: BrainWatchHandle | undefined
+  try {
+    await f.put(child, [message(0, parent, 'work'), done(1)])
+    const events: ProviderEvent[] = []
+    handle = watchBrain(
+      f.root,
+      child,
+      'child',
+      (event) => events.push(event),
+      5,
+    )
+    await handle.ready
+    const turnsBefore = events.filter(
+      (event) => event.type === 'session.turn',
+    ).length
+    await appendFile(
+      f.path(child),
+      encode([{ ...(await checkpointFixture()), step_index: 2 }]),
+    )
+    await until(() =>
+      events.some(
+        (event) =>
+          event.type === 'timeline.item' && event.item.type === 'compaction',
+      ),
+    )
+    assert.equal(handle.isRunning(), false)
+    assert.equal(
+      events.filter((event) => event.type === 'session.turn').length,
+      turnsBefore,
+    )
+    const projected = events.find(
+      (event) =>
+        event.type === 'timeline.item' && event.item.type === 'compaction',
+    )
+    assert.ok(projected?.type === 'timeline.item')
+    assert.equal(projected.sessionId, 'child')
+    assert.equal(projected.item.id, 'child:step:2:compaction')
+  } finally {
+    handle?.()
+    await f.close()
+  }
+})
+
+test('a complete checkpoint before a partial trailing row is delivered before cancellation', async () => {
+  const f = await fixture()
+  let handle: BrainWatchHandle | undefined
+  try {
+    await f.put(child, [
+      message(0, parent, 'work'),
+      { ...(await checkpointFixture()), step_index: 1 },
+    ])
+    await appendFile(f.path(child), '{"step_index":2,"type":"PLANNER_RESPONSE"')
+    const events: ProviderEvent[] = []
+    handle = watchBrain(
+      f.root,
+      child,
+      'child',
+      (event) => events.push(event),
+      5,
+    )
+    await handle.ready
+    await handle.cancel()
+    const projected = events.flatMap((event) =>
+      event.type === 'timeline.item' && event.item.type === 'compaction'
+        ? [event]
+        : [],
+    )
+    assert.equal(
+      projected.length,
+      1,
+      'a partial tail must not discard the complete checkpoint prefix',
+    )
+    assert.equal(projected[0].sessionId, 'child')
+    assert.ok(
+      events.some(
+        (event) => event.type === 'session.turn' && event.state === 'canceled',
+      ),
+    )
+  } finally {
+    handle?.()
+    await f.close()
+  }
+})
+
+test('a completed checkpoint retains background and daemon task tracking', async () => {
+  const checkpoint = await checkpointFixture()
+  for (const IsDaemon of [false, true]) {
+    const projector = new BrainTranscriptProjector('p')
+    projector.project({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      tool_calls: [{ name: 'run_command', args: { IsDaemon } }],
+    })
+    projector.project({
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: 'Tool is running as a background task with task id: tracked',
+    })
+    projector.project({ ...checkpoint, step_index: 3 })
+    assert.equal(projector.hasBackground(), !IsDaemon)
+    assert.equal(projector.hasDaemons(), IsDaemon)
   }
 })

@@ -1159,3 +1159,118 @@ test(
     }
   },
 )
+
+test('native compaction has stable live/history identity, command-only visibility and no invented canceled completion or usage', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-compaction-session-'))
+  const events: ProviderEvent[] = []
+  const m = new SessionManager({
+    launch: {
+      command: process.execPath,
+      args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+      env: {
+        HOME: home,
+        PATH: process.env.PATH ?? '',
+        AGY_TEST_CHECKPOINT_HISTORY: '1',
+      },
+    },
+    usage: new AgyUsageSource(),
+    capabilities: ['prompt.message', 'prompt.command'],
+    emit: (event) => events.push(structuredClone(event)),
+  })
+  const config = {
+    cwd: home,
+    env: {},
+    mcpServers: {},
+    settings: {},
+    persist: true,
+  }
+  const compactions = () =>
+    events.flatMap((event) =>
+      event.type === 'timeline.item' && event.item.type === 'compaction'
+        ? [event]
+        : [],
+    )
+  try {
+    await m.open({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'skip',
+      config,
+    })
+    const opened = events.find((event) => event.type === 'session.opened')
+    assert.ok(opened?.type === 'session.opened')
+    const persistence = opened.persistence!
+    for (const text of ['checkpoint-turn', '/compact', 'checkpoint-cancel']) {
+      const before = compactions().length
+      await m.handle({
+        type: 'session.prompt',
+        sessionId: 's',
+        prompt: {
+          clientMessageId: text,
+          delivery: 'auto',
+          input:
+            text === '/compact'
+              ? { type: 'command', name: 'compact', arguments: '' }
+              : { type: 'message', content: [{ type: 'text', text }] },
+        },
+      })
+      assert.equal(
+        compactions().length - before,
+        text === 'checkpoint-cancel' ? 0 : 1,
+      )
+      const usage = events.findLast((event) => event.type === 'session.usage')
+      assert.ok(usage?.type === 'session.usage')
+      assert.equal(usage.usage.contextWindowUsedTokens, 12)
+      assert.equal(usage.usage.inputTokens, 500)
+      assert.equal(usage.usage.outputTokens, 50)
+    }
+    const liveIds = compactions().map((event) => event.item.id)
+    assert.equal(liveIds.length, 2)
+    assert.ok(
+      events.some(
+        (event) => event.type === 'session.turn' && event.state === 'canceled',
+      ),
+    )
+    await m.handle({
+      type: 'session.close',
+      requestId: 'close',
+      sessionId: 's',
+    })
+    for (const history of ['replay', 'skip', 'replay'] as const) {
+      events.length = 0
+      await m.open({
+        type: 'session.open',
+        requestId: `open:${history}`,
+        sessionId: 's',
+        history,
+        persistence,
+        config,
+      })
+      assert.deepEqual(
+        compactions().map((event) => event.item.id),
+        history === 'skip' ? [] : liveIds,
+      )
+      for (const event of compactions()) {
+        assert.equal(event.sessionId, 's')
+        assert.equal(event.timestamp, '2026-01-01T00:00:00Z')
+        assert.deepEqual(event.item, {
+          type: 'compaction',
+          id: event.item.id,
+          status: 'completed',
+        })
+      }
+      const usage = events.findLast((event) => event.type === 'session.usage')
+      assert.ok(usage?.type === 'session.usage')
+      assert.equal(usage.usage.contextWindowUsedTokens, 12)
+      await m.handle({
+        type: 'session.close',
+        requestId: `close:${history}`,
+        sessionId: 's',
+      })
+    }
+  } finally {
+    await m.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})

@@ -26,9 +26,12 @@ import {
   type SubagentRecord,
 } from './brain-io.ts'
 
+export type NativeToolIdentitySource = 'tool_id' | 'step_metadata'
+
 export type PendingTool = {
   id: string
   callId: string
+  nativeIdentitySource?: NativeToolIdentitySource
   name: string
   args: Record<string, unknown>
   rawInput: unknown
@@ -70,6 +73,10 @@ function terminalToolStatus(
 /** Project transcript_full.jsonl steps and correlate tools with structured Brain metadata. */
 export class BrainTranscriptProjector {
   private pending: PendingTool[] = []
+  private nativeIdentities = new WeakMap<
+    ProviderTimelineItem,
+    NativeToolIdentitySource
+  >()
   private background = new Map<string, PendingTool>()
   private daemons = new Map<string, number>()
   private touchedSubagents = new Set<string>()
@@ -92,6 +99,12 @@ export class BrainTranscriptProjector {
   ) {
     this.sessionId = sessionId
     this.onQuestionSettledByGeneric = onQuestionSettledByGeneric
+  }
+
+  nativeToolIdentitySource(
+    item: ProviderTimelineItem,
+  ): NativeToolIdentitySource | undefined {
+    return this.nativeIdentities.get(item)
   }
 
   bindToolCallIds(ids: readonly string[]) {
@@ -208,13 +221,17 @@ export class BrainTranscriptProjector {
     ) {
       this.touchedSubagents.add(base.detail.childSessionId)
     }
-    return status === 'failed'
-      ? {
-          ...base,
-          status: 'failed',
-          error: { message: text || 'Tool execution failed' },
-        }
-      : { ...base, status, error: null }
+    const item: ProviderTimelineItem =
+      status === 'failed'
+        ? {
+            ...base,
+            status: 'failed',
+            error: { message: text || 'Tool execution failed' },
+          }
+        : { ...base, status, error: null }
+    if (pending.nativeIdentitySource)
+      this.nativeIdentities.set(item, pending.nativeIdentitySource)
+    return item
   }
 
   project(value: unknown): ProviderTimelineItem[] {
@@ -306,7 +323,15 @@ export class BrainTranscriptProjector {
         for (const p of this.pending) {
           if (p.stepIndex >= stepIndex) p.stepIndex++
         }
-        return []
+        return row.status === 'DONE'
+          ? [
+              {
+                type: 'compaction',
+                id: `${id}:compaction`,
+                status: 'completed',
+              },
+            ]
+          : []
       case 'ERROR_MESSAGE':
         if (isRetryWarning(row)) return []
         this.pending = []
@@ -395,15 +420,21 @@ export class BrainTranscriptProjector {
             const args = record(tool.args)
             const genericStep = stepIndex + index + 1
             const acpId = this.acpToolCallIds[this.toolIndex++]
+            const toolId =
+              typeof tool.id === 'string' && tool.id ? tool.id : undefined
+            const stepId = this.stepCallIds.get(genericStep)
             const callId =
-              (typeof tool.id === 'string' && tool.id ? tool.id : undefined) ??
-              this.stepCallIds.get(genericStep) ??
-              acpId ??
-              `tool-${stepIndex}-${index}`
+              toolId ?? stepId ?? acpId ?? `tool-${stepIndex}-${index}`
+            const nativeIdentitySource = toolId
+              ? 'tool_id'
+              : stepId
+                ? 'step_metadata'
+                : undefined
             const cleanName = cleanToolName(String(tool.name ?? 'Tool'))
             const pending: PendingTool = {
               id: `${this.sessionId}:tool:${callId}`,
               callId,
+              nativeIdentitySource,
               name: cleanName,
               args,
               rawInput: tool.args,
@@ -416,7 +447,7 @@ export class BrainTranscriptProjector {
                 : {}),
             }
             this.pending.push(pending)
-            items.push({
+            const item: ProviderTimelineItem = {
               type: 'tool_call',
               id: pending.id,
               callId: pending.callId,
@@ -428,7 +459,10 @@ export class BrainTranscriptProjector {
               }),
               status: 'running',
               error: null,
-            })
+            }
+            if (pending.nativeIdentitySource)
+              this.nativeIdentities.set(item, pending.nativeIdentitySource)
+            items.push(item)
           })
         return items
       }

@@ -682,6 +682,9 @@ export class Timeline {
     if (item.status === 'running') this.running.set(item.id, item)
     else this.running.delete(item.id)
   }
+  toolCallSnapshot(callId: string): Readonly<ToolCall> | undefined {
+    return this.tools.get(callId)
+  }
   isRunning(id: string): boolean {
     return this.running.has(id)
   }
