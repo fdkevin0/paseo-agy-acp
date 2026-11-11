@@ -118,7 +118,13 @@ export function extractStepUsage(
   if (row.type !== 'PLANNER_RESPONSE') return undefined
   const input = nonnegative(row.input_tokens) ? row.input_tokens : undefined
   const output = nonnegative(row.output_tokens) ? row.output_tokens : undefined
-  if (input === undefined && output === undefined) return undefined
+  if (
+    input === undefined &&
+    output === undefined &&
+    !nonnegative(row.cache_read_tokens) &&
+    !nonnegative(row.cache_write_tokens)
+  )
+    return undefined
   const cacheWrite = nonnegative(row.cache_write_tokens)
     ? row.cache_write_tokens
     : undefined
@@ -591,5 +597,24 @@ export class StepDedupe {
     if (this.seen.get(step) === signature) return false
     this.seen.set(step, signature)
     return true
+  }
+}
+
+/** Latest reliable model snapshot after the caller's turn boundary, never cumulative usage. */
+export async function readLatestStepUsage(
+  root: string,
+  nativeId: string,
+  minStepIndex = -1,
+): Promise<StepUsage | undefined> {
+  const rows = await readTranscriptRows(root, nativeId)
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i]
+    if (
+      !Number.isInteger(row.step_index) ||
+      Number(row.step_index) <= minStepIndex
+    )
+      continue
+    const usage = extractStepUsage(row)
+    if (usage) return usage
   }
 }

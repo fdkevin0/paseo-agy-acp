@@ -110,8 +110,6 @@ test('usage rejects invalid context, ignores foreign currency, and computes last
       inputTokens: 4,
       outputTokens: 2,
       cachedInputTokens: 3,
-      contextWindowUsedTokens: 9,
-      contextWindowMaxTokens: 256_000,
     },
   )
   const usage = {
@@ -142,9 +140,9 @@ test('usage rejects invalid context, ignores foreign currency, and computes last
   assert.equal(
     promptUsage({ inputTokens: -1, outputTokens: NaN, totalTokens: 30 })
       .contextWindowUsedTokens,
-    30,
+    undefined,
   )
-  assert.equal(promptUsage(usage).contextWindowUsedTokens, 189)
+  assert.equal(promptUsage(usage).contextWindowUsedTokens, undefined)
   assert.equal(
     promptUsage(usage, {
       lastStep: {

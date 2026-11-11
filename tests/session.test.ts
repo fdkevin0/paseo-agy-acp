@@ -841,3 +841,98 @@ new AgentSideConnection((client) => ({
     await rm(home, { recursive: true, force: true })
   }
 })
+
+test('context uses latest turn snapshot on cancel/error/restore and preserves native updates', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-context-snapshot-'))
+  const events: ProviderEvent[] = []
+  const m = new SessionManager({
+    launch: {
+      command: process.execPath,
+      args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+      env: { HOME: home, PATH: process.env.PATH ?? '' },
+    },
+    usage: new AgyUsageSource(),
+    capabilities: ['prompt.message'],
+    emit: (e) => events.push(structuredClone(e)),
+  })
+  const config = {
+    cwd: home,
+    env: {},
+    mcpServers: {},
+    settings: {},
+    persist: true,
+  }
+  try {
+    await m.open({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'skip',
+      config,
+    })
+    const openedEvent = events.find((e) => e.type === 'session.opened')
+    assert.ok(openedEvent?.type === 'session.opened')
+    const persistence = openedEvent.persistence!
+    let promptIndex = 0
+    for (const text of [
+      'usage-cancel',
+      'usage-empty',
+      'usage-error',
+      'usage-native',
+      'usage-empty',
+    ]) {
+      events.length = 0
+      await m.handle({
+        type: 'session.prompt',
+        sessionId: 's',
+        prompt: {
+          clientMessageId: `${text}:${++promptIndex}`,
+          delivery: 'auto',
+          input: { type: 'message', content: [{ type: 'text', text }] },
+        },
+      })
+      const usage = events.findLast((e) => e.type === 'session.usage')
+      assert.ok(usage?.type === 'session.usage')
+      assert.equal(
+        usage.usage.contextWindowUsedTokens,
+        text === 'usage-native' || usage.usage.contextWindowMaxTokens === 128000
+          ? 1234
+          : 70463,
+      )
+      assert.equal(usage.usage.inputTokens, 600000)
+      assert.equal(usage.usage.outputTokens, 4405)
+      assert.ok(
+        events.some(
+          (e) =>
+            e.type === 'session.turn' &&
+            e.state ===
+              (text === 'usage-cancel'
+                ? 'canceled'
+                : text === 'usage-error'
+                  ? 'failed'
+                  : 'completed'),
+        ),
+      )
+    }
+    await m.handle({
+      type: 'session.close',
+      requestId: 'close',
+      sessionId: 's',
+    })
+    events.length = 0
+    await m.open({
+      type: 'session.open',
+      requestId: 'restore',
+      sessionId: 'restored',
+      history: 'skip',
+      config,
+      persistence,
+    })
+    const restored = events.findLast((e) => e.type === 'session.usage')
+    assert.ok(restored?.type === 'session.usage')
+    assert.equal(restored.usage.contextWindowUsedTokens, 70463)
+  } finally {
+    await m.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
