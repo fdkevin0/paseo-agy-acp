@@ -842,6 +842,143 @@ new AgentSideConnection((client) => ({
   }
 })
 
+test(
+  'retry exhaustion with retained background work stops its owner instead of leaking the task',
+  { timeout: 5000 },
+  async () => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-retry-owner-'))
+    const events: ProviderEvent[] = []
+    const m = new SessionManager({
+      launch: {
+        command: process.execPath,
+        args: [fileURLToPath(new URL('./interrupt-acp.ts', import.meta.url))],
+        env: { HOME: home, PATH: process.env.PATH ?? '' },
+      },
+      usage: new AgyUsageSource(),
+      capabilities: ['prompt.message'],
+      emit: (event) => events.push(event),
+      stallTimeoutMs: 30,
+      retryTimeoutMs: 50,
+    })
+    try {
+      await m.open({
+        type: 'session.open',
+        requestId: 'open',
+        sessionId: 's',
+        history: 'skip',
+        config: {
+          cwd: home,
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: true,
+        },
+      })
+      await m.handle({
+        type: 'session.prompt',
+        sessionId: 's',
+        prompt: {
+          clientMessageId: 'retry-background',
+          delivery: 'auto',
+          input: {
+            type: 'message',
+            content: [{ type: 'text', text: 'retry-background' }],
+          },
+        },
+      })
+      const failed = events.find(
+        (event) => event.type === 'session.turn' && event.state === 'failed',
+      )
+      assert.ok(failed?.type === 'session.turn' && failed.state === 'failed')
+      assert.match(failed.error?.message ?? '', /attempt 8.*synthetic timeout/)
+      await delay(750)
+      const log = (await readFile(join(home, 'runtime.jsonl'), 'utf8'))
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line))
+      assert.equal(
+        log.filter((row) => row.event === 'start').length,
+        2,
+        'active background work requires stopping and relaunching its native owner',
+      )
+      assert.ok(log.some((row) => row.event === 'cancel'))
+      assert.equal(
+        log.some((row) => row.event === 'leaked-background'),
+        false,
+      )
+    } finally {
+      await m.close()
+      await rm(home, { recursive: true, force: true })
+    }
+  },
+)
+
+test(
+  'retry timeout cannot interrupt an active foreground RPC or leak its old deadline into the next turn',
+  { timeout: 5000 },
+  async () => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-retry-foreground-'))
+    const events: ProviderEvent[] = []
+    const m = new SessionManager({
+      launch: {
+        command: process.execPath,
+        args: [fileURLToPath(new URL('./interrupt-acp.ts', import.meta.url))],
+        env: { HOME: home, PATH: process.env.PATH ?? '' },
+      },
+      usage: new AgyUsageSource(),
+      capabilities: ['prompt.message'],
+      emit: (event) => events.push(event),
+      stallTimeoutMs: 10,
+      retryTimeoutMs: 20,
+    })
+    try {
+      await m.open({
+        type: 'session.open',
+        requestId: 'open',
+        sessionId: 's',
+        history: 'skip',
+        config: {
+          cwd: home,
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: true,
+        },
+      })
+      for (const text of ['retry-foreground-active', 'normal next turn']) {
+        await m.handle({
+          type: 'session.prompt',
+          sessionId: 's',
+          prompt: {
+            clientMessageId: text,
+            delivery: 'auto',
+            input: { type: 'message', content: [{ type: 'text', text }] },
+          },
+        })
+      }
+      const turns = events.flatMap((event) =>
+        event.type === 'session.turn' && event.state !== 'started'
+          ? [event.state]
+          : [],
+      )
+      assert.deepEqual(turns, ['completed', 'completed'])
+      const log = (await readFile(join(home, 'runtime.jsonl'), 'utf8'))
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line))
+      assert.ok(log.some((row) => row.event === 'held-foreground'))
+      assert.equal(
+        log.some((row) => row.event === 'cancel'),
+        false,
+      )
+      assert.equal(log.filter((row) => row.event === 'start').length, 1)
+    } finally {
+      await m.close()
+      await rm(home, { recursive: true, force: true })
+    }
+  },
+)
+
 test('context uses latest turn snapshot on cancel/error/restore and preserves native updates', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-context-snapshot-'))
   const events: ProviderEvent[] = []

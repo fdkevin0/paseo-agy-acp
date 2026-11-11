@@ -112,6 +112,29 @@ export function stepErrorMessage(
   return fallback
 }
 
+// shortcut: Brain has no retry outcome; replace these observed warning forms when upstream supplies one.
+export function isRetryWarning(
+  step: Record<string, unknown> | undefined,
+): boolean {
+  if (
+    step?.type !== 'ERROR_MESSAGE' ||
+    step.status !== 'DONE' ||
+    (step.source !== undefined && step.source !== 'SYSTEM')
+  )
+    return false
+  const message = stepErrorMessage(step).replace(/^Error: /, '')
+  return (
+    message ===
+      'The stream was interrupted. Please continue the task you were working on.' ||
+    /^API error \(attempt [1-9]\d*\): [\s\S]+$/.test(message) ||
+    message ===
+      'model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again'
+  )
+}
+
+// Brain has no exhaustion event: allow the normal silent model window after the latest retry warning.
+export const RETRY_IDLE_TIMEOUT_MS = 15 * 60_000
+
 export function extractStepUsage(
   row: Record<string, unknown>,
 ): StepUsage | undefined {
