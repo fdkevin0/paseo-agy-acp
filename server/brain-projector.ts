@@ -306,7 +306,15 @@ export class BrainTranscriptProjector {
         for (const p of this.pending) {
           if (p.stepIndex >= stepIndex) p.stepIndex++
         }
-        return []
+        return row.status === 'DONE'
+          ? [
+              {
+                type: 'compaction',
+                id: `${id}:compaction`,
+                status: 'completed',
+              },
+            ]
+          : []
       case 'ERROR_MESSAGE':
         if (isRetryWarning(row)) return []
         this.pending = []

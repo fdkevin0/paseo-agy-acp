@@ -1036,9 +1036,16 @@ async function createSession(
           )
             state.lastKnownStepIndex = stepIndex
           for (const item of projector.project(row)) {
-            if (item.type !== 'tool_call' || item.status === 'running') continue
+            if (
+              item.type !== 'compaction' &&
+              (item.type !== 'tool_call' || item.status === 'running')
+            )
+              continue
             await subagents.waitCurrentReady()
-            emitItem(item)
+            emitItem(
+              item,
+              typeof row.created_at === 'string' ? row.created_at : undefined,
+            )
           }
         }
         // A child opened by the last replayed tool must read its history before a historical kill cancels it.

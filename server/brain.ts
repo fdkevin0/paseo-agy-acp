@@ -343,6 +343,20 @@ export async function settleBrainTurn(
         }
       }
       if (start < 0) {
+        // Native commands can persist a checkpoint without a USER_INPUT anchor.
+        for (const row of rows) {
+          if (
+            row.type !== 'CHECKPOINT' ||
+            Number(row.step_index) <= minStepIndex ||
+            !dedupe.fresh(row)
+          )
+            continue
+          for (const item of node.projector.project(row))
+            onItem(
+              item,
+              typeof row.created_at === 'string' ? row.created_at : undefined,
+            )
+        }
         if (!anchored && !withinGrace()) return { status: 'completed' }
         // A rewrite that dropped this turn altogether is bounded like any other stall.
         if (anchored && Date.now() - lastActivity >= stallTimeoutMs)
@@ -376,7 +390,12 @@ export async function settleBrainTurn(
           typeof row.created_at === 'string' ? row.created_at : undefined
         for (const item of items) {
           if (item.type === 'user_message') continue
-          if (node.wokeUp || emitForeground || item.type === 'error') {
+          if (
+            node.wokeUp ||
+            emitForeground ||
+            item.type === 'error' ||
+            item.type === 'compaction'
+          ) {
             onItem(item, timestamp)
           } else if (
             item.type === 'tool_call' &&

@@ -1,6 +1,6 @@
 import { AgentSideConnection, ndJsonStream } from '@agentclientprotocol/sdk'
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { WritableStream } from 'node:stream/web'
 import { Readable, Writable } from 'node:stream'
@@ -246,6 +246,55 @@ new AgentSideConnection((client) => {
     async prompt({ sessionId, prompt }) {
       const text = prompt.map((c) => (c.type === 'text' ? c.text : '')).join('')
       if (process.env.AGY_TEST_LOG_ELICITATION_CAP) log(`prompt:${text}`)
+      if (
+        text === 'checkpoint-turn' ||
+        text === '/compact' ||
+        text === 'checkpoint-cancel'
+      ) {
+        const dir = join(
+          process.env.HOME!,
+          '.gemini/antigravity-cli/brain',
+          sessionId,
+          '.system_generated/logs',
+        )
+        mkdirSync(dir, { recursive: true })
+        const step = ++wokenStepBase * 10
+        const checkpoint = JSON.parse(
+          readFileSync(
+            new URL('./fixtures/checkpoint.sanitized.jsonl', import.meta.url),
+            'utf8',
+          ),
+        )
+        const rows: object[] =
+          text === '/compact'
+            ? []
+            : [{ step_index: step, type: 'USER_INPUT', content: text }]
+        rows.push({
+          ...checkpoint,
+          step_index: step + 1,
+          ...(text === 'checkpoint-cancel' ? { status: 'RUNNING' } : {}),
+        })
+        if (text === 'checkpoint-turn')
+          rows.push({
+            step_index: step + 2,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'After checkpoint',
+            input_tokens: 10,
+            output_tokens: 2,
+          })
+        appendFileSync(
+          join(dir, 'transcript_full.jsonl'),
+          rows.map((row) => JSON.stringify(row) + '\n').join(''),
+        )
+        return {
+          stopReason:
+            text === 'checkpoint-cancel'
+              ? ('cancelled' as const)
+              : ('end_turn' as const),
+          usage: { inputTokens: 500, outputTokens: 50, totalTokens: 550 },
+        }
+      }
       if (text.startsWith('usage-')) {
         const dir = join(
           process.env.HOME!,
