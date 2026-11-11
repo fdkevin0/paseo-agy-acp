@@ -44,6 +44,7 @@ import {
   readLastStepIndex,
   settleBrainTurn,
 } from './brain.ts'
+import { readLatestStepUsage } from './brain-io.ts'
 import { SubagentRegistry, isSubagentMessage } from './subagents.ts'
 import { dataDirectory, removeSessionArtifacts } from './preflight.ts'
 import { connectAcp } from './transport.ts'
@@ -235,6 +236,7 @@ export class SessionManager {
         await session.refreshSubagents()
         await session.flush()
         if (input.persistence) {
+          await session.restoreUsage()
           if (session.state.replay) {
             await session.replayTools()
           } else {
@@ -981,6 +983,20 @@ async function createSession(
       canLinkChild: subagents.canLinkChild,
       drain,
       waitForCommands,
+      async restoreUsage() {
+        if (usage?.contextWindowUsedTokens !== undefined) return
+        const lastStep = await readLatestStepUsage(
+          brainRoot,
+          state.nativeId,
+        ).catch(() => undefined)
+        if (lastStep)
+          publishUsage(
+            promptUsage(null, {
+              model: configState(state.metadata).model,
+              lastStep,
+            }),
+          )
+      },
       async replayTools() {
         if (!state.replay) return
         const [inbox, subagentRecords, rows] = await Promise.all([
@@ -1350,12 +1366,13 @@ async function promptSession(
     turnId,
     state: 'started',
   })
+  let minStepIndex: number | undefined
   try {
     const readStep = await readLastStepIndex(
       session.brainRoot,
       session.state.nativeId,
     ).catch(() => -1)
-    const minStepIndex = Math.max(session.state.lastKnownStepIndex, readStep)
+    minStepIndex = Math.max(session.state.lastKnownStepIndex, readStep)
     session.state.lastKnownStepIndex = minStepIndex
     turnAbort.signal.throwIfAborted()
     const result = await session.transport.rpc.prompt({
@@ -1492,7 +1509,12 @@ async function promptSession(
         await session.interrupt().catch(() => undefined)
       }
     }
-    if (result.usage || turnWakeupUsage) {
+    lastStep ??= await readLatestStepUsage(
+      session.brainRoot,
+      session.state.nativeId,
+      minStepIndex,
+    ).catch(() => undefined)
+    if (result.usage || turnWakeupUsage || lastStep) {
       const carriedWakeup = result.usage
         ? session.state.wakeup.carriedUsage
         : undefined
@@ -1500,7 +1522,7 @@ async function promptSession(
       session.publishUsage(
         promptUsage(result.usage, {
           model: configState(session.state.metadata).model,
-          preserveContext: session.state.turnHadContextUsage && !turnWokeUp,
+          preserveContext: session.state.turnHadContextUsage,
           lastStep,
           carriedWakeup,
           wakeup: turnWakeupUsage,
@@ -1524,6 +1546,26 @@ async function promptSession(
     }
   } catch (error) {
     await session.drain()
+    if (minStepIndex !== undefined && !session.state.turnHadContextUsage) {
+      const lastStep = await readLatestStepUsage(
+        session.brainRoot,
+        session.state.nativeId,
+        minStepIndex,
+      ).catch(() => undefined)
+      if (lastStep) {
+        const { contextWindowUsedTokens, contextWindowMaxTokens } = promptUsage(
+          null,
+          {
+            model: configState(session.state.metadata).model,
+            lastStep,
+          },
+        )
+        session.publishUsage({
+          contextWindowUsedTokens,
+          contextWindowMaxTokens,
+        })
+      }
+    }
     const restartError = await session.state.interrupting?.then(
       () => undefined,
       (err: unknown) => err,
