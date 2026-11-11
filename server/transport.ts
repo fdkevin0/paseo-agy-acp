@@ -100,6 +100,10 @@ export function connectAcp(
   const exited = new Promise<void>((resolve) => {
     resolveExited = resolve
   })
+  let resolveStopped!: () => void
+  const stopped = new Promise<void>((resolve) => {
+    resolveStopped = resolve
+  })
   function formatExitError(fallback: string): Error {
     const detail = stderr.trim()
     if (exitInfo) {
@@ -207,6 +211,7 @@ export function connectAcp(
           Promise.all([exited, stderrClosed]),
           delay(STDERR_DRAIN_MS, undefined, { ref: false }),
         ])
+        fail(formatExitError('ACP connection closed'))
       },
     }),
   )
@@ -272,6 +277,7 @@ export function connectAcp(
         // EOF may exit agy before its detached command sessions have stopped.
         if (process.platform !== 'win32')
           for (const group of groups) killGroup(group)
+        resolveStopped()
       }
     })()
     return closing
@@ -301,6 +307,7 @@ export function connectAcp(
   return {
     rpc,
     exited,
+    stopped,
     close,
     request,
     get closed() {

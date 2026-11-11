@@ -410,7 +410,6 @@ async function createSession(
     loading: true,
     ready: false,
     replay: true,
-    relaunching: false,
     turn: '',
     turnAbort: null as AbortController | null,
     interrupting: null as Promise<void> | null,
@@ -612,7 +611,7 @@ async function createSession(
     }
   }
   function publishConfig() {
-    if (!state.opened || state.closing || state.silenced) return
+    if (!state.opened || state.closing || state.failed || state.silenced) return
     emit({
       type: 'session.config',
       sessionId: id,
@@ -809,8 +808,9 @@ async function createSession(
       })
     },
   }
+  const retiring = new WeakSet<ReturnType<typeof connectAcp>>()
   const onExit = (error: Error) => {
-    if (state.failed || state.closing || state.relaunching) return
+    if (state.failed || state.closing) return
     state.failed = true
     state.turnAbort?.abort(error)
     resolveCommands()
@@ -831,17 +831,12 @@ async function createSession(
       config?.env ?? {},
       client,
       (error) => {
-        if (transport !== currentTransport) return
+        if (transport !== currentTransport || retiring.has(transport)) return
         onExit(error)
       },
     )
     transports.add(transport)
-    void transport.exited
-      .then(() => transport.close())
-      .then(
-        () => transports.delete(transport),
-        () => undefined,
-      )
+    void transport.stopped.then(() => transports.delete(transport))
     return transport
   }
   function initializeRuntime(transport: ReturnType<typeof connectAcp>) {
@@ -864,11 +859,13 @@ async function createSession(
       skipPermissions: boolean,
       force = false,
     ): Promise<void> {
+      if (state.closing) return
+      if (state.failed)
+        throw new Error('ACP runtime has exited; reopen the session')
       if (
-        state.closing ||
-        (!force &&
-          (state.skipPermissions === skipPermissions ||
-            !currentInitialized.agentCapabilities?.loadSession))
+        !force &&
+        (state.skipPermissions === skipPermissions ||
+          !currentInitialized.agentCapabilities?.loadSession)
       )
         return
       const prev = configState(state.metadata)
@@ -878,10 +875,12 @@ async function createSession(
       }).mode
       state.loading = true
       state.replay = false
-      state.relaunching = true
+      retiring.add(currentTransport)
       try {
         await currentTransport.close()
         if (state.closing) return
+        if (state.failed)
+          throw new Error('ACP runtime has exited; reopen the session')
         if (!currentInitialized.agentCapabilities?.loadSession)
           throw new Error(
             'agy cannot reload after interruption; reopen the session',
@@ -890,6 +889,8 @@ async function createSession(
         currentTransport = next
         currentInitialized = await initializeRuntime(next)
         if (state.closing) return
+        if (state.failed || next.closed)
+          throw new Error('ACP runtime exited during relaunch')
         state.skipPermissions = skipPermissions
         state.metadata = {
           ...(await next.request(
@@ -904,6 +905,8 @@ async function createSession(
         }
         await drain()
         if (state.closing) return
+        if (state.failed || next.closed)
+          throw new Error('ACP runtime exited during relaunch')
         for (const [k, v] of [
           ['model', prev.model],
           ['thought_level', prev.thinkingOption],
@@ -918,13 +921,15 @@ async function createSession(
           )
         }
         await drain()
-        state.failed = false
+        if (state.closing) return
+        if (state.failed || next.closed)
+          throw new Error('ACP runtime exited during relaunch')
       } catch (error) {
-        state.relaunching = false
+        if (state.closing) return
         onExit(error instanceof Error ? error : new Error(String(error)))
+        void currentTransport.close().catch(() => undefined)
         throw error
       } finally {
-        state.relaunching = false
         state.wakeup = {
           pendingReplay: false,
           suppressEcho: false,
@@ -1024,6 +1029,9 @@ async function createSession(
       },
       async interrupt(): Promise<void> {
         if (state.interrupting) return state.interrupting
+        if (state.closing) return
+        if (state.failed)
+          throw new Error('ACP runtime has exited; reopen the session')
         state.turnAbort?.abort()
         cancelPermissions()
         // Children stay registered when canceled so they are neither reopened nor left unclosed.
@@ -1036,11 +1044,14 @@ async function createSession(
             (await hasActiveBackgroundWork(brainRoot, state.nativeId).catch(
               () => true,
             ))
-          if (needsRelaunch) {
-            state.relaunching = true
-            await Promise.all(subagents.cancelAll())
-          }
+          if (state.closing) return
+          if (state.failed)
+            throw new Error('ACP runtime has exited; reopen the session')
           try {
+            if (needsRelaunch) {
+              retiring.add(currentTransport)
+              await Promise.all(subagents.cancelAll())
+            }
             await currentTransport.request(
               currentTransport.rpc.cancel({ sessionId: state.nativeId }),
               { timeoutMs: 5000, fatalOnTimeout: false },
@@ -1050,17 +1061,17 @@ async function createSession(
             if (
               !needsRelaunch &&
               !state.closing &&
+              !state.failed &&
               currentInitialized.agentCapabilities?.loadSession
             ) {
               needsRelaunch = true
-              state.relaunching = true
-            } else if (!state.closing && !needsRelaunch) {
+              retiring.add(currentTransport)
+            } else if (!state.closing && (!needsRelaunch || state.failed)) {
               throw error
             }
           } finally {
-            if (needsRelaunch && !state.closing)
+            if (needsRelaunch && !state.closing && !state.failed)
               await this.relaunch(state.skipPermissions, true)
-            else state.relaunching = false
           }
         })()
         try {

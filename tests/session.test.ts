@@ -581,3 +581,263 @@ test('history:skip coalesces restored context usage before ready and configure v
     await rm(home, { recursive: true, force: true })
   }
 })
+
+test('interrupt rejects after runtime_failed without reviving or spawning a replacement runtime', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-interrupt-failed-'))
+  const log = join(home, 'starts.log')
+  const fixture = join(home, 'fixture-crash.mjs')
+  const sdkUrl = import.meta.resolve('@agentclientprotocol/sdk')
+  await writeFile(
+    fixture,
+    `
+import { AgentSideConnection, ndJsonStream } from ${JSON.stringify(sdkUrl)}
+import { appendFileSync } from 'node:fs'
+import { Readable, Writable } from 'node:stream'
+
+appendFileSync(process.env.AGY_TEST_LOG, 'start\\n')
+const nativeId = '11111111-1111-4111-8111-111111111111'
+const stream = ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin))
+new AgentSideConnection((client) => ({
+  async initialize() {
+    return { protocolVersion: 1, agentCapabilities: { loadSession: true } }
+  },
+  async authenticate() { return {} },
+  async newSession() {
+    setImmediate(() => {
+      void client.sessionUpdate({
+        sessionId: nativeId,
+        update: { sessionUpdate: 'available_commands_update', availableCommands: [] },
+      })
+    })
+    return { sessionId: nativeId, configOptions: [] }
+  },
+  async loadSession() {
+    appendFileSync(process.env.AGY_TEST_LOG, 'load\\n')
+    return { configOptions: [] }
+  },
+  async cancel() {},
+  async prompt() {
+    process.stderr.write('fatal runtime crash\\n')
+    process.exit(3)
+  },
+}), stream)
+`,
+  )
+  const events: ProviderEvent[] = []
+  const m = new SessionManager({
+    launch: {
+      command: process.execPath,
+      args: [fixture],
+      env: {
+        HOME: home,
+        PATH: process.env.PATH ?? '',
+        AGY_TEST_LOG: log,
+      },
+    },
+    usage: new AgyUsageSource(),
+    capabilities: ['session.configure'],
+    emit: (e) => events.push(structuredClone(e)),
+  })
+  try {
+    await m.open({
+      type: 'session.open',
+      requestId: 'open-crash',
+      sessionId: 's',
+      history: 'skip',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    // Seed an unconsumed high-priority inbox message so hasActiveBackgroundWork would be true if reached.
+    const inboxDir = join(
+      home,
+      '.gemini',
+      'antigravity-cli',
+      'brain',
+      '11111111-1111-4111-8111-111111111111',
+      '.system_generated',
+      'inbox',
+    )
+    await mkdir(inboxDir, { recursive: true })
+    await writeFile(
+      join(inboxDir, 'msg-1.json'),
+      JSON.stringify({ priority: 'MESSAGE_PRIORITY_HIGH', consumed: false }),
+    )
+
+    await m.handle({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'crash-turn',
+        delivery: 'auto',
+        input: { type: 'message', content: [{ type: 'text', text: 'crash' }] },
+      },
+    })
+    const failedEvents = events.filter(
+      (e) => e.type === 'session.runtime_failed',
+    )
+    assert.equal(failedEvents.length, 1)
+    assert.match(failedEvents[0].error.message, /code 3/)
+    assert.match(failedEvents[0].error.message, /fatal runtime crash/)
+
+    await assert.rejects(
+      m.handle({
+        type: 'session.interrupt',
+        requestId: 'int-after-crash',
+        sessionId: 's',
+      }),
+      /ACP runtime has exited; reopen the session/,
+    )
+    const lines = (await readFile(log, 'utf8')).trim().split('\n')
+    assert.deepEqual(lines, ['start'])
+    assert.equal(
+      events.filter((e) => e.type === 'session.runtime_failed').length,
+      1,
+    )
+    await assert.rejects(
+      m.handle({
+        type: 'session.configure',
+        requestId: 'cfg-after-crash',
+        sessionId: 's',
+        changes: { mode: 'full-access' },
+      }),
+      /ACP runtime has exited; reopen the session/,
+    )
+  } finally {
+    await m.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('relaunch surfaces replacement runtime crash during drain and emits runtime_failed', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-relaunch-drain-crash-'))
+  const log = join(home, 'relaunch.log')
+  const fixture = join(home, 'fixture-relaunch-crash.mjs')
+  const sdkUrl = import.meta.resolve('@agentclientprotocol/sdk')
+  await writeFile(
+    fixture,
+    `
+import { AgentSideConnection, ndJsonStream } from ${JSON.stringify(sdkUrl)}
+import { appendFileSync, readFileSync } from 'node:fs'
+import { Readable, Writable } from 'node:stream'
+
+appendFileSync(process.env.AGY_TEST_LOG, 'start\\n')
+const starts = readFileSync(process.env.AGY_TEST_LOG, 'utf8').trim().split('\\n').filter((l) => l === 'start').length
+const nativeId = '11111111-1111-4111-8111-111111111111'
+const configOptions = [
+  {
+    id: 'mode',
+    name: 'Mode',
+    category: 'mode',
+    type: 'select',
+    currentValue: 'default',
+    options: [
+      { value: 'default', name: 'Default' },
+      { value: 'accept-edits', name: 'Accept edits' },
+    ],
+  },
+]
+const stream = ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin))
+new AgentSideConnection((client) => ({
+  async initialize() {
+    return { protocolVersion: 1, agentCapabilities: { loadSession: true } }
+  },
+  async authenticate() { return {} },
+  async newSession() {
+    setImmediate(() => {
+      void client.sessionUpdate({
+        sessionId: nativeId,
+        update: { sessionUpdate: 'available_commands_update', availableCommands: [] },
+      })
+    })
+    return { sessionId: nativeId, configOptions }
+  },
+  async loadSession() {
+    appendFileSync(process.env.AGY_TEST_LOG, 'load\\n')
+    if (starts >= 2) {
+      setImmediate(() => {
+        process.stderr.write('relaunch tail crash\\n')
+        process.exit(4)
+      })
+    }
+    return { configOptions }
+  },
+  async setSessionConfigOption({ configId, value }) {
+    return {
+      configOptions: configOptions.map((o) =>
+        o.id === configId ? { ...o, currentValue: String(value) } : o,
+      ),
+    }
+  },
+  async cancel() {},
+  async prompt() { return { stopReason: 'end_turn' } },
+}), stream)
+`,
+  )
+  const events: ProviderEvent[] = []
+  const m = new SessionManager({
+    launch: {
+      command: process.execPath,
+      args: [fixture],
+      env: {
+        HOME: home,
+        PATH: process.env.PATH ?? '',
+        AGY_TEST_LOG: log,
+      },
+    },
+    usage: new AgyUsageSource(),
+    capabilities: ['session.configure'],
+    emit: (e) => events.push(structuredClone(e)),
+  })
+  try {
+    await m.open({
+      type: 'session.open',
+      requestId: 'open-relaunch',
+      sessionId: 's',
+      history: 'skip',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    const configsBefore = events.filter(
+      (e) => e.type === 'session.config',
+    ).length
+    await assert.rejects(
+      m.handle({
+        type: 'session.configure',
+        requestId: 'cfg-relaunch-crash',
+        sessionId: 's',
+        changes: { mode: 'full-access' },
+      }),
+    )
+    const failedEvents = events.filter(
+      (e) => e.type === 'session.runtime_failed',
+    )
+    assert.equal(failedEvents.length, 1)
+    assert.match(failedEvents[0].error.message, /code 4/)
+    assert.match(failedEvents[0].error.message, /relaunch tail crash/)
+    assert.equal(
+      events.filter((e) => e.type === 'session.config').length,
+      configsBefore,
+    )
+    await assert.rejects(
+      m.handle({
+        type: 'session.interrupt',
+        requestId: 'int-after-relaunch-crash',
+        sessionId: 's',
+      }),
+      /ACP runtime has exited; reopen the session/,
+    )
+  } finally {
+    await m.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
