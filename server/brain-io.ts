@@ -83,8 +83,6 @@ export function isCompletePlannerResponse(
   return (
     step?.type === 'PLANNER_RESPONSE' &&
     step.status === 'DONE' &&
-    ((typeof step.content === 'string' && step.content.trim().length > 0) ||
-      (Array.isArray(step.tool_calls) && step.tool_calls.length > 0)) &&
     (!Array.isArray(step.tool_calls) ||
       step.tool_calls.length === 0 ||
       step.tool_calls.every((call) =>
@@ -114,21 +112,28 @@ export function stepErrorMessage(
   return fallback
 }
 
-// shortcut: Brain exposes no retry outcome; replace this exact observed warning match when upstream supplies one.
-export function isStreamInterruption(
+// shortcut: Brain has no retry outcome; replace these observed warning forms when upstream supplies one.
+export function isRetryWarning(
   step: Record<string, unknown> | undefined,
 ): boolean {
+  if (
+    step?.type !== 'ERROR_MESSAGE' ||
+    step.status !== 'DONE' ||
+    (step.source !== undefined && step.source !== 'SYSTEM')
+  )
+    return false
+  const message = stepErrorMessage(step).replace(/^Error: /, '')
   return (
-    step?.type === 'ERROR_MESSAGE' &&
-    step.status === 'DONE' &&
-    /^(?:Error: )?The stream was interrupted\. Please continue the task you were working on\.$/.test(
-      stepErrorMessage(step),
-    )
+    message ===
+      'The stream was interrupted. Please continue the task you were working on.' ||
+    /^API error \(attempt [1-9]\d*\): [\s\S]+$/.test(message) ||
+    message ===
+      'model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again'
   )
 }
 
-// Bound warnings without a recovery event; this is a local policy, not an upstream retry deadline.
-export const STREAM_RETRY_TIMEOUT_MS = 120_000
+// Brain has no exhaustion event: allow the normal silent model window after the latest retry warning.
+export const RETRY_IDLE_TIMEOUT_MS = 15 * 60_000
 
 export function extractStepUsage(
   row: Record<string, unknown>,

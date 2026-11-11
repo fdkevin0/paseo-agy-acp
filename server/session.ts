@@ -95,6 +95,7 @@ interface SessionOptions {
   capabilities: readonly string[]
   emit: (event: ProviderEvent) => void
   stallTimeoutMs?: number
+  retryTimeoutMs?: number
 }
 
 const SKIP_PERMISSIONS_FLAG = '--dangerously-skip-permissions'
@@ -428,6 +429,7 @@ async function createSession(
     isParentTurnActive: () => Boolean(state.turn),
     isLoading: () => state.loading,
     isUnavailable: () => state.closing || state.failed,
+    retryTimeoutMs: options.retryTimeoutMs,
   })
   let notificationLane = Promise.resolve()
   let relaunching = Promise.resolve()
@@ -946,6 +948,7 @@ async function createSession(
       config,
       brainRoot,
       stallTimeoutMs: options.stallTimeoutMs,
+      retryTimeoutMs: options.retryTimeoutMs,
       state,
       get initialized() {
         return currentInitialized
@@ -1019,6 +1022,7 @@ async function createSession(
           return false
         return !(await hasActiveBackgroundWork(brainRoot, state.nativeId, {
           includeDaemons: true,
+          retryTimeoutMs: options.retryTimeoutMs,
         }).catch(() => true))
       },
       async flush() {
@@ -1041,9 +1045,9 @@ async function createSession(
           await Promise.all(canceling)
           let needsRelaunch =
             canceling.length > 0 ||
-            (await hasActiveBackgroundWork(brainRoot, state.nativeId).catch(
-              () => true,
-            ))
+            (await hasActiveBackgroundWork(brainRoot, state.nativeId, {
+              retryTimeoutMs: options.retryTimeoutMs,
+            }).catch(() => true))
           if (state.closing) return
           if (state.failed)
             throw new Error('ACP runtime has exited; reopen the session')
@@ -1401,6 +1405,7 @@ async function promptSession(
           transcriptGraceMs:
             session.state.turnHadModelOutput || suppressedForeground ? 2000 : 0,
           stallTimeoutMs: session.stallTimeoutMs,
+          retryTimeoutMs: session.retryTimeoutMs,
           isWaitingOnUser: () => session.permissions.size > 0,
           onQuestionSettled: (questions, wokeUp) => {
             const idx = session.state.handledElicitations.findIndex(

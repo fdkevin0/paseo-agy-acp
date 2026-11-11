@@ -18,7 +18,7 @@ import {
   readLastStepIndex,
   readSubagents,
   readTranscriptRows,
-  STREAM_RETRY_TIMEOUT_MS,
+  RETRY_IDLE_TIMEOUT_MS,
   type InboxState,
   type SubagentRecord,
 } from './brain-io.ts'
@@ -44,7 +44,7 @@ export {
 export async function hasActiveBackgroundWork(
   root: string,
   nativeId: string,
-  options: { includeDaemons?: boolean } = {},
+  options: { includeDaemons?: boolean; retryTimeoutMs?: number } = {},
   visiting = new Set<string>(),
   isChild = false,
 ): Promise<boolean> {
@@ -68,23 +68,24 @@ export async function hasActiveBackgroundWork(
       if (isRestartNotice(row)) node.resetPhase()
       node.ingest(row, observedAt)
     }
-    if (node.retryPending() && node.failure()) return false
     if (inbox.unconsumedHighPriority.length > 0) return true
-    if (node.failure()) return false
-    if (node.retryPending()) return true
     if (
       node.projector.hasBackground() ||
       (options.includeDaemons && node.projector.hasDaemons())
     )
       return true
-    // A failed step is finished; an unsettled child or woken parent turn is still working outside ACP prompt RPC.
-    if (
-      isChild
-        ? node.hasUnprocessedMessages(inbox) || !node.isSettled(inbox)
-        : (node.foregroundIdleReached && node.hasUnprocessedMessages(inbox)) ||
-          node.isWokenWorking()
-    )
-      return true
+    // A timed-out model retry does not stop tracked processes or descendants.
+    if (!node.failure(options.retryTimeoutMs)) {
+      if (node.retryPending()) return true
+      if (
+        isChild
+          ? node.hasUnprocessedMessages(inbox) || !node.isSettled(inbox)
+          : (node.foregroundIdleReached &&
+              node.hasUnprocessedMessages(inbox)) ||
+            node.isWokenWorking()
+      )
+        return true
+    }
     const activeChildIds = activeChildIdsForTurn(
       subagents,
       node.projector,
@@ -106,7 +107,7 @@ async function settleChildren(
   parentInbox: InboxState,
   activeChildIds: readonly string[],
   visiting = new Set<string>(),
-  retryTimeoutMs = STREAM_RETRY_TIMEOUT_MS,
+  retryTimeoutMs = RETRY_IDLE_TIMEOUT_MS,
 ): Promise<{ settled: boolean; error?: string; stalled?: boolean }> {
   if (visiting.has(parentNode.nativeId)) return { settled: true }
   visiting.add(parentNode.nativeId)
@@ -202,6 +203,7 @@ export async function settleBrainTurn(
     transcriptGraceMs = 0,
     stallTimeoutMs = 120_000,
     wokenStallTimeoutMs = 15 * 60_000,
+    retryTimeoutMs = RETRY_IDLE_TIMEOUT_MS,
     isWaitingOnUser,
     onQuestion,
     onQuestionSettled,
@@ -226,6 +228,8 @@ export async function settleBrainTurn(
     stallTimeoutMs?: number
     /** Upper bound on a single silent woken-turn step (tool execution or post-wakeup/post-tool LLM generation). */
     wokenStallTimeoutMs?: number
+    /** Maximum silence after the latest distinct retry warning, independent of ordinary stalls. */
+    retryTimeoutMs?: number
     /** Pending approvals legitimately block agy; they suspend the stall timeout. */
     isWaitingOnUser?: () => boolean
     /** Handle an unlogged ask_question step discovered at the tail of the transcript. */
@@ -312,7 +316,7 @@ export async function settleBrainTurn(
     } catch (error) {
       if (!isMissing(error)) throw error
       if (node.retryPending()) {
-        const failure = node.failure(stallTimeoutMs)
+        const failure = node.failure(retryTimeoutMs)
         if (failure) return { ...finish('failed', failure), stalled: true }
         await pause(pollIntervalMs, signal)
         continue
@@ -385,7 +389,7 @@ export async function settleBrainTurn(
       }
     }
     if (signal?.aborted) continue
-    const failure = node.failure(stallTimeoutMs)
+    const failure = node.failure(retryTimeoutMs)
     if (failure)
       return {
         ...finish('failed', failure),
@@ -444,7 +448,7 @@ export async function settleBrainTurn(
       inbox,
       activeChildIds,
       new Set(),
-      stallTimeoutMs,
+      retryTimeoutMs,
     )
     if (signal?.aborted) continue
     if (childStatus.error)
@@ -468,7 +472,7 @@ export async function settleBrainTurn(
     const idleLimitMs = node.isWokenWorking()
       ? wokenStallTimeoutMs
       : stallTimeoutMs
-    if (tracking) lastActivity = Date.now()
+    if (tracking || node.retryPending()) lastActivity = Date.now()
     else if (Date.now() - lastActivity >= idleLimitMs) {
       return stall(idleLimitMs)
     }
@@ -501,7 +505,7 @@ export function watchBrain(
   /** Resume an existing child session: earlier steps are only projected, and turn IDs continue. */
   resume?: { afterStep: number; turnSeq: number },
   onSubagents?: (subagents: readonly SubagentRecord[]) => void,
-  retryTimeoutMs = STREAM_RETRY_TIMEOUT_MS,
+  retryTimeoutMs = RETRY_IDLE_TIMEOUT_MS,
 ): BrainWatchHandle {
   if (!sessionIdPattern.test(nativeId))
     throw new Error('Invalid Brain session ID')
