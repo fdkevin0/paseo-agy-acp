@@ -1,3 +1,4 @@
+import { BrainTurnObservation } from './brain-observer.ts'
 import type { AgyUsageSource } from './usage.ts'
 import { z } from 'zod'
 import { randomUUID } from 'node:crypto'
@@ -398,6 +399,7 @@ async function createSession(
       wokeUp: boolean
     }>,
     suppressContinuationAcp: false,
+    continuationEchoSeen: false,
     preStagedQuestion: undefined as
       | {
           questions: NormalizedQuestion[]
@@ -418,6 +420,8 @@ async function createSession(
     replay: true,
     turn: '',
     turnAbort: null as AbortController | null,
+    observation: null as BrainTurnObservation | null,
+    turnFinished: false,
     interrupting: null as Promise<void> | null,
     failed: false,
     metadata: { sessionId: '' } as NewSessionResponse & SessionMetadata,
@@ -514,6 +518,22 @@ async function createSession(
       emit({ type: 'timeline.item', sessionId: id, item })
     }
   }
+  function finishTurnOnce(
+    turnId: string,
+    status: 'completed' | 'canceled' | 'failed',
+    error?: string,
+  ) {
+    if (state.turn !== turnId || state.turnFinished || state.silenced) return
+    state.turnFinished = true
+    terminalize(status, error)
+    emit({
+      type: 'session.turn',
+      sessionId: id,
+      turnId,
+      state: status,
+      ...(status === 'failed' && error ? { error: { message: error } } : {}),
+    })
+  }
   /** Brain-projected items are not yet known to the ACP timeline. */
   function emitItem(item: ProviderTimelineItem, timestamp?: string) {
     if (state.silenced) return
@@ -583,8 +603,11 @@ async function createSession(
     } else {
       if (state.loading && !state.replay) return
       if (state.suppressContinuationAcp) {
+        if (u.sessionUpdate === 'user_message_chunk')
+          state.continuationEchoSeen = true
         if (
           u.sessionUpdate === 'tool_call' &&
+          state.continuationEchoSeen &&
           !state.turnToolCallIds.includes(u.toolCallId)
         )
           state.turnToolCallIds.push(u.toolCallId)
@@ -927,6 +950,7 @@ async function createSession(
         ...state.metadata,
         fullAccess: false,
       }).mode
+      state.observation?.stop()
       state.loading = true
       state.replay = false
       retiring.add(currentTransport)
@@ -1016,6 +1040,7 @@ async function createSession(
       publishUsage,
       flushDeferredUsage,
       terminalize,
+      finishTurnOnce,
       emitItem,
       resetWakeup() {
         state.wakeup = {
@@ -1220,21 +1245,16 @@ async function createSession(
       close(): Promise<void> {
         if (closing) return closing
         state.closing = true
+        const closingObservation = state.observation
+        closingObservation?.stop()
         const closingTurnId = state.turn
         state.turnAbort?.abort()
         resolveCommands()
         closing = (async () => {
           cancelPermissions()
           subagents.closeAll()
-          terminalize('canceled')
-          if (state.opened && closingTurnId && !state.silenced) {
-            emit({
-              type: 'session.turn',
-              sessionId: id,
-              turnId: closingTurnId,
-              state: 'canceled',
-            })
-          }
+          if (closingTurnId) finishTurnOnce(closingTurnId, 'canceled')
+          else terminalize('canceled')
           state.silenced = true
           const disposable =
             !state.persisted &&
@@ -1250,6 +1270,7 @@ async function createSession(
               )
               .catch(() => undefined)
           const dir = dataDirectory(launch, config?.env, cwd)
+          await closingObservation?.dispose()
           const stopped = await currentTransport.close().then(
             () => true,
             () => false,
@@ -1435,6 +1456,7 @@ async function promptSession(
     blocks.some((c) => c.type !== 'text' || c.text.trim().length > 0)
   session.state.turn = turnId
   session.state.turnAbort = turnAbort
+  session.state.turnFinished = false
   session.state.turnHadContextUsage = false
   session.state.turnHadModelOutput = false
   session.state.inSettle = false
@@ -1474,6 +1496,91 @@ async function promptSession(
   })
   const nativeId = session.state.nativeId
   let minStepIndex: number | undefined
+  let observation: BrainTurnObservation | undefined
+  let observationTransport = session.transport
+  let continuationActive = false
+  const isCurrent = () =>
+    session.state.turn === turnId &&
+    session.state.turnAbort === turnAbort &&
+    !session.state.closing &&
+    !session.state.silenced &&
+    session.state.nativeId === nativeId &&
+    session.transport === observationTransport
+  const stopObservation = () => observation?.stop()
+  turnAbort.signal.addEventListener('abort', stopObservation, { once: true })
+  const waitPrompt = async (
+    operation: ReturnType<typeof session.transport.rpc.prompt>,
+  ) => {
+    const transport = session.transport
+    const outcome = operation.then(
+      (value) => ({ ok: true as const, value }),
+      (error) => ({ ok: false as const, error }),
+    )
+    let aborted!: () => void
+    const cancellation = new Promise<null>((resolve) => {
+      aborted = () => resolve(null)
+    })
+    turnAbort.signal.addEventListener('abort', aborted, { once: true })
+    try {
+      if (turnAbort.signal.aborted) aborted()
+      let result = await Promise.race([outcome, cancellation])
+      if (!result) {
+        if (session.state.closing) throw turnAbort.signal.reason
+        await session.state.interrupting
+        if (session.state.closing) throw turnAbort.signal.reason
+        // Cancel is a notification. Bound convergence with the existing control-request policy, not a flush sleep.
+        try {
+          result = await transport.request(outcome, { fatalOnTimeout: false })
+        } catch (error) {
+          if (!session.state.closing && session.transport === transport)
+            await session.relaunch(session.state.skipPermissions, true)
+          throw error
+        }
+      }
+      if (!result.ok) throw result.error
+      return result.value
+    } finally {
+      turnAbort.signal.removeEventListener('abort', aborted)
+    }
+  }
+  const finalDrain = async () => {
+    observation?.stop()
+    if (session.state.closing || session.state.silenced) return
+    await session.state.interrupting
+    await session.drain()
+    if (
+      session.state.turn !== turnId ||
+      session.state.turnAbort !== turnAbort ||
+      session.state.closing ||
+      session.state.silenced ||
+      session.state.nativeId !== nativeId
+    )
+      return
+    if (session.transport !== observationTransport && !turnAbort.signal.aborted)
+      return
+    observationTransport = session.transport
+    await observation?.drain()
+  }
+  let finalSnapshot: Promise<StepUsage | undefined> | undefined
+  const reconcileFinalSnapshot = (fallback?: StepUsage) =>
+    (finalSnapshot ??= (async () => {
+      await finalDrain()
+      if (!isCurrent() || minStepIndex === undefined) return
+      const observed = observation?.usage.latest ?? fallback
+      // A complete EOF can be newer than streamed rows; it is a measurement, not snapshot commit evidence.
+      const snapshot = await readLatestStepUsage(
+        session.brainRoot,
+        nativeId,
+        Math.max(minStepIndex, (observation?.usage.latestStepIndex ?? -1) - 1),
+      ).catch(() => undefined)
+      if (!isCurrent()) return
+      if (snapshot)
+        session.state.lastKnownStepIndex = Math.max(
+          session.state.lastKnownStepIndex,
+          snapshot.lastStepIndex,
+        )
+      return snapshot?.lastStepUsage ?? observed
+    })())
   try {
     const readStep = await readLastStepIndex(
       session.brainRoot,
@@ -1482,11 +1589,42 @@ async function promptSession(
     minStepIndex = Math.max(session.state.lastKnownStepIndex, readStep)
     session.state.lastKnownStepIndex = minStepIndex
     turnAbort.signal.throwIfAborted()
-    const result = await session.transport.rpc.prompt({
-      sessionId: session.state.nativeId,
-      prompt: blocks,
-    })
+    observation = new BrainTurnObservation(
+      session.brainRoot,
+      nativeId,
+      session.id,
+      minStepIndex,
+      {
+        isCurrent,
+        onUsage: (usage) => {
+          if (
+            session.state.turnHadContextUsage &&
+            !observation?.wokeUp &&
+            observation?.phase !== 'continuation'
+          )
+            return false
+          session.publishStepContext(usage)
+        },
+        onItem: session.emitItem,
+        onBoundary: (index, reconciled) => {
+          if (!isCurrent() || index < 0) return
+          session.state.lastKnownStepIndex = reconciled
+            ? index
+            : Math.max(session.state.lastKnownStepIndex, index)
+        },
+      },
+    )
+    session.state.observation = observation
+    observation.start()
+    const result = await waitPrompt(
+      session.transport.rpc.prompt({
+        sessionId: session.state.nativeId,
+        prompt: blocks,
+      }),
+    )
     await session.drain()
+    if (!isCurrent() && !turnAbort.signal.aborted)
+      throw new Error('ACP runtime replaced during turn')
     const suppressedForeground = session.state.wakeup.suppressEcho
     session.state.wakeup.suppressEcho = false
     let status: 'completed' | 'canceled' | 'failed' =
@@ -1504,6 +1642,8 @@ async function promptSession(
         session.emitItem,
         {
           signal: turnAbort.signal,
+          observation,
+          isRpcActive: () => continuationActive,
           onSubagents: session.rememberSubagents,
           minStepIndex,
           acpToolCallIds: session.state.turnToolCallIds,
@@ -1568,6 +1708,9 @@ async function promptSession(
             if (!response || turnAbort.signal.aborted) {
               return { status: 'canceled' }
             }
+            if (observation?.error) throw observation.error
+            if (!isCurrent())
+              throw new Error('ACP runtime replaced during question')
             if (response.behavior === 'deny') {
               await session.interrupt()
               return { status: 'canceled' }
@@ -1582,17 +1725,28 @@ async function promptSession(
               questions: pendingQuestion.questions,
               response,
             }
+            pendingQuestion.beginContinuation?.(answerText)
             session.state.suppressContinuationAcp = true
+            session.state.continuationEchoSeen = false
+            continuationActive = true
+            if (observation) {
+              observation.phase = 'continuation'
+              observation.wokeUp = true
+            }
             try {
-              const contResult = await session.transport.rpc.prompt({
-                sessionId: session.state.nativeId,
-                prompt: [{ type: 'text', text: answerText }],
-              })
+              const contResult = await waitPrompt(
+                session.transport.rpc.prompt({
+                  sessionId: session.state.nativeId,
+                  prompt: [{ type: 'text', text: answerText }],
+                }),
+              )
               await session.drain()
               if (contResult.stopReason === 'cancelled') {
                 return { status: 'canceled' }
               }
             } finally {
+              continuationActive = false
+              if (observation?.acceptsRows()) observation.phase = 'settling'
               session.state.suppressContinuationAcp = false
               session.state.preStagedQuestion = undefined
             }
@@ -1616,22 +1770,8 @@ async function promptSession(
         await session.interrupt().catch(() => undefined)
       }
     }
-    await session.state.interrupting
-    await session.drain()
-    if (!lastStep || status === 'canceled' || turnAbort.signal.aborted) {
-      const snapshot = await readLatestStepUsage(
-        session.brainRoot,
-        nativeId,
-        minStepIndex,
-      ).catch(() => undefined)
-      if (snapshot) {
-        session.state.lastKnownStepIndex = Math.max(
-          session.state.lastKnownStepIndex,
-          snapshot.lastStepIndex,
-        )
-        lastStep = snapshot.lastStepUsage ?? lastStep
-      }
-    }
+    lastStep = await reconcileFinalSnapshot(lastStep)
+    turnWokeUp ||= observation?.wokeUp === true
     if (turnAbort.signal.aborted) {
       if (
         turnAbort.signal.reason instanceof Error &&
@@ -1662,39 +1802,23 @@ async function promptSession(
     } else if (lastStep && !preserveContext) {
       session.publishStepContext(lastStep)
     }
-    session.terminalize(status, turnError)
-    if (!session.state.silenced) {
-      emit({
-        type: 'session.turn',
-        sessionId: session.id,
-        turnId,
-        state: status,
-        ...(status === 'failed' && turnError
-          ? { error: { message: turnError } }
-          : {}),
-      })
-    }
+    session.finishTurnOnce(turnId, status, turnError)
   } catch (error) {
-    const restartError = await session.state.interrupting?.then(
-      () => undefined,
-      (err: unknown) => err,
-    )
-    await session.drain()
-    if (minStepIndex !== undefined) {
-      const snapshot = await readLatestStepUsage(
-        session.brainRoot,
-        nativeId,
-        minStepIndex,
-      ).catch(() => undefined)
-      if (snapshot) {
-        session.state.lastKnownStepIndex = Math.max(
-          session.state.lastKnownStepIndex,
-          snapshot.lastStepIndex,
+    const restartError = session.state.closing
+      ? undefined
+      : await session.state.interrupting?.then(
+          () => undefined,
+          (err: unknown) => err,
         )
-        if (snapshot.lastStepUsage && !session.state.turnHadContextUsage)
-          session.publishStepContext(snapshot.lastStepUsage)
-      }
-    }
+    const lastStep = await reconcileFinalSnapshot().catch(
+      () => observation?.usage.latest,
+    )
+    if (
+      lastStep &&
+      (!session.state.turnHadContextUsage || observation?.wokeUp) &&
+      isCurrent()
+    )
+      session.publishStepContext(lastStep)
     const turnError = restartError ?? error
     const status =
       !restartError &&
@@ -1704,25 +1828,24 @@ async function promptSession(
         ? 'canceled'
         : 'failed'
     const message = formatErrorMessage(turnError)
-    session.terminalize(status, message)
-    if (!session.state.silenced) {
-      emit({
-        type: 'session.turn',
-        sessionId: session.id,
-        turnId,
-        state: status,
-        ...(status === 'failed' ? { error: { message } } : {}),
-      })
-    }
+    session.finishTurnOnce(turnId, status, message)
   } finally {
-    session.state.wakeup.suppressEcho = false
-    session.state.inSettle = false
-    session.state.handledElicitations = []
-    session.state.suppressContinuationAcp = false
-    session.state.preStagedQuestion = undefined
-    session.state.turnAbort = null
-    session.state.turn = ''
-    session.timeline.boundary()
-    session.cancelPermissions()
+    turnAbort.signal.removeEventListener('abort', stopObservation)
+    await observation?.dispose()
+    if (
+      session.state.turn === turnId &&
+      session.state.turnAbort === turnAbort
+    ) {
+      session.state.observation = null
+      session.state.wakeup.suppressEcho = false
+      session.state.inSettle = false
+      session.state.handledElicitations = []
+      session.state.suppressContinuationAcp = false
+      session.state.preStagedQuestion = undefined
+      session.state.turnAbort = null
+      session.state.turn = ''
+      session.timeline.boundary()
+      session.cancelPermissions()
+    }
   }
 }

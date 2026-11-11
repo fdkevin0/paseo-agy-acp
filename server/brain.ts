@@ -1,8 +1,17 @@
+import {
+  BrainTurnObservation,
+  ModelUsageObserver,
+  type BrainRead,
+} from './brain-observer.ts'
 import { stat } from 'node:fs/promises'
 import { join } from 'node:path'
-import { setTimeout as delay } from 'node:timers/promises'
 import { formatErrorMessage, sessionIdPattern } from './common.ts'
-import { Timeline, addStepUsage, type StepUsage } from './mapping.ts'
+import {
+  Timeline,
+  addStepUsage,
+  promptUsage,
+  type StepUsage,
+} from './mapping.ts'
 import type {
   ProviderEvent,
   ProviderTimelineItem,
@@ -180,11 +189,6 @@ async function settleChildren(
   }
 }
 
-function pause(ms: number, signal?: AbortSignal) {
-  if (signal?.aborted) return Promise.resolve()
-  return delay(ms, undefined, { ref: false, signal }).catch(() => undefined)
-}
-
 /** Follow background tasks and post-RPC Reactive Wakeup steps in transcript_full.jsonl until the turn settles. */
 export async function settleBrainTurn(
   root: string,
@@ -208,7 +212,13 @@ export async function settleBrainTurn(
     onQuestion,
     onQuestionSettled,
     onSubagents,
+    observation,
+    onUsage,
+    isRpcActive,
   }: {
+    observation?: BrainTurnObservation
+    onUsage?: (usage: StepUsage, wokeUp: boolean) => void
+    isRpcActive?: () => boolean
     onSubagents?: (subagents: readonly SubagentRecord[]) => void
     signal?: AbortSignal
     minStepIndex?: number
@@ -249,27 +259,83 @@ export async function settleBrainTurn(
   wakeupUsage?: StepUsage
 }> {
   if (!sessionIdPattern.test(nativeId)) return { status: 'completed' }
-  const node = new BrainNode(nativeId, sessionId, onQuestionSettled)
+  const settledQuestions = new Map<
+    string,
+    { questions: readonly NormalizedQuestion[]; wokeUp: boolean }
+  >()
+  const deliveredQuestions = new Set<string>()
+  const questionAnswers = new Map<string, QuestionOutcome>()
+  const node = new BrainNode(
+    nativeId,
+    sessionId,
+    (questions, wokeUp, key) => {
+      if (!deliveredQuestions.has(key))
+        settledQuestions.set(key, { questions, wokeUp })
+    },
+    observation?.reader,
+  )
+  const ownsObservation = !observation
+  const stream =
+    observation ??
+    new BrainTurnObservation(
+      root,
+      nativeId,
+      sessionId,
+      minStepIndex,
+      {
+        isCurrent: () => !signal?.aborted,
+        onUsage: (usage) => onUsage?.(usage, node.wokeUp),
+        onItem,
+      },
+      pollIntervalMs,
+      node.reader,
+    )
+  stream.phase = 'settling'
   const startedAt = Date.now()
   let lastActivity = startedAt
   let fingerprint = ''
+  let foldVersion = 0
   let initial = true
   // Once anchored, a rewrite caught mid-O_TRUNC (empty or partial file) is not "no turn".
   let anchored = false
   let preamble: Record<string, unknown>[] = []
+  let appliedHistoricalMessages = 0
+  const continuations: {
+    afterStep: number
+    acpIndex: number
+    userStep?: number
+  }[] = []
+  const beginContinuation = () => {
+    const boundary = {
+      afterStep: Number(node.lastStep?.step_index ?? -1),
+      acpIndex: acpToolCallIds.length,
+    }
+    continuations.push(boundary)
+    node.markQuestionContinuation()
+    node.projector.bindToolCallIds(acpToolCallIds, boundary.acpIndex)
+    stream.wokeUp = true
+  }
   let lastStepIndex = -1
   const dedupe = new StepDedupe()
-  let lastStepUsage: StepUsage | undefined
-  let wakeupUsage: StepUsage | undefined
+  const wakeupSteps = new Map<number, StepUsage>()
+  let inbox!: InboxState
+  let subagents: SubagentRecord[] = []
   const finish = (
     status: 'completed' | 'canceled' | 'failed',
     error?: string,
   ) => ({
     status,
     ...(error !== undefined ? { error } : {}),
-    lastStepUsage,
+    lastStepUsage: stream.usage.latest,
     ...(node.wokeUp ? { wokeUp: true as const } : {}),
-    ...(wakeupUsage ? { wakeupUsage } : {}),
+    ...(wakeupSteps.size
+      ? {
+          wakeupUsage: [...wakeupSteps.values()].reduce<StepUsage | undefined>(
+            (sum, usage) => addStepUsage(sum, usage),
+            undefined,
+          ),
+        }
+      : {}),
   })
   const withinGrace = () => Date.now() - startedAt < transcriptGraceMs
   const stall = (timeoutMs = stallTimeoutMs) => {
@@ -287,53 +353,51 @@ export async function settleBrainTurn(
       (info) => info.isDirectory(),
       () => false,
     )
-  while (true) {
-    if (signal?.aborted) {
-      if (signal.reason instanceof Error && signal.reason.name !== 'AbortError')
-        throw signal.reason
-      return finish('canceled')
-    }
-    const { inbox, subagents } = await node.pollMetadata(root)
+  const consume = async (read: BrainRead) => {
+    if (!stream.acceptsRows() || signal?.aborted) return
+    const metadata = await node.pollMetadata(root)
+    if (!stream.acceptsRows() || signal?.aborted) return
+    inbox = metadata.inbox
+    subagents = metadata.subagents
     onSubagents?.(subagents)
     const nextFingerprint = `${inbox.messages.length}:${inbox.readIds.size}:${subagents
       .map((s) => `${s.conversationId}=${s.state}`)
       .join(',')}`
     if (nextFingerprint !== fingerprint) {
       fingerprint = nextFingerprint
+      foldVersion++
       lastActivity = Date.now()
     }
-    let rows: Record<string, unknown>[]
-    try {
-      const result = await node.reader.read(root, nativeId)
-      rows = result.rows
-      if (result.snapshotStepIndices) dedupe.prune(result.snapshotStepIndices)
-      if (result.reset) {
-        initial = true
-        preamble = []
-        wakeupUsage = undefined
-        node.reset(inbox, subagents)
-      }
-    } catch (error) {
-      if (!isMissing(error)) throw error
-      if (node.retryPending()) {
-        const failure = node.failure(retryTimeoutMs)
-        if (failure) return { ...finish('failed', failure), stalled: true }
-        await pause(pollIntervalMs, signal)
-        continue
-      }
-      // A missing transcript cannot be settled from; it only delays completion while agy may still flush it.
-      if (!withinGrace() || !(await sessionDirExists()))
-        return { status: 'completed' }
-      await pause(pollIntervalMs, signal)
-      continue
+    const identities = node.projector.resolveToolIdentities(
+      isRpcActive?.() === true,
+    )
+    if (identities.length) foldVersion++
+    for (const item of identities) onItem(item)
+    const rows = read.rows
+    if (read.snapshotStepIndices) {
+      dedupe.prune(read.snapshotStepIndices)
+      for (const step of wakeupSteps.keys())
+        if (!read.snapshotStepIndices.has(step)) wakeupSteps.delete(step)
     }
+    if (read.reset) {
+      initial = true
+      preamble = []
+      node.reset(inbox, subagents)
+      appliedHistoricalMessages = 0
+    }
+    const historicalDelta =
+      stream.historicalMessages - appliedHistoricalMessages
+    node.consumedMessages += historicalDelta
+    appliedHistoricalMessages = stream.historicalMessages
+    if (historicalDelta) foldVersion++
+    if (rows.length || read.reset) foldVersion++
     if (rows.length) lastActivity = Date.now()
     let slice = rows
     if (initial) {
       // Keep rows already consumed by the cursor until this turn's USER_INPUT is visible.
       preamble.push(...rows)
       let start = -1
-      for (let i = preamble.length - 1; i >= 0; i--) {
+      for (let i = 0; i < preamble.length; i++) {
         if (
           preamble[i].type === 'USER_INPUT' &&
           Number(preamble[i].step_index) > minStepIndex
@@ -342,44 +406,37 @@ export async function settleBrainTurn(
           break
         }
       }
-      if (start < 0) {
-        // Native commands can persist a checkpoint without a USER_INPUT anchor.
-        for (const row of rows) {
-          if (
-            row.type !== 'CHECKPOINT' ||
-            Number(row.step_index) <= minStepIndex ||
-            !dedupe.fresh(row)
-          )
-            continue
-          for (const item of node.projector.project(row))
-            onItem(
-              item,
-              typeof row.created_at === 'string' ? row.created_at : undefined,
-            )
-        }
-        if (!anchored && !withinGrace()) return { status: 'completed' }
-        // A rewrite that dropped this turn altogether is bounded like any other stall.
-        if (anchored && Date.now() - lastActivity >= stallTimeoutMs)
-          return stall()
-        await pause(pollIntervalMs, signal)
-        continue
-      }
+      if (start < 0) return
       initial = false
       anchored = true
       for (const row of preamble.slice(0, start))
         node.consumedMessages += countRowMessages(row)
       node.projector.bindToolCallIds(acpToolCallIds)
+      node.projector.resolveToolIdentities(isRpcActive?.() === true)
       slice = preamble.slice(start)
       preamble = []
     }
     for (const row of slice) {
       const stepIndex = Number(row.step_index)
+      if (row.type === 'USER_INPUT') {
+        const boundary = continuations.find(
+          (entry) =>
+            entry.userStep === stepIndex ||
+            (entry.userStep === undefined && stepIndex > entry.afterStep),
+        )
+        if (boundary) {
+          boundary.userStep = stepIndex
+          node.markQuestionContinuation()
+          node.projector.bindToolCallIds(acpToolCallIds, boundary.acpIndex)
+        }
+      }
       const items = node.ingest(row)
+      stream.wokeUp ||= node.wokeUp
       const usage = extractStepUsage(row)
       if (usage) {
-        lastStepUsage = usage
         if (node.wokeUp && row.status === 'DONE')
-          wakeupUsage = addStepUsage(wakeupUsage, usage)
+          wakeupSteps.set(stepIndex, usage)
+        else wakeupSteps.delete(stepIndex)
       }
       if (Number.isInteger(stepIndex) && stepIndex > lastStepIndex) {
         lastStepIndex = stepIndex
@@ -389,13 +446,9 @@ export async function settleBrainTurn(
         const timestamp =
           typeof row.created_at === 'string' ? row.created_at : undefined
         for (const item of items) {
-          if (item.type === 'user_message') continue
-          if (
-            node.wokeUp ||
-            emitForeground ||
-            item.type === 'error' ||
-            item.type === 'compaction'
-          ) {
+          if (item.type === 'user_message' || item.type === 'compaction')
+            continue
+          if (node.wokeUp || emitForeground || item.type === 'error') {
             onItem(item, timestamp)
           } else if (
             item.type === 'tool_call' &&
@@ -407,95 +460,173 @@ export async function settleBrainTurn(
         }
       }
     }
-    if (signal?.aborted) continue
-    const failure = node.failure(retryTimeoutMs)
-    if (failure)
-      return {
-        ...finish('failed', failure),
-        ...(node.retryPending() ? { stalled: true } : {}),
-      }
-    node.settleAbortedDenial(deniedToolCallIds)
-    let continuedQuestion = false
-    // A question at the head of the pending queue blocks agy until it is answered.
-    // Without a handler (direct callers and tests) it is closed as already handled.
+  }
+  try {
+    await stream.attach(consume)
+    if (ownsObservation) stream.start()
+    await stream.poll()
     while (true) {
-      const question = node.projector.consumePendingQuestion()
-      if (!question) break
-      const outcome: QuestionOutcome = onQuestion
-        ? await onQuestion({ ...question, wokeUp: node.wokeUp })
-        : { status: 'already_handled' }
-      if (signal?.aborted || outcome.status === 'canceled') {
-        onItem(
-          node.projector.completePendingQuestion(
-            question.tool,
-            null,
-            'canceled',
-          ),
+      const revision = stream.revision
+      if (signal?.aborted) {
+        if (
+          signal.reason instanceof Error &&
+          signal.reason.name !== 'AbortError'
         )
+          throw signal.reason
         return finish('canceled')
       }
-      const completed = node.projector.completePendingQuestion(
-        question.tool,
-        outcome.answerText ?? null,
+      if (stream.error) throw stream.error
+      if (!stream.acceptsRows())
+        throw new Error('Brain observation stopped during turn')
+      if (isRpcActive?.()) {
+        await stream.wait(revision, signal)
+        continue
+      }
+      for (const item of node.projector.resolveToolIdentities(false))
+        onItem(item)
+      for (const [key, event] of settledQuestions) {
+        if (!deliveredQuestions.has(key)) {
+          onQuestionSettled?.(event.questions, event.wokeUp)
+          deliveredQuestions.add(key)
+        }
+      }
+      settledQuestions.clear()
+      if (initial) {
+        if (
+          stream.missing &&
+          !node.retryPending() &&
+          (!withinGrace() || !(await sessionDirExists()))
+        )
+          return { status: 'completed' }
+        if (!anchored && !withinGrace()) return { status: 'completed' }
+        if (anchored && Date.now() - lastActivity >= stallTimeoutMs)
+          return stall()
+        await stream.wait(revision, signal)
+        continue
+      }
+      if (signal?.aborted) continue
+      const failure = node.failure(retryTimeoutMs)
+      if (failure)
+        return {
+          ...finish('failed', failure),
+          ...(node.retryPending() ? { stalled: true } : {}),
+        }
+      node.settleAbortedDenial(deniedToolCallIds)
+      let continuedQuestion = false
+      // A question at the head of the pending queue blocks agy until it is answered.
+      // Without a handler (direct callers and tests) it is closed as already handled.
+      while (true) {
+        const question = node.projector.consumePendingQuestion()
+        if (!question) break
+        let beganContinuation = false
+        const previous = questionAnswers.get(question.tool.callId)
+        const outcome: QuestionOutcome = previous
+          ? {
+              status: 'already_handled',
+              answerText:
+                previous.status === 'canceled'
+                  ? undefined
+                  : previous.answerText,
+            }
+          : onQuestion
+            ? await onQuestion({
+                ...question,
+                wokeUp: node.wokeUp,
+                beginContinuation: (answerText) => {
+                  beganContinuation = true
+                  onItem(
+                    node.projector.completePendingQuestion(
+                      question.tool,
+                      answerText,
+                    ),
+                  )
+                  beginContinuation()
+                },
+              })
+            : { status: 'already_handled' }
+        if (signal?.aborted || outcome.status === 'canceled') {
+          onItem(
+            node.projector.completePendingQuestion(
+              question.tool,
+              null,
+              'canceled',
+            ),
+          )
+          return finish('canceled')
+        }
+        questionAnswers.set(question.tool.callId, outcome)
+        if (beganContinuation) {
+          continuedQuestion = true
+          lastActivity = Date.now()
+          break
+        }
+        const completed = node.projector.completePendingQuestion(
+          question.tool,
+          outcome.answerText ?? null,
+        )
+        if (outcome.status === 'answered') {
+          onItem(completed)
+          beginContinuation()
+          lastActivity = Date.now()
+          continuedQuestion = true
+          break
+        }
+        // Answered through elicitation/create: only surface the card where its tool call is shown.
+        if (
+          node.wokeUp ||
+          emitForeground ||
+          (completed.type === 'tool_call' &&
+            shouldEmitPreWakeupTool?.(completed) !== false)
+        )
+          onItem(completed)
+        node.markQuestionSettled()
+      }
+      if (continuedQuestion) continue
+      const checkedVersion = foldVersion
+      const activeChildIds = activeChildIdsForTurn(
+        subagents,
+        node.projector,
+        minStepIndex,
       )
-      if (outcome.status === 'answered') {
-        onItem(completed)
-        node.markQuestionContinuation()
-        lastActivity = Date.now()
-        continuedQuestion = true
-        break
-      }
-      // Answered through elicitation/create: only surface the card where its tool call is shown.
-      if (
-        node.wokeUp ||
-        emitForeground ||
-        (completed.type === 'tool_call' &&
-          shouldEmitPreWakeupTool?.(completed) !== false)
+      const childStatus = await settleChildren(
+        root,
+        node,
+        inbox,
+        activeChildIds,
+        new Set(),
+        retryTimeoutMs,
       )
-        onItem(completed)
-      node.markQuestionSettled()
-    }
-    if (continuedQuestion) continue
-    const activeChildIds = activeChildIdsForTurn(
-      subagents,
-      node.projector,
-      minStepIndex,
-    )
-    const childStatus = await settleChildren(
-      root,
-      node,
-      inbox,
-      activeChildIds,
-      new Set(),
-      retryTimeoutMs,
-    )
-    if (signal?.aborted) continue
-    if (childStatus.error)
-      return {
-        ...finish('failed', childStatus.error),
-        ...(childStatus.stalled ? { stalled: true } : {}),
+      if (signal?.aborted || checkedVersion !== foldVersion) continue
+      if (childStatus.error)
+        return {
+          ...finish('failed', childStatus.error),
+          ...(childStatus.stalled ? { stalled: true } : {}),
+        }
+      if (childStatus.settled && node.isSettled(inbox)) {
+        if (activeChildIds.length > 0) {
+          if (node.hasUnprocessedMessages(await readInboxState(root, nativeId)))
+            continue
+        }
+        if (checkedVersion !== foldVersion) continue
+        return finish('completed')
       }
-    if (childStatus.settled && node.isSettled(inbox)) {
-      if (activeChildIds.length > 0) {
-        if (node.hasUnprocessedMessages(await readInboxState(root, nativeId)))
-          continue
+      // Background tasks, live children and user approvals may run indefinitely; woken-turn tools and
+      // post-wakeup/post-tool LLM generation get a bounded longer window (wokenStallTimeoutMs) before stalling.
+      const tracking =
+        node.projector.hasBackground() ||
+        !childStatus.settled ||
+        isWaitingOnUser?.() === true
+      const idleLimitMs = node.isWokenWorking()
+        ? wokenStallTimeoutMs
+        : stallTimeoutMs
+      if (tracking || node.retryPending()) lastActivity = Date.now()
+      else if (Date.now() - lastActivity >= idleLimitMs) {
+        return stall(idleLimitMs)
       }
-      return finish('completed')
+      await stream.wait(revision, signal)
     }
-    // Background tasks, live children and user approvals may run indefinitely; woken-turn tools and
-    // post-wakeup/post-tool LLM generation get a bounded longer window (wokenStallTimeoutMs) before stalling.
-    const tracking =
-      node.projector.hasBackground() ||
-      !childStatus.settled ||
-      isWaitingOnUser?.() === true
-    const idleLimitMs = node.isWokenWorking()
-      ? wokenStallTimeoutMs
-      : stallTimeoutMs
-    if (tracking || node.retryPending()) lastActivity = Date.now()
-    else if (Date.now() - lastActivity >= idleLimitMs) {
-      return stall(idleLimitMs)
-    }
-    await pause(pollIntervalMs, signal)
+  } finally {
+    if (ownsObservation) await stream.dispose()
   }
 }
 
@@ -540,6 +671,19 @@ export function watchBrain(
   let turnId = `${sessionId}:turn:${turnSeq}`
   let lastStepIndex = resume?.afterStep ?? -1
   const dedupe = new StepDedupe()
+  const childUsage = new ModelUsageObserver(
+    resume?.afterStep ?? -1,
+    (usage) => {
+      if (stopped) return false
+      const { contextWindowUsedTokens } = promptUsage(null, { lastStep: usage })
+      emit({
+        type: 'session.usage',
+        sessionId,
+        turnId: running ? turnId : undefined,
+        usage: { contextWindowUsedTokens },
+      })
+    },
+  )
   function ensureTurnStarted() {
     if (running && !turnStartedEmitted && !stopped) {
       turnStartedEmitted = true
@@ -630,6 +774,7 @@ export function watchBrain(
           })
         }
       }
+      childUsage.observe({ rows, reset, snapshotStepIndices })
       const activeChildIds = activeChildIdsForTurn(
         subagents,
         node.projector,

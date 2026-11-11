@@ -488,6 +488,24 @@ export class TranscriptReader {
     /** Complete replacement identities, separate from immediately deliverable records. */
     snapshotStepIndices?: ReadonlySet<number>
   }> {
+    const previous = {
+      identity: this.identity,
+      offset: this.offset,
+      remainder: this.remainder,
+      snapshotStepIndices: this.snapshotStepIndices,
+      head: this.head,
+      tail: this.tail,
+    }
+    try {
+      return await this.readOnce(root, nativeId)
+    } catch (error) {
+      // Nothing was delivered: cursor bytes, probes and pending snapshot evidence must all roll back.
+      Object.assign(this, previous)
+      throw error
+    }
+  }
+
+  private async readOnce(root: string, nativeId: string) {
     const path = await resolveTranscriptPath(root, nativeId)
     const file = await open(path, 'r')
     const rows: Record<string, unknown>[] = []
@@ -548,8 +566,11 @@ export class TranscriptReader {
         }
         throw error
       }
-      for (const row of rows)
-        this.snapshotStepIndices?.add(Number(row.step_index))
+      if (this.snapshotStepIndices && rows.length) {
+        this.snapshotStepIndices = new Set(this.snapshotStepIndices)
+        for (const row of rows)
+          this.snapshotStepIndices.add(Number(row.step_index))
+      }
       // shortcut: observed JSONL has no commit marker; only a nonempty newline-complete snapshot authorizes pruning.
       const snapshotStepIndices =
         this.remainder.length === 0 && this.snapshotStepIndices?.size
