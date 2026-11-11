@@ -1,0 +1,19 @@
+{
+  "name": "Vendor.Lookup",
+  "input": {
+    "command": "describe only",
+    "path": "/example/document",
+    "questions": [{ "question": "stored data", "options": ["A", "B"] }],
+    "query": "example",
+    "Recipient": "example-recipient"
+  },
+  "output": {
+    "content": [
+      { "type": "text", "text": "found" },
+      { "type": "text", "text": "second block" }
+    ],
+    "structuredContent": { "count": 1, "items": [{ "id": 7 }] },
+    "isError": false,
+    "_meta": { "example": "retained" }
+  }
+}
