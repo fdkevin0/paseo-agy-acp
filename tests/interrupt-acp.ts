@@ -128,7 +128,33 @@ new AgentSideConnection(
           sessionUpdate: 'user_message_chunk',
           content: { type: 'text', text },
         })
-        if (text === 'background') {
+        if (text === 'retry-foreground-active') {
+          rows(
+            [
+              { step_index: 0, type: 'USER_INPUT', content: text },
+              {
+                step_index: 1,
+                type: 'ERROR_MESSAGE',
+                status: 'DONE',
+                source: 'SYSTEM',
+                created_at: '2020-01-01T00:00:00Z',
+                error:
+                  'API error (attempt 1): request failed: synthetic timeout',
+              },
+            ],
+            false,
+          )
+          log('held-foreground')
+          await new Promise((resolve) => setTimeout(resolve, 150))
+          rows([
+            {
+              step_index: 2,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              thinking: 'Recovered silently',
+            },
+          ])
+        } else if (text === 'background' || text === 'retry-background') {
           rows(
             [
               { step_index: 0, type: 'USER_INPUT', content: text },
@@ -159,6 +185,18 @@ new AgentSideConnection(
             ],
             false,
           )
+          if (text === 'retry-background')
+            rows([
+              {
+                step_index: 4,
+                type: 'ERROR_MESSAGE',
+                status: 'DONE',
+                source: 'SYSTEM',
+                created_at: '2020-01-01T00:00:00Z',
+                error:
+                  'API error (attempt 8): request failed: synthetic timeout',
+              },
+            ])
           await update({
             sessionUpdate: 'tool_call',
             toolCallId: 'call-background',

@@ -23,6 +23,7 @@ export interface SubagentRegistryOptions {
   isParentTurnActive: () => boolean
   isLoading: () => boolean
   isUnavailable: () => boolean
+  retryTimeoutMs?: number
 }
 
 /** Own child sub-session watchers, parent-child ownership, and resumption for one root session. */
@@ -154,6 +155,7 @@ export class SubagentRegistry {
       this.opts.isParentTurnActive,
       resume,
       (subagents) => this.rememberSubagents(subagents, nativeId),
+      this.opts.retryTimeoutMs,
     )
     this.children.set(childId, child)
     void child.ready.then(() => {

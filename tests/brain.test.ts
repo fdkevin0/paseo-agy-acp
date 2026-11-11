@@ -27,6 +27,7 @@ import {
   type BrainWatchHandle,
 } from '../server/brain.ts'
 import { waitUntil } from './helpers.ts'
+import { SubagentRegistry } from '../server/subagents.ts'
 import type {
   ProviderEvent,
   ProviderTimelineItem,
@@ -2735,13 +2736,19 @@ test('stream retries preserve tool correlation and do not project historical err
   )
 })
 
-test('root retries recover after 4s and multiple interruptions; thinking-only DONE stays pending', async () => {
+test('API/stream retries recover after 4s and multiple interruptions; unfinished response stays pending', async () => {
   const f = await fixture()
   const items: ProviderTimelineItem[] = []
   try {
     await f.put(parent, [
       { step_index: 1, type: 'USER_INPUT', content: 'work' },
-      interrupted(2),
+      {
+        step_index: 2,
+        type: 'ERROR_MESSAGE',
+        status: 'DONE',
+        source: 'SYSTEM',
+        error: 'API error (attempt 1): request failed: synthetic timeout',
+      },
     ])
     let finished = false
     const pending = alive(
@@ -2761,7 +2768,7 @@ test('root retries recover after 4s and multiple interruptions; thinking-only DO
         {
           step_index: 4,
           type: 'PLANNER_RESPONSE',
-          status: 'DONE',
+          status: 'RUNNING',
           thinking: 'still thinking',
         },
       ]),
@@ -2802,10 +2809,14 @@ test('root retry exhaustion is bounded even with retained background work; cance
       settleBrainTurn(f.root, parent, 'p', () => {}, {
         pollIntervalMs: 5,
         stallTimeoutMs: 30,
+        retryTimeoutMs: 30,
       }),
     )
     assert.equal(result.status, 'failed')
-    assert.match(result.error!, /stream was interrupted.*Retry did not recover/)
+    assert.match(
+      result.error!,
+      /stream was interrupted.*No retry recovery was observed/,
+    )
     assert.equal(result.stalled, true)
     const controller = new AbortController()
     const pending = alive(
@@ -2863,7 +2874,7 @@ test('expired child retry fails parent and active-work checks, recovered history
       settleBrainTurn(f.root, parent, 'p', () => {}, { pollIntervalMs: 5 }),
     )
     assert.equal(result.status, 'failed')
-    assert.match(result.error!, /Subagent .*Retry did not recover/)
+    assert.match(result.error!, /Subagent .*No retry recovery was observed/)
     assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
     await appendFile(f.path(child), encode([done(2)]))
     assert.equal(
@@ -2907,7 +2918,7 @@ test('watcher retries recover without failed events, while cancellation and exha
             {
               step_index: 2,
               type: 'PLANNER_RESPONSE',
-              status: 'DONE',
+              status: 'RUNNING',
               thinking: 'retry',
             },
           ]),
@@ -3093,6 +3104,219 @@ test('cancellation observed while ingesting wins over a terminal failure', async
       }),
     )
     assert.equal(result.status, 'canceled')
+  } finally {
+    await f.close()
+  }
+})
+
+test('quiet DONE completes root and child turns instead of stalling them', async () => {
+  const f = await fixture()
+  let handle: BrainWatchHandle | undefined
+  try {
+    const quiet = {
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      thinking: 'No further reply',
+    }
+    await f.put(parent, [{ step_index: 1, type: 'USER_INPUT' }, quiet])
+    assert.equal(
+      (
+        await alive(
+          settleBrainTurn(f.root, parent, 'p', () => {}, {
+            stallTimeoutMs: 50,
+            pollIntervalMs: 5,
+          }),
+        )
+      ).status,
+      'completed',
+    )
+    await f.put(child, [quiet])
+    const events: ProviderEvent[] = []
+    handle = watchBrain(f.root, child, 'c', (event) => events.push(event), 5)
+    await handle.ready
+    assert.equal(handle.isRunning(), false)
+    assert.ok(
+      events.some(
+        (event) => event.type === 'session.turn' && event.state === 'completed',
+      ),
+    )
+    await f.subagent(parent, child)
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
+  } finally {
+    handle?.()
+    await f.close()
+  }
+})
+
+test('root retry wait uses its own bounded policy and can recover with a quiet DONE', async () => {
+  const f = await fixture()
+  const controller = new AbortController()
+  let pending: ReturnType<typeof settleBrainTurn> | undefined
+  try {
+    await f.put(parent, [
+      { step_index: 1, type: 'USER_INPUT' },
+      {
+        step_index: 2,
+        type: 'ERROR_MESSAGE',
+        status: 'DONE',
+        source: 'SYSTEM',
+        error: 'API error (attempt 1): request failed: synthetic timeout',
+      },
+    ])
+    let finished = false
+    pending = alive(
+      settleBrainTurn(f.root, parent, 'p', () => {}, {
+        signal: controller.signal,
+        pollIntervalMs: 5,
+        stallTimeoutMs: 5,
+        retryTimeoutMs: 1000,
+      }),
+    ).then((result) => {
+      finished = true
+      return result
+    })
+    await delay(25)
+    assert.equal(
+      finished,
+      false,
+      'the ordinary stall must not cut short a retry',
+    )
+    await appendFile(
+      f.path(parent),
+      encode([
+        {
+          step_index: 3,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          thinking: 'Quiet recovery',
+        },
+      ]),
+    )
+    assert.equal((await pending).status, 'completed')
+  } finally {
+    controller.abort()
+    await pending
+    await f.close()
+  }
+})
+
+test('expired retries do not hide retained processes, daemon policy, unread messages or active descendants', async () => {
+  const f = await fixture()
+  try {
+    const expired = interrupted(4, '2020-01-01T00:00:00Z')
+    for (const IsDaemon of [false, true]) {
+      await f.put(parent, [
+        { step_index: 1, type: 'USER_INPUT' },
+        {
+          step_index: 2,
+          type: 'PLANNER_RESPONSE',
+          tool_calls: [{ name: 'run_command', args: { IsDaemon } }],
+        },
+        {
+          step_index: 3,
+          type: 'GENERIC',
+          status: 'RUNNING',
+          content:
+            'Tool is running as a background task with task id: retained',
+        },
+        expired,
+      ])
+      assert.equal(await hasActiveBackgroundWork(f.root, parent), !IsDaemon)
+      assert.equal(
+        await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
+        true,
+      )
+    }
+    await f.put(parent, [{ step_index: 1, type: 'USER_INPUT' }, expired])
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
+    await f.deliver(parent, child, 'unread report', false)
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), true)
+    await f.subagent(parent, child)
+    await f.put(child, [
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'RUNNING',
+        thinking: 'active child',
+      },
+    ])
+    await f.deliver(parent, child, 'unread report', true)
+    // Use a fresh root inbox to isolate live descendants from unread-message detection.
+    await rm(join(f.root, parent, '.system_generated/messages'), {
+      recursive: true,
+      force: true,
+    })
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), true)
+  } finally {
+    await f.close()
+  }
+})
+
+test('child registry forwards the shared retry policy to its watcher', async () => {
+  const f = await fixture()
+  const events: ProviderEvent[] = []
+  const registry = new SubagentRegistry({
+    sessionId: 'p',
+    cwd: f.root,
+    brainRoot: f.root,
+    capabilities: ['session.subsession'],
+    emit: (event) => events.push(event),
+    getNativeId: () => parent,
+    isParentTurnActive: () => true,
+    isLoading: () => false,
+    isUnavailable: () => false,
+    retryTimeoutMs: 50,
+  })
+  try {
+    await f.put(child, [
+      interrupted(1, new Date(Date.now() - 1000).toISOString()),
+    ])
+    registry.linkSubsession('p', parent, {
+      type: 'tool_call',
+      id: 'spawn',
+      callId: 'spawn',
+      name: 'invoke_subagent',
+      status: 'completed',
+      error: null,
+      detail: { type: 'sub_agent', childSessionId: child, log: '' },
+    })
+    await registry.waitCurrentReady()
+    assert.ok(
+      events.some(
+        (event) =>
+          event.type === 'session.turn' &&
+          event.sessionId === `p:child:${child}` &&
+          event.state === 'failed',
+      ),
+    )
+    assert.equal(registry.hasRunningChildren(), false)
+  } finally {
+    registry.closeAll()
+    await f.close()
+  }
+})
+
+test('cancel wins after multiple exhausted warnings are ingested', async () => {
+  const f = await fixture()
+  const controller = new AbortController()
+  try {
+    await f.put(parent, [
+      { step_index: 1, type: 'USER_INPUT' },
+      interrupted(2, '2020-01-01T00:00:00Z'),
+      interrupted(3, '2020-01-01T00:00:01Z'),
+    ])
+    const result = await alive(
+      settleBrainTurn(f.root, parent, 'p', () => {}, {
+        signal: controller.signal,
+        onStep: (step) => {
+          if (step === 3) controller.abort()
+        },
+        retryTimeoutMs: 50,
+      }),
+    )
+    assert.equal(result.status, 'canceled')
+    assert.equal(result.error, undefined)
   } finally {
     await f.close()
   }
