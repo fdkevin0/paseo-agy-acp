@@ -83,6 +83,8 @@ export function isCompletePlannerResponse(
   return (
     step?.type === 'PLANNER_RESPONSE' &&
     step.status === 'DONE' &&
+    ((typeof step.content === 'string' && step.content.trim().length > 0) ||
+      (Array.isArray(step.tool_calls) && step.tool_calls.length > 0)) &&
     (!Array.isArray(step.tool_calls) ||
       step.tool_calls.length === 0 ||
       step.tool_calls.every((call) =>
@@ -111,6 +113,20 @@ export function stepErrorMessage(
     return errObj.message
   return fallback
 }
+
+/** Only this observed upstream warning is retryable; unknown errors remain failures. */
+export function isStreamInterruption(
+  step: Record<string, unknown> | undefined,
+): boolean {
+  return (
+    step?.type === 'ERROR_MESSAGE' &&
+    /^(?:Error: )?The stream was interrupted\. Please continue the task you were working on\.$/.test(
+      stepErrorMessage(step),
+    )
+  )
+}
+
+export const STREAM_RETRY_TIMEOUT_MS = 120_000
 
 export function extractStepUsage(
   row: Record<string, unknown>,

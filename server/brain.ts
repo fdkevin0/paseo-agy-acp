@@ -18,7 +18,7 @@ import {
   readLastStepIndex,
   readSubagents,
   readTranscriptRows,
-  stepErrorMessage,
+  STREAM_RETRY_TIMEOUT_MS,
   type InboxState,
   type SubagentRecord,
 } from './brain-io.ts'
@@ -56,13 +56,22 @@ export async function hasActiveBackgroundWork(
       node.pollMetadata(root),
       readTranscriptRows(root, nativeId),
     ])
-    if (inbox.unconsumedHighPriority.length > 0) return true
     if (isChild && rows.length === 0) return true
+    const observedAt = await stat(
+      join(root, nativeId, '.system_generated/logs/transcript_full.jsonl'),
+    ).then(
+      (info) => info.mtimeMs,
+      () => Date.now(),
+    )
     for (const row of rows) {
       // The restarted runtime left no woken turn running.
       if (isRestartNotice(row)) node.resetPhase()
-      node.ingest(row)
+      node.ingest(row, observedAt)
     }
+    if (node.retryPending() && node.failure()) return false
+    if (inbox.unconsumedHighPriority.length > 0) return true
+    if (node.failure()) return false
+    if (node.retryPending()) return true
     if (
       node.projector.hasBackground() ||
       (options.includeDaemons && node.projector.hasDaemons())
@@ -71,8 +80,7 @@ export async function hasActiveBackgroundWork(
     // A failed step is finished; an unsettled child or woken parent turn is still working outside ACP prompt RPC.
     if (
       isChild
-        ? node.hasUnprocessedMessages(inbox) ||
-          (!node.isSettled(inbox) && node.lastStep?.type !== 'ERROR_MESSAGE')
+        ? node.hasUnprocessedMessages(inbox) || !node.isSettled(inbox)
         : (node.foregroundIdleReached && node.hasUnprocessedMessages(inbox)) ||
           node.isWokenWorking()
     )
@@ -98,10 +106,12 @@ async function settleChildren(
   parentInbox: InboxState,
   activeChildIds: readonly string[],
   visiting = new Set<string>(),
-): Promise<{ settled: boolean; error?: string }> {
+  retryTimeoutMs = STREAM_RETRY_TIMEOUT_MS,
+): Promise<{ settled: boolean; error?: string; stalled?: boolean }> {
   if (visiting.has(parentNode.nativeId)) return { settled: true }
   visiting.add(parentNode.nativeId)
   try {
+    let settled = true
     for (const childId of activeChildIds) {
       if (!sessionIdPattern.test(childId) || visiting.has(childId)) continue
       let child = parentNode.children.get(childId)
@@ -116,16 +126,31 @@ async function settleChildren(
         if (reset) child.reset(childInbox, childSubagents)
         for (const row of rows) child.ingest(row)
       } catch (error) {
-        if (isMissing(error)) return { settled: false }
+        if (isMissing(error)) {
+          const failure = child.failure(retryTimeoutMs)
+          if (failure)
+            return {
+              settled: false,
+              error: `Subagent ${childId} failed: ${failure}`,
+              stalled: child.retryPending(),
+            }
+          settled = false
+          continue
+        }
         throw error
       }
-      if (child.hasUnprocessedMessages(childInbox)) return { settled: false }
-      if (child.lastStep?.type === 'ERROR_MESSAGE')
+      if (!child.retryPending() && child.hasUnprocessedMessages(childInbox)) {
+        settled = false
+        continue
+      }
+      const failure = child.failure(retryTimeoutMs)
+      if (failure)
         return {
           settled: false,
-          error: `Subagent ${childId} failed: ${stepErrorMessage(child.lastStep)}`,
+          error: `Subagent ${childId} failed: ${failure}`,
+          stalled: child.retryPending(),
         }
-      if (!child.isSettled(childInbox)) return { settled: false }
+      if (!child.isSettled(childInbox)) settled = false
       const grandchildIds = activeChildIdsForTurn(
         childSubagents,
         child.projector,
@@ -137,17 +162,18 @@ async function settleChildren(
         childInbox,
         grandchildIds,
         visiting,
+        retryTimeoutMs,
       )
       if (nested.error) return nested
-      if (!nested.settled) return { settled: false }
+      if (!nested.settled) settled = false
       // This child's report must reach the parent's transcript before the child counts as settled.
       if (
         parentInbox.unconsumedHighPriority.some((m) => m.sender === childId) ||
         parentNode.consumedMessages < parentInbox.consumedNonUserCount
       )
-        return { settled: false }
+        settled = false
     }
-    return { settled: true }
+    return { settled }
   } finally {
     visiting.delete(parentNode.nativeId)
   }
@@ -285,6 +311,12 @@ export async function settleBrainTurn(
       }
     } catch (error) {
       if (!isMissing(error)) throw error
+      if (node.retryPending()) {
+        const failure = node.failure(stallTimeoutMs)
+        if (failure) return { ...finish('failed', failure), stalled: true }
+        await pause(pollIntervalMs, signal)
+        continue
+      }
       // A missing transcript cannot be settled from; it only delays completion while agy may still flush it.
       if (!withinGrace() || !(await sessionDirExists()))
         return { status: 'completed' }
@@ -352,8 +384,12 @@ export async function settleBrainTurn(
         }
       }
     }
-    if (node.lastStep?.type === 'ERROR_MESSAGE')
-      return finish('failed', stepErrorMessage(node.lastStep, 'Turn failed'))
+    const failure = node.failure(stallTimeoutMs)
+    if (failure)
+      return {
+        ...finish('failed', failure),
+        ...(node.retryPending() ? { stalled: true } : {}),
+      }
     node.settleAbortedDenial(deniedToolCallIds)
     let continuedQuestion = false
     // A question at the head of the pending queue blocks agy until it is answered.
@@ -401,8 +437,19 @@ export async function settleBrainTurn(
       node.projector,
       minStepIndex,
     )
-    const childStatus = await settleChildren(root, node, inbox, activeChildIds)
-    if (childStatus.error) return finish('failed', childStatus.error)
+    const childStatus = await settleChildren(
+      root,
+      node,
+      inbox,
+      activeChildIds,
+      new Set(),
+      stallTimeoutMs,
+    )
+    if (childStatus.error)
+      return {
+        ...finish('failed', childStatus.error),
+        ...(childStatus.stalled ? { stalled: true } : {}),
+      }
     if (childStatus.settled && node.isSettled(inbox)) {
       if (activeChildIds.length > 0) {
         if (node.hasUnprocessedMessages(await readInboxState(root, nativeId)))
@@ -452,6 +499,7 @@ export function watchBrain(
   /** Resume an existing child session: earlier steps are only projected, and turn IDs continue. */
   resume?: { afterStep: number; turnSeq: number },
   onSubagents?: (subagents: readonly SubagentRecord[]) => void,
+  retryTimeoutMs = STREAM_RETRY_TIMEOUT_MS,
 ): BrainWatchHandle {
   if (!sessionIdPattern.test(nativeId))
     throw new Error('Invalid Brain session ID')
@@ -482,7 +530,7 @@ export function watchBrain(
     state: 'completed' | 'failed' | 'canceled',
     error?: string,
   ) {
-    if (!running || stopped) return
+    if (!running || stopped || (cancelling && state !== 'canceled')) return
     ensureTurnStarted()
     running = false
     for (const item of timeline.terminalize(state, error))
@@ -564,14 +612,17 @@ export function watchBrain(
         node,
         inbox,
         activeChildIds,
+        new Set(),
+        retryTimeoutMs,
       )
       if (childStatus.error) finishTurn('failed', childStatus.error)
-      if (running && !node.hasUnprocessedMessages(inbox)) {
-        if (node.lastStep?.type === 'ERROR_MESSAGE') {
-          finishTurn(
-            'failed',
-            stepErrorMessage(node.lastStep, 'Subagent error'),
-          )
+      if (
+        running &&
+        (node.retryPending() || !node.hasUnprocessedMessages(inbox))
+      ) {
+        const failure = node.failure(retryTimeoutMs)
+        if (failure) {
+          finishTurn('failed', failure)
         } else if (childStatus.settled && node.isSettled(inbox)) {
           const latestInbox =
             activeChildIds.length > 0
@@ -582,7 +633,11 @@ export function watchBrain(
       }
     } catch (error) {
       if (isMissing(error)) {
-        if (isParentTurnActive && !isParentTurnActive()) finishTurn('completed')
+        if (node.retryPending()) {
+          const failure = node.failure(retryTimeoutMs)
+          if (failure) finishTurn('failed', failure)
+        } else if (isParentTurnActive && !isParentTurnActive())
+          finishTurn('completed')
         return
       }
       if (!warned && !stopped) {
