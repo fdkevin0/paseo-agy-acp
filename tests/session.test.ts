@@ -978,3 +978,184 @@ test(
     }
   },
 )
+
+test('context uses latest turn snapshot on cancel/error/restore and preserves native updates', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-context-snapshot-'))
+  const events: ProviderEvent[] = []
+  const m = new SessionManager({
+    launch: {
+      command: process.execPath,
+      args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+      env: { HOME: home, PATH: process.env.PATH ?? '' },
+    },
+    usage: new AgyUsageSource(),
+    capabilities: ['prompt.message'],
+    emit: (e) => events.push(structuredClone(e)),
+  })
+  const config = {
+    cwd: home,
+    env: {},
+    mcpServers: {},
+    settings: {},
+    persist: true,
+  }
+  try {
+    await m.open({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'skip',
+      config,
+    })
+    const openedEvent = events.find((e) => e.type === 'session.opened')
+    assert.ok(openedEvent?.type === 'session.opened')
+    const persistence = openedEvent.persistence!
+    let promptIndex = 0
+    for (const text of [
+      'usage-cancel',
+      'usage-empty',
+      'usage-error',
+      'usage-native',
+      'usage-empty',
+    ]) {
+      events.length = 0
+      await m.handle({
+        type: 'session.prompt',
+        sessionId: 's',
+        prompt: {
+          clientMessageId: `${text}:${++promptIndex}`,
+          delivery: 'auto',
+          input: { type: 'message', content: [{ type: 'text', text }] },
+        },
+      })
+      const usage = events.findLast((e) => e.type === 'session.usage')
+      assert.ok(usage?.type === 'session.usage')
+      assert.equal(
+        usage.usage.contextWindowUsedTokens,
+        text === 'usage-native' || usage.usage.contextWindowMaxTokens === 128000
+          ? 1234
+          : 70463,
+      )
+      assert.equal(usage.usage.inputTokens, 600000)
+      assert.equal(usage.usage.outputTokens, 4405)
+      assert.ok(
+        events.some(
+          (e) =>
+            e.type === 'session.turn' &&
+            e.state ===
+              (text === 'usage-cancel'
+                ? 'canceled'
+                : text === 'usage-error'
+                  ? 'failed'
+                  : 'completed'),
+        ),
+      )
+    }
+    await m.handle({
+      type: 'session.close',
+      requestId: 'close',
+      sessionId: 's',
+    })
+    events.length = 0
+    await m.open({
+      type: 'session.open',
+      requestId: 'restore',
+      sessionId: 'restored',
+      history: 'skip',
+      config,
+      persistence,
+    })
+    const restored = events.findLast((e) => e.type === 'session.usage')
+    assert.ok(restored?.type === 'session.usage')
+    assert.equal(restored.usage.contextWindowUsedTokens, 70463)
+  } finally {
+    await m.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test(
+  'history replay retains completed tools before a partial transcript tail',
+  { timeout: 5000 },
+  async () => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-tool-prefix-'))
+    const events: ProviderEvent[] = []
+    const m = new SessionManager({
+      launch: {
+        command: process.execPath,
+        args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+        env: { HOME: home, PATH: process.env.PATH ?? '' },
+      },
+      usage: new AgyUsageSource(),
+      capabilities: [],
+      emit: (e) => events.push(e),
+    })
+    const session = await m.start('s', home)
+    try {
+      const native = '11111111-1111-4111-8111-111111111111'
+      const dir = join(session.brainRoot, native, '.system_generated/logs')
+      await mkdir(dir, { recursive: true })
+      const rows = [
+        {
+          step_index: 0,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [
+            {
+              id: 'historical-tool',
+              name: 'run_command',
+              args: { CommandLine: 'echo retained' },
+            },
+          ],
+        },
+        {
+          step_index: 1,
+          type: 'GENERIC',
+          status: 'DONE',
+          content: 'retained output',
+        },
+      ]
+      await writeFile(
+        join(dir, 'transcript_full.jsonl'),
+        rows.map((r) => JSON.stringify(r) + '\n').join('') + '{"step_index":2',
+      )
+      session.state.nativeId = native
+      session.state.persisted = true
+      session.state.opening = false
+      session.state.opened = true
+      session.state.loading = false
+      session.state.replay = true
+      await session.replayTools()
+      assert.deepEqual(
+        events.flatMap((e) =>
+          e.type === 'timeline.item' && e.item.type === 'tool_call'
+            ? [
+                {
+                  callId: e.item.callId,
+                  status: e.item.status,
+                  detail: e.item.detail,
+                },
+              ]
+            : [],
+        ),
+        [
+          {
+            callId: 'historical-tool',
+            status: 'completed',
+            detail: {
+              type: 'shell',
+              command: 'echo retained',
+              cwd: undefined,
+              output: 'retained output',
+            },
+          },
+        ],
+      )
+      assert.equal(session.state.lastKnownStepIndex, 1)
+    } finally {
+      await session.close()
+      await m.close()
+      await rm(home, { recursive: true, force: true })
+    }
+  },
+)

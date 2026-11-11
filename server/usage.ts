@@ -24,6 +24,10 @@ const USAGE_FETCH_TIMEOUT_MS = 15_000
 const LOG_CHUNK_SIZE = 64 * 1024
 const ACCOUNT_CACHE_LIMIT = 100
 
+function windowOrder(window: string): number {
+  return window === '5h' ? 0 : window === 'weekly' ? 1 : 2
+}
+
 const usageInputSchema = z.object({
   dataDir: z.string().min(1),
 })
@@ -299,38 +303,46 @@ export class AgyUsageSource {
         },
       )
       const windows = parseUsage(stdout).flatMap((group) =>
-        group.buckets.map((bucket) => {
-          const utilizationPct =
-            bucket.remainingFraction === undefined
-              ? null
-              : Math.round(
-                  Math.max(0, Math.min(1, 1 - bucket.remainingFraction)) * 100,
-                )
-          return windowFromReportedDuration({
-            durationSeconds:
-              bucket.window === '5h'
-                ? FIVE_HOURS_SECONDS
-                : bucket.window === 'weekly'
-                  ? WEEKLY_SECONDS
-                  : null,
-            scope: {
-              id: group.name
-                .toLowerCase()
-                .replace(/[^a-z0-9]+/g, '_')
-                .replace(/^_|_$/g, ''),
-              label: group.name,
-            },
-            unknown: {
-              id: bucket.id,
-              label: bucket.name,
-              shortLabel: bucket.window,
-            },
-            utilizationPct,
-            resetsAt: bucket.resetTime || null,
-            summary: true,
-            tone: toneFromUsedPct(utilizationPct),
-          })
-        }),
+        group.buckets
+          .toSorted((a, b) => windowOrder(a.window) - windowOrder(b.window))
+          .map((bucket) => {
+            const utilizationPct =
+              bucket.remainingFraction === undefined
+                ? null
+                : Math.round(
+                    Math.max(0, Math.min(1, 1 - bucket.remainingFraction)) *
+                      100,
+                  )
+            return windowFromReportedDuration({
+              durationSeconds:
+                bucket.window === '5h'
+                  ? FIVE_HOURS_SECONDS
+                  : bucket.window === 'weekly'
+                    ? WEEKLY_SECONDS
+                    : null,
+              scope: {
+                id: group.name
+                  .toLowerCase()
+                  .replace(/[^a-z0-9]+/g, '_')
+                  .replace(/^_|_$/g, ''),
+                label:
+                  group.name === 'Gemini Models'
+                    ? 'Gemini'
+                    : group.name === 'Claude and GPT models'
+                      ? 'Claude / GPT'
+                      : group.name,
+              },
+              unknown: {
+                id: bucket.id,
+                label: bucket.name,
+                shortLabel: bucket.window,
+              },
+              utilizationPct,
+              resetsAt: bucket.resetTime || null,
+              summary: true,
+              tone: toneFromUsedPct(utilizationPct),
+            })
+          }),
       )
       if (!windows.length)
         return unavailable({
@@ -339,7 +351,9 @@ export class AgyUsageSource {
         })
       return {
         status: 'available',
-        planLabel: this.tiers.get(dataDir),
+        planLabel: this.tiers
+          .get(dataDir)
+          ?.replace(/^Google AI (Pro|Ultra)$/, '$1'),
         windows,
       }
     } catch (error) {

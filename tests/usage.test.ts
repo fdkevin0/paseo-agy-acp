@@ -154,11 +154,19 @@ test('usage discovers account scopes and maps windows, tier and failures through
       ).length,
       1,
     )
-    await writeFile(fixture, envelope(groups))
+    await writeFile(
+      fixture,
+      envelope(
+        groups.map((group) => ({
+          ...group,
+          buckets: [...group.buckets].reverse(),
+        })),
+      ),
+    )
     const report = await usage.fetch(account.input)
     assert.equal(report.status, 'available')
     assert.ok(report.status === 'available')
-    assert.equal(report.planLabel, 'Google AI Ultra')
+    assert.equal(report.planLabel, 'Ultra')
     assert.deepEqual(
       report.windows.map((w) => w.id),
       [
@@ -177,6 +185,19 @@ test('usage discovers account scopes and maps windows, tier and failures through
       ['ok', 'danger', 'ok', 'danger'],
     )
     assert.ok(report.windows.every((w) => w.summary))
+    assert.deepEqual(
+      report.windows.map((w) => w.label),
+      [
+        'Gemini · 5-hour',
+        'Gemini · Weekly',
+        'Claude / GPT · 5-hour',
+        'Claude / GPT · Weekly',
+      ],
+    )
+    assert.deepEqual(
+      report.windows.map((w) => w.shortLabel),
+      ['Gemini 5h', 'Gemini wk', 'Claude / GPT 5h', 'Claude / GPT wk'],
+    )
     assert.equal(report.windows[0].resetsAt, groups[0].buckets[0].reset_time)
     assert.deepEqual(JSON.parse(await readFile(argsLog, 'utf8')), [
       '--gemini-dir',
@@ -196,6 +217,7 @@ test('usage discovers account scopes and maps windows, tier and failures through
             { window: 'daily' },
             { window: '5h', remaining_fraction: -1 },
             { window: 'weekly', remaining_fraction: 2 },
+            { id: 'future', name: 'Future allowance', window: 'future' },
           ],
         },
       ]),
@@ -204,9 +226,31 @@ test('usage discovers account scopes and maps windows, tier and failures through
     assert.ok(clamped.status === 'available')
     assert.deepEqual(
       clamped.windows.map((w) => w.usedPct),
-      [null, 100, 0],
+      [100, 0, null, null],
     )
-    assert.equal(clamped.windows[0].id, 'extra:daily')
+    assert.deepEqual(
+      clamped.windows.map((w) => w.id),
+      ['extra:five_hour', 'extra:weekly', 'extra:daily', 'extra:future'],
+    )
+    assert.equal(clamped.windows[2].label, 'Extra · daily')
+    assert.equal(clamped.windows[3].label, 'Extra · Future allowance')
+    assert.equal(clamped.windows[3].shortLabel, 'Extra future')
+    for (const [tier, expected] of [
+      ['Google AI Pro', 'Pro'],
+      ['Google AI Ultra', 'Ultra'],
+      ['Google AI Ultra Business', 'Google AI Ultra Business'],
+      ['Google AI Future', 'Google AI Future'],
+      ['Other Pro', 'Other Pro'],
+    ]) {
+      usage.tiers.set(dir, tier)
+      const result = await usage.fetch(account.input)
+      assert.ok(result.status === 'available')
+      assert.equal(result.planLabel, expected)
+    }
+    usage.tiers.delete(dir)
+    const withoutTier = await usage.fetch(account.input)
+    assert.ok(withoutTier.status === 'available')
+    assert.equal(withoutTier.planLabel, undefined)
     await writeFile(fixture, envelope([]))
     assert.deepEqual(await usage.fetch(account.input), {
       status: 'unavailable',

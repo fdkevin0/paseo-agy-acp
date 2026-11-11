@@ -95,6 +95,8 @@ Subagent lifecycle is tracked directly from `.system_generated/subagents/*.json`
 
 agy appends each step once, when it reaches `RUNNING`, `WAITING` or `DONE` (or fails), and occasionally rewrites the whole file in place (`O_TRUNC`, same inode). The reader detects such rewrites by size, by re-checking the first bytes and the bytes before its offset, and when mid-`O_TRUNC` reads encounter corrupt partial lines, then resets to byte `0` and re-projects the file; `StepDedupe.fresh` hashes `(type, status, content, thinking, tool_calls)` with SHA-1 so a step is re-emitted only when its status or payload actually changed. Rows in `PENDING`, `QUEUED` or `GENERATING` can only come from a rewrite and are always superseded by a later row for the same step, so they are ignored.
 
+An empty or torn rewrite observation does not delete delivered-step identities. Every complete JSONL record is immediately available to live, cancellation and history readers, even when the next record is partial. `reset` tells projectors to rebuild after a cursor reset; a separate `snapshotStepIndices` set authorizes dedupe pruning only after a nonempty replacement has no partial tail. The reader accumulates only step indices across partial reads, resetting that candidate set on another truncation or file replacement. Missing indices are then removed from the dedupe map, and changed or subsequently reused indices remain visible. The map retains one digest per observed step, not transcript bodies or every historical revision; an empty file retains the preceding snapshot's identities. A new watcher/session owns a new map. AGY supplies no generation or rewrite-commit marker: clearing a file and restoring identical rows within the same watcher is indistinguishable from rewriting history and does not create new events. A newline-complete nonempty prefix is still treated as a replacement snapshot; a writer pausing between complete records cannot be distinguished from deletion without an upstream commit marker.
+
 Tool results do not become assistant bubbles. Child watchers emit `session.ready` immediately after `session.opened`, emit `session.turn(started)` lazily on their first active step, and emit completed or failed turn events when settled; successful native `manage_subagents` cancellation stops the affected watchers and emits canceled events. New native child turns restart lifecycle tracking. Cancellation (historical or live) first drains the child rows already written, so the child timeline is complete before its canceled turn, and finishes before the parent turn or session readiness is reported. Canceled children stay registered: they are never reopened and are closed with their parent. A later `send_message` to a child stopped by interruption resumes watching the same child session without replaying its history, after the previous watcher has drained; killed children are not resumed. Independent child control and Artifacts panels are unsupported.
 
 ## Permissions and runtime lifecycle
@@ -111,9 +113,9 @@ Steering, rewind, archive operations and structured output are unsupported.
 
 ## Context window occupancy
 
-Paseo's context meter needs both `contextWindowUsedTokens` and a positive `contextWindowMaxTokens`. On foreground-only turns (`!turnWokeUp`), valid native `usage_update` notifications take precedence for the current turn; used tokens must be finite and nonnegative. Only USD costs populate `totalCostUsd`.
+Paseo's context meter needs both `contextWindowUsedTokens` and a positive `contextWindowMaxTokens`. Valid native `usage_update` notifications take precedence during the foreground phase; later Reactive Wakeup planner snapshots can update occupancy while retaining the same model's known native capacity; used tokens must be finite and nonnegative. Only USD costs populate `totalCostUsd`.
 
-agy prompt responses report cumulative token counters across internal model steps, whereas `transcript_full.jsonl` records exact per-step `input_tokens`, `cache_read_tokens` and `output_tokens` on each `PLANNER_RESPONSE`. When no valid `usage_update` notification arrives during a turn—or when a turn enters post-RPC Reactive Wakeup (`turnWokeUp === true`), where `agy` sends no post-RPC `usage_update` notifications—the plugin computes context window occupancy from the final `PLANNER_RESPONSE` step in `transcript_full.jsonl`:
+agy prompt responses report cumulative token counters across internal model steps, whereas `transcript_full.jsonl` records exact per-step `input_tokens`, `cache_read_tokens` and `output_tokens` on each `PLANNER_RESPONSE`. When no valid foreground `usage_update` arrives, or later Reactive Wakeup steps execute, the plugin computes context window occupancy from the latest reliable `PLANNER_RESPONSE` usage snapshot in `transcript_full.jsonl`:
 
 ```text
 usedTokens = lastStep.inputTokens + lastStep.cachedReadTokens + lastStep.cachedWriteTokens + lastStep.outputTokens
@@ -121,12 +123,18 @@ usedTokens = lastStep.inputTokens + lastStep.cachedReadTokens + lastStep.cachedW
 
 `cachedWriteTokens` is taken from the step's `cache_write_tokens` when agy records it and is otherwise zero; agy 1.5.3 records only the first three counters. Per-step and cumulative ACP counters are never mixed in one sum. When a turn concludes with Reactive Wakeup steps, its wakeup token totals are recorded in `carriedWakeup` and subtracted from `agy`'s cumulative ACP prompt counters on the next turn so woken tokens are not double-counted.
 
-When no step-level counters are available in `transcript_full.jsonl`, occupancy falls back to `inputTokens + cachedReadTokens + cachedWriteTokens + outputTokens` (or `totalTokens` if zero) from the ACP prompt response. Invalid counters are treated as zero.
+When no reliable step-level counters are available, context occupancy stays unchanged or unknown; cumulative ACP prompt counters never substitute for context occupancy. Cancellation and prompt errors recover only snapshots after the current turn boundary. Restoration can recover the latest historical snapshot when native context is absent. Cache-only model steps with positive usage are valid snapshots; invalid and all-zero placeholder counters are ignored. A native `usage_update` explicitly reporting zero remains valid. Snapshot-only updates never replace turn consumption or pending wakeup deductions. Restoration publishes context after applying requested model configuration.
 
 | Model                        | Fallback capacity |
 | ---------------------------- | ----------------- |
 | IDs beginning with `gpt-oss` | 131,072 tokens.   |
 | Other models                 | 256,000 tokens.   |
+
+Snapshot recovery reads complete records backwards in 64 KiB blocks, stops at this turn's boundary, and retains at most one JSONL record (8 MiB limit). If no snapshot exists, a historical restore can still scan the full file; it does not retain the full transcript. Cancel/error recovery also records the highest observed complete step so a later turn cannot claim canceled history as its own.
+
+For snapshot recovery and turn boundaries, a complete JSON record at the observed file end is readable even without a final newline; an unparseable partial record is skipped. This restores the existing tail-index behavior, but does not establish that the writer has finished or prevent later revisions. The streaming transcript reader still requires a newline to deliver a record; this tail-only measurement never authorizes replacement-snapshot pruning.
+
+ACP `session/cancel` is a notification, not a server acknowledgement. Recovery waits for local interruption/relaunch work and drains pending ACP notifications after the original prompt resolves or rejects, then reads the complete records currently available. A runtime that writes Brain after those observable boundaries cannot be guaranteed to have flushed: no sleep or invented acknowledgement is used. Later history restoration can recover late counters without charging them to a new turn.
 
 Prompt token counters are merged with context usage and emitted before turn completion. Context occupancy and subscription quota are separate measurements.
 

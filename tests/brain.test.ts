@@ -1890,26 +1890,210 @@ test('a resumed child watcher skips its history and continues turn IDs', async (
   }
 })
 
-test('a child watcher does not restart turns when its transcript is rewritten in place', async () => {
-  const f = await fixture()
-  const events: ProviderEvent[] = []
-  let handle: BrainWatchHandle | undefined
-  try {
-    const rows = [message(0, parent, 'work'), done(1, 'Reply')]
-    await f.put(child, rows)
-    handle = watchBrain(f.root, child, 'c', (event) => events.push(event), 5)
-    await until(() =>
-      events.some((e) => e.type === 'session.turn' && e.state === 'completed'),
-    )
-    const before = events.length
-    await f.rewrite(child, [...rows, { step_index: 2, type: 'CHECKPOINT' }])
-    await delay(50)
-    assert.equal(events.length, before, 'unchanged steps are not new activity')
-  } finally {
-    handle?.()
-    await f.close()
-  }
-})
+for (const emptyWindowMs of [0, 50]) {
+  test(
+    `a child watcher does not restart turns across an observed ${emptyWindowMs}ms rewrite window`,
+    { timeout: 5000 },
+    async () => {
+      const f = await fixture()
+      const events: ProviderEvent[] = []
+      let handle: BrainWatchHandle | undefined
+      let polls = 0
+      const afterRead = async () => {
+        const target = polls + 2
+        // Metadata is read before the transcript; two sequential polls guarantee an intervening transcript read.
+        await until(() => polls >= target)
+      }
+      try {
+        const rows = [message(0, parent, 'work'), done(1, 'Reply')]
+        await f.put(child, rows)
+        handle = watchBrain(
+          f.root,
+          child,
+          'c',
+          (event) => events.push(event),
+          5,
+          undefined,
+          undefined,
+          () => {
+            polls++
+          },
+        )
+        await handle.ready
+        const before = events.length
+        await f.rewrite(
+          child,
+          [...rows, { step_index: 2, type: 'CHECKPOINT' }],
+          async () => {
+            await afterRead()
+            if (emptyWindowMs > 0) await delay(emptyWindowMs)
+          },
+        )
+        await afterRead()
+        assert.equal(
+          events.length,
+          before,
+          'unchanged steps are not new activity',
+        )
+        await appendFile(
+          f.path(child),
+          encode([message(3, parent, 'New work'), done(4, 'New reply')]),
+        )
+        await afterRead()
+        assert.deepEqual(
+          events.flatMap((e) =>
+            e.type === 'timeline.item' && e.item.type === 'assistant_message'
+              ? [e.item.text]
+              : [],
+          ),
+          ['Reply', 'New reply'],
+        )
+        const beforeCancel = events.length
+        // Cancel drains a rewrite while preserving history identity, then stops future polling.
+        await f.rewrite(
+          child,
+          [
+            ...rows,
+            { step_index: 2, type: 'CHECKPOINT' },
+            message(3, parent, 'New work'),
+            done(4, 'New reply'),
+          ],
+          afterRead,
+        )
+        await handle.cancel()
+        const canceled = events.length
+        assert.equal(
+          canceled,
+          beforeCancel,
+          'cancel must not re-emit rewritten history',
+        )
+        assert.equal(handle.isStopped(), true)
+        await appendFile(
+          f.path(child),
+          encode([message(5, parent, 'After cancel'), done(6, 'Invisible')]),
+        )
+        await handle.cancel()
+        assert.equal(events.length, canceled)
+      } finally {
+        handle?.()
+        await f.close()
+      }
+    },
+  )
+}
+
+test(
+  'canceling an active child during an observed empty rewrite emits one canceled terminal',
+  { timeout: 5000 },
+  async () => {
+    const f = await fixture()
+    const events: ProviderEvent[] = []
+    let handle: BrainWatchHandle | undefined
+    try {
+      const rows = [
+        message(0, parent, 'work'),
+        {
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          status: 'RUNNING',
+          content: 'Still running',
+        },
+      ]
+      await f.put(child, rows)
+      handle = watchBrain(f.root, child, 'c', (event) => events.push(event), 5)
+      await handle.ready
+      assert.equal(handle.isRunning(), true)
+      await f.rewrite(child, rows, () => handle!.cancel())
+      assert.equal(handle.isStopped(), true)
+      assert.deepEqual(
+        events.flatMap((e) => (e.type === 'session.turn' ? [e.state] : [])),
+        ['started', 'canceled'],
+      )
+      const count = events.length
+      await handle.cancel()
+      assert.equal(
+        events.length,
+        count,
+        'a stopped watcher cannot replay restored rows',
+      )
+    } finally {
+      handle?.()
+      await f.close()
+    }
+  },
+)
+
+test(
+  'cancel drains a complete rewritten prefix once even when the next record is partial',
+  { timeout: 5000 },
+  async () => {
+    const f = await fixture()
+    const events: ProviderEvent[] = []
+    let handle: BrainWatchHandle | undefined
+    let polls = 0
+    try {
+      const rows = [
+        { step_index: 0, type: 'USER_INPUT', content: 'work' },
+        {
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          status: 'RUNNING',
+          content: 'old',
+        },
+      ]
+      await f.put(child, rows)
+      handle = watchBrain(
+        f.root,
+        child,
+        'c',
+        (e) => events.push(e),
+        5,
+        undefined,
+        undefined,
+        () => {
+          polls++
+        },
+      )
+      await handle.ready
+      const file = await open(f.path(child), 'r+')
+      try {
+        await file.truncate(0)
+        const target = polls + 2
+        await until(() => polls >= target)
+        await file.write(
+          encode([
+            ...rows,
+            {
+              step_index: 2,
+              type: 'PLANNER_RESPONSE',
+              status: 'RUNNING',
+              content: 'NEW COMPLETE ROW',
+            },
+          ]) + '{"step_index":3',
+          0,
+        )
+        await handle.cancel()
+      } finally {
+        await file.close()
+      }
+      assert.deepEqual(
+        events.flatMap((e) =>
+          e.type === 'timeline.item' && e.item.type === 'assistant_message'
+            ? [e.item.text]
+            : [],
+        ),
+        ['old', 'NEW COMPLETE ROW'],
+      )
+      assert.deepEqual(
+        events.flatMap((e) => (e.type === 'session.turn' ? [e.state] : [])),
+        ['started', 'canceled'],
+      )
+    } finally {
+      handle?.()
+      await f.close()
+    }
+  },
+)
 
 test('a rewrite observed mid-O_TRUNC does not end an anchored turn', async () => {
   const f = await fixture()

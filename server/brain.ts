@@ -306,11 +306,11 @@ export async function settleBrainTurn(
     try {
       const result = await node.reader.read(root, nativeId)
       rows = result.rows
+      if (result.snapshotStepIndices) dedupe.prune(result.snapshotStepIndices)
       if (result.reset) {
         initial = true
         preamble = []
         wakeupUsage = undefined
-        dedupe.prune(rows)
         node.reset(inbox, subagents)
       }
     } catch (error) {
@@ -561,9 +561,12 @@ export function watchBrain(
     try {
       const { inbox, subagents } = await node.pollMetadata(root)
       onSubagents?.(subagents)
-      const { rows, reset } = await node.reader.read(root, nativeId)
+      const { rows, reset, snapshotStepIndices } = await node.reader.read(
+        root,
+        nativeId,
+      )
+      if (snapshotStepIndices) dedupe.prune(snapshotStepIndices)
       if (reset) {
-        dedupe.prune(rows)
         node.reset(inbox, subagents)
       }
       for (const row of rows) {

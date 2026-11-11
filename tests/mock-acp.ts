@@ -246,6 +246,57 @@ new AgentSideConnection((client) => {
     async prompt({ sessionId, prompt }) {
       const text = prompt.map((c) => (c.type === 'text' ? c.text : '')).join('')
       if (process.env.AGY_TEST_LOG_ELICITATION_CAP) log(`prompt:${text}`)
+      if (text.startsWith('usage-')) {
+        const dir = join(
+          process.env.HOME!,
+          '.gemini/antigravity-cli/brain',
+          sessionId,
+          '.system_generated/logs',
+        )
+        mkdirSync(dir, { recursive: true })
+        const step = ++wokenStepBase * 10
+        const rows: object[] = [
+          { step_index: step, type: 'USER_INPUT', content: text },
+        ]
+        if (text !== 'usage-empty')
+          rows.push({
+            step_index: step + 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Synthetic usage regression',
+            input_tokens: 70207,
+            output_tokens: 256,
+          })
+        if (text === 'usage-empty')
+          rows.push({
+            step_index: step + 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'No counters',
+          })
+        appendFileSync(
+          join(dir, 'transcript_full.jsonl'),
+          rows.map((row) => JSON.stringify(row) + '\n').join(''),
+        )
+        if (text === 'usage-native')
+          await client.sessionUpdate({
+            sessionId,
+            update: { sessionUpdate: 'usage_update', used: 1234, size: 128000 },
+          })
+        if (text === 'usage-error') throw new Error('Synthetic prompt failure')
+        return {
+          stopReason:
+            text === 'usage-cancel'
+              ? ('cancelled' as const)
+              : ('end_turn' as const),
+          usage: {
+            inputTokens: 600000,
+            outputTokens: 4405,
+            totalTokens: 604405,
+          },
+        }
+      }
+
       if (text === 'message-refresh-boundary') {
         await client.sessionUpdate({
           sessionId,
