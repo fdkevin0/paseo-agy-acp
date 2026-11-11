@@ -76,9 +76,17 @@ export function createProvider(
           const cwd = input.cwd ?? homedir()
           let catalog = catalogs.get(cwd)
           if (!catalog) {
-            catalog = probeCatalog(manager, connection.launch, cwd, usage)
-            setBounded(catalogs, cwd, catalog, CATALOG_CACHE_LIMIT)
-            void catalog.catch(() => catalogs.delete(cwd))
+            const pendingCatalog = probeCatalog(
+              manager,
+              connection.launch,
+              cwd,
+              usage,
+            )
+            catalog = pendingCatalog
+            setBounded(catalogs, cwd, pendingCatalog, CATALOG_CACHE_LIMIT)
+            void pendingCatalog.catch(() => {
+              if (catalogs.get(cwd) === pendingCatalog) catalogs.delete(cwd)
+            })
           }
           emit({
             type: 'catalog',

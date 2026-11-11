@@ -248,9 +248,11 @@ export class SessionManager {
         await session.drain()
         session.state.loading = false
         session.state.replay = true
+        session.flushDeferredUsage()
         await session.waitForCommands()
         if (this.closed || session.state.closing || session.state.failed)
           throw new Error('Session closed before ready')
+        session.state.ready = true
         emit({
           type: 'session.ready',
           sessionId: input.sessionId,
@@ -406,7 +408,9 @@ async function createSession(
     },
     opening: true,
     loading: true,
+    ready: false,
     replay: true,
+    relaunching: false,
     turn: '',
     turnAbort: null as AbortController | null,
     interrupting: null as Promise<void> | null,
@@ -429,6 +433,7 @@ async function createSession(
   let notificationLane = Promise.resolve()
   let relaunching = Promise.resolve()
   let usage: ProviderUsage = {}
+  let deferredUsage = false
   let commandsReceived = false
   let emittedCommands: string | undefined
   let commandWaiter: (() => void) | null = null
@@ -460,6 +465,17 @@ async function createSession(
   function publishUsage(next: ProviderUsage) {
     if (!state.opened || state.silenced) return
     usage = { ...usage, ...next }
+    deferredUsage = false
+    emit({
+      type: 'session.usage',
+      sessionId: id,
+      turnId: state.turn || undefined,
+      usage,
+    })
+  }
+  function flushDeferredUsage() {
+    if (!deferredUsage || !state.opened || state.silenced) return
+    deferredUsage = false
     emit({
       type: 'session.usage',
       sessionId: id,
@@ -532,9 +548,13 @@ async function createSession(
     } else if (u.sessionUpdate === 'usage_update') {
       if (state.wakeup.suppressEcho || state.suppressContinuationAcp) return
       const next = contextUsage(u)
-      if (next && (!state.loading || state.replay)) {
+      if (!next) return
+      if (!state.loading || state.replay) {
         if (state.turn) state.turnHadContextUsage = true
         publishUsage(next)
+      } else if (!state.ready) {
+        usage = { ...usage, ...next }
+        deferredUsage = true
       }
     } else {
       if (state.loading && !state.replay) return
@@ -790,13 +810,13 @@ async function createSession(
     },
   }
   const onExit = (error: Error) => {
-    if (state.failed || state.closing) return
+    if (state.failed || state.closing || state.relaunching) return
     state.failed = true
     state.turnAbort?.abort(error)
     resolveCommands()
     cancelPermissions()
     terminalize('failed', error.message)
-    if (!state.opening && state.opened && !state.silenced)
+    if (state.ready && !state.silenced)
       emit({
         type: 'session.runtime_failed',
         sessionId: id,
@@ -810,7 +830,10 @@ async function createSession(
       cwd,
       config?.env ?? {},
       client,
-      onExit,
+      (error) => {
+        if (transport !== currentTransport) return
+        onExit(error)
+      },
     )
     transports.add(transport)
     void transport.exited
@@ -855,6 +878,7 @@ async function createSession(
       }).mode
       state.loading = true
       state.replay = false
+      state.relaunching = true
       try {
         await currentTransport.close()
         if (state.closing) return
@@ -893,10 +917,14 @@ async function createSession(
             v,
           )
         }
+        await drain()
+        state.failed = false
       } catch (error) {
+        state.relaunching = false
         onExit(error instanceof Error ? error : new Error(String(error)))
         throw error
       } finally {
+        state.relaunching = false
         state.wakeup = {
           pendingReplay: false,
           suppressEcho: false,
@@ -926,6 +954,7 @@ async function createSession(
       cancelPermissions,
       publishConfig,
       publishUsage,
+      flushDeferredUsage,
       terminalize,
       emitItem,
       resetWakeup() {
@@ -1002,22 +1031,36 @@ async function createSession(
         // Native session/cancel leaves background tasks alive; stop their owner when background work is active.
         state.interrupting = (async () => {
           await Promise.all(canceling)
-          const needsRelaunch =
+          let needsRelaunch =
             canceling.length > 0 ||
             (await hasActiveBackgroundWork(brainRoot, state.nativeId).catch(
               () => true,
             ))
-          if (needsRelaunch) await Promise.all(subagents.cancelAll())
+          if (needsRelaunch) {
+            state.relaunching = true
+            await Promise.all(subagents.cancelAll())
+          }
           try {
             await currentTransport.request(
               currentTransport.rpc.cancel({ sessionId: state.nativeId }),
+              { timeoutMs: 5000, fatalOnTimeout: false },
             )
           } catch (error) {
-            // A concurrent close or forced relaunch replaces this runtime; its closed stream is not an interrupt failure.
-            if (!state.closing && !needsRelaunch) throw error
+            // A concurrent close or forced relaunch replaces this runtime; if loadSession is supported, recover via relaunch.
+            if (
+              !needsRelaunch &&
+              !state.closing &&
+              currentInitialized.agentCapabilities?.loadSession
+            ) {
+              needsRelaunch = true
+              state.relaunching = true
+            } else if (!state.closing && !needsRelaunch) {
+              throw error
+            }
           } finally {
             if (needsRelaunch && !state.closing)
               await this.relaunch(state.skipPermissions, true)
+            else state.relaunching = false
           }
         })()
         try {
@@ -1066,6 +1109,7 @@ async function createSession(
                 currentTransport.rpc.closeSession({
                   sessionId: state.nativeId,
                 }),
+                { timeoutMs: 1500, fatalOnTimeout: false },
               )
               .catch(() => undefined)
           const dir = dataDirectory(launch, config?.env, cwd)
@@ -1118,16 +1162,20 @@ async function configureSession(
   session: Session,
   changes: ProviderConfigChanges,
 ) {
+  if (session.state.closing || session.state.failed)
+    throw new Error('ACP runtime has exited; reopen the session')
   if (session.state.turn)
     throw new Error('Wait for the current turn before changing configuration')
   if (changes.settings && Object.keys(changes.settings).length)
     throw new Error('Custom settings are not supported')
-  for (const [key, value] of [
+  const entries = [
     ['model', changes.model],
     ['mode', changes.mode],
     ['thought_level', changes.thinkingOption],
-  ] as const) {
+  ] as const
+  for (const [key, value] of entries) {
     if (value == null) continue
+    if (key === 'mode' && value === FULL_ACCESS_MODE_ID) continue
     const current = configState(session.state.metadata)
     const selected =
       key === 'model'
@@ -1136,37 +1184,61 @@ async function configureSession(
           ? current.mode
           : current.thinkingOption
     if (value === selected) continue
-    if (key === 'mode' && value === FULL_ACCESS_MODE_ID) {
-      await session.relaunch(true)
-      session.state.metadata.fullAccess = true
-      const nativeModes = configState({
-        ...session.state.metadata,
-        fullAccess: false,
-      }).modes.map((m) => m.id)
-      const target = ['accept-edits', 'default'].find((m) =>
-        nativeModes.includes(m),
-      )
+    const advertised = session.state.metadata.configOptions?.some(
+      (o) => o.id === key || o.category === key,
+    )
+    if (!advertised) throw new Error(`agy does not advertise ${key}`)
+  }
+  let mutated = false
+  try {
+    for (const [key, value] of entries) {
+      if (value == null) continue
+      const current = configState(session.state.metadata)
+      const selected =
+        key === 'model'
+          ? current.model
+          : key === 'mode'
+            ? current.mode
+            : current.thinkingOption
+      if (value === selected) continue
+      if (key === 'mode' && value === FULL_ACCESS_MODE_ID) {
+        await session.relaunch(true)
+        session.state.metadata.fullAccess = true
+        mutated = true
+        const nativeModes = configState({
+          ...session.state.metadata,
+          fullAccess: false,
+        }).modes.map((m) => m.id)
+        const target = ['accept-edits', 'default'].find((m) =>
+          nativeModes.includes(m),
+        )
+        await applyNativeConfigOption(
+          session.transport,
+          session.state.nativeId,
+          session.state.metadata,
+          key,
+          target,
+        )
+        continue
+      }
+      if (key === 'mode') {
+        await session.relaunch(false)
+        session.state.metadata.fullAccess = false
+        mutated = true
+      }
       await applyNativeConfigOption(
         session.transport,
         session.state.nativeId,
         session.state.metadata,
         key,
-        target,
+        value,
+        true,
       )
-      continue
+      mutated = true
     }
-    if (key === 'mode') {
-      await session.relaunch(false)
-      session.state.metadata.fullAccess = false
-    }
-    await applyNativeConfigOption(
-      session.transport,
-      session.state.nativeId,
-      session.state.metadata,
-      key,
-      value,
-      true,
-    )
+  } catch (error) {
+    if (mutated) session.publishConfig()
+    throw error
   }
   session.publishConfig()
 }

@@ -24,11 +24,9 @@ const USAGE_FETCH_TIMEOUT_MS = 15_000
 const LOG_CHUNK_SIZE = 64 * 1024
 const ACCOUNT_CACHE_LIMIT = 100
 
-const usageInputSchema = z
-  .object({
-    dataDir: z.string().min(1),
-  })
-  .strict()
+const usageInputSchema = z.object({
+  dataDir: z.string().min(1),
+})
 
 const groupsSchema = z.object({
   command: z.object({

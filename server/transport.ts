@@ -276,7 +276,12 @@ export function connectAcp(
     })()
     return closing
   }
-  async function request<T>(operation: Promise<T>): Promise<T> {
+  async function request<T>(
+    operation: Promise<T>,
+    options?: { timeoutMs?: number; fatalOnTimeout?: boolean },
+  ): Promise<T> {
+    const timeoutMs = options?.timeoutMs ?? requestTimeoutMs
+    const fatalOnTimeout = options?.fatalOnTimeout ?? true
     let timer: NodeJS.Timeout | undefined
     try {
       return await Promise.race([
@@ -284,9 +289,9 @@ export function connectAcp(
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
             const error = new Error('ACP request timed out')
-            fail(error)
+            if (fatalOnTimeout) fail(error)
             reject(error)
-          }, requestTimeoutMs)
+          }, timeoutMs)
         }),
       ])
     } finally {

@@ -593,15 +593,3 @@ export class StepDedupe {
     return true
   }
 }
-
-/** Whether a GENERIC ERROR row records a user-rejected permission check, which ends agy's foreground turn without a follow-up PLANNER_RESPONSE. */
-export function isPermissionDeniedGeneric(
-  row: Record<string, unknown> | undefined,
-): boolean {
-  return (
-    row?.type === 'GENERIC' &&
-    row.status === 'ERROR' &&
-    typeof row.content === 'string' &&
-    /permission check failed|user denied permission/i.test(row.content)
-  )
-}

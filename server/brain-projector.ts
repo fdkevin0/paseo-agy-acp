@@ -15,7 +15,6 @@ import {
   TranscriptReader,
   countRowMessages,
   isCompletePlannerResponse,
-  isPermissionDeniedGeneric,
   isRestartNotice,
   readInboxState,
   readSubagents,
@@ -75,6 +74,7 @@ export class BrainTranscriptProjector {
   private callSubagents = new Map<string, SubagentRecord>()
   private toolIndex = 0
   private acpToolCallIds: readonly string[] = []
+  private lastErrorCallId?: string
   private sessionId: string
   private onQuestionSettledByGeneric?: (
     questions: readonly NormalizedQuestion[],
@@ -112,8 +112,18 @@ export class BrainTranscriptProjector {
     return this.pending.some((p) => !p.isQuestion)
   }
 
-  hasDeniedPending(denied: ReadonlySet<string>): boolean {
-    return denied.size > 0 && this.pending.some((p) => denied.has(p.callId))
+  hasDeniedOutcome(
+    denied: ReadonlySet<string>,
+    lastStep?: Record<string, unknown>,
+  ): boolean {
+    if (denied.size === 0) return false
+    if (this.pending.some((p) => denied.has(p.callId))) return true
+    return (
+      lastStep?.type === 'GENERIC' &&
+      lastStep.status === 'ERROR' &&
+      this.lastErrorCallId !== undefined &&
+      denied.has(this.lastErrorCallId)
+    )
   }
 
   clearPending() {
@@ -210,9 +220,11 @@ export class BrainTranscriptProjector {
     switch (row.type) {
       case 'USER_INPUT':
         this.pending = []
+        this.lastErrorCallId = undefined
         this.touchedSubagents.clear()
         return text ? [{ type: 'user_message', id, text }] : []
       case 'SYSTEM_MESSAGE': {
+        this.lastErrorCallId = undefined
         if (isRestartNotice(row)) {
           // Stopped calls never log a result; child transcripts have no USER_INPUT to reset them.
           this.pending = []
@@ -291,6 +303,7 @@ export class BrainTranscriptProjector {
         return []
       case 'ERROR_MESSAGE':
         this.pending = []
+        this.lastErrorCallId = undefined
         this.background.clear()
         this.daemons.clear()
         this.touchedSubagents.clear()
@@ -350,19 +363,15 @@ export class BrainTranscriptProjector {
           (!text || !text.includes(subagent.conversationId))
             ? { conversationId: subagent.conversationId }
             : (row.content ?? row.error ?? null)
-        return [
-          this.finishTool(
-            pending,
-            rawOutput,
-            terminalToolStatus(row.status),
-            text,
-          ),
-        ]
+        const status = terminalToolStatus(row.status)
+        this.lastErrorCallId = status === 'failed' ? pending.callId : undefined
+        return [this.finishTool(pending, rawOutput, status, text)]
       }
       case 'PLANNER_RESPONSE': {
         // A new model response means calls of the previous one without a GENERIC row were stopped;
         // keeping them would misattribute this response's results in FIFO order.
         this.pending = []
+        this.lastErrorCallId = undefined
         const items: ProviderTimelineItem[] = []
         if (typeof row.thinking === 'string' && row.thinking)
           items.push({
@@ -500,7 +509,11 @@ export class BrainNode {
   }
 
   settleAbortedDenial(denied?: ReadonlySet<string>) {
-    if (!this.wokeUp && denied && this.projector.hasDeniedPending(denied)) {
+    if (
+      !this.wokeUp &&
+      denied &&
+      this.projector.hasDeniedOutcome(denied, this.lastStep)
+    ) {
       this.projector.clearPending()
       this.abortedByDenial = true
       this.foregroundIdleReached = true
@@ -585,8 +598,7 @@ export class BrainNode {
       Number(this.lastStep?.step_index ?? -1) > this.answeredQuestionStep &&
       (isCompletePlannerResponse(this.lastStep) ||
         this.questionSettled ||
-        (!this.wokeUp &&
-          (this.abortedByDenial || isPermissionDeniedGeneric(this.lastStep))))
+        (!this.wokeUp && this.abortedByDenial))
     )
   }
 }

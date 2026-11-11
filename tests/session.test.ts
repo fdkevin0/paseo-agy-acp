@@ -504,3 +504,80 @@ test('ownership read failures do not poison subsequent ACP notifications', async
     await rm(home, { recursive: true, force: true })
   }
 })
+
+test('history:skip coalesces restored context usage before ready and configure validates options before full-access relaunch', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-skip-usage-config-'))
+  const log = join(home, 'calls.log')
+  const events: ProviderEvent[] = []
+  const m = new SessionManager({
+    launch: {
+      command: process.execPath,
+      args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+      env: {
+        HOME: home,
+        PATH: process.env.PATH ?? '',
+        AGY_TEST_LOAD_USAGE: '1',
+        AGY_TEST_LOG_LOAD: '1',
+        AGY_TEST_LOG: log,
+      },
+    },
+    usage: new AgyUsageSource(),
+    capabilities: ['session.configure'],
+    emit: (e) => events.push(structuredClone(e)),
+  })
+  try {
+    await m.open({
+      type: 'session.open',
+      requestId: 'open-skip',
+      sessionId: 's',
+      history: 'skip',
+      persistence: {
+        version: 1,
+        data: { sessionId: '11111111-1111-4111-8111-111111111111' },
+      },
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    assert.equal(events.filter((e) => e.type === 'timeline.item').length, 0)
+    const usageEvents = events.filter((e) => e.type === 'session.usage')
+    assert.equal(usageEvents.length, 1)
+    assert.equal(usageEvents[0].usage.contextWindowUsedTokens, 900)
+    assert.ok(
+      events.findIndex((e) => e.type === 'session.opened') <
+        events.findIndex((e) => e.type === 'session.usage') &&
+        events.findIndex((e) => e.type === 'session.usage') <
+          events.findIndex((e) => e.type === 'session.ready'),
+    )
+
+    // thought_level is omitted from advertised options, so { mode: 'full-access', thinkingOption: 'high' } fails pre-validation without relaunching.
+    const loadsBefore = (await readFile(log, 'utf8'))
+      .trim()
+      .split('\n')
+      .filter((l) => l === 'load').length
+    await assert.rejects(
+      m.handle({
+        type: 'session.configure',
+        requestId: 'cfg-bad',
+        sessionId: 's',
+        changes: { mode: 'full-access', thinkingOption: 'high' },
+      }),
+      /does not advertise thought_level/,
+    )
+    const loadsAfter = (await readFile(log, 'utf8'))
+      .trim()
+      .split('\n')
+      .filter((l) => l === 'load').length
+    assert.equal(loadsAfter, loadsBefore)
+    const latestConfig = events.findLast((e) => e.type === 'session.config')
+    assert.ok(latestConfig?.type === 'session.config')
+    assert.notEqual(latestConfig.config.mode, 'full-access')
+  } finally {
+    await m.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})

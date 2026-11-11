@@ -220,7 +220,20 @@ test('usage discovers account scopes and maps windows, tier and failures through
       failure.status === 'error' &&
         failure.error.includes('Authentication required'),
     )
-    await assert.rejects(usage.fetch({ dataDir: dir, extra: true }))
+    assert.deepEqual(account.input, { dataDir: dir })
+    await assert.rejects(usage.fetch({ dataDir: '' }))
+    usage.remember(launch, {}, home)
+    await writeFile(fixture, envelope(groups))
+    assert.equal(
+      (
+        await usage.fetch({
+          dataDir: dir,
+          command: '/nonexistent/legacy-binary',
+          args: ['--legacy'],
+        })
+      ).status,
+      'available',
+    )
     await rm(join(dir, 'antigravity-oauth-token'))
     await assert.rejects(
       usage.fetch(account.input),

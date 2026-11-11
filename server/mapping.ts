@@ -21,6 +21,7 @@ import {
   cleanToolName,
   isAskQuestionName,
   sessionIdPattern,
+  setBounded,
   record,
   str,
   num,
@@ -121,6 +122,19 @@ function nonEmptyRawOutput(rawOutput: unknown): string | undefined {
 }
 
 /** Map native tool arguments and output to Paseo detail cards. */
+const canonicalWriteToolPattern =
+  /^(?:write_file|write_to_file|create_file|fs\/write_text_file|write_text_file)$/i
+const TOOL_SNAPSHOT_LIMIT = 1024
+
+function isTerminalToolStatus(status: unknown): boolean {
+  return (
+    status === 'completed' ||
+    status === 'failed' ||
+    status === 'canceled' ||
+    status === 'cancelled'
+  )
+}
+
 export function toolDetail(
   tool: Partial<ToolCall> | ToolCallUpdate,
 ): ProviderToolCallDetail {
@@ -129,7 +143,8 @@ export function toolDetail(
     typeof tool.rawOutput === 'string'
       ? tool.rawOutput
       : (extractToolContentText(tool) ?? nonEmptyRawOutput(tool.rawOutput))
-  const rawName = cleanToolName(str(record(tool).name) ?? tool.title ?? '')
+  const explicitRawName = str(record(tool).name)
+  const rawName = cleanToolName(explicitRawName ?? tool.title ?? '')
   const name = rawName.toLowerCase()
   if (isAskQuestionName(rawName) || Array.isArray(input.questions)) {
     const questions = normalizeAskQuestionInput(input)
@@ -211,16 +226,35 @@ export function toolDetail(
       : undefined
   if (planText) return { type: 'plan', text: planText }
   const diff = tool.content?.find((c) => c.type === 'diff')
-  const writeContent = str(input.Content ?? input.CodeContent ?? input.content)
+  const nativeWriteContent = str(input.Content ?? input.CodeContent)
+  const writeContent = nativeWriteContent ?? str(input.content)
   const hasEditTarget =
     input.Target !== undefined ||
     input.TargetContent !== undefined ||
     input.old_string !== undefined ||
+    input.oldString !== undefined ||
+    input.OldString !== undefined ||
     Array.isArray(input.ReplacementChunks) ||
     diff?.oldText != null
+  const isCanonicalWrite =
+    !rawName.startsWith('mcp__') &&
+    !rawName.includes(':') &&
+    canonicalWriteToolPattern.test(rawName)
+  const isUnnamedWriteFallback =
+    explicitRawName === undefined &&
+    !rawName.startsWith('mcp__') &&
+    !rawName.includes(':') &&
+    tool.kind !== 'read' &&
+    !hasEditTarget &&
+    (nativeWriteContent !== undefined ||
+      (diff?.type === 'diff' &&
+        Boolean(diff.path) &&
+        diff.oldText == null &&
+        Object.keys(input).length === 0 &&
+        /^file(?:\s|$)/i.test(rawName)))
   if (
     (filePath || (diff?.type === 'diff' && diff.path)) &&
-    (/write/.test(name) || (writeContent !== undefined && !hasEditTarget))
+    (isCanonicalWrite || isUnnamedWriteFallback)
   ) {
     return {
       type: 'write',
@@ -262,11 +296,11 @@ export function toolDetail(
     }
   }
   if (filePath) {
-    if (/write/.test(name))
+    if (isCanonicalWrite)
       return {
         type: 'write',
         filePath,
-        content: str(input.Content ?? input.CodeContent ?? input.content),
+        content: writeContent,
       }
     if (tool.kind === 'edit' || /edit|replace/.test(name)) {
       const chunks = Array.isArray(input.ReplacementChunks)
@@ -276,33 +310,47 @@ export function toolDetail(
         type: 'edit',
         filePath,
         oldString:
-          str(input.Target ?? input.TargetContent ?? input.old_string) ??
-          joinChunks(chunks, 'TargetContent', 'Target'),
+          str(
+            input.Target ??
+              input.TargetContent ??
+              input.old_string ??
+              input.oldString ??
+              input.OldString,
+          ) ?? joinChunks(chunks, 'TargetContent', 'Target'),
         newString:
           str(
-            input.Replacement ?? input.ReplacementContent ?? input.new_string,
+            input.Replacement ??
+              input.ReplacementContent ??
+              input.new_string ??
+              input.newString ??
+              input.NewString,
           ) ?? joinChunks(chunks, 'ReplacementContent', 'Replacement'),
       }
     }
-    const cleaned = cleanReadOutput(output)
-    const start = num(input.StartLine) ?? cleaned.startLine
-    const end = num(input.EndLine) ?? cleaned.endLine
-    return {
-      type: 'read',
-      filePath,
-      content: cleaned.content,
-      offset:
-        num(
-          input.offset ??
-            input.StartLine ??
-            input.ByteOffset ??
-            input.ContentOffset,
-        ) ?? cleaned.startLine,
-      limit:
-        num(input.limit) ??
-        (start !== undefined && end !== undefined
-          ? Math.max(1, end - start + 1)
-          : undefined),
+    if (
+      !rawName.startsWith('mcp__') ||
+      /(?:^|_)(?:read|view|cat)(?:_|$)/i.test(name)
+    ) {
+      const cleaned = cleanReadOutput(output)
+      const start = num(input.StartLine) ?? cleaned.startLine
+      const end = num(input.EndLine) ?? cleaned.endLine
+      return {
+        type: 'read',
+        filePath,
+        content: cleaned.content,
+        offset:
+          num(
+            input.offset ??
+              input.StartLine ??
+              input.ByteOffset ??
+              input.ContentOffset,
+          ) ?? cleaned.startLine,
+        limit:
+          num(input.limit) ??
+          (start !== undefined && end !== undefined
+            ? Math.max(1, end - start + 1)
+            : undefined),
+      }
     }
   }
   return {
@@ -617,14 +665,29 @@ export class Timeline {
     denied?: ReadonlySet<string>,
   ): ProviderTimelineItem[] {
     const items = [...this.running.values()].map((item) => {
-      if (status === 'failed') return { ...item, status, error }
-      if (status === 'completed' && item.callId && denied?.has(item.callId)) {
-        return { ...item, status: 'canceled' as const, error: null }
+      const isDenied = Boolean(item.callId && denied?.has(item.callId))
+      const nextStatus = isDenied ? ('canceled' as const) : status
+      if (item.callId) {
+        const prev = this.tools.get(item.callId)
+        if (prev) {
+          setBounded(
+            this.tools,
+            item.callId,
+            {
+              ...prev,
+              status: (nextStatus === 'canceled'
+                ? 'cancelled'
+                : nextStatus) as ToolCall['status'],
+            },
+            TOOL_SNAPSHOT_LIMIT,
+          )
+        }
       }
-      return { ...item, status, error: null }
+      if (nextStatus === 'failed')
+        return { ...item, status: 'failed' as const, error }
+      return { ...item, status: nextStatus, error: null }
     })
     this.running.clear()
-    this.tools.clear()
     return items
   }
   update(
@@ -660,14 +723,33 @@ export class Timeline {
       update.sessionUpdate === 'tool_call' ||
       update.sessionUpdate === 'tool_call_update'
     ) {
-      const old = this.tools.get(update.toolCallId)
+      const old =
+        update.sessionUpdate === 'tool_call_update'
+          ? this.tools.get(update.toolCallId)
+          : undefined
+      if (
+        !old &&
+        update.sessionUpdate === 'tool_call_update' &&
+        update.status == null &&
+        update.title == null &&
+        str(record(update).name) === undefined
+      ) {
+        return undefined
+      }
+      const oldStatus = str((old as { status?: unknown } | undefined)?.status)
+      const incomingStatus = str((update as { status?: unknown }).status)
+      const preserveStatus =
+        update.sessionUpdate === 'tool_call_update' &&
+        isTerminalToolStatus(oldStatus) &&
+        !isTerminalToolStatus(incomingStatus)
       const tool = {
         ...old,
         ...Object.fromEntries(
           Object.entries(update).filter(([, v]) => v != null),
         ),
+        ...(preserveStatus ? { status: old!.status } : {}),
       } as ToolCall
-      this.tools.set(update.toolCallId, tool)
+      setBounded(this.tools, update.toolCallId, tool, TOOL_SNAPSHOT_LIMIT)
       const base = {
         type: 'tool_call' as const,
         id: `${this.prefix}:tool:${tool.toolCallId}`,
@@ -713,9 +795,6 @@ export class Timeline {
                   status: tool.status === 'completed' ? 'completed' : 'running',
                   error: null,
                 }
-      if (item.status !== 'running') {
-        this.tools.delete(update.toolCallId)
-      }
       this.track(item)
       return item
     }

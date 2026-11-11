@@ -200,10 +200,21 @@ test('transport surfaces stderr on immediate startup failure and notifies onExit
     )
     try {
       await assert.rejects(
+        hung.request(new Promise(() => {}), {
+          timeoutMs: 20,
+          fatalOnTimeout: false,
+        }),
+        /ACP request timed out/,
+      )
+      assert.equal(timeoutExit, undefined)
+      await assert.rejects(
         hung.request(new Promise(() => {})),
         /ACP request timed out/,
       )
-      assert.equal(timeoutExit?.message, 'ACP request timed out')
+      assert.equal(
+        (timeoutExit as Error | undefined)?.message,
+        'ACP request timed out',
+      )
     } finally {
       await hung.close()
     }

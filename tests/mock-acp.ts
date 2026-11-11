@@ -194,7 +194,21 @@ new AgentSideConnection((client) => {
           rawOutput: { conversationId: '22222222-2222-4222-8222-222222222222' },
         },
       })
-      return { configOptions }
+      if (process.env.AGY_TEST_LOAD_USAGE) {
+        await client.sessionUpdate({
+          sessionId,
+          update: { sessionUpdate: 'usage_update', used: 300, size: 256_000 },
+        })
+        await client.sessionUpdate({
+          sessionId,
+          update: { sessionUpdate: 'usage_update', used: 900, size: 256_000 },
+        })
+      }
+      return {
+        configOptions: process.env.AGY_TEST_LOAD_USAGE
+          ? configOptions.filter((o) => o.id !== 'thought_level')
+          : configOptions,
+      }
     },
     async resumeSession({ sessionId, _meta }) {
       const append = (

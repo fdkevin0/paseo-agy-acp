@@ -689,4 +689,113 @@ test('write_file with kind:edit and diff maps to Write card and denied failed up
   assert.ok(deniedDone?.type === 'tool_call')
   assert.equal(deniedDone.status, 'canceled')
   assert.equal(deniedDone.error, null)
+
+  // Late status-less update on a denied tool keeps its canceled status and metadata.
+  const deniedLate = t.update(
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'call_deny',
+      content: [{ type: 'content', content: { type: 'text', text: 'denied' } }],
+    },
+    denied,
+  )
+  assert.ok(deniedLate?.type === 'tool_call')
+  assert.equal(deniedLate.status, 'canceled')
+  assert.equal(deniedLate.detail.type, 'shell')
+  assert.equal(t.isRunning(deniedLate.id), false)
+})
+
+test('late status-less tool_call_update preserves terminal status and metadata while orphan updates are ignored', () => {
+  const t = new Timeline('s')
+  assert.equal(
+    t.update({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'orphan',
+      content: [{ type: 'content', content: { type: 'text', text: 'stray' } }],
+    }),
+    undefined,
+  )
+  t.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'a',
+    title: 'run_command',
+    status: 'in_progress',
+    rawInput: { CommandLine: 'ls' },
+  })
+  t.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'a',
+    status: 'completed',
+  })
+  const late = t.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'a',
+    content: [{ type: 'content', content: { type: 'text', text: 'out' } }],
+  })
+  assert.ok(late?.type === 'tool_call')
+  assert.equal(late.name, 'run_command')
+  assert.equal(late.status, 'completed')
+  assert.deepEqual(late.detail, {
+    type: 'shell',
+    command: 'ls',
+    cwd: undefined,
+    output: 'out',
+  })
+  assert.equal(t.isRunning(late.id), false)
+  assert.deepEqual(t.terminalize('failed', 'boom'), [])
+})
+
+test('write card classification ignores paths or non-write tools containing "write"', () => {
+  assert.equal(
+    toolDetail({
+      title: 'Read src/write_buffer.ts',
+      kind: 'read',
+      locations: [{ path: '/repo/src/write_buffer.ts' }],
+    }).type,
+    'read',
+  )
+  assert.deepEqual(
+    toolDetail({
+      title: 'Edit src/write_buffer.ts',
+      kind: 'edit',
+      rawInput: {
+        Path: '/repo/src/write_buffer.ts',
+        Target: 'old',
+        Replacement: 'new',
+      },
+    }),
+    {
+      type: 'edit',
+      filePath: '/repo/src/write_buffer.ts',
+      oldString: 'old',
+      newString: 'new',
+    },
+  )
+  assert.equal(
+    toolDetail({
+      title: 'mcp__git__rewrite_history',
+      rawInput: { path: '/repo/file.ts', content: 'note' },
+    }).type,
+    'plain_text',
+  )
+  assert.equal(
+    toolDetail({
+      title: 'save_memory',
+      rawInput: { content: 'remember me' },
+    }).type,
+    'plain_text',
+  )
+  assert.equal(
+    toolDetail({
+      title: 'custom_replace',
+      kind: 'edit',
+      rawInput: {
+        file_path: '/repo/a.ts',
+        oldString: 'before',
+        newString: 'after',
+        content: 'unused',
+      },
+    }).type,
+    'edit',
+  )
 })

@@ -2,7 +2,7 @@
 import { createHash } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import { lstat, rm } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { execCommand } from '@getpaseo/plugin/server'
 import type {
@@ -94,15 +94,18 @@ export function dataDirectory(
     }
     return value
   }
+  const home = env.HOME ?? launch?.env?.HOME ?? homedir()
+  const gemini = flag(['--gemini-dir', '--gemini_dir'], join(home, '.gemini'))
+  const app = flag(['--app-data-dir', '--app_data_dir'], 'antigravity-cli')
+  if (isAbsolute(gemini)) {
+    return resolve(gemini, app)
+  }
   let baseCwd = cwd
   try {
     baseCwd = realpathSync.native(cwd)
   } catch {
     /* Fall back to lexical cwd when the workspace path does not exist yet. */
   }
-  const home = env.HOME ?? launch?.env?.HOME ?? homedir()
-  const gemini = flag(['--gemini-dir', '--gemini_dir'], join(home, '.gemini'))
-  const app = flag(['--app-data-dir', '--app_data_dir'], 'antigravity-cli')
   return resolve(baseCwd, gemini, app)
 }
 
