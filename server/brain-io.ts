@@ -445,6 +445,7 @@ export class TranscriptReader {
   private identity = ''
   private offset = 0
   private remainder = ''
+  private resetPending = false
   private head = Buffer.alloc(0)
   private tail = Buffer.alloc(0)
 
@@ -490,6 +491,7 @@ export class TranscriptReader {
         !(await this.matches(file, this.tail, this.offset - this.tail.length))
       if (reset) {
         this.clearCursor(identity)
+        this.resetPending = true
       }
       const startedAtZero = this.offset === 0 && this.remainder === ''
       try {
@@ -532,12 +534,20 @@ export class TranscriptReader {
             !(await this.matches(file, this.head, 0).catch(() => false))
           if (racedRewrite) {
             this.clearCursor()
+            this.resetPending = true
             return { rows: [], reset: true }
           }
         }
         throw error
       }
-      return { rows, reset }
+      // shortcut: observed JSONL has no commit marker; use complete nonempty reads until agy exposes one.
+      if (this.resetPending && this.remainder.length > 0) {
+        this.clearCursor()
+        return { rows: [], reset: true }
+      }
+      const replayReset = this.resetPending
+      if (rows.length > 0) this.resetPending = false
+      return { rows, reset: replayReset }
     } finally {
       await file.close()
     }
@@ -630,6 +640,8 @@ export class StepDedupe {
   private seen = new Map<number, string>()
 
   prune(rows: readonly Record<string, unknown>[]) {
+    // An empty read can be the O_TRUNC window, not evidence that delivered steps were deleted.
+    if (rows.length === 0) return
     const keep = new Set(rows.map((r) => Number(r.step_index)))
     for (const step of this.seen.keys())
       if (!keep.has(step)) this.seen.delete(step)
