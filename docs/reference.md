@@ -111,9 +111,9 @@ Steering, rewind, archive operations and structured output are unsupported.
 
 ## Context window occupancy
 
-Paseo's context meter needs both `contextWindowUsedTokens` and a positive `contextWindowMaxTokens`. On foreground-only turns (`!turnWokeUp`), valid native `usage_update` notifications take precedence for the current turn; used tokens must be finite and nonnegative. Only USD costs populate `totalCostUsd`.
+Paseo's context meter needs both `contextWindowUsedTokens` and a positive `contextWindowMaxTokens`. Valid native `usage_update` notifications take precedence for the current turn, including turns with Reactive Wakeup; used tokens must be finite and nonnegative. Only USD costs populate `totalCostUsd`.
 
-agy prompt responses report cumulative token counters across internal model steps, whereas `transcript_full.jsonl` records exact per-step `input_tokens`, `cache_read_tokens` and `output_tokens` on each `PLANNER_RESPONSE`. When no valid `usage_update` notification arrives during a turn—or when a turn enters post-RPC Reactive Wakeup (`turnWokeUp === true`), where `agy` sends no post-RPC `usage_update` notifications—the plugin computes context window occupancy from the final `PLANNER_RESPONSE` step in `transcript_full.jsonl`:
+agy prompt responses report cumulative token counters across internal model steps, whereas `transcript_full.jsonl` records exact per-step `input_tokens`, `cache_read_tokens` and `output_tokens` on each `PLANNER_RESPONSE`. When no valid `usage_update` notification arrives during a turn, the plugin computes context window occupancy from the latest reliable `PLANNER_RESPONSE` usage snapshot in `transcript_full.jsonl`:
 
 ```text
 usedTokens = lastStep.inputTokens + lastStep.cachedReadTokens + lastStep.cachedWriteTokens + lastStep.outputTokens
@@ -121,7 +121,7 @@ usedTokens = lastStep.inputTokens + lastStep.cachedReadTokens + lastStep.cachedW
 
 `cachedWriteTokens` is taken from the step's `cache_write_tokens` when agy records it and is otherwise zero; agy 1.5.3 records only the first three counters. Per-step and cumulative ACP counters are never mixed in one sum. When a turn concludes with Reactive Wakeup steps, its wakeup token totals are recorded in `carriedWakeup` and subtracted from `agy`'s cumulative ACP prompt counters on the next turn so woken tokens are not double-counted.
 
-When no step-level counters are available in `transcript_full.jsonl`, occupancy falls back to `inputTokens + cachedReadTokens + cachedWriteTokens + outputTokens` (or `totalTokens` if zero) from the ACP prompt response. Invalid counters are treated as zero.
+When no reliable step-level counters are available, context occupancy stays unchanged or unknown; cumulative ACP prompt counters never substitute for context occupancy. Cancellation and prompt errors recover only snapshots after the current turn boundary. Restoration can recover the latest historical snapshot when native context is absent. Cache-only model steps are valid snapshots; invalid counters are ignored.
 
 | Model                        | Fallback capacity |
 | ---------------------------- | ----------------- |
