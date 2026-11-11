@@ -777,6 +777,15 @@ export class Timeline {
         ),
         ...(preserveStatus ? { status: old!.status } : {}),
       } as ToolCall
+      // New content supersedes a running null placeholder, not an explicit result.
+      if (
+        old?.rawOutput === null &&
+        !isTerminalToolStatus(oldStatus) &&
+        update.rawOutput === undefined &&
+        update.content != null
+      ) {
+        delete tool.rawOutput
+      }
       setBounded(this.tools, update.toolCallId, tool, TOOL_SNAPSHOT_LIMIT)
       const base = {
         type: 'tool_call' as const,

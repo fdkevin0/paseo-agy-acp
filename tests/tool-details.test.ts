@@ -304,3 +304,73 @@ test('native identities and ACP semantic hints retain dedicated cards', () => {
     'shell',
   )
 })
+
+test('completion content replaces an earlier running null placeholder without losing input', () => {
+  const timeline = new Timeline('session-example')
+  const start = timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'call-example',
+    title: fixture.name,
+    status: 'in_progress',
+    rawInput: fixture.input,
+    rawOutput: null,
+  })
+  const content = [
+    {
+      type: 'content' as const,
+      content: { type: 'text' as const, text: 'ACTUAL RESULT' },
+    },
+  ]
+  const completed = timeline.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'call-example',
+    status: 'completed',
+    content,
+  })
+  assert.ok(start?.type === 'tool_call' && completed?.type === 'tool_call')
+  assert.equal(completed.id, start.id)
+  assert.equal(completed.status, 'completed')
+  assert.deepEqual(completed.detail, unknownDetail(fixture.input, content))
+  // Later status-only snapshots must retain the actual content too.
+  const late = timeline.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'call-example',
+    status: 'completed',
+  })
+  assert.ok(late?.type === 'tool_call')
+  assert.deepEqual(late.detail, completed.detail)
+})
+
+test('completion content does not override explicit null or existing structured raw output', () => {
+  const content = [
+    {
+      type: 'content' as const,
+      content: { type: 'text' as const, text: 'presentation only' },
+    },
+  ]
+  for (const [oldStatus, oldOutput, incoming, expected] of [
+    ['in_progress', null, { rawOutput: null }, null],
+    ['in_progress', fixture.output, {}, fixture.output],
+    ['completed', null, {}, null],
+    ['in_progress', null, { rawOutput: fixture.output }, fixture.output],
+  ] as const) {
+    const timeline = new Timeline('session-example')
+    timeline.update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'call-example',
+      title: fixture.name,
+      status: oldStatus,
+      rawInput: fixture.input,
+      rawOutput: oldOutput,
+    })
+    const completed = timeline.update({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'call-example',
+      status: 'completed',
+      content,
+      ...incoming,
+    })
+    assert.ok(completed?.type === 'tool_call')
+    assert.deepEqual(completed.detail, unknownDetail(fixture.input, expected))
+  }
+})
