@@ -2,7 +2,7 @@ import type {
   ProviderEvent,
   ProviderTimelineItem,
 } from '@getpaseo/plugin/server/provider'
-import { sessionIdPattern } from './common.ts'
+import { isNativeToolName, sessionIdPattern } from './common.ts'
 import {
   readSubagents,
   watchBrain,
@@ -10,8 +10,8 @@ import {
   type SubagentRecord,
 } from './brain.ts'
 
-const isSpawn = (name: string) => name.includes('invoke_subagent')
-export const isSubagentMessage = (name: string) => name.includes('send_message')
+export const isSubagentMessage = (name: string) =>
+  isNativeToolName(name, 'send_message')
 
 export interface SubagentRegistryOptions {
   sessionId: string
@@ -187,7 +187,7 @@ export class SubagentRegistry {
     name: string,
   ): boolean => {
     const childId = this.childKey(nativeId)
-    const spawn = isSpawn(name)
+    const spawn = isNativeToolName(name, 'invoke_subagent')
     // Killed children are only linked for history, their own spawn call, or an already open session.
     const killedAllowed =
       this.opts.isLoading() ||
@@ -200,6 +200,7 @@ export class SubagentRegistry {
       (spawn && !this.childParents.has(nativeId))
     return (
       !this.opts.isUnavailable() &&
+      (spawn || isSubagentMessage(name)) &&
       this.opts.capabilities.includes('session.subsession') &&
       sessionIdPattern.test(nativeId) &&
       nativeId !== this.opts.getNativeId() &&
@@ -248,7 +249,7 @@ export class SubagentRegistry {
     if (
       item.type === 'tool_call' &&
       item.status === 'completed' &&
-      item.name.includes('manage_subagents')
+      isNativeToolName(item.name, 'manage_subagents')
     ) {
       void this.syncKilledChildren(undefined, parentNativeId)
     }

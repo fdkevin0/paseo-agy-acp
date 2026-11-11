@@ -10,6 +10,7 @@ import { createHash } from 'node:crypto'
 import { join, sep } from 'node:path'
 import {
   isAskQuestionName,
+  isNativeToolName,
   nonnegative,
   record,
   sessionIdPattern,
@@ -310,7 +311,7 @@ export async function readInboxState(
   }
   const isWakeupMessage = (m: BrainMessageRecord) =>
     m.sender !== 'user' &&
-    m.tool?.name !== 'invoke_subagent' &&
+    !isNativeToolName(m.tool?.name ?? '', 'invoke_subagent') &&
     !m.hideFromUser &&
     m.priority !== 'MESSAGE_PRIORITY_LOW'
   const unconsumedHighPriority = messages.filter(
@@ -370,7 +371,7 @@ export async function readSubagents(
             const init = childInbox.messages.find(
               (m) =>
                 m.tool?.conversationId === nativeId &&
-                m.tool.name === 'invoke_subagent',
+                isNativeToolName(m.tool.name ?? '', 'invoke_subagent'),
             )?.tool
             if (init) {
               spawn = { callId: init.callId, stepIndex: init.stepIndex }
