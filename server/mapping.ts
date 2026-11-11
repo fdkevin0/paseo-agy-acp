@@ -178,9 +178,11 @@ export function toolDetail(
     explicitRawName === undefined && Object.hasOwn(nativeToolKinds, legacyName)
       ? legacyName
       : rawName.toLowerCase()
-  const kind =
-    nativeToolKinds[name] ??
-    (explicitRawName === undefined ? tool.kind : undefined)
+  const kind = Object.hasOwn(nativeToolKinds, name)
+    ? nativeToolKinds[name]
+    : explicitRawName === undefined
+      ? tool.kind
+      : undefined
   if (isAskQuestionName(name)) {
     const questions = normalizeAskQuestionInput(input)
     if (questions.length > 0) {
