@@ -27,8 +27,4 @@ jobs:
           cache: npm
           cache-dependency-path: npm-shrinkwrap.json
       - run: npm ci --ignore-scripts
-      - run: |
-          npm run format:check
-          npm run check
-          npm test
-          npm pack --dry-run --ignore-scripts
+      - run: npm run verify

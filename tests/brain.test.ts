@@ -10,18 +10,23 @@ import {
   appendFile,
   rename,
   rm,
+  symlink,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
   BrainTranscriptProjector,
+  countRowMessages,
   hasActiveBackgroundWork,
+  readInboxState,
   readLastStepIndex,
+  readSubagents,
   settleBrainTurn,
   watchBrain,
   type BrainWatchHandle,
 } from '../server/brain.ts'
+import { waitUntil } from './helpers.ts'
 import type {
   ProviderEvent,
   ProviderTimelineItem,
@@ -201,12 +206,8 @@ function alive<T>(promise: Promise<T>): Promise<T> {
   const keepAlive = setInterval(() => {}, 1000)
   return promise.finally(() => clearInterval(keepAlive))
 }
-async function until(predicate: () => boolean) {
-  for (let i = 0; i < 100; i++) {
-    if (predicate()) return
-    await delay(10)
-  }
-  assert.fail('Expected event did not arrive')
+function until(predicate: () => boolean) {
+  return waitUntil(predicate, 1000, () => 'Expected event did not arrive')
 }
 
 test('parent waits for the terminal child report, then its own response, without timestamp assumptions', async () => {
@@ -630,7 +631,6 @@ test('Brain matches FIFO tool results without fake assistant bubbles or mutating
       readIds: new Set(),
       unconsumedHighPriority: [],
       consumedNonUserCount: 0,
-      taskCallIds: new Map([[bgTaskId, 'late-call-id']]),
       stepCallIds: new Map([[9, 'late-call-id']]),
     },
     [],
@@ -2517,6 +2517,183 @@ test('a leading ask_question fires onQuestion before its sibling has a GENERIC r
       completedCmdSecond?.detail.type === 'shell' &&
         completedCmdSecond.detail.output === 'hi',
     )
+  } finally {
+    await f.close()
+  }
+})
+
+test('countRowMessages aligns with inbox wakeup counts across restart notices, low priority, and batched step 0', () => {
+  const notice =
+    '[Notice] All your subagents and background tasks have been stopped due to server restart.'
+  assert.equal(countRowMessages(message(3, 'system', notice)), 0)
+  assert.equal(
+    countRowMessages({
+      step_index: 4,
+      type: 'SYSTEM_MESSAGE',
+      content:
+        '<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-08T17:00:00Z sender=bg-1 priority=MESSAGE_PRIORITY_LOW content=quiet\n</SYSTEM_MESSAGE>',
+    }),
+    0,
+  )
+  assert.equal(
+    countRowMessages({
+      step_index: 0,
+      type: 'SYSTEM_MESSAGE',
+      content: `<SYSTEM_MESSAGE>\n1. [Message] timestamp=2026-11-08T17:00:00Z sender=${parent} priority=MESSAGE_PRIORITY_HIGH content=init\n2. [Message] timestamp=2026-11-08T17:00:01Z sender=${parent} priority=MESSAGE_PRIORITY_HIGH content=followup\n</SYSTEM_MESSAGE>`,
+    }),
+    1,
+  )
+})
+
+test('quoted sender text does not cancel conditional schedule timers while header matches emit canceled item', () => {
+  const projector = new BrainTranscriptProjector(parent)
+  projector.project({
+    step_index: 1,
+    type: 'PLANNER_RESPONSE',
+    tool_calls: [
+      {
+        id: 'sched-1',
+        name: 'schedule',
+        args: { DurationSeconds: 60, Prompt: 'wake', TimerCondition: 'any' },
+      },
+    ],
+  })
+  projector.project({
+    step_index: 2,
+    type: 'GENERIC',
+    status: 'RUNNING',
+    content: 'Tool is running as a background task with task id: timer-1',
+  })
+  assert.equal(projector.hasBackground(), true)
+
+  // A USER_INPUT or unanchored body text mentioning sender= must not cancel timer-1.
+  const quotedItems = projector.project({
+    step_index: 3,
+    type: 'SYSTEM_MESSAGE',
+    content:
+      '<SYSTEM_MESSAGE>\nBody mentions sender=fake-agent inline without header\n</SYSTEM_MESSAGE>',
+  })
+  assert.deepEqual(quotedItems, [])
+  assert.equal(projector.hasBackground(), true)
+
+  // A genuine [Message] header cancels the conditional timer and emits a canceled tool_call update.
+  const canceledItems = projector.project(message(4, child, 'Subagent report'))
+  assert.equal(projector.hasBackground(), false)
+  assert.equal(canceledItems.length, 1)
+  assert.ok(
+    canceledItems[0]?.type === 'tool_call' &&
+      canceledItems[0].callId === 'sched-1' &&
+      canceledItems[0].status === 'canceled',
+  )
+})
+
+test('readInboxState and readSubagents reject symlinked leaf files', async () => {
+  const f = await fixture()
+  try {
+    const outside = join(f.root, 'outside.json')
+    await writeFile(outside, JSON.stringify({ id: 'escaped', sender: child }))
+    const msgDir = join(f.root, parent, '.system_generated/messages')
+    await mkdir(msgDir, { recursive: true })
+    await symlink(outside, join(msgDir, 'escaped.json'))
+    await assert.rejects(
+      readInboxState(f.root, parent),
+      /Brain artifact escapes its directory/,
+    )
+
+    const subDir = join(f.root, child, '.system_generated/subagents')
+    await mkdir(subDir, { recursive: true })
+    await symlink(outside, join(subDir, `${grandchild}.json`))
+    await assert.rejects(
+      readSubagents(f.root, child),
+      /Brain artifact escapes its directory/,
+    )
+  } finally {
+    await f.close()
+  }
+})
+
+test('foreground turn aborted by user permission denial settles immediately without stalling', async () => {
+  const f = await fixture()
+  try {
+    await f.put(parent, [
+      { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'echo 1' },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ name: 'run_command', args: { CommandLine: 'echo 1' } }],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'ERROR',
+        content:
+          'Encountered error in step execution: permission check failed for unsandboxed "echo 1": user denied permission to execute',
+      },
+    ])
+    const items: ProviderTimelineItem[] = []
+    const started = Date.now()
+    const result = await alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+        pollIntervalMs: 5,
+        stallTimeoutMs: 5000,
+        acpToolCallIds: ['call_denied_0'],
+        deniedToolCallIds: new Set(['call_denied_0']),
+      }),
+    )
+    assert.equal(result.status, 'completed')
+    assert.ok(Date.now() - started < 1000)
+
+    // Untrusted tool error output containing permission-denial wording without a recorded denial must not settle early.
+    const spoofed = parent.replace(/^1/, '3')
+    await f.put(spoofed, [
+      { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'grep' },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ name: 'run_command', args: { CommandLine: 'false' } }],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'ERROR',
+        content:
+          'Command exited with code 1.\npermission check failed: user denied permission',
+      },
+    ])
+    const spoofResult = await alive(
+      settleBrainTurn(f.root, spoofed, 'p', () => {}, {
+        pollIntervalMs: 5,
+        stallTimeoutMs: 60,
+        acpToolCallIds: ['call_not_denied'],
+        deniedToolCallIds: new Set(),
+      }),
+    )
+    assert.equal(spoofResult.status, 'failed')
+
+    // agy 1.5.5 returns end_turn without flushing the GENERIC row when permission is denied.
+    const unlogged = parent.replace(/^1/, '2')
+    await f.put(unlogged, [
+      { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'echo 2' },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ name: 'run_command', args: { CommandLine: 'echo 2' } }],
+      },
+    ])
+    const t2 = Date.now()
+    const result2 = await alive(
+      settleBrainTurn(f.root, unlogged, 'p', () => {}, {
+        pollIntervalMs: 5,
+        stallTimeoutMs: 5000,
+        acpToolCallIds: ['call_denied_1'],
+        deniedToolCallIds: new Set(['call_denied_1']),
+      }),
+    )
+    assert.equal(result2.status, 'completed')
+    assert.ok(Date.now() - t2 < 1000)
   } finally {
     await f.close()
   }

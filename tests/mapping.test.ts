@@ -322,6 +322,34 @@ test('attachments preserve file paths, issue context and review comments', () =>
       review.text.includes('test.ts:3') &&
       review.text.includes('Fix here'),
   )
+  const textAttachment = promptContent({
+    type: 'text',
+    mimeType: 'text/plain',
+    title: 'Sprint Notes',
+    text: 'Fix login timeout',
+    externalResource: {
+      provider: 'linear',
+      providerLabel: 'Linear',
+      resourceType: 'issue',
+      id: 'id-1',
+      identifier: 'ENG-42',
+      title: 'Auth timeout on slow network',
+      url: 'https://linear.app/team/issue/ENG-42',
+    },
+  })
+  assert.deepEqual(textAttachment, {
+    type: 'text',
+    text: [
+      'Linear ENG-42: Auth timeout on slow network',
+      'Sprint Notes',
+      'https://linear.app/team/issue/ENG-42',
+      'Fix login timeout',
+    ].join('\n'),
+  })
+  assert.deepEqual(promptContent({ type: 'text', text: 'plain message' }), {
+    type: 'text',
+    text: 'plain message',
+  })
 })
 
 test('native PascalCase tools retain paths, content, ranges and recipients', () => {
@@ -509,6 +537,44 @@ test('tool details enrich shell exit codes, clean read gutters, map plan artifac
   assert.ok(failed?.type === 'tool_call')
   assert.equal(failed.error, 'permission denied')
 
+  const failedContent = timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'err-2',
+    title: 'run_command',
+    status: 'failed',
+    rawInput: { CommandLine: 'bad2' },
+    content: [
+      { type: 'content', content: { type: 'text', text: 'stderr detail' } },
+    ],
+  })
+  assert.ok(failedContent?.type === 'tool_call')
+  assert.equal(failedContent.error, 'stderr detail')
+
+  const canceledTool = timeline.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'cancel-1',
+    title: 'run_command',
+    status: 'cancelled' as 'failed',
+  })
+  assert.ok(canceledTool?.type === 'tool_call')
+  assert.equal(canceledTool.status, 'canceled')
+  assert.equal(canceledTool.error, null)
+
+  timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'denied-1',
+    title: 'run_command',
+    status: 'in_progress',
+    rawInput: { CommandLine: 'rm -rf /' },
+  })
+  const [deniedSettled] = timeline.terminalize(
+    'completed',
+    undefined,
+    new Set(['denied-1']),
+  )
+  assert.ok(deniedSettled?.type === 'tool_call')
+  assert.equal(deniedSettled.status, 'canceled')
+
   const askRunning = timeline.update({
     sessionUpdate: 'tool_call',
     toolCallId: 'ask-1',
@@ -549,5 +615,187 @@ test('tool details enrich shell exit codes, clean read gutters, map plan artifac
       label: 'ask_question',
       text: 'Which approach?\n  1. Option A\n  2. Option B\n\nAnswer:\nOption A',
     },
+  )
+})
+
+test('timeline maps plan session updates into todo items', () => {
+  const t = new Timeline('sess-1')
+  const item = t.update({
+    sessionUpdate: 'plan',
+    entries: [
+      { content: 'Step 1: Explore', status: 'completed', priority: 'medium' },
+      {
+        content: 'Step 2: Implement',
+        status: 'in_progress',
+        priority: 'medium',
+      },
+      { content: 'Step 3: Verify', status: 'pending', priority: 'medium' },
+    ],
+  })
+  assert.deepEqual(item, {
+    type: 'todo',
+    id: 'sess-1:plan',
+    items: [
+      { text: 'Step 1: Explore', completed: true, status: 'completed' },
+      { text: 'Step 2: Implement', completed: false, status: 'in_progress' },
+      { text: 'Step 3: Verify', completed: false, status: 'pending' },
+    ],
+  })
+})
+
+test('write_file with kind:edit and diff maps to Write card and denied failed update becomes canceled', () => {
+  const t = new Timeline('sess-live')
+  const writeItem = t.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'call_write',
+    name: 'write_file',
+    title: 'File ../../../../tmp/hello.txt',
+    kind: 'edit',
+    status: 'completed',
+    content: [{ type: 'diff', path: '/tmp/hello.txt', newText: 'HELLO\n' }],
+    locations: [{ path: '/tmp/hello.txt' }],
+    rawInput: { Path: '/tmp/hello.txt', Content: 'HELLO' },
+    rawOutput: {},
+  } as unknown as Parameters<Timeline['update']>[0])
+  assert.ok(writeItem?.type === 'tool_call')
+  assert.equal(writeItem.name, 'write_file')
+  assert.deepEqual(writeItem.detail, {
+    type: 'write',
+    filePath: '/tmp/hello.txt',
+    content: 'HELLO',
+  })
+
+  const denied = new Set(['call_deny'])
+  t.update(
+    {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'call_deny',
+      title: 'echo LIVE_DENY_99',
+      kind: 'execute',
+      status: 'in_progress',
+      rawInput: { CommandLine: 'echo LIVE_DENY_99' },
+    },
+    denied,
+  )
+  const deniedDone = t.update(
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'call_deny',
+      status: 'failed',
+      rawOutput: { output: '' },
+    },
+    denied,
+  )
+  assert.ok(deniedDone?.type === 'tool_call')
+  assert.equal(deniedDone.status, 'canceled')
+  assert.equal(deniedDone.error, null)
+
+  // Late status-less update on a denied tool keeps its canceled status and metadata.
+  const deniedLate = t.update(
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'call_deny',
+      content: [{ type: 'content', content: { type: 'text', text: 'denied' } }],
+    },
+    denied,
+  )
+  assert.ok(deniedLate?.type === 'tool_call')
+  assert.equal(deniedLate.status, 'canceled')
+  assert.equal(deniedLate.detail.type, 'shell')
+  assert.equal(t.isRunning(deniedLate.id), false)
+})
+
+test('late status-less tool_call_update preserves terminal status and metadata while orphan updates are ignored', () => {
+  const t = new Timeline('s')
+  assert.equal(
+    t.update({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'orphan',
+      content: [{ type: 'content', content: { type: 'text', text: 'stray' } }],
+    }),
+    undefined,
+  )
+  t.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'a',
+    title: 'run_command',
+    status: 'in_progress',
+    rawInput: { CommandLine: 'ls' },
+  })
+  t.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'a',
+    status: 'completed',
+  })
+  const late = t.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'a',
+    content: [{ type: 'content', content: { type: 'text', text: 'out' } }],
+  })
+  assert.ok(late?.type === 'tool_call')
+  assert.equal(late.name, 'run_command')
+  assert.equal(late.status, 'completed')
+  assert.deepEqual(late.detail, {
+    type: 'shell',
+    command: 'ls',
+    cwd: undefined,
+    output: 'out',
+  })
+  assert.equal(t.isRunning(late.id), false)
+  assert.deepEqual(t.terminalize('failed', 'boom'), [])
+})
+
+test('write card classification ignores paths or non-write tools containing "write"', () => {
+  assert.equal(
+    toolDetail({
+      title: 'Read src/write_buffer.ts',
+      kind: 'read',
+      locations: [{ path: '/repo/src/write_buffer.ts' }],
+    }).type,
+    'read',
+  )
+  assert.deepEqual(
+    toolDetail({
+      title: 'Edit src/write_buffer.ts',
+      kind: 'edit',
+      rawInput: {
+        Path: '/repo/src/write_buffer.ts',
+        Target: 'old',
+        Replacement: 'new',
+      },
+    }),
+    {
+      type: 'edit',
+      filePath: '/repo/src/write_buffer.ts',
+      oldString: 'old',
+      newString: 'new',
+    },
+  )
+  assert.equal(
+    toolDetail({
+      title: 'mcp__git__rewrite_history',
+      rawInput: { path: '/repo/file.ts', content: 'note' },
+    }).type,
+    'plain_text',
+  )
+  assert.equal(
+    toolDetail({
+      title: 'save_memory',
+      rawInput: { content: 'remember me' },
+    }).type,
+    'plain_text',
+  )
+  assert.equal(
+    toolDetail({
+      title: 'custom_replace',
+      kind: 'edit',
+      rawInput: {
+        file_path: '/repo/a.ts',
+        oldString: 'before',
+        newString: 'after',
+        content: 'unused',
+      },
+    }).type,
+    'edit',
   )
 })

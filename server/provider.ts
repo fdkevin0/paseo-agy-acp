@@ -3,6 +3,7 @@ import { homedir } from 'node:os'
 import {
   negotiateProviderCapabilities,
   requireProviderCapabilities,
+  PROVIDER_PROTOCOL_VERSION,
   ProviderInputSchema,
 } from '@getpaseo/plugin/server/provider'
 import type {
@@ -14,9 +15,13 @@ import type {
   ProviderInput,
 } from '@getpaseo/plugin/server/provider'
 import { providerStatus, catalogCacheKey } from './preflight.ts'
-import { configState, record } from './mapping.ts'
+import { configState } from './mapping.ts'
+import { formatErrorMessage, record, setBounded } from './common.ts'
 import { AgyUsageSource } from './usage.ts'
 import { SessionManager } from './session.ts'
+
+const CATALOG_CACHE_LIMIT = 100
+
 const supported = [
   'prompt.message',
   'prompt.command',
@@ -29,6 +34,7 @@ const supported = [
   'permission.tool_policy',
   'session.subsession',
 ] as const
+
 /** Register the direct ACP provider and own every runtime for its connection. */
 export function createProvider(
   usage = new AgyUsageSource(),
@@ -44,8 +50,10 @@ export function createProvider(
       return catalogCacheKey(launch)
     },
     async connect(connection): Promise<ProviderConnection> {
-      if (!connection.versions.includes(1))
-        throw new Error('Provider protocol version 1 required')
+      if (!connection.versions.includes(PROVIDER_PROTOCOL_VERSION))
+        throw new Error(
+          `Provider protocol version ${PROVIDER_PROTOCOL_VERSION} required`,
+        )
       const capabilities = negotiateProviderCapabilities(
         connection.capabilities,
         supported,
@@ -68,9 +76,17 @@ export function createProvider(
           const cwd = input.cwd ?? homedir()
           let catalog = catalogs.get(cwd)
           if (!catalog) {
-            catalog = probeCatalog(manager, connection.launch, cwd, usage)
-            catalogs.set(cwd, catalog)
-            void catalog.catch(() => catalogs.delete(cwd))
+            const pendingCatalog = probeCatalog(
+              manager,
+              connection.launch,
+              cwd,
+              usage,
+            )
+            catalog = pendingCatalog
+            setBounded(catalogs, cwd, pendingCatalog, CATALOG_CACHE_LIMIT)
+            void pendingCatalog.catch(() => {
+              if (catalogs.get(cwd) === pendingCatalog) catalogs.delete(cwd)
+            })
           }
           emit({
             type: 'catalog',
@@ -82,7 +98,7 @@ export function createProvider(
         else await manager.handle(input)
       }
       return {
-        version: 1,
+        version: PROVIDER_PROTOCOL_VERSION,
         capabilities,
         onEvent(listener) {
           listeners.add(listener)
@@ -94,20 +110,30 @@ export function createProvider(
           if (closed) throw new Error('Provider connection is closed')
           input = ProviderInputSchema.parse(input)
           requireProviderCapabilities(capabilities, input)
-          if (input.type === 'session.permission') return handle(input)
+          if (input.type === 'session.permission') {
+            const task = handle(input)
+            const tracked = task.then(
+              () => undefined,
+              () => undefined,
+            )
+            pending.add(tracked)
+            void tracked.finally(() => pending.delete(tracked))
+            return task
+          }
           const task = handle(input).catch((error) => {
+            const message = formatErrorMessage(error)
             if ('requestId' in input)
               emit({
                 type: 'request.failed',
                 requestId: input.requestId,
-                error: { message: String(error) },
+                error: { message },
               })
             else if (input.type === 'session.prompt')
               emit({
                 type: 'session.prompt_result',
                 sessionId: input.sessionId,
                 clientMessageId: input.prompt.clientMessageId,
-                result: { type: 'failed', error: { message: String(error) } },
+                result: { type: 'failed', error: { message } },
               })
           })
           pending.add(task)
@@ -138,9 +164,12 @@ async function probeCatalog(
     session.state.nativeId = response.sessionId
     const dir = usage.remember(launch, {}, cwd)
     if (session.transport.tier?.name)
-      usage.tiers.set(dir, session.transport.tier.name)
-    await session.flush()
-    await session.waitForCommands(100)
+      setBounded(
+        usage.tiers,
+        dir,
+        session.transport.tier.name,
+        CATALOG_CACHE_LIMIT,
+      )
     const config = configState({
       ...response,
       models: session.transport.models,
@@ -215,5 +244,4 @@ async function listSessions(
   } finally {
     await session.close()
   }
-  return
 }

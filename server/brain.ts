@@ -1,1042 +1,43 @@
-import {
-  open,
-  readdir,
-  readFile,
-  realpath,
-  stat,
-  type FileHandle,
-} from 'node:fs/promises'
-import { createHash } from 'node:crypto'
-import { join, sep } from 'node:path'
-import {
-  Timeline,
-  cleanToolName,
-  isAskQuestionName,
-  record,
-  toolDetail,
-  sessionIdPattern,
-  addStepUsage,
-  type StepUsage,
-} from './mapping.ts'
+import { stat } from 'node:fs/promises'
+import { join } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
+import { formatErrorMessage, sessionIdPattern } from './common.ts'
+import { Timeline, addStepUsage, type StepUsage } from './mapping.ts'
 import type {
   ProviderEvent,
   ProviderTimelineItem,
 } from '@getpaseo/plugin/server/provider'
+import type { NormalizedQuestion } from './questions.ts'
 import {
-  normalizeAskQuestionInput,
-  type NormalizedQuestion,
-} from './permissions.ts'
+  StepDedupe,
+  countRowMessages,
+  extractStepUsage,
+  isMissing,
+  isRestartNotice,
+  readInboxState,
+  readLastStepIndex,
+  readSubagents,
+  readTranscriptRows,
+  stepErrorMessage,
+  type InboxState,
+  type SubagentRecord,
+} from './brain-io.ts'
+import {
+  BrainNode,
+  BrainTranscriptProjector,
+  activeChildIdsForTurn,
+  type PendingQuestion,
+  type QuestionOutcome,
+} from './brain-projector.ts'
 
-type PendingTool = {
-  id: string
-  callId: string
-  name: string
-  args: Record<string, unknown>
-  stepIndex: number
-  isQuestion?: boolean
-  questions?: NormalizedQuestion[]
-  questionConsumed?: boolean
-  questionCompleted?: boolean
-}
-
-export type PendingQuestion = {
-  tool: PendingTool
-  questions: NormalizedQuestion[]
-  wokeUp: boolean
-}
-
-export type QuestionOutcome =
-  | { status: 'answered' | 'already_handled'; answerText?: string }
-  | { status: 'canceled' }
-
-export type SubagentRecord = {
-  conversationId: string
-  /** Native lifecycle state; only SUBAGENT_STATE_ALIVE counts as active work. */
-  state: string
-  spawnStepIndex: number
-  spawnCallId?: string
-}
-
-const SUBAGENT_ALIVE = 'SUBAGENT_STATE_ALIVE'
-
-type BrainMessageRecord = {
-  id: string
-  sender: string
-  priority?: string
-  hideFromUser?: boolean
-  tool?: {
-    conversationId?: string
-    stepIndex?: number
-    callId?: string
-    name?: string
-  }
-}
-
-type InboxState = {
-  messages: BrainMessageRecord[]
-  readIds: Set<string>
-  unconsumedHighPriority: BrainMessageRecord[]
-  consumedNonUserCount: number
-  taskCallIds: Map<string, string>
-  stepCallIds: Map<number, string>
-}
-
-const backgroundTaskPattern =
-  /Tool is running as a background task with task id:\s*(\S+)/
-const systemTaskResultPattern =
-  /\bsender=(\S+)[^\n]*\scontent=Task id "([^"]+)" (finished|was canceled|failed) with result:\n([\s\S]*?)(?:\nLog: file:\/\/\S+)?(?=\n(?:\d+\.\s+)?\[Message\]\s+|\s*<\/SYSTEM_MESSAGE>|\s*$)/g
-const restartNoticePattern =
-  /\bsender=system\b[^\n]*\scontent=\[Notice\] All your subagents and background tasks have been stopped/
-
-/**
- * agy logs a step once it reaches RUNNING, WAITING or DONE (or fails) and never appends it again.
- * Only full O_TRUNC rewrites can contain these earlier statuses, and a later row for the same step
- * always supersedes them, so readers drop them entirely.
- */
-const unloggedStepStatuses = new Set(['PENDING', 'QUEUED', 'GENERATING'])
-/** Logged while still running: the transcript never records this step's own result. */
-const runningStepStatuses = new Set(['RUNNING', 'WAITING'])
-
-function isMissing(error: unknown) {
-  return (error as NodeJS.ErrnoException).code === 'ENOENT'
-}
-
-function isUnloggedStep(row: Record<string, unknown>) {
-  return typeof row.status === 'string' && unloggedStepStatuses.has(row.status)
-}
-
-function terminalToolStatus(
-  status: unknown,
-): 'completed' | 'failed' | 'canceled' {
-  if (status === 'ERROR') return 'failed'
-  if (status === 'CANCELED' || status === 'INTERRUPTED') return 'canceled'
-  return 'completed'
-}
-
-function isCompletePlannerResponse(step: Record<string, unknown> | undefined) {
-  return (
-    step?.type === 'PLANNER_RESPONSE' &&
-    step.status === 'DONE' &&
-    (!Array.isArray(step.tool_calls) ||
-      step.tool_calls.length === 0 ||
-      step.tool_calls.every((call) =>
-        isAskQuestionName(String(record(call).name ?? '')),
-      ))
-  )
-}
-
-function isRestartNotice(row: Record<string, unknown> | undefined) {
-  return (
-    row?.type === 'SYSTEM_MESSAGE' &&
-    restartNoticePattern.test(String(row.content ?? ''))
-  )
-}
-
-function stepErrorMessage(
-  step: Record<string, unknown> | undefined,
-  fallback = 'Turn failed',
-) {
-  if (typeof step?.content === 'string' && step.content) return step.content
-  if (typeof step?.error === 'string' && step.error) return step.error
-  const errObj = record(step?.error)
-  if (typeof errObj.message === 'string' && errObj.message)
-    return errObj.message
-  return fallback
-}
-
-function extractStepUsage(row: Record<string, unknown>): StepUsage | undefined {
-  if (row.type !== 'PLANNER_RESPONSE') return undefined
-  const count = (value: unknown) =>
-    typeof value === 'number' && Number.isFinite(value) && value >= 0
-      ? value
-      : undefined
-  const input = count(row.input_tokens)
-  const output = count(row.output_tokens)
-  if (input === undefined && output === undefined) return undefined
-  const cacheWrite = count(row.cache_write_tokens)
-  return {
-    inputTokens: input ?? 0,
-    outputTokens: output ?? 0,
-    cachedReadTokens: count(row.cache_read_tokens) ?? 0,
-    ...(cacheWrite !== undefined ? { cachedWriteTokens: cacheWrite } : {}),
-  }
-}
-
-function countRowMessages(row: Record<string, unknown>): number {
-  if (row.type !== 'SYSTEM_MESSAGE' || typeof row.content !== 'string') return 0
-  if (
-    Number(row.step_index) === 0 &&
-    /\bsender=[a-f0-9-]{36}(?=\s|$)/i.test(row.content)
-  )
-    return 0
-  return (
-    row.content.match(
-      /(?:^|\n)(?:\d+\.\s+)?\[Message\]\s+(?:timestamp=\S+\s+)?sender=(?!user\b)\S+/g,
-    )?.length ?? 0
-  )
-}
-
-type CachedMessage = {
-  mtimeMs: number
-  size: number
-  record: BrainMessageRecord
-}
-const messageCache = new Map<string, CachedMessage>()
-const MESSAGE_CACHE_LIMIT = 4096
-
-/** Parse a write-once inbox message into its light record (bodies and signatures are dropped). */
-function parseMessage(raw: Record<string, unknown>, fallbackId: string) {
-  const toolMeta = record(record(raw.sourceMetadata).tool)
-  const toolCall = record(toolMeta.toolCall)
-  const callId =
-    typeof toolCall.id === 'string' && toolCall.id ? toolCall.id : undefined
-  const stepIndex =
-    typeof toolMeta.stepIndex === 'number' &&
-    Number.isInteger(toolMeta.stepIndex)
-      ? toolMeta.stepIndex
-      : undefined
-  const conversationId =
-    typeof toolMeta.conversationId === 'string'
-      ? toolMeta.conversationId
-      : undefined
-  const message: BrainMessageRecord = {
-    id: typeof raw.id === 'string' && raw.id ? raw.id : fallbackId,
-    sender: typeof raw.sender === 'string' ? raw.sender : '',
-    priority: typeof raw.priority === 'string' ? raw.priority : undefined,
-    hideFromUser: raw.hideFromUser === true,
-    ...(conversationId || stepIndex !== undefined || callId
-      ? {
-          tool: {
-            conversationId,
-            stepIndex,
-            callId,
-            name: typeof toolCall.name === 'string' ? toolCall.name : undefined,
-          },
-        }
-      : {}),
-  }
-  return message
-}
-
-/** Read a message file, re-parsing it only when its mtime or size changes. */
-async function readMessageCached(path: string, fallbackId: string) {
-  const info = await stat(path)
-  const hit = messageCache.get(path)
-  if (hit && hit.mtimeMs === info.mtimeMs && hit.size === info.size)
-    return hit.record
-  const message = parseMessage(
-    record(JSON.parse(await readFile(path, 'utf8'))),
-    fallbackId,
-  )
-  messageCache.delete(path)
-  messageCache.set(path, {
-    mtimeMs: info.mtimeMs,
-    size: info.size,
-    record: message,
-  })
-  if (messageCache.size > MESSAGE_CACHE_LIMIT)
-    messageCache.delete(messageCache.keys().next().value!)
-  return message
-}
-
-/** A subagent's spawning call never changes once its init message exists. */
-const spawnCache = new Map<string, { callId?: string; stepIndex?: number }>()
-
-async function resolveBrainPath(
-  root: string,
-  nativeId: string,
-  subpath: string,
-) {
-  const base = await realpath(root)
-  const path = await realpath(
-    join(base, nativeId, '.system_generated', subpath),
-  )
-  if (!path.startsWith(base + sep))
-    throw new Error('Brain artifact escapes its directory')
-  return path
-}
-
-/** Read structured inbox messages and read.json state from .system_generated/messages. */
-export async function readInboxState(
-  root: string,
-  nativeId: string,
-): Promise<InboxState> {
-  const empty: InboxState = {
-    messages: [],
-    readIds: new Set(),
-    unconsumedHighPriority: [],
-    consumedNonUserCount: 0,
-    taskCallIds: new Map(),
-    stepCallIds: new Map(),
-  }
-  if (!sessionIdPattern.test(nativeId)) return empty
-  let dir: string
-  try {
-    dir = await resolveBrainPath(root, nativeId, 'messages')
-  } catch (error) {
-    if (isMissing(error)) return empty
-    throw error
-  }
-  const entries = await readdir(dir).catch(() => [] as string[])
-  const readIds = new Set<string>()
-  if (entries.includes('read.json')) {
-    try {
-      const parsed = record(
-        JSON.parse(await readFile(join(dir, 'read.json'), 'utf8')),
-      )
-      for (const [id, isRead] of Object.entries(parsed))
-        if (isRead === true) readIds.add(id)
-    } catch {
-      /* Ignore partially written read.json and re-poll on next tick. */
-    }
-  }
-  const messages: BrainMessageRecord[] = []
-  const taskCallIds = new Map<string, string>()
-  const stepCallIds = new Map<number, string>()
-  for (const name of entries) {
-    if (!name.endsWith('.json') || name === 'read.json') continue
-    try {
-      const message = await readMessageCached(
-        join(dir, name),
-        name.slice(0, -5),
-      )
-      const { sender, tool } = message
-      if (tool?.conversationId === nativeId && tool.callId) {
-        if (sender) taskCallIds.set(sender, tool.callId)
-        if (tool.stepIndex !== undefined)
-          stepCallIds.set(tool.stepIndex, tool.callId)
-      }
-      messages.push(message)
-    } catch {
-      /* Ignore partially written message files and re-poll on next tick. */
-    }
-  }
-  const isWakeupMessage = (m: BrainMessageRecord) =>
-    m.sender !== 'user' &&
-    m.tool?.name !== 'invoke_subagent' &&
-    !m.hideFromUser &&
-    m.priority !== 'MESSAGE_PRIORITY_LOW'
-  const unconsumedHighPriority = messages.filter(
-    (m) => isWakeupMessage(m) && !readIds.has(m.id),
-  )
-  const consumedNonUserCount = messages.filter(
-    (m) => isWakeupMessage(m) && readIds.has(m.id),
-  ).length
-  return {
-    messages,
-    readIds,
-    unconsumedHighPriority,
-    consumedNonUserCount,
-    taskCallIds,
-    stepCallIds,
-  }
-}
-
-/** Read structured subagent descriptors from .system_generated/subagents. */
-export async function readSubagents(
-  root: string,
-  nativeId: string,
-): Promise<SubagentRecord[]> {
-  if (!sessionIdPattern.test(nativeId)) return []
-  let dir: string
-  try {
-    dir = await resolveBrainPath(root, nativeId, 'subagents')
-  } catch (error) {
-    if (isMissing(error)) return []
-    throw error
-  }
-  const entries = await readdir(dir).catch(() => [] as string[])
-  const loaded = await Promise.all(
-    entries
-      .filter((name) => name.endsWith('.json'))
-      .map(async (name): Promise<SubagentRecord | undefined> => {
-        try {
-          const raw = record(
-            JSON.parse(await readFile(join(dir, name), 'utf8')),
-          )
-          const conversationId =
-            typeof raw.conversationId === 'string'
-              ? raw.conversationId
-              : name.slice(0, -5)
-          if (!sessionIdPattern.test(conversationId)) return undefined
-          // A missing state means the descriptor predates lifecycle tracking; unknown states are not active.
-          const state =
-            typeof raw.state === 'string' && raw.state
-              ? raw.state
-              : SUBAGENT_ALIVE
-          let spawnStepIndex =
-            typeof raw.spawnStepIndex === 'number' &&
-            Number.isInteger(raw.spawnStepIndex)
-              ? raw.spawnStepIndex
-              : 0
-          const spawnKey = `${root}\0${nativeId}\0${conversationId}`
-          let spawn = spawnCache.get(spawnKey)
-          if (!spawn) {
-            const childInbox = await readInboxState(root, conversationId)
-            const init = childInbox.messages.find(
-              (m) =>
-                m.tool?.conversationId === nativeId &&
-                m.tool.name === 'invoke_subagent',
-            )?.tool
-            if (init) {
-              spawn = { callId: init.callId, stepIndex: init.stepIndex }
-              spawnCache.set(spawnKey, spawn)
-            }
-          }
-          const spawnCallId = spawn?.callId
-          if (spawn?.stepIndex !== undefined) spawnStepIndex = spawn.stepIndex
-          return {
-            conversationId,
-            state,
-            spawnStepIndex,
-            spawnCallId,
-          }
-        } catch {
-          /* Ignore partially written subagent descriptor files. */
-          return undefined
-        }
-      }),
-  )
-  return loaded.filter((r): r is SubagentRecord => r !== undefined)
-}
-
-/** Project transcript_full.jsonl steps and correlate tools with structured Brain metadata. */
-export class BrainTranscriptProjector {
-  private pending: PendingTool[] = []
-  private background = new Map<string, PendingTool>()
-  private daemons = new Map<string, number>()
-  private touchedSubagents = new Set<string>()
-  private stepCallIds = new Map<number, string>()
-  private stepSubagents = new Map<number, SubagentRecord>()
-  private callSubagents = new Map<string, SubagentRecord>()
-  private toolIndex = 0
-  private acpToolCallIds: readonly string[] = []
-  private sessionId: string
-
-  constructor(sessionId: string) {
-    this.sessionId = sessionId
-  }
-
-  bindToolCallIds(ids: readonly string[]) {
-    this.acpToolCallIds = ids
-    this.toolIndex = 0
-  }
-
-  syncMetadata(inbox: InboxState, subagents: readonly SubagentRecord[]) {
-    this.stepCallIds = new Map(inbox.stepCallIds)
-    this.stepSubagents.clear()
-    this.callSubagents.clear()
-    for (const sub of subagents) {
-      this.stepSubagents.set(sub.spawnStepIndex, sub)
-      if (sub.spawnCallId) {
-        this.stepCallIds.set(sub.spawnStepIndex, sub.spawnCallId)
-        this.callSubagents.set(sub.spawnCallId, sub)
-      }
-    }
-  }
-
-  hasPending(): boolean {
-    return this.pending.some((p) => !p.isQuestion)
-  }
-
-  hasBackground(): boolean {
-    return this.background.size > 0
-  }
-
-  hasDaemons(): boolean {
-    return this.daemons.size > 0
-  }
-
-  consumePendingQuestion() {
-    const next = this.pending.find((p) => !p.questionConsumed)
-    if (!next?.isQuestion) return undefined
-    next.questionConsumed = true
-    return { tool: next, questions: next.questions ?? [] }
-  }
-
-  completePendingQuestion(
-    pending: PendingTool,
-    output: unknown,
-    status: 'completed' | 'failed' | 'canceled' = 'completed',
-  ): ProviderTimelineItem {
-    pending.questionCompleted = true
-    return this.finishTool(
-      pending,
-      output,
-      status,
-      typeof output === 'string' ? output : '',
-    )
-  }
-
-  private forgetTask(taskId: string) {
-    this.background.delete(taskId)
-    this.daemons.delete(taskId)
-  }
-
-  touchedSubagentIds(): ReadonlySet<string> {
-    const ids = new Set(this.touchedSubagents)
-    for (const p of this.pending) {
-      if (
-        p.name.includes('send_message') &&
-        typeof p.args.Recipient === 'string' &&
-        sessionIdPattern.test(p.args.Recipient)
-      ) {
-        ids.add(p.args.Recipient)
-      }
-    }
-    return ids
-  }
-
-  private finishTool(
-    pending: PendingTool,
-    output: unknown,
-    status: 'completed' | 'failed' | 'canceled',
-    text: string,
-  ): ProviderTimelineItem {
-    const base = {
-      type: 'tool_call' as const,
-      id: pending.id,
-      callId: pending.callId,
-      name: pending.name,
-      detail: toolDetail({
-        title: pending.name,
-        rawInput: pending.args,
-        rawOutput: output,
-      }),
-    }
-    if (
-      status === 'completed' &&
-      base.detail.type === 'sub_agent' &&
-      base.detail.childSessionId
-    ) {
-      this.touchedSubagents.add(base.detail.childSessionId)
-    }
-    return status === 'failed'
-      ? {
-          ...base,
-          status: 'failed',
-          error: { message: text || 'Tool execution failed' },
-        }
-      : { ...base, status, error: null }
-  }
-
-  project(value: unknown): ProviderTimelineItem[] {
-    const row = record(value)
-    if (!Number.isInteger(row.step_index)) return []
-    const stepIndex = Number(row.step_index)
-    const id = `${this.sessionId}:step:${stepIndex}`
-    const text = typeof row.content === 'string' ? row.content : ''
-    switch (row.type) {
-      case 'USER_INPUT':
-        this.pending = []
-        this.touchedSubagents.clear()
-        return text ? [{ type: 'user_message', id, text }] : []
-      case 'SYSTEM_MESSAGE': {
-        if (isRestartNotice(row)) {
-          // Stopped calls never log a result; child transcripts have no USER_INPUT to reset them.
-          this.pending = []
-          this.background.clear()
-          this.daemons.clear()
-          this.touchedSubagents.clear()
-          return []
-        }
-        const taskResults = [...text.matchAll(systemTaskResultPattern)]
-        const finishedIds = new Set<string>()
-        for (const match of taskResults) {
-          finishedIds.add(match[1])
-          finishedIds.add(match[2])
-          this.daemons.delete(match[1])
-          this.daemons.delete(match[2])
-        }
-        const senders = [...text.matchAll(/\bsender=(\S+)/g)].map((m) => m[1])
-        for (const sender of senders) {
-          const remaining = this.daemons.get(sender)
-          if (remaining !== undefined && !finishedIds.has(sender)) {
-            if (remaining <= 1) this.daemons.delete(sender)
-            else this.daemons.set(sender, remaining - 1)
-          }
-          for (const [taskId, task] of this.background)
-            if (
-              task.name === 'schedule' &&
-              !finishedIds.has(taskId) &&
-              (sender === taskId ||
-                task.args.TimerCondition === 'any' ||
-                task.args.TimerCondition === sender)
-            )
-              this.background.delete(taskId)
-        }
-        if (taskResults.length > 0) {
-          const completed: ProviderTimelineItem[] = []
-          for (const [, senderId, quotedId, outcome, output] of taskResults) {
-            const key = this.background.has(quotedId) ? quotedId : senderId
-            const pending = this.background.get(key)
-            if (!pending) continue
-            this.background.delete(key)
-            const status =
-              outcome === 'failed'
-                ? 'failed'
-                : outcome === 'was canceled'
-                  ? 'canceled'
-                  : 'completed'
-            completed.push(this.finishTool(pending, output, status, output))
-          }
-          return completed
-        }
-        if (stepIndex === 0 && /\bsender=[a-f0-9-]{36}(?=\s|$)/i.test(text)) {
-          const promptMatch = text.match(
-            /\bcontent=([\s\S]*?)(?:\s*<\/SYSTEM_MESSAGE>)?\s*$/,
-          )
-          const promptText = promptMatch?.[1]?.trim()
-          return promptText
-            ? [{ type: 'user_message', id, text: promptText }]
-            : []
-        }
-        return []
-      }
-      case 'CHECKPOINT':
-        // A checkpoint takes a step index between a response and its GENERIC rows; shift expected rows past it.
-        for (const p of this.pending) {
-          if (p.stepIndex >= stepIndex) p.stepIndex++
-        }
-        return []
-      case 'ERROR_MESSAGE':
-        this.pending = []
-        this.background.clear()
-        this.daemons.clear()
-        this.touchedSubagents.clear()
-        return [
-          {
-            type: 'error',
-            id: `${id}:error`,
-            message: stepErrorMessage(row, 'Subagent error'),
-          },
-        ]
-      case 'GENERIC': {
-        // Match by stepIndex first so an unlogged WAITING ask_question never steals a sibling tool's GENERIC row.
-        let matchIndex = this.pending.findIndex(
-          (p) => p.stepIndex === stepIndex,
-        )
-        if (matchIndex < 0) {
-          matchIndex = this.pending.findIndex((p) => !p.isQuestion)
-          if (matchIndex < 0) matchIndex = 0
-        }
-        const [pending] = this.pending.splice(matchIndex, 1)
-        if (!pending || pending.questionCompleted) return []
-        if (runningStepStatuses.has(String(row.status))) {
-          const taskId = text.match(backgroundTaskPattern)?.[1]
-          if (taskId) {
-            if (pending.args.IsDaemon === true) {
-              const max = Number(pending.args.MaxIterations)
-              this.daemons.set(
-                taskId,
-                Number.isInteger(max) && max > 0 ? max : Infinity,
-              )
-            } else {
-              this.background.set(taskId, pending)
-            }
-          }
-          return []
-        }
-        if (
-          pending.name.includes('manage_task') &&
-          pending.args.Action === 'kill' &&
-          typeof pending.args.TaskId === 'string' &&
-          terminalToolStatus(row.status) === 'completed'
-        ) {
-          this.forgetTask(pending.args.TaskId)
-        }
-        const subagent =
-          this.callSubagents.get(pending.callId) ??
-          this.stepSubagents.get(stepIndex) ??
-          this.stepSubagents.get(pending.stepIndex)
-        const rawOutput =
-          pending.name === 'invoke_subagent' &&
-          subagent &&
-          (!text || !text.includes(subagent.conversationId))
-            ? { conversationId: subagent.conversationId }
-            : (row.content ?? row.error ?? null)
-        return [
-          this.finishTool(
-            pending,
-            rawOutput,
-            terminalToolStatus(row.status),
-            text,
-          ),
-        ]
-      }
-      case 'PLANNER_RESPONSE': {
-        // A new model response means calls of the previous one without a GENERIC row were stopped;
-        // keeping them would misattribute this response's results in FIFO order.
-        this.pending = []
-        const items: ProviderTimelineItem[] = []
-        if (typeof row.thinking === 'string' && row.thinking)
-          items.push({
-            type: 'reasoning',
-            id: `${id}:thought`,
-            text: row.thinking,
-          })
-        if (text) items.push({ type: 'assistant_message', id, text })
-        if (Array.isArray(row.tool_calls))
-          row.tool_calls.forEach((value, index) => {
-            const tool = record(value)
-            const args = record(tool.args)
-            const genericStep = stepIndex + index + 1
-            const acpId = this.acpToolCallIds[this.toolIndex++]
-            const callId =
-              (typeof tool.id === 'string' && tool.id ? tool.id : undefined) ??
-              this.stepCallIds.get(genericStep) ??
-              acpId ??
-              `tool-${stepIndex}-${index}`
-            const cleanName = cleanToolName(String(tool.name ?? 'Tool'))
-            const pending: PendingTool = {
-              id: `${this.sessionId}:tool:${callId}`,
-              callId,
-              name: cleanName,
-              args,
-              stepIndex: genericStep,
-              ...(isAskQuestionName(cleanName)
-                ? {
-                    isQuestion: true,
-                    questions: normalizeAskQuestionInput(args),
-                  }
-                : {}),
-            }
-            this.pending.push(pending)
-            items.push({
-              type: 'tool_call',
-              id: pending.id,
-              callId: pending.callId,
-              name: pending.name,
-              detail: toolDetail({
-                title: pending.name,
-                rawInput: args,
-                rawOutput: null,
-              }),
-              status: 'running',
-              error: null,
-            })
-          })
-        return items
-      }
-      default:
-        return []
-    }
-  }
-}
-
-async function resolveTranscriptPath(root: string, nativeId: string) {
-  return resolveBrainPath(root, nativeId, 'logs/transcript_full.jsonl')
-}
-
-const REWRITE_PROBE_BYTES = 4096
-
-/**
- * One cursor owns partial records across polls, path replacement and in-place rewrites.
- * agy rewrites transcript_full.jsonl with O_TRUNC on the same inode, so besides inode and size
- * changes the reader re-checks the first bytes and the bytes just before its offset.
- */
-class TranscriptReader {
-  private identity = ''
-  private offset = 0
-  private remainder = ''
-  private head = Buffer.alloc(0)
-  private tail = Buffer.alloc(0)
-
-  private async matches(file: FileHandle, probe: Buffer, position: number) {
-    if (!probe.length) return true
-    const buffer = Buffer.alloc(probe.length)
-    const { bytesRead } = await file.read(buffer, 0, probe.length, position)
-    return bytesRead === probe.length && buffer.equals(probe)
-  }
-
-  /** Keep the probes equal to bytes actually parsed, so a rewrite racing this read is still noticed. */
-  private remember(chunk: Buffer) {
-    if (this.head.length < REWRITE_PROBE_BYTES)
-      this.head = Buffer.concat([
-        this.head,
-        chunk.subarray(0, REWRITE_PROBE_BYTES - this.head.length),
-      ])
-    this.tail =
-      chunk.length >= REWRITE_PROBE_BYTES
-        ? Buffer.from(chunk.subarray(chunk.length - REWRITE_PROBE_BYTES))
-        : Buffer.concat([this.tail, chunk]).subarray(-REWRITE_PROBE_BYTES)
-  }
-
-  async read(root: string, nativeId: string) {
-    const path = await resolveTranscriptPath(root, nativeId)
-    const file = await open(path, 'r')
-    const rows: Record<string, unknown>[] = []
-    try {
-      const stat = await file.stat()
-      const identity = `${path}:${stat.dev}:${stat.ino}`
-      const reset =
-        identity !== this.identity ||
-        stat.size < this.offset ||
-        !(await this.matches(file, this.head, 0)) ||
-        !(await this.matches(file, this.tail, this.offset - this.tail.length))
-      if (reset) {
-        this.identity = identity
-        this.offset = 0
-        this.remainder = ''
-        this.head = Buffer.alloc(0)
-        this.tail = Buffer.alloc(0)
-      }
-      while (this.offset < stat.size) {
-        const buffer = Buffer.alloc(
-          Math.min(stat.size - this.offset, 1024 * 1024),
-        )
-        const { bytesRead } = await file.read(
-          buffer,
-          0,
-          buffer.length,
-          this.offset,
-        )
-        if (!bytesRead) break
-        this.offset += bytesRead
-        this.remember(buffer.subarray(0, bytesRead))
-        // Preserve bytes until a complete line is available, including split UTF-8 characters.
-        this.remainder += buffer.subarray(0, bytesRead).toString('latin1')
-        const lines = this.remainder.split('\n')
-        this.remainder = lines.pop()!
-        if (this.remainder.length > 8 * 1024 * 1024)
-          throw new Error('Brain JSONL line exceeds 8 MiB')
-        for (const line of lines) {
-          if (line.length > 8 * 1024 * 1024)
-            throw new Error('Brain JSONL line exceeds 8 MiB')
-          if (!line.trim()) continue
-          const row = record(
-            JSON.parse(Buffer.from(line, 'latin1').toString('utf8')),
-          )
-          if (!isUnloggedStep(row)) rows.push(row)
-        }
-      }
-      return { rows, reset }
-    } finally {
-      await file.close()
-    }
-  }
-}
-
-export async function readTranscriptRows(
-  root: string,
-  nativeId: string,
-): Promise<Record<string, unknown>[]> {
-  if (!sessionIdPattern.test(nativeId)) return []
-  try {
-    return (await new TranscriptReader().read(root, nativeId)).rows
-  } catch (error) {
-    if (isMissing(error)) return []
-    throw error
-  }
-}
-
-/** Step index of the newest transcript row; reads only the file tail since rows are appended in step order. */
-export async function readLastStepIndex(
-  root: string,
-  nativeId: string,
-): Promise<number> {
-  if (!sessionIdPattern.test(nativeId)) return -1
-  let file
-  try {
-    file = await open(await resolveTranscriptPath(root, nativeId), 'r')
-  } catch (error) {
-    if (isMissing(error)) return -1
-    throw error
-  }
-  try {
-    const { size } = await file.stat()
-    for (let window = 64 * 1024; ; window *= 4) {
-      const length = Math.min(size, window)
-      const buffer = Buffer.alloc(length)
-      const { bytesRead } = await file.read(buffer, 0, length, size - length)
-      const lines = buffer.subarray(0, bytesRead).toString('utf8').split('\n')
-      // The first line may be cut by the window unless it starts the file.
-      const complete = length < size ? lines.slice(1) : lines
-      for (let i = complete.length - 1; i >= 0; i--) {
-        if (!complete[i].trim()) continue
-        try {
-          const step = Number(record(JSON.parse(complete[i])).step_index)
-          if (Number.isInteger(step)) return step
-        } catch {
-          /* A torn trailing write; look at the previous record. */
-        }
-      }
-      if (length >= size) return -1
-    }
-  } finally {
-    await file.close()
-  }
-}
-
-function activeChildIdsForTurn(
-  subagents: readonly SubagentRecord[],
-  projector: BrainTranscriptProjector,
-  minStepIndex: number,
-): string[] {
-  const touched = projector.touchedSubagentIds()
-  const ids = new Set<string>()
-  for (const sub of subagents) {
-    if (
-      sub.state === SUBAGENT_ALIVE &&
-      (sub.spawnStepIndex > minStepIndex || touched.has(sub.conversationId))
-    ) {
-      ids.add(sub.conversationId)
-    }
-  }
-  return [...ids]
-}
-
-/** Remembers each step's delivered shape, so a rewrite re-delivers only changed steps. */
-class StepDedupe {
-  private seen = new Map<number, string>()
-
-  prune(rows: readonly Record<string, unknown>[]) {
-    const keep = new Set(rows.map((r) => Number(r.step_index)))
-    for (const step of this.seen.keys())
-      if (!keep.has(step)) this.seen.delete(step)
-  }
-
-  /** Whether this row is new or changed since its step was last seen. */
-  fresh(row: Record<string, unknown>): boolean {
-    const step = Number(row.step_index)
-    // Store a digest, not the payload: long-lived watchers would otherwise retain every step's full text.
-    const signature = createHash('sha1')
-      .update(
-        JSON.stringify([
-          row.type,
-          row.status ?? '',
-          row.content ?? '',
-          row.thinking ?? '',
-          row.tool_calls ?? null,
-        ]),
-      )
-      .digest('base64')
-    if (this.seen.get(step) === signature) return false
-    this.seen.set(step, signature)
-    return true
-  }
-}
-
-class BrainNode {
-  readonly reader = new TranscriptReader()
-  projector: BrainTranscriptProjector
-  readonly children = new Map<string, BrainNode>()
-  consumedMessages = 0
-  turnStartStep = -1
-  seenPlannerResponse = false
-  foregroundIdleReached = false
-  wokeUp = false
-  continuingQuestion = false
-  questionSettled = false
-  /** Last step seen when a question was answered; agy's reply must come after it. */
-  answeredQuestionStep = -1
-  lastStep?: Record<string, unknown>
-  readonly nativeId: string
-  readonly sessionId: string
-
-  constructor(nativeId: string, sessionId = nativeId) {
-    this.nativeId = nativeId
-    this.sessionId = sessionId
-    this.projector = new BrainTranscriptProjector(sessionId)
-  }
-
-  reset(inbox: InboxState, subagents: readonly SubagentRecord[]) {
-    this.projector = new BrainTranscriptProjector(this.sessionId)
-    this.projector.syncMetadata(inbox, subagents)
-    this.consumedMessages = 0
-    this.turnStartStep = -1
-    this.lastStep = undefined
-    this.resetPhase()
-  }
-
-  /** Forget the wakeup phase: a new USER_INPUT, a transcript rewrite or (for hasActiveBackgroundWork) a runtime restart. */
-  resetPhase() {
-    this.seenPlannerResponse = false
-    this.foregroundIdleReached = false
-    this.wokeUp = false
-    this.continuingQuestion = false
-    this.questionSettled = false
-    this.answeredQuestionStep = -1
-  }
-
-  markQuestionContinuation() {
-    this.continuingQuestion = true
-    this.questionSettled = false
-    this.wokeUp = true
-    this.answeredQuestionStep = Number(this.lastStep?.step_index ?? -1)
-  }
-
-  markQuestionSettled() {
-    this.questionSettled = true
-  }
-
-  async pollMetadata(root: string) {
-    const [inbox, subagents] = await Promise.all([
-      readInboxState(root, this.nativeId),
-      readSubagents(root, this.nativeId),
-    ])
-    this.projector.syncMetadata(inbox, subagents)
-    return { inbox, subagents }
-  }
-
-  /** Fold one transcript row into wakeup phase, message accounting, projection and the last step. */
-  ingest(row: Record<string, unknown>): ProviderTimelineItem[] {
-    this.questionSettled = false
-    if (row.type === 'USER_INPUT' || isRestartNotice(row))
-      this.turnStartStep = Number(row.step_index)
-    // A restart notice or a question-continuation USER_INPUT does not end a woken turn:
-    // the rows after it are still Brain's to project.
-    if (row.type === 'USER_INPUT') {
-      if (this.continuingQuestion) this.continuingQuestion = false
-      else this.resetPhase()
-    } else if (
-      row.type === 'SYSTEM_MESSAGE' &&
-      !isRestartNotice(row) &&
-      this.foregroundIdleReached
-    )
-      this.wokeUp = true
-    this.consumedMessages += countRowMessages(row)
-    const items = this.projector.project(row)
-    if (row.type !== 'CHECKPOINT') this.lastStep = row
-    if (row.type === 'PLANNER_RESPONSE') this.seenPlannerResponse = true
-    if (
-      this.seenPlannerResponse &&
-      !this.projector.hasPending() &&
-      (isCompletePlannerResponse(row) || this.projector.hasBackground())
-    )
-      this.foregroundIdleReached = true
-    return items
-  }
-
-  hasUnprocessedMessages(inbox: InboxState): boolean {
-    return (
-      inbox.unconsumedHighPriority.length > 0 ||
-      this.consumedMessages < inbox.consumedNonUserCount
-    )
-  }
-
-  isWokenWorking(): boolean {
-    return (
-      this.wokeUp &&
-      (this.projector.hasPending() ||
-        (this.lastStep?.type === 'SYSTEM_MESSAGE' &&
-          !isRestartNotice(this.lastStep)) ||
-        (this.lastStep?.type === 'GENERIC' &&
-          this.lastStep.status !== 'CANCELED' &&
-          this.lastStep.status !== 'INTERRUPTED'))
-    )
-  }
-
-  isSettled(inbox: InboxState): boolean {
-    return (
-      !this.hasUnprocessedMessages(inbox) &&
-      !this.projector.hasPending() &&
-      !this.projector.hasBackground() &&
-      // An answered question's own ask-only response is not agy's reply to the answer.
-      Number(this.lastStep?.step_index ?? -1) > this.answeredQuestionStep &&
-      (isCompletePlannerResponse(this.lastStep) || this.questionSettled)
-    )
-  }
+export {
+  BrainTranscriptProjector,
+  countRowMessages,
+  readInboxState,
+  readLastStepIndex,
+  readSubagents,
+  readTranscriptRows,
+  type SubagentRecord,
 }
 
 /** Determine whether the session has running background tasks or active subagents. Standing IsDaemon schedules are excluded by default so foreground interrupts do not kill them, and included when checking whether an idle runtime can stop. */
@@ -1153,20 +154,8 @@ async function settleChildren(
 }
 
 function pause(ms: number, signal?: AbortSignal) {
-  return new Promise<void>((resolve) => {
-    // An abort during the previous poll has already fired; do not wait for it again.
-    if (signal?.aborted) return resolve()
-    const onAbort = () => {
-      clearTimeout(timer)
-      resolve()
-    }
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort)
-      resolve()
-    }, ms)
-    timer.unref()
-    signal?.addEventListener('abort', onAbort, { once: true })
-  })
+  if (signal?.aborted) return Promise.resolve()
+  return delay(ms, undefined, { ref: false, signal }).catch(() => undefined)
 }
 
 /** Follow background tasks and post-RPC Reactive Wakeup steps in transcript_full.jsonl until the turn settles. */
@@ -1180,6 +169,7 @@ export async function settleBrainTurn(
     minStepIndex = -1,
     pollIntervalMs = 200,
     acpToolCallIds = [],
+    deniedToolCallIds,
     shouldEmitPreWakeupTool,
     emitForeground = false,
     onStep,
@@ -1188,6 +178,7 @@ export async function settleBrainTurn(
     wokenStallTimeoutMs = 15 * 60_000,
     isWaitingOnUser,
     onQuestion,
+    onQuestionSettled,
     onSubagents,
   }: {
     onSubagents?: (subagents: readonly SubagentRecord[]) => void
@@ -1195,6 +186,7 @@ export async function settleBrainTurn(
     minStepIndex?: number
     pollIntervalMs?: number
     acpToolCallIds?: readonly string[]
+    deniedToolCallIds?: ReadonlySet<string>
     shouldEmitPreWakeupTool?: (
       item: Extract<ProviderTimelineItem, { type: 'tool_call' }>,
     ) => boolean
@@ -1212,6 +204,11 @@ export async function settleBrainTurn(
     isWaitingOnUser?: () => boolean
     /** Handle an unlogged ask_question step discovered at the tail of the transcript. */
     onQuestion?: (question: PendingQuestion) => Promise<QuestionOutcome>
+    /** Invoked when a GENERIC row settles a logged ask_question step directly. */
+    onQuestionSettled?: (
+      questions: readonly NormalizedQuestion[],
+      wokeUp: boolean,
+    ) => void
   } = {},
 ): Promise<{
   status: 'completed' | 'canceled' | 'failed'
@@ -1222,7 +219,7 @@ export async function settleBrainTurn(
   wakeupUsage?: StepUsage
 }> {
   if (!sessionIdPattern.test(nativeId)) return { status: 'completed' }
-  const node = new BrainNode(nativeId, sessionId)
+  const node = new BrainNode(nativeId, sessionId, onQuestionSettled)
   const startedAt = Date.now()
   let lastActivity = startedAt
   let fingerprint = ''
@@ -1357,6 +354,7 @@ export async function settleBrainTurn(
     }
     if (node.lastStep?.type === 'ERROR_MESSAGE')
       return finish('failed', stepErrorMessage(node.lastStep, 'Turn failed'))
+    node.settleAbortedDenial(deniedToolCallIds)
     let continuedQuestion = false
     // A question at the head of the pending queue blocks agy until it is answered.
     // Without a handler (direct callers and tests) it is closed as already handled.
@@ -1464,15 +462,28 @@ export function watchBrain(
   let cancelling: Promise<void> | undefined
   let warned = false
   let running = !resume
+  let turnStartedEmitted = Boolean(resume)
   let turnSeq = resume?.turnSeq ?? 1
   let turnId = `${sessionId}:turn:${turnSeq}`
   let lastStepIndex = resume?.afterStep ?? -1
   const dedupe = new StepDedupe()
+  function ensureTurnStarted() {
+    if (running && !turnStartedEmitted && !stopped) {
+      turnStartedEmitted = true
+      emit({
+        type: 'session.turn',
+        sessionId,
+        turnId,
+        state: 'started',
+      })
+    }
+  }
   function finishTurn(
     state: 'completed' | 'failed' | 'canceled',
     error?: string,
   ) {
     if (!running || stopped) return
+    ensureTurnStarted()
     running = false
     for (const item of timeline.terminalize(state, error))
       emit({ type: 'timeline.item', sessionId, item })
@@ -1504,7 +515,7 @@ export function watchBrain(
       for (const row of rows) {
         if (stopped) return
         const stepIndex = Number(row.step_index)
-        // A rewrite re-delivers earlier steps; only a new (step, status) is new child activity.
+        // A rewrite re-delivers earlier steps; StepDedupe.fresh hashes type/status/content/thinking/tool_calls.
         const replayed =
           !dedupe.fresh(row) ||
           (resume !== undefined && stepIndex <= resume.afterStep)
@@ -1521,12 +532,15 @@ export function watchBrain(
         ) {
           running = true
           turnId = `${sessionId}:turn:${++turnSeq}`
+          turnStartedEmitted = true
           emit({
             type: 'session.turn',
             sessionId,
             turnId,
             state: 'started',
           })
+        } else if (running && items.length > 0) {
+          ensureTurnStarted()
         }
         const timestamp =
           typeof row.created_at === 'string' ? row.created_at : undefined
@@ -1579,7 +593,7 @@ export function watchBrain(
           item: {
             type: 'error',
             id: `${sessionId}:brain-error`,
-            message: `Cannot read child transcript: ${String(error)}`,
+            message: `Cannot read child transcript: ${formatErrorMessage(error)}`,
           },
         })
       }

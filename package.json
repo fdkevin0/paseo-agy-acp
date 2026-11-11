@@ -15,11 +15,11 @@
     "npm-shrinkwrap.json"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "test": "node --test tests/*.test.ts",
     "check": "tsc --noEmit",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "verify": "npm run format:check && npm run check && npm test && npm pack --dry-run --ignore-scripts"
   },
   "devDependencies": {
     "@getpaseo/plugin": "0.15.4",

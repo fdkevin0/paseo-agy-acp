@@ -22,6 +22,6 @@ Temporary discovery sessions and new sessions closed before their first prompt a
 
 ## Known limits
 
-When native `usage_update` measurements are unavailable, context occupancy is computed from per-step token counters in `transcript_full.jsonl`. Current agy print mode rejects custom ACP directory flags; quota queries with those flags return an error instead of querying another account. Subagent timelines depend on native Brain artifacts and do not provide independent session control.
+When native `usage_update` measurements are unavailable—or after a turn enters post-RPC Reactive Wakeup, where `agy` emits no further `usage_update` notifications—context occupancy is computed from per-step token counters in `transcript_full.jsonl`. Current agy print mode rejects custom ACP directory flags; quota queries with those flags return an error instead of querying another account. Subagent timelines depend on native Brain artifacts and do not provide independent session control.
 
 Steering, rewind, archive operations, structured output and Artifacts panels are unsupported. Idle runtime cleanup (`session.can_stop_runtime`) is permitted only when no foreground turn, pending approval, active subagent, background task, or standing `IsDaemon` schedule is running.

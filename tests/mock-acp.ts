@@ -194,7 +194,21 @@ new AgentSideConnection((client) => {
           rawOutput: { conversationId: '22222222-2222-4222-8222-222222222222' },
         },
       })
-      return { configOptions }
+      if (process.env.AGY_TEST_LOAD_USAGE) {
+        await client.sessionUpdate({
+          sessionId,
+          update: { sessionUpdate: 'usage_update', used: 300, size: 256_000 },
+        })
+        await client.sessionUpdate({
+          sessionId,
+          update: { sessionUpdate: 'usage_update', used: 900, size: 256_000 },
+        })
+      }
+      return {
+        configOptions: process.env.AGY_TEST_LOAD_USAGE
+          ? configOptions.filter((o) => o.id !== 'thought_level')
+          : configOptions,
+      }
     },
     async resumeSession({ sessionId, _meta }) {
       const append = (
@@ -1191,6 +1205,21 @@ new AgentSideConnection((client) => {
                   : choice.outcome.outcome,
             },
           },
+        })
+        return { stopReason: 'end_turn' as const }
+      }
+      if (text === 'permission-deny') {
+        await client.requestPermission({
+          sessionId,
+          toolCall: {
+            toolCallId: 'unfinished',
+            title: 'run_command',
+            rawInput: { CommandLine: 'echo unfinished' },
+          },
+          options: [
+            { optionId: 'yes', name: 'Allow', kind: 'allow_once' },
+            { optionId: 'no', name: 'Deny', kind: 'reject_once' },
+          ],
         })
         return { stopReason: 'end_turn' as const }
       }

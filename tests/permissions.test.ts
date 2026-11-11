@@ -2,16 +2,18 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import elicitationFixtures from './fixtures/elicitation-form.json' with { type: 'json' }
 import {
-  buildElicitationResponse,
-  formatQuestionAnswersText,
   isPreapprovedMcpTool,
-  normalizeAskQuestionInput,
-  normalizeElicitationQuestions,
   permissionKind,
   pickPermissionOption,
+} from '../server/permissions.ts'
+import {
+  buildElicitationResponse,
+  formatQuestionAnswersText,
+  normalizeAskQuestionInput,
+  normalizeElicitationQuestions,
   sameNormalizedQuestions,
   toQuestionPermissionInput,
-} from '../server/permissions.ts'
+} from '../server/questions.ts'
 
 const options = [
   { optionId: 'always', kind: 'allow_always' },
@@ -68,6 +70,10 @@ test('isPreapprovedMcpTool matches exact direct and lazy MCP grants only', () =>
     preapproved: [{ kind: 'mcp' as const, server: 'rea', tool: 'open' }],
   }
   assert.equal(isPreapprovedMcpTool('mcp__rea__open', {}, policy), true)
+  assert.equal(
+    isPreapprovedMcpTool('default_api:mcp__rea__open', {}, policy),
+    true,
+  )
   assert.equal(isPreapprovedMcpTool('rea:open', {}, policy), true)
   assert.equal(
     isPreapprovedMcpTool(
@@ -76,6 +82,22 @@ test('isPreapprovedMcpTool matches exact direct and lazy MCP grants only', () =>
       policy,
     ),
     true,
+  )
+  assert.equal(
+    isPreapprovedMcpTool(
+      'default_api:call_mcp_tool',
+      { ServerName: 'rea', ToolName: 'open' },
+      policy,
+    ),
+    true,
+  )
+  assert.equal(
+    isPreapprovedMcpTool(
+      'untrusted:call_mcp_tool',
+      { ServerName: 'rea', ToolName: 'open' },
+      policy,
+    ),
+    false,
   )
   assert.equal(
     isPreapprovedMcpTool(
@@ -147,6 +169,38 @@ test('elicitation forms become Paseo QuestionCard input', () => {
     ['Continue?'],
   )
   assert.deepEqual(normalizeElicitationQuestions({}), [])
+  const enumBased = normalizeElicitationQuestions({
+    requestedSchema: {
+      type: 'object',
+      properties: {
+        env: {
+          type: 'string',
+          title: 'Deploy target',
+          enum: ['staging', 'prod'],
+        },
+      },
+    },
+  })
+  assert.deepEqual(enumBased, [
+    {
+      id: 'env',
+      header: 'Question 1',
+      question: 'Deploy target',
+      options: [
+        { id: 'staging', label: 'staging' },
+        { id: 'prod', label: 'prod' },
+      ],
+      multiSelect: false,
+      allowOther: false,
+    },
+  ])
+  assert.deepEqual(
+    buildElicitationResponse(enumBased, {
+      behavior: 'allow',
+      updatedInput: { answers: { 'Question 1': 'canary' } },
+    }),
+    { action: 'accept', content: { env: 'canary' } },
+  )
 })
 
 test('QuestionCard answers map back to schema values and Other fields', () => {

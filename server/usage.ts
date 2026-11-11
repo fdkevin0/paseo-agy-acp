@@ -15,15 +15,18 @@ import {
   type UsageScope,
   type UsageSourceRegistration,
 } from '@getpaseo/plugin/server/usage'
+import { formatErrorMessage, setBounded } from './common.ts'
 import { dataDirectory } from './preflight.ts'
 
-const usageInputSchema = z
-  .object({
-    dataDir: z.string().min(1),
-    command: z.string().min(1).optional(),
-    args: z.array(z.string()).optional(),
-  })
-  .strict()
+const FIVE_HOURS_SECONDS = 5 * 3600
+const WEEKLY_SECONDS = 7 * 86_400
+const USAGE_FETCH_TIMEOUT_MS = 15_000
+const LOG_CHUNK_SIZE = 64 * 1024
+const ACCOUNT_CACHE_LIMIT = 100
+
+const usageInputSchema = z.object({
+  dataDir: z.string().min(1),
+})
 
 const groupsSchema = z.object({
   command: z.object({
@@ -48,21 +51,25 @@ const groupsSchema = z.object({
 
 /** Validate the CLI envelope before translating its quota groups. */
 export function parseUsage(stdout: string) {
-  return groupsSchema
-    .parse(JSON.parse(stdout))
-    .command.data.groups.map((group) => ({
-      name: group.name,
-      buckets: group.buckets.map((bucket) => ({
-        id: bucket.id ?? bucket.window,
-        name: bucket.name ?? bucket.window,
-        window: bucket.window,
-        remainingFraction: bucket.remaining_fraction ?? undefined,
-        resetTime: bucket.reset_time ?? '',
-      })),
-    }))
+  let parsed: z.infer<typeof groupsSchema>
+  try {
+    parsed = groupsSchema.parse(JSON.parse(stdout))
+  } catch (error) {
+    throw new Error('Unexpected /usage JSON output from agy', { cause: error })
+  }
+  return parsed.command.data.groups.map((group) => ({
+    name: group.name,
+    buckets: group.buckets.map((bucket) => ({
+      id: bucket.id ?? bucket.window,
+      name: bucket.name ?? bucket.window,
+      window: bucket.window,
+      remainingFraction: bucket.remaining_fraction ?? undefined,
+      resetTime: bucket.reset_time ?? '',
+    })),
+  }))
 }
 
-/** Read only bounded log tails, preferring the most recently modified login log. */
+/** Read only bounded log tails, preferring the most recently modified login log while retaining cli.log. */
 export async function readLoggedEmail(
   dataDir: string,
 ): Promise<string | undefined> {
@@ -74,33 +81,38 @@ export async function readLoggedEmail(
   } catch {
     /* Logs are optional. */
   }
-  const recent = await Promise.all(
-    names.map(async (name) => {
-      const path = join(dataDir, 'log', name)
-      return {
-        path,
-        modified: await stat(path).then(
-          (s) => s.mtimeMs,
-          () => 0,
-        ),
-      }
-    }),
+  const recent = (
+    await Promise.all(
+      names.map(async (name) => {
+        const path = join(dataDir, 'log', name)
+        return {
+          path,
+          modified: await stat(path).then(
+            (s) => s.mtimeMs,
+            () => 0,
+          ),
+        }
+      }),
+    )
   )
-  const paths = recent.sort((a, b) => b.modified - a.modified).slice(0, 10)
+    .filter((entry) => entry.modified > 0)
+    .sort((a, b) => b.modified - a.modified)
+    .slice(0, 10)
   const main = join(dataDir, 'cli.log')
-  paths.push({
-    path: main,
-    modified: await stat(main).then(
-      (s) => s.mtimeMs,
-      () => 0,
-    ),
-  })
-  for (const { path } of paths.sort((a, b) => b.modified - a.modified)) {
+  const mainModified = await stat(main).then(
+    (s) => s.mtimeMs,
+    () => 0,
+  )
+  if (mainModified > 0) {
+    recent.push({ path: main, modified: mainModified })
+    recent.sort((a, b) => b.modified - a.modified)
+  }
+  for (const { path } of recent) {
     try {
       const file = await open(path, 'r')
       try {
         const size = (await file.stat()).size
-        const bytes = Buffer.alloc(Math.min(size, 64 * 1024))
+        const bytes = Buffer.alloc(Math.min(size, LOG_CHUNK_SIZE))
         const { bytesRead } = await file.read(
           bytes,
           0,
@@ -131,13 +143,38 @@ async function hasLogin(dataDir: string): Promise<boolean> {
   )
 }
 
+const VALUE_FLAGS = new Set([
+  '--gemini-dir',
+  '--gemini_dir',
+  '--app-data-dir',
+  '--app_data_dir',
+])
+
+const STRIPPED_ACP_FLAGS = new Set([
+  '--stdio',
+  '--worker',
+  '--process-per-session',
+  '--dangerously-skip-permissions',
+])
+
 function usageArgs(args: readonly string[]): string[] {
-  const result = [...args]
-  const acp = result.indexOf('acp')
-  if (acp >= 0) result.splice(acp, 1)
-  return result.filter(
-    (arg) => !['--stdio', '--worker', '--process-per-session'].includes(arg),
-  )
+  const result: string[] = []
+  let removedAcp = false
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (VALUE_FLAGS.has(arg)) {
+      result.push(arg)
+      if (i + 1 < args.length) result.push(args[++i])
+      continue
+    }
+    if (!removedAcp && arg === 'acp') {
+      removedAcp = true
+      continue
+    }
+    if (STRIPPED_ACP_FLAGS.has(arg)) continue
+    result.push(arg)
+  }
+  return result
 }
 
 /** Share native launch/account observations with Paseo's subscription usage surface. */
@@ -159,12 +196,18 @@ export class AgyUsageSource {
     cwd?: string,
   ): string {
     const dir = dataDirectory(launch, env, cwd)
-    this.launches.set(dir, {
-      launch,
-      env: { ...launch?.env, ...env },
-      cwd,
-      hadLogin: this.launches.get(dir)?.hadLogin ?? false,
-    })
+    const hadLogin = this.launches.get(dir)?.hadLogin ?? false
+    setBounded(
+      this.launches,
+      dir,
+      {
+        launch,
+        env: { ...launch?.env, ...env },
+        cwd,
+        hadLogin,
+      },
+      ACCOUNT_CACHE_LIMIT,
+    )
     return dir
   }
 
@@ -192,7 +235,7 @@ export class AgyUsageSource {
     for (const dir of new Set(dirs)) {
       let known = this.launches.get(dir)
       const loggedIn = await hasLogin(dir)
-      if (!loggedIn && !known) continue
+      if (!loggedIn && (!known || known.hadLogin)) continue
       if (!known) {
         this.remember(undefined, scope.kind === 'session' ? scope.env : {})
         known = this.launches.get(dir)
@@ -211,13 +254,15 @@ export class AgyUsageSource {
   }
 
   async fetch(rawInput: unknown): Promise<UsageReport> {
-    const { dataDir, command, args } = usageInputSchema.parse(rawInput)
+    const { dataDir } = usageInputSchema.parse(rawInput)
     const known = this.launches.get(dataDir)
-    const cmd = command ?? known?.launch?.command ?? 'agy'
-    const rawArgs = args ?? known?.launch?.args ?? []
+    const cmd = known?.launch?.command ?? 'agy'
+    const rawArgs = known?.launch?.args ?? []
     const loggedIn = await hasLogin(dataDir)
     if (!loggedIn && (!known || known.hadLogin))
-      throw new Error('Antigravity login store no longer exists')
+      throw new Error(
+        'Antigravity login store no longer exists; run agy to sign in again',
+      )
     if (known && loggedIn) known.hadLogin = true
     try {
       let cwd = known?.cwd
@@ -239,15 +284,17 @@ export class AgyUsageSource {
           (!isAbsolute(launch.command) && /[/\\]/.test(launch.command))
         )
           throw new Error(
-            'Remembered workspace is missing and the usage launch depends on it',
+            'Remembered workspace is missing and the usage launch depends on relative paths',
           )
       }
       const { stdout } = await execCommand(
         cmd,
         [...usageArgs(rawArgs), '-p', '/usage', '--output-format', 'json'],
         {
-          timeout: 15_000,
-          env: known ? { ...process.env, ...known.env } : process.env,
+          timeout: USAGE_FETCH_TIMEOUT_MS,
+          env: known?.launch
+            ? { ...known.env }
+            : { ...process.env, ...known?.env },
           cwd,
         },
       )
@@ -262,9 +309,9 @@ export class AgyUsageSource {
           return windowFromReportedDuration({
             durationSeconds:
               bucket.window === '5h'
-                ? 18_000
+                ? FIVE_HOURS_SECONDS
                 : bucket.window === 'weekly'
-                  ? 604_800
+                  ? WEEKLY_SECONDS
                   : null,
             scope: {
               id: group.name
@@ -298,7 +345,7 @@ export class AgyUsageSource {
     } catch (error) {
       return {
         status: 'error',
-        error: error instanceof Error ? error.message : String(error),
+        error: formatErrorMessage(error),
       }
     }
   }

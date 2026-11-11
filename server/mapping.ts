@@ -17,19 +17,20 @@ import type {
   ProviderContent,
   ProviderUsage,
 } from '@getpaseo/plugin/server/provider'
-import { normalizeAskQuestionInput } from './permissions.ts'
+import {
+  cleanToolName,
+  isAskQuestionName,
+  sessionIdPattern,
+  setBounded,
+  record,
+  str,
+  num,
+  nonnegative,
+  text,
+} from './common.ts'
+import { normalizeAskQuestionInput } from './questions.ts'
 
 export const FULL_ACCESS_MODE_ID = 'full-access'
-
-/** Drop agy's `default_api:` namespace from native tool names. */
-export function cleanToolName(name: string): string {
-  return name.replace(/^default_api:/, '')
-}
-
-/** Whether a native tool name is agy's interactive question tool. */
-export function isAskQuestionName(name: string): boolean {
-  return /^ask_(?:question|user)$/i.test(cleanToolName(name))
-}
 
 const modeVisuals: Record<
   string,
@@ -45,21 +46,6 @@ const modeVisuals: Record<
   },
 }
 
-export const sessionIdPattern =
-  /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i
-
-/** Narrow opaque protocol payloads before reading vendor fields. */
-export function record(value: unknown): Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : {}
-}
-export function str(value: unknown): string | undefined {
-  return typeof value === 'string' ? value : undefined
-}
-function num(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
-}
 function joinChunks(
   chunks: readonly Record<string, unknown>[] | undefined,
   ...keys: string[]
@@ -75,6 +61,7 @@ function joinChunks(
     })
     .join('\n...\n')
 }
+
 const searchToolNames: ReadonlyArray<
   readonly [string, 'grep' | 'glob' | 'web_search']
 > = [
@@ -84,6 +71,19 @@ const searchToolNames: ReadonlyArray<
   ['search_web', 'web_search'],
   ['web_search', 'web_search'],
 ]
+
+function extractToolContentText(
+  tool: Partial<ToolCall> | ToolCallUpdate,
+): string | undefined {
+  const joined = tool.content
+    ?.map((c) =>
+      c.type === 'content' && c.content.type === 'text' ? c.content.text : '',
+    )
+    .filter(Boolean)
+    .join('\n')
+  return joined || undefined
+}
+
 function cleanReadOutput(output: string | undefined): {
   content: string | undefined
   startLine?: number
@@ -109,7 +109,32 @@ function cleanReadOutput(output: string | undefined): {
       : {}),
   }
 }
+
+function nonEmptyRawOutput(rawOutput: unknown): string | undefined {
+  if (typeof rawOutput === 'string')
+    return rawOutput.trim() ? rawOutput : undefined
+  if (rawOutput == null || rawOutput === '') return undefined
+  const obj = record(rawOutput)
+  const keys = Object.keys(obj)
+  if (keys.length === 0) return undefined
+  if (keys.length === 1 && obj.output === '') return undefined
+  return JSON.stringify(rawOutput)
+}
+
 /** Map native tool arguments and output to Paseo detail cards. */
+const canonicalWriteToolPattern =
+  /^(?:write_file|write_to_file|create_file|fs\/write_text_file|write_text_file)$/i
+const TOOL_SNAPSHOT_LIMIT = 1024
+
+function isTerminalToolStatus(status: unknown): boolean {
+  return (
+    status === 'completed' ||
+    status === 'failed' ||
+    status === 'canceled' ||
+    status === 'cancelled'
+  )
+}
+
 export function toolDetail(
   tool: Partial<ToolCall> | ToolCallUpdate,
 ): ProviderToolCallDetail {
@@ -117,17 +142,11 @@ export function toolDetail(
   const output =
     typeof tool.rawOutput === 'string'
       ? tool.rawOutput
-      : tool.content
-          ?.map((c) =>
-            c.type === 'content' && c.content.type === 'text'
-              ? c.content.text
-              : '',
-          )
-          .filter(Boolean)
-          .join('\n') ||
-        (tool.rawOutput != null ? JSON.stringify(tool.rawOutput) : undefined)
-  const name = cleanToolName(tool.title ?? '')
-  if (isAskQuestionName(name) || Array.isArray(input.questions)) {
+      : (extractToolContentText(tool) ?? nonEmptyRawOutput(tool.rawOutput))
+  const explicitRawName = str(record(tool).name)
+  const rawName = cleanToolName(explicitRawName ?? tool.title ?? '')
+  const name = rawName.toLowerCase()
+  if (isAskQuestionName(rawName) || Array.isArray(input.questions)) {
     const questions = normalizeAskQuestionInput(input)
     if (questions.length > 0) {
       const formatted = questions
@@ -140,7 +159,7 @@ export function toolDetail(
         .join('\n\n')
       return {
         type: 'plain_text',
-        label: name || 'ask_question',
+        label: rawName || 'ask_question',
         text: output ? `${formatted}\n\nAnswer:\n${output}` : formatted,
       }
     }
@@ -207,10 +226,47 @@ export function toolDetail(
       : undefined
   if (planText) return { type: 'plan', text: planText }
   const diff = tool.content?.find((c) => c.type === 'diff')
-  if (diff?.type === 'diff')
+  const nativeWriteContent = str(input.Content ?? input.CodeContent)
+  const writeContent = nativeWriteContent ?? str(input.content)
+  const hasEditTarget =
+    input.Target !== undefined ||
+    input.TargetContent !== undefined ||
+    input.old_string !== undefined ||
+    input.oldString !== undefined ||
+    input.OldString !== undefined ||
+    Array.isArray(input.ReplacementChunks) ||
+    diff?.oldText != null
+  const isCanonicalWrite =
+    !rawName.startsWith('mcp__') &&
+    !rawName.includes(':') &&
+    canonicalWriteToolPattern.test(rawName)
+  const isUnnamedWriteFallback =
+    explicitRawName === undefined &&
+    !rawName.startsWith('mcp__') &&
+    !rawName.includes(':') &&
+    tool.kind !== 'read' &&
+    !hasEditTarget &&
+    (nativeWriteContent !== undefined ||
+      (diff?.type === 'diff' &&
+        Boolean(diff.path) &&
+        diff.oldText == null &&
+        Object.keys(input).length === 0 &&
+        /^file(?:\s|$)/i.test(rawName)))
+  if (
+    (filePath || (diff?.type === 'diff' && diff.path)) &&
+    (isCanonicalWrite || isUnnamedWriteFallback)
+  ) {
+    return {
+      type: 'write',
+      filePath: (filePath ?? diff?.path)!,
+      content:
+        writeContent ?? (diff?.type === 'diff' ? diff.newText : undefined),
+    }
+  }
+  if (diff?.type === 'diff' && (diff.path || filePath))
     return {
       type: 'edit',
-      filePath: diff.path,
+      filePath: (diff.path || filePath)!,
       oldString: diff.oldText ?? '',
       newString: diff.newText,
     }
@@ -240,11 +296,11 @@ export function toolDetail(
     }
   }
   if (filePath) {
-    if (/write/.test(name))
+    if (isCanonicalWrite)
       return {
         type: 'write',
         filePath,
-        content: str(input.Content ?? input.CodeContent ?? input.content),
+        content: writeContent,
       }
     if (tool.kind === 'edit' || /edit|replace/.test(name)) {
       const chunks = Array.isArray(input.ReplacementChunks)
@@ -254,33 +310,47 @@ export function toolDetail(
         type: 'edit',
         filePath,
         oldString:
-          str(input.Target ?? input.TargetContent ?? input.old_string) ??
-          joinChunks(chunks, 'TargetContent', 'Target'),
+          str(
+            input.Target ??
+              input.TargetContent ??
+              input.old_string ??
+              input.oldString ??
+              input.OldString,
+          ) ?? joinChunks(chunks, 'TargetContent', 'Target'),
         newString:
           str(
-            input.Replacement ?? input.ReplacementContent ?? input.new_string,
+            input.Replacement ??
+              input.ReplacementContent ??
+              input.new_string ??
+              input.newString ??
+              input.NewString,
           ) ?? joinChunks(chunks, 'ReplacementContent', 'Replacement'),
       }
     }
-    const cleaned = cleanReadOutput(output)
-    const start = num(input.StartLine) ?? cleaned.startLine
-    const end = num(input.EndLine) ?? cleaned.endLine
-    return {
-      type: 'read',
-      filePath,
-      content: cleaned.content,
-      offset:
-        num(
-          input.offset ??
-            input.StartLine ??
-            input.ByteOffset ??
-            input.ContentOffset,
-        ) ?? cleaned.startLine,
-      limit:
-        num(input.limit) ??
-        (start !== undefined && end !== undefined
-          ? Math.max(1, end - start + 1)
-          : undefined),
+    if (
+      !rawName.startsWith('mcp__') ||
+      /(?:^|_)(?:read|view|cat)(?:_|$)/i.test(name)
+    ) {
+      const cleaned = cleanReadOutput(output)
+      const start = num(input.StartLine) ?? cleaned.startLine
+      const end = num(input.EndLine) ?? cleaned.endLine
+      return {
+        type: 'read',
+        filePath,
+        content: cleaned.content,
+        offset:
+          num(
+            input.offset ??
+              input.StartLine ??
+              input.ByteOffset ??
+              input.ContentOffset,
+          ) ?? cleaned.startLine,
+        limit:
+          num(input.limit) ??
+          (start !== undefined && end !== undefined
+            ? Math.max(1, end - start + 1)
+            : undefined),
+      }
     }
   }
   return {
@@ -389,7 +459,26 @@ export function configState(response: SessionMetadata): ProviderConfigState {
 export function promptContent(content: ProviderContent): ContentBlock {
   if (content.type === 'image')
     return { type: 'image', data: content.data, mimeType: content.mimeType }
-  if (content.type === 'text') return { type: 'text', text: content.text }
+  if (content.type === 'text') {
+    const res =
+      'externalResource' in content ? content.externalResource : undefined
+    const title = 'title' in content ? text(content.title) : undefined
+    if (!res && !title) return { type: 'text', text: content.text }
+    const header = res
+      ? `${res.providerLabel} ${res.identifier}: ${res.title}`
+      : title
+    return {
+      type: 'text',
+      text: [
+        header,
+        res && title && title !== res.title ? title : undefined,
+        res?.url,
+        content.text,
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    }
+  }
   if (content.type === 'uploaded_file')
     return {
       type: 'text',
@@ -421,10 +510,6 @@ export function promptContent(content: ProviderContent): ContentBlock {
       .filter(Boolean)
       .join('\n'),
   }
-}
-
-function nonnegative(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0
 }
 
 /** Ignore malformed native usage; retain context size and USD cost when valid. */
@@ -577,16 +662,38 @@ export class Timeline {
   terminalize(
     status: 'completed' | 'canceled' | 'failed',
     error = 'Tool did not finish',
+    denied?: ReadonlySet<string>,
   ): ProviderTimelineItem[] {
-    const items = [...this.running.values()].map((item) =>
-      status === 'failed'
-        ? { ...item, status, error }
-        : { ...item, status, error: null },
-    )
+    const items = [...this.running.values()].map((item) => {
+      const isDenied = Boolean(item.callId && denied?.has(item.callId))
+      const nextStatus = isDenied ? ('canceled' as const) : status
+      if (item.callId) {
+        const prev = this.tools.get(item.callId)
+        if (prev) {
+          setBounded(
+            this.tools,
+            item.callId,
+            {
+              ...prev,
+              status: (nextStatus === 'canceled'
+                ? 'cancelled'
+                : nextStatus) as ToolCall['status'],
+            },
+            TOOL_SNAPSHOT_LIMIT,
+          )
+        }
+      }
+      if (nextStatus === 'failed')
+        return { ...item, status: 'failed' as const, error }
+      return { ...item, status: nextStatus, error: null }
+    })
     this.running.clear()
     return items
   }
-  update(update: SessionUpdate): ProviderTimelineItem | undefined {
+  update(
+    update: SessionUpdate,
+    denied?: ReadonlySet<string>,
+  ): ProviderTimelineItem | undefined {
     if (
       update.sessionUpdate === 'user_message_chunk' ||
       update.sessionUpdate === 'agent_message_chunk' ||
@@ -616,38 +723,78 @@ export class Timeline {
       update.sessionUpdate === 'tool_call' ||
       update.sessionUpdate === 'tool_call_update'
     ) {
-      const old = this.tools.get(update.toolCallId)
+      const old =
+        update.sessionUpdate === 'tool_call_update'
+          ? this.tools.get(update.toolCallId)
+          : undefined
+      if (
+        !old &&
+        update.sessionUpdate === 'tool_call_update' &&
+        update.status == null &&
+        update.title == null &&
+        str(record(update).name) === undefined
+      ) {
+        return undefined
+      }
+      const oldStatus = str((old as { status?: unknown } | undefined)?.status)
+      const incomingStatus = str((update as { status?: unknown }).status)
+      const preserveStatus =
+        update.sessionUpdate === 'tool_call_update' &&
+        isTerminalToolStatus(oldStatus) &&
+        !isTerminalToolStatus(incomingStatus)
       const tool = {
         ...old,
         ...Object.fromEntries(
           Object.entries(update).filter(([, v]) => v != null),
         ),
+        ...(preserveStatus ? { status: old!.status } : {}),
       } as ToolCall
-      this.tools.set(update.toolCallId, tool)
+      setBounded(this.tools, update.toolCallId, tool, TOOL_SNAPSHOT_LIMIT)
       const base = {
         type: 'tool_call' as const,
         id: `${this.prefix}:tool:${tool.toolCallId}`,
         callId: tool.toolCallId,
-        name: cleanToolName(tool.title ?? old?.title ?? 'Tool'),
+        name: cleanToolName(
+          str(record(tool).name) ??
+            tool.title ??
+            str(record(old).name) ??
+            old?.title ??
+            'Tool',
+        ),
         detail: toolDetail(tool),
       }
+      const rawStatus = str((tool as { status?: unknown }).status)
+      const isDenied = denied?.has(tool.toolCallId) === true
       const item: Extract<ProviderTimelineItem, { type: 'tool_call' }> =
-        tool.status === 'failed'
+        isDenied &&
+        (tool.status === 'failed' ||
+          rawStatus === 'cancelled' ||
+          rawStatus === 'canceled')
           ? {
               ...base,
-              status: 'failed',
-              error:
-                typeof tool.rawOutput === 'string'
-                  ? tool.rawOutput
-                  : tool.rawOutput != null
-                    ? JSON.stringify(tool.rawOutput)
-                    : 'Tool failed',
-            }
-          : {
-              ...base,
-              status: tool.status === 'completed' ? 'completed' : 'running',
+              status: 'canceled',
               error: null,
             }
+          : tool.status === 'failed'
+            ? {
+                ...base,
+                status: 'failed',
+                error:
+                  extractToolContentText(tool) ??
+                  nonEmptyRawOutput(tool.rawOutput) ??
+                  'Tool failed',
+              }
+            : rawStatus === 'cancelled' || rawStatus === 'canceled'
+              ? {
+                  ...base,
+                  status: 'canceled',
+                  error: null,
+                }
+              : {
+                  ...base,
+                  status: tool.status === 'completed' ? 'completed' : 'running',
+                  error: null,
+                }
       this.track(item)
       return item
     }

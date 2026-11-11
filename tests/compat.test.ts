@@ -7,11 +7,11 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   PROVIDER_CAPABILITIES,
-  ProviderEventSchema,
   type ProviderEvent,
 } from '@getpaseo/plugin/server/provider'
 import { createProvider } from '../server/provider.ts'
 import { AgyUsageSource } from '../server/usage.ts'
+import { collectProviderEvents } from './helpers.ts'
 
 async function run(
   scenario: string,
@@ -36,22 +36,11 @@ async function run(
       },
     },
   })
-  const events: ProviderEvent[] = []
-  const opened = new Map<string, readonly string[]>()
-  const protocolErrors: string[] = []
-  provider.onEvent((event) => {
-    ProviderEventSchema.parse(event)
-    if (event.type === 'session.opened') {
-      if (
-        event.parentSessionId &&
-        !opened.get(event.parentSessionId)?.includes('session.subsession')
-      )
-        protocolErrors.push(
-          `Parent lacks session.subsession: ${event.parentSessionId}`,
-        )
-      opened.set(event.sessionId, event.capabilities)
-    } else if (event.type === 'session.closed') opened.delete(event.sessionId)
-    events.push(structuredClone(event))
+  const {
+    events,
+    protocolErrors,
+    wait: until,
+  } = collectProviderEvents(provider, (event) => {
     if (
       event.type === 'timeline.item' &&
       event.item.type === 'tool_call' &&
@@ -60,16 +49,6 @@ async function run(
     )
       writeFileSync(join(home, 'message-observed'), '')
   })
-  async function until(predicate: (event: ProviderEvent) => boolean) {
-    const deadline = Date.now() + 5000
-    while (!events.some(predicate)) {
-      assert.ok(
-        Date.now() < deadline,
-        `Missing event: ${JSON.stringify(events)}`,
-      )
-      await new Promise((resolve) => setTimeout(resolve, 10))
-    }
-  }
   try {
     await provider.send({
       type: 'session.open',
