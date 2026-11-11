@@ -397,3 +397,56 @@ test('late historical counters stay outside the next turn but remain recoverable
     'restoring late history does not create a consumption bill',
   )
 })
+
+for (const throws of [false, true])
+  test(`newline-less snapshot survives cancel/error, next-turn baseline and restore (throw: ${throws})`, async (t) => {
+    const h = await harness(t)
+    const snapshot = JSON.stringify({
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      input_tokens: 70207,
+      output_tokens: 256,
+    })
+    t.mock.method(h.session.transport.rpc, 'prompt', async () => {
+      await h.write([{ step_index: 1, type: 'USER_INPUT' }], snapshot)
+      if (throws) throw new Error('Synthetic RPC failure')
+      h.session.state.turnAbort?.abort()
+      return { stopReason: 'cancelled' as const }
+    })
+    await h.prompt()
+    assert.equal(h.latest().contextWindowUsedTokens, 70463)
+    assert.equal(h.session.state.lastKnownStepIndex, 2)
+    const count = h.events.filter((e) => e.type === 'session.usage').length
+    t.mock.method(h.session.transport.rpc, 'prompt', async () => ({
+      stopReason: 'cancelled' as const,
+    }))
+    await h.prompt()
+    assert.equal(
+      h.events.filter((e) => e.type === 'session.usage').length,
+      count,
+      'the complete previous-turn EOF record is not republished as this turn',
+    )
+    const opened = h.events.find((e) => e.type === 'session.opened')
+    assert.ok(opened?.type === 'session.opened')
+    await h.m.handle({
+      type: 'session.close',
+      requestId: 'close',
+      sessionId: 's',
+    })
+    await h.m.open({
+      type: 'session.open',
+      requestId: 'restore',
+      sessionId: 'restored',
+      history: 'skip',
+      persistence: opened.persistence,
+      config: {
+        cwd: h.home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    assert.equal(h.latest().contextWindowUsedTokens, 70463)
+    assert.equal(h.latest().inputTokens, undefined)
+  })

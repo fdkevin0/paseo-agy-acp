@@ -589,7 +589,6 @@ async function* readTranscriptTail(root: string, nativeId: string) {
   try {
     let end = (await file.stat()).size
     let prefix = Buffer.alloc(0)
-    let trailing = true
     while (end > 0) {
       const start = Math.max(0, end - 64 * 1024)
       const chunk = Buffer.alloc(end - start)
@@ -605,8 +604,8 @@ async function* readTranscriptTail(root: string, nativeId: string) {
         lineEnd = i
         if (line.length > 8 * 1024 * 1024)
           throw new Error('Brain JSONL line exceeds 8 MiB')
-        if (trailing) trailing = false
-        else if (line.length) {
+        // Tail snapshots may end at a complete JSON value without LF; this does not commit a reader snapshot.
+        if (line.length) {
           try {
             yield record(JSON.parse(line.toString('utf8')))
           } catch (error) {
@@ -620,7 +619,7 @@ async function* readTranscriptTail(root: string, nativeId: string) {
         throw new Error('Brain JSONL line exceeds 8 MiB')
       end = start
     }
-    if (!trailing && prefix.length) {
+    if (prefix.length) {
       try {
         yield record(JSON.parse(prefix.toString('utf8')))
       } catch (error) {

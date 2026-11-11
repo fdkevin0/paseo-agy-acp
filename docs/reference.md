@@ -138,6 +138,8 @@ When no reliable step-level counters are available, context occupancy stays unch
 
 Snapshot recovery reads complete records backwards in 64 KiB blocks, stops at this turn's boundary, and retains at most one JSONL record (8 MiB limit). If no snapshot exists, a historical restore can still scan the full file; it does not retain the full transcript. Cancel/error recovery also records the highest observed complete step so a later turn cannot claim canceled history as its own.
 
+For snapshot recovery and turn boundaries, a complete JSON record at the observed file end is readable even without a final newline; an unparseable partial record is skipped. This restores the existing tail-index behavior, but does not establish that the writer has finished or prevent later revisions. The streaming transcript reader still requires a newline to deliver a record; this tail-only measurement never authorizes replacement-snapshot pruning.
+
 ACP `session/cancel` is a notification, not a server acknowledgement. Recovery waits for local interruption/relaunch work and drains pending ACP notifications after the original prompt resolves or rejects, then reads the complete records currently available. A runtime that writes Brain after those observable boundaries cannot be guaranteed to have flushed: no sleep or invented acknowledgement is used. Later history restoration can recover late counters without charging them to a new turn.
 
 Prompt token counters are merged with context usage and emitted before turn completion. Context occupancy and subscription quota are separate measurements.
