@@ -17,6 +17,7 @@ export class ModelUsageObserver {
   private published?: { stepIndex: number; signature: string }
   private replacing = false
   latest?: StepUsage
+  latestStepIndex = -1
   private minStepIndex: number
   private publish: (usage: StepUsage) => boolean | void
   constructor(
@@ -52,6 +53,7 @@ export class ModelUsageObserver {
     )
       return
     this.latest = candidate.usage
+    this.latestStepIndex = candidate.stepIndex
     const signature = JSON.stringify(candidate.usage)
     if (
       signature !== this.published?.signature &&

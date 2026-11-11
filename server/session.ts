@@ -1547,6 +1547,7 @@ async function promptSession(
   }
   const finalDrain = async () => {
     observation?.stop()
+    if (session.state.closing || session.state.silenced) return
     await session.state.interrupting
     await session.drain()
     if (
@@ -1562,6 +1563,26 @@ async function promptSession(
     observationTransport = session.transport
     await observation?.drain()
   }
+  let finalSnapshot: Promise<StepUsage | undefined> | undefined
+  const reconcileFinalSnapshot = (fallback?: StepUsage) =>
+    (finalSnapshot ??= (async () => {
+      await finalDrain()
+      if (!isCurrent() || minStepIndex === undefined) return
+      const observed = observation?.usage.latest ?? fallback
+      // A complete EOF can be newer than streamed rows; it is a measurement, not snapshot commit evidence.
+      const snapshot = await readLatestStepUsage(
+        session.brainRoot,
+        nativeId,
+        Math.max(minStepIndex, (observation?.usage.latestStepIndex ?? -1) - 1),
+      ).catch(() => undefined)
+      if (!isCurrent()) return
+      if (snapshot)
+        session.state.lastKnownStepIndex = Math.max(
+          session.state.lastKnownStepIndex,
+          snapshot.lastStepIndex,
+        )
+      return snapshot?.lastStepUsage ?? observed
+    })())
   try {
     const readStep = await readLastStepIndex(
       session.brainRoot,
@@ -1751,23 +1772,8 @@ async function promptSession(
         await session.interrupt().catch(() => undefined)
       }
     }
-    await finalDrain()
-    lastStep = observation?.usage.latest ?? lastStep
+    lastStep = await reconcileFinalSnapshot(lastStep)
     turnWokeUp ||= observation?.wokeUp === true
-    if (!lastStep) {
-      const snapshot = await readLatestStepUsage(
-        session.brainRoot,
-        nativeId,
-        minStepIndex,
-      ).catch(() => undefined)
-      if (snapshot) {
-        session.state.lastKnownStepIndex = Math.max(
-          session.state.lastKnownStepIndex,
-          snapshot.lastStepIndex,
-        )
-        lastStep = snapshot.lastStepUsage ?? lastStep
-      }
-    }
     if (turnAbort.signal.aborted) {
       if (
         turnAbort.signal.reason instanceof Error &&
@@ -1800,36 +1806,21 @@ async function promptSession(
     }
     session.finishTurnOnce(turnId, status, turnError)
   } catch (error) {
-    const restartError = await session.state.interrupting?.then(
-      () => undefined,
-      (err: unknown) => err,
-    )
-    await finalDrain().catch(() => undefined)
-    if (
-      observation?.usage.latest &&
-      !session.state.turnHadContextUsage &&
-      isCurrent()
-    )
-      session.publishStepContext(observation.usage.latest)
-    if (
-      !observation?.usage.latest &&
-      minStepIndex !== undefined &&
-      isCurrent()
-    ) {
-      const snapshot = await readLatestStepUsage(
-        session.brainRoot,
-        nativeId,
-        minStepIndex,
-      ).catch(() => undefined)
-      if (snapshot) {
-        session.state.lastKnownStepIndex = Math.max(
-          session.state.lastKnownStepIndex,
-          snapshot.lastStepIndex,
+    const restartError = session.state.closing
+      ? undefined
+      : await session.state.interrupting?.then(
+          () => undefined,
+          (err: unknown) => err,
         )
-        if (snapshot.lastStepUsage && !session.state.turnHadContextUsage)
-          session.publishStepContext(snapshot.lastStepUsage)
-      }
-    }
+    const lastStep = await reconcileFinalSnapshot().catch(
+      () => observation?.usage.latest,
+    )
+    if (
+      lastStep &&
+      (!session.state.turnHadContextUsage || observation?.wokeUp) &&
+      isCurrent()
+    )
+      session.publishStepContext(lastStep)
     const turnError = restartError ?? error
     const status =
       !restartError &&

@@ -144,6 +144,8 @@ Snapshot recovery reads complete records backwards in 64 KiB blocks, stops at th
 
 For snapshot recovery and turn boundaries, a complete JSON record at the observed file end is readable even without a final newline; an unparseable partial record is skipped. This restores the existing tail-index behavior, but does not establish that the writer has finished or prevent later revisions. The streaming transcript reader still requires a newline to deliver a record; this tail-only measurement never authorizes replacement-snapshot pruning.
 
+At turn completion or cancellation/error recovery, one shared final tail measurement reconciles complete EOF records even when live observation already cached usage. Older or absent snapshots retain observed context; a newer complete step without usage still advances the turn boundary. This does not add consumption or override authoritative foreground native context. An already closed session skips this recovery and cannot publish late updates.
+
 ACP `session/cancel` is a notification, not a server acknowledgement. Recovery waits for local interruption/relaunch work and drains pending ACP notifications after the original prompt resolves or rejects, then reads the complete records currently available. A runtime that writes Brain after those observable boundaries cannot be guaranteed to have flushed: no sleep or invented acknowledgement is used. Later history restoration can recover late counters without charging them to a new turn.
 
 Prompt token counters are merged with context usage and emitted before turn completion. Context occupancy and subscription quota are separate measurements.

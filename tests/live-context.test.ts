@@ -971,3 +971,178 @@ test(
     assert.equal(h.compactions().length, 1)
   },
 )
+
+for (const cached of [false, true])
+  for (const throws of [false, true])
+    test(
+      `final drain prefers complete no-LF EOF snapshot (prior observed usage=${cached}, throw=${throws})`,
+      { timeout: 5000 },
+      async (t) => {
+        const h = await harness(t),
+          held = await h.hold()
+        h.session.publishUsage({ inputTokens: 1000, outputTokens: 100 })
+        await h.write(
+          cached
+            ? [user(1), model(2, 10), checkpoint(3)]
+            : [user(1), checkpoint(3)],
+        )
+        await h.read()
+        assert.equal(h.compactions().length, 1)
+        await appendFile(
+          h.path,
+          JSON.stringify({
+            step_index: 4,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            input_tokens: 70,
+            output_tokens: 3,
+            content: 'newest',
+          }),
+        )
+        await h.read()
+        const streamingIndex = held.observation.lastStepIndex
+        assert.equal(
+          streamingIndex,
+          3,
+          'no-LF EOF is not a delivered streaming row',
+        )
+        h.session.state.turnAbort!.abort()
+        if (throws) held.done.reject(new Error('native cancellation'))
+        else held.done.resolve({ stopReason: 'cancelled' })
+        await held.running
+        assert.equal(h.latest().contextWindowUsedTokens, 73)
+        assert.equal(h.session.state.lastKnownStepIndex, 4)
+        assert.equal(
+          h.latest().inputTokens,
+          1000,
+          'context observation does not add a bill',
+        )
+        assert.equal(h.compactions().length, 1)
+        assert.deepEqual(h.turns(), ['canceled'])
+      },
+    )
+
+test(
+  'normal completion reconciles a newer complete no-LF snapshot without projecting its row',
+  { timeout: 5000 },
+  async (t) => {
+    const h = await harness(t),
+      held = await h.hold()
+    await h.write([user(1), model(2, 10), checkpoint(3)])
+    await h.read()
+    await appendFile(
+      h.path,
+      JSON.stringify({
+        step_index: 4,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        input_tokens: 70,
+        output_tokens: 3,
+        content: 'withheld',
+      }),
+    )
+    held.done.resolve({ stopReason: 'end_turn' })
+    await held.running
+    assert.equal(h.latest().contextWindowUsedTokens, 73)
+    assert.equal(h.session.state.lastKnownStepIndex, 4)
+    assert.deepEqual(h.turns(), ['completed'])
+    assert.equal(h.compactions().length, 1)
+    assert.equal(
+      h.events.some(
+        (event) =>
+          event.type === 'timeline.item' &&
+          event.item.type === 'assistant_message' &&
+          event.item.text === 'withheld',
+      ),
+      false,
+    )
+  },
+)
+
+test(
+  'final no-LF measurement advances boundary without overwriting authoritative foreground native context',
+  { timeout: 5000 },
+  async (t) => {
+    const h = await harness(t)
+    const nativePrompt = h.session.transport.rpc.prompt.bind(
+      h.session.transport.rpc,
+    )
+    const held = await h.hold()
+    await nativePrompt({
+      sessionId: h.session.state.nativeId,
+      prompt: [{ type: 'text', text: 'usage-native' }],
+    })
+    await h.session.drain()
+    const native = h.latest()
+    assert.equal(native.contextWindowUsedTokens, 1234)
+    await h.write([user(20), model(21, 10), checkpoint(22)])
+    await h.read()
+    await appendFile(
+      h.path,
+      JSON.stringify({
+        step_index: 23,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        input_tokens: 70,
+        output_tokens: 3,
+      }),
+    )
+    held.done.resolve({ stopReason: 'cancelled' })
+    await held.running
+    assert.equal(h.latest().contextWindowUsedTokens, 1234)
+    assert.equal(h.latest().contextWindowMaxTokens, 128000)
+    assert.equal(h.session.state.lastKnownStepIndex, 23)
+    assert.deepEqual(h.turns(), ['canceled'])
+  },
+)
+
+for (const tail of ['older', 'missing', 'higher-nonusage'] as const)
+  test(
+    `final ${tail} tail preserves observed context while reconciling only complete boundaries`,
+    { timeout: 5000 },
+    async (t) => {
+      const h = await harness(t),
+        held = await h.hold()
+      await h.write([user(1), model(4, 80)])
+      await h.read()
+      if (tail === 'missing') await rm(h.path)
+      else if (tail === 'older')
+        await writeFile(h.path, JSON.stringify(model(2, 10)))
+      else
+        await appendFile(
+          h.path,
+          JSON.stringify({
+            step_index: 6,
+            type: 'GENERIC',
+            status: 'CANCELED',
+          }),
+        )
+      held.done.resolve({ stopReason: 'cancelled' })
+      await held.running
+      assert.equal(h.latest().contextWindowUsedTokens, 81)
+      assert.equal(
+        h.session.state.lastKnownStepIndex,
+        tail === 'higher-nonusage' ? 6 : 4,
+      )
+      assert.deepEqual(h.turns(), ['canceled'])
+    },
+  )
+
+test(
+  'already closing turn skips final snapshot and pending local interruption without waiting for the RPC',
+  { timeout: 5000 },
+  async (t) => {
+    const h = await harness(t),
+      held = await h.hold(),
+      local = deferred<void>()
+    h.session.state.interrupting = local.promise
+    await h.manager.close()
+    await held.running
+    assert.deepEqual(h.turns(), ['canceled'])
+    const count = h.events.length
+    local.resolve()
+    held.done.resolve({ stopReason: 'cancelled' })
+    await held.observation.poll()
+    assert.equal(h.events.length, count)
+  },
+)
