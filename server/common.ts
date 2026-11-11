@@ -12,6 +12,20 @@ export function cleanToolName(name: string): string {
   return name.replace(/^default_api:/, '')
 }
 
+/** Match native lifecycle identities, including agy's legacy ACP `Run` title. */
+export function isNativeToolName(
+  name: string,
+  expected:
+    | 'invoke_subagent'
+    | 'send_message'
+    | 'manage_subagents'
+    | 'manage_task'
+    | 'schedule',
+): boolean {
+  const cleaned = cleanToolName(name)
+  return cleaned === expected || cleaned === `Run ${expected}`
+}
+
 /** Whether a native tool name is agy's interactive question tool. */
 export function isAskQuestionName(name: string): boolean {
   return /^ask_(?:question|user)$/i.test(cleanToolName(name))

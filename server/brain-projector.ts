@@ -1,5 +1,6 @@
 import {
   cleanToolName,
+  isNativeToolName,
   isAskQuestionName,
   record,
   sessionIdPattern,
@@ -170,7 +171,7 @@ export class BrainTranscriptProjector {
     const ids = new Set(this.touchedSubagents)
     for (const p of this.pending) {
       if (
-        p.name.includes('send_message') &&
+        isNativeToolName(p.name, 'send_message') &&
         typeof p.args.Recipient === 'string' &&
         sessionIdPattern.test(p.args.Recipient)
       ) {
@@ -199,6 +200,8 @@ export class BrainTranscriptProjector {
     }
     if (
       status === 'completed' &&
+      (isNativeToolName(pending.name, 'invoke_subagent') ||
+        isNativeToolName(pending.name, 'send_message')) &&
       base.detail.type === 'sub_agent' &&
       base.detail.childSessionId
     ) {
@@ -255,7 +258,7 @@ export class BrainTranscriptProjector {
           }
           for (const [taskId, task] of this.background)
             if (
-              task.name === 'schedule' &&
+              isNativeToolName(task.name, 'schedule') &&
               !finishedIds.has(taskId) &&
               (sender === taskId ||
                 task.args.TimerCondition === 'any' ||
@@ -347,7 +350,7 @@ export class BrainTranscriptProjector {
           this.onQuestionSettledByGeneric?.(pending.questions)
         }
         if (
-          pending.name.includes('manage_task') &&
+          isNativeToolName(pending.name, 'manage_task') &&
           pending.args.Action === 'kill' &&
           typeof pending.args.TaskId === 'string' &&
           terminalToolStatus(row.status) === 'completed'
@@ -361,7 +364,7 @@ export class BrainTranscriptProjector {
           this.stepSubagents.get(stepIndex) ??
           this.stepSubagents.get(pending.stepIndex)
         const rawOutput =
-          pending.name === 'invoke_subagent' &&
+          isNativeToolName(pending.name, 'invoke_subagent') &&
           subagent &&
           (!text || !text.includes(subagent.conversationId))
             ? { conversationId: subagent.conversationId }
