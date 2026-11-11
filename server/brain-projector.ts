@@ -39,6 +39,9 @@ export type PendingTool = {
   isQuestion?: boolean
   questions?: NormalizedQuestion[]
   questionConsumed?: boolean
+  acpIndex?: number
+  fallbackId?: string
+  deferredResult?: Record<string, unknown>
   questionCompleted?: boolean
 }
 
@@ -46,6 +49,7 @@ export type PendingQuestion = {
   tool: PendingTool
   questions: NormalizedQuestion[]
   wokeUp: boolean
+  beginContinuation?: (answerText: string) => void
 }
 
 export type QuestionOutcome =
@@ -84,17 +88,21 @@ export class BrainTranscriptProjector {
   private stepSubagents = new Map<number, SubagentRecord>()
   private callSubagents = new Map<string, SubagentRecord>()
   private toolIndex = 0
+  private deferAnonymous = false
+  private retired: PendingTool[] = []
   private acpToolCallIds: readonly string[] = []
   private lastErrorCallId?: string
   private sessionId: string
   private onQuestionSettledByGeneric?: (
     questions: readonly NormalizedQuestion[],
+    tool: PendingTool,
   ) => void
 
   constructor(
     sessionId: string,
     onQuestionSettledByGeneric?: (
       questions: readonly NormalizedQuestion[],
+      tool: PendingTool,
     ) => void,
   ) {
     this.sessionId = sessionId
@@ -107,9 +115,9 @@ export class BrainTranscriptProjector {
     return this.nativeIdentities.get(item)
   }
 
-  bindToolCallIds(ids: readonly string[]) {
+  bindToolCallIds(ids: readonly string[], startIndex = 0) {
     this.acpToolCallIds = ids
-    this.toolIndex = 0
+    this.toolIndex = startIndex
   }
 
   syncMetadata(inbox: InboxState, subagents: readonly SubagentRecord[]) {
@@ -126,7 +134,7 @@ export class BrainTranscriptProjector {
   }
 
   hasPending(): boolean {
-    return this.pending.some((p) => !p.isQuestion)
+    return this.retired.length > 0 || this.pending.some((p) => !p.isQuestion)
   }
 
   hasDeniedOutcome(
@@ -234,6 +242,104 @@ export class BrainTranscriptProjector {
     return item
   }
 
+  private completeGeneric(
+    pending: PendingTool,
+    row: Record<string, unknown>,
+  ): ProviderTimelineItem[] {
+    const text = typeof row.content === 'string' ? row.content : ''
+    const stepIndex = Number(row.step_index)
+    if (runningStepStatuses.has(String(row.status))) {
+      const taskId = text.match(backgroundTaskPattern)?.[1]
+      if (taskId) {
+        if (pending.args.IsDaemon === true) {
+          const max = Number(pending.args.MaxIterations)
+          this.daemons.set(
+            taskId,
+            Number.isInteger(max) && max > 0 ? max : Infinity,
+          )
+        } else {
+          this.background.set(taskId, pending)
+        }
+      }
+      return []
+    }
+    if (pending.isQuestion && pending.questions) {
+      this.onQuestionSettledByGeneric?.(pending.questions, pending)
+    }
+    if (
+      isNativeToolName(pending.name, 'manage_task') &&
+      pending.args.Action === 'kill' &&
+      typeof pending.args.TaskId === 'string' &&
+      terminalToolStatus(row.status) === 'completed'
+    ) {
+      this.forgetTask(pending.args.TaskId)
+    }
+    const stepCallId = this.stepCallIds.get(stepIndex)
+    const subagent =
+      this.callSubagents.get(pending.callId) ??
+      (stepCallId ? this.callSubagents.get(stepCallId) : undefined) ??
+      this.stepSubagents.get(stepIndex) ??
+      this.stepSubagents.get(pending.stepIndex)
+    const rawOutput =
+      isNativeToolName(pending.name, 'invoke_subagent') &&
+      subagent &&
+      (!text || !text.includes(subagent.conversationId))
+        ? { conversationId: subagent.conversationId }
+        : (row.content ?? row.error ?? null)
+    const status = terminalToolStatus(row.status)
+    this.lastErrorCallId = status === 'failed' ? pending.callId : undefined
+    return [this.finishTool(pending, rawOutput, status, text)]
+  }
+  private startTool(pending: PendingTool): ProviderTimelineItem {
+    const item: ProviderTimelineItem = {
+      type: 'tool_call',
+      id: pending.id,
+      callId: pending.callId,
+      name: pending.name,
+      detail: toolDetail({
+        title: pending.name,
+        rawInput: pending.rawInput,
+        rawOutput: null,
+      }),
+      status: 'running',
+      error: null,
+    }
+    if (pending.nativeIdentitySource)
+      this.nativeIdentities.set(item, pending.nativeIdentitySource)
+    return item
+  }
+  /** Anonymous continuation tools wait for ACP/metadata identity; only the RPC boundary permits fallback. */
+  resolveToolIdentities(deferAnonymous: boolean): ProviderTimelineItem[] {
+    this.deferAnonymous = deferAnonymous
+    const items: ProviderTimelineItem[] = []
+    for (const pending of [...this.retired, ...this.pending]) {
+      if (pending.callId) continue
+      const stepId = this.stepCallIds.get(pending.stepIndex)
+      const callId =
+        stepId ??
+        this.acpToolCallIds[pending.acpIndex!] ??
+        (deferAnonymous ? undefined : pending.fallbackId)
+      if (!callId) continue
+      pending.callId = callId
+      pending.nativeIdentitySource = stepId ? 'step_metadata' : undefined
+      pending.id = `${this.sessionId}:tool:${callId}`
+      const retired = this.retired.includes(pending)
+      if (retired) this.retired = this.retired.filter((p) => p !== pending)
+      if (pending.deferredResult) {
+        this.pending = this.pending.filter((p) => p !== pending)
+        items.push(
+          this.startTool(pending),
+          ...this.completeGeneric(pending, pending.deferredResult),
+        )
+      } else
+        items.push(
+          retired
+            ? this.finishTool(pending, null, 'canceled', '')
+            : this.startTool(pending),
+        )
+    }
+    return items
+  }
   project(value: unknown): ProviderTimelineItem[] {
     const row = record(value)
     if (!Number.isInteger(row.step_index)) return []
@@ -243,6 +349,7 @@ export class BrainTranscriptProjector {
     switch (row.type) {
       case 'USER_INPUT':
         this.pending = []
+        this.retired = []
         this.lastErrorCallId = undefined
         this.touchedSubagents.clear()
         return text ? [{ type: 'user_message', id, text }] : []
@@ -251,6 +358,7 @@ export class BrainTranscriptProjector {
         if (isRestartNotice(row)) {
           // Stopped calls never log a result; child transcripts have no USER_INPUT to reset them.
           this.pending = []
+          this.retired = []
           this.background.clear()
           this.daemons.clear()
           this.touchedSubagents.clear()
@@ -334,6 +442,7 @@ export class BrainTranscriptProjector {
           : []
       case 'ERROR_MESSAGE':
         if (isRetryWarning(row)) return []
+        this.retired = []
         this.pending = []
         this.lastErrorCallId = undefined
         this.background.clear()
@@ -357,53 +466,21 @@ export class BrainTranscriptProjector {
         }
         const [pending] = this.pending.splice(matchIndex, 1)
         if (!pending || pending.questionCompleted) return []
-        if (runningStepStatuses.has(String(row.status))) {
-          const taskId = text.match(backgroundTaskPattern)?.[1]
-          if (taskId) {
-            if (pending.args.IsDaemon === true) {
-              const max = Number(pending.args.MaxIterations)
-              this.daemons.set(
-                taskId,
-                Number.isInteger(max) && max > 0 ? max : Infinity,
-              )
-            } else {
-              this.background.set(taskId, pending)
-            }
-          }
+        if (!pending.callId && this.deferAnonymous) {
+          pending.deferredResult = row
+          this.pending.splice(Math.max(matchIndex, 0), 0, pending)
           return []
         }
-        if (pending.isQuestion && pending.questions) {
-          this.onQuestionSettledByGeneric?.(pending.questions)
-        }
-        if (
-          isNativeToolName(pending.name, 'manage_task') &&
-          pending.args.Action === 'kill' &&
-          typeof pending.args.TaskId === 'string' &&
-          terminalToolStatus(row.status) === 'completed'
-        ) {
-          this.forgetTask(pending.args.TaskId)
-        }
-        const stepCallId = this.stepCallIds.get(stepIndex)
-        const subagent =
-          this.callSubagents.get(pending.callId) ??
-          (stepCallId ? this.callSubagents.get(stepCallId) : undefined) ??
-          this.stepSubagents.get(stepIndex) ??
-          this.stepSubagents.get(pending.stepIndex)
-        const rawOutput =
-          isNativeToolName(pending.name, 'invoke_subagent') &&
-          subagent &&
-          (!text || !text.includes(subagent.conversationId))
-            ? { conversationId: subagent.conversationId }
-            : (row.content ?? row.error ?? null)
-        const status = terminalToolStatus(row.status)
-        this.lastErrorCallId = status === 'failed' ? pending.callId : undefined
-        return [this.finishTool(pending, rawOutput, status, text)]
+        return this.completeGeneric(pending, row)
       }
       case 'PLANNER_RESPONSE': {
         // A new model response means calls of the previous one without a GENERIC row were stopped;
         // keeping them would misattribute this response's results in FIFO order.
+        this.retired.push(
+          ...this.pending.filter((p) => !p.callId && !p.questionCompleted),
+        )
         const items: ProviderTimelineItem[] = this.pending
-          .filter((p) => !p.questionCompleted)
+          .filter((p) => p.callId && !p.questionCompleted)
           .map((p) => this.finishTool(p, null, 'canceled', ''))
         this.pending = []
         this.lastErrorCallId = undefined
@@ -419,12 +496,16 @@ export class BrainTranscriptProjector {
             const tool = record(value)
             const args = record(tool.args)
             const genericStep = stepIndex + index + 1
-            const acpId = this.acpToolCallIds[this.toolIndex++]
+            const acpIndex = this.toolIndex++
+            const acpId = this.acpToolCallIds[acpIndex]
             const toolId =
               typeof tool.id === 'string' && tool.id ? tool.id : undefined
             const stepId = this.stepCallIds.get(genericStep)
             const callId =
-              toolId ?? stepId ?? acpId ?? `tool-${stepIndex}-${index}`
+              toolId ??
+              stepId ??
+              acpId ??
+              (this.deferAnonymous ? '' : `tool-${stepIndex}-${index}`)
             const nativeIdentitySource = toolId
               ? 'tool_id'
               : stepId
@@ -432,9 +513,11 @@ export class BrainTranscriptProjector {
                 : undefined
             const cleanName = cleanToolName(String(tool.name ?? 'Tool'))
             const pending: PendingTool = {
-              id: `${this.sessionId}:tool:${callId}`,
+              id: callId ? `${this.sessionId}:tool:${callId}` : '',
               callId,
+              acpIndex,
               nativeIdentitySource,
+              fallbackId: `tool-${stepIndex}-${index}`,
               name: cleanName,
               args,
               rawInput: tool.args,
@@ -447,22 +530,7 @@ export class BrainTranscriptProjector {
                 : {}),
             }
             this.pending.push(pending)
-            const item: ProviderTimelineItem = {
-              type: 'tool_call',
-              id: pending.id,
-              callId: pending.callId,
-              name: pending.name,
-              detail: toolDetail({
-                title: pending.name,
-                rawInput: tool.args,
-                rawOutput: null,
-              }),
-              status: 'running',
-              error: null,
-            }
-            if (pending.nativeIdentitySource)
-              this.nativeIdentities.set(item, pending.nativeIdentitySource)
-            items.push(item)
+            if (callId) items.push(this.startTool(pending))
           })
         return items
       }
@@ -491,7 +559,7 @@ export function activeChildIdsForTurn(
 }
 
 export class BrainNode {
-  readonly reader = new TranscriptReader()
+  readonly reader: TranscriptReader
   projector: BrainTranscriptProjector
   readonly children = new Map<string, BrainNode>()
   consumedMessages = 0
@@ -513,6 +581,7 @@ export class BrainNode {
   private onQuestionSettled?: (
     questions: readonly NormalizedQuestion[],
     wokeUp: boolean,
+    occurrence: string,
   ) => void
 
   constructor(
@@ -521,8 +590,11 @@ export class BrainNode {
     onQuestionSettled?: (
       questions: readonly NormalizedQuestion[],
       wokeUp: boolean,
+      occurrence: string,
     ) => void,
+    reader = new TranscriptReader(),
   ) {
+    this.reader = reader
     this.nativeId = nativeId
     this.sessionId = sessionId
     this.onQuestionSettled = onQuestionSettled
@@ -530,8 +602,8 @@ export class BrainNode {
   }
 
   private createProjector() {
-    return new BrainTranscriptProjector(this.sessionId, (questions) =>
-      this.onQuestionSettled?.(questions, this.wokeUp),
+    return new BrainTranscriptProjector(this.sessionId, (questions, tool) =>
+      this.onQuestionSettled?.(questions, this.wokeUp, tool.callId),
     )
   }
 
