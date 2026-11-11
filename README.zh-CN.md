@@ -87,7 +87,7 @@ paseo usage ls --json
 | 订阅配额 | Gemini 与 Claude/GPT 模型组的 5 小时及每周配额窗口。                                                                         |
 | 子 Agent | 原生多层级子会话链接与只读 Brain 日志时间线卡片。                                                                            |
 
-暂不支持运行中追加指令（steering）、回退（rewind）、归档操作、结构化输出或 Artifacts 面板。子会话卡片不提供独立的会话控制。优先采用本轮收到的有效原生 `usage_update` 上下文通知；否则使用 `transcript_full.jsonl` 中最新可靠模型步骤的 Token 快照。缺少快照时保留已有上下文或保持未知，累计回合消耗单独统计。当前 `agy` 的 print 模式不接受用于配额查询的自定义 ACP 目录参数。详见[参考文档](docs/reference.md)。
+暂不支持运行中追加指令（steering）、回退（rewind）、归档操作、结构化输出或 Artifacts 面板。子会话卡片不提供独立的会话控制。前台阶段优先采用有效原生 `usage_update` 上下文通知；后续 Reactive Wakeup 模型快照可更新占用，并保留同模型已知的原生窗口上限。缺少可靠快照时保留已有上下文或保持未知，累计回合消耗单独统计。当前 `agy` 的 print 模式不接受用于配额查询的自定义 ACP 目录参数。详见[参考文档](docs/reference.md)。
 
 ## 更多信息
 

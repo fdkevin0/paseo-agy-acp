@@ -107,9 +107,9 @@ Steering, rewind, archive operations and structured output are unsupported.
 
 ## Context window occupancy
 
-Paseo's context meter needs both `contextWindowUsedTokens` and a positive `contextWindowMaxTokens`. Valid native `usage_update` notifications take precedence for the current turn, including turns with Reactive Wakeup; used tokens must be finite and nonnegative. Only USD costs populate `totalCostUsd`.
+Paseo's context meter needs both `contextWindowUsedTokens` and a positive `contextWindowMaxTokens`. Valid native `usage_update` notifications take precedence during the foreground phase; later Reactive Wakeup planner snapshots can update occupancy while retaining the same model's known native capacity; used tokens must be finite and nonnegative. Only USD costs populate `totalCostUsd`.
 
-agy prompt responses report cumulative token counters across internal model steps, whereas `transcript_full.jsonl` records exact per-step `input_tokens`, `cache_read_tokens` and `output_tokens` on each `PLANNER_RESPONSE`. When no valid `usage_update` notification arrives during a turn, the plugin computes context window occupancy from the latest reliable `PLANNER_RESPONSE` usage snapshot in `transcript_full.jsonl`:
+agy prompt responses report cumulative token counters across internal model steps, whereas `transcript_full.jsonl` records exact per-step `input_tokens`, `cache_read_tokens` and `output_tokens` on each `PLANNER_RESPONSE`. When no valid foreground `usage_update` arrives, or later Reactive Wakeup steps execute, the plugin computes context window occupancy from the latest reliable `PLANNER_RESPONSE` usage snapshot in `transcript_full.jsonl`:
 
 ```text
 usedTokens = lastStep.inputTokens + lastStep.cachedReadTokens + lastStep.cachedWriteTokens + lastStep.outputTokens
@@ -117,12 +117,16 @@ usedTokens = lastStep.inputTokens + lastStep.cachedReadTokens + lastStep.cachedW
 
 `cachedWriteTokens` is taken from the step's `cache_write_tokens` when agy records it and is otherwise zero; agy 1.5.3 records only the first three counters. Per-step and cumulative ACP counters are never mixed in one sum. When a turn concludes with Reactive Wakeup steps, its wakeup token totals are recorded in `carriedWakeup` and subtracted from `agy`'s cumulative ACP prompt counters on the next turn so woken tokens are not double-counted.
 
-When no reliable step-level counters are available, context occupancy stays unchanged or unknown; cumulative ACP prompt counters never substitute for context occupancy. Cancellation and prompt errors recover only snapshots after the current turn boundary. Restoration can recover the latest historical snapshot when native context is absent. Cache-only model steps are valid snapshots; invalid counters are ignored.
+When no reliable step-level counters are available, context occupancy stays unchanged or unknown; cumulative ACP prompt counters never substitute for context occupancy. Cancellation and prompt errors recover only snapshots after the current turn boundary. Restoration can recover the latest historical snapshot when native context is absent. Cache-only model steps with positive usage are valid snapshots; invalid and all-zero placeholder counters are ignored. A native `usage_update` explicitly reporting zero remains valid. Snapshot-only updates never replace turn consumption or pending wakeup deductions. Restoration publishes context after applying requested model configuration.
 
 | Model                        | Fallback capacity |
 | ---------------------------- | ----------------- |
 | IDs beginning with `gpt-oss` | 131,072 tokens.   |
 | Other models                 | 256,000 tokens.   |
+
+Snapshot recovery reads complete records backwards in 64 KiB blocks, stops at this turn's boundary, and retains at most one JSONL record (8 MiB limit). If no snapshot exists, a historical restore can still scan the full file; it does not retain the full transcript. Cancel/error recovery also records the highest observed complete step so a later turn cannot claim canceled history as its own.
+
+ACP `session/cancel` is a notification, not a server acknowledgement. Recovery waits for local interruption/relaunch work and drains pending ACP notifications after the original prompt resolves or rejects, then reads the complete records currently available. A runtime that writes Brain after those observable boundaries cannot be guaranteed to have flushed: no sleep or invented acknowledgement is used. Later history restoration can recover late counters without charging them to a new turn.
 
 Prompt token counters are merged with context usage and emitted before turn completion. Context occupancy and subscription quota are separate measurements.
 
