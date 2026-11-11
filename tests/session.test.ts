@@ -1072,6 +1072,8 @@ test('context uses latest turn snapshot on cancel/error/restore and preserves na
     await rm(home, { recursive: true, force: true })
   }
 })
+
+test(
   'history replay retains completed tools before a partial transcript tail',
   { timeout: 5000 },
   async () => {
