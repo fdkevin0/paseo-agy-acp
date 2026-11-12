@@ -1,8 +1,9 @@
 {
   "name": "@fdkevin/paseo-agy-acp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "files": [
     "paseo-plugin.json",
+    "icon.png",
     "icon.svg",
     "OVERVIEW.md",
     "OVERVIEW.*.md",
@@ -35,7 +36,7 @@
   "engines": {
     "node": ">=22.18.0"
   },
-  "description": "Antigravity ACP provider for Paseo with native sessions, permissions and rich tool timelines",
+  "description": "Connect Antigravity ACP to Paseo with native sessions, permissions and rich tool timelines",
   "license": "MIT",
   "author": "fdkevin0",
   "repository": {
