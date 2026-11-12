@@ -10,7 +10,7 @@
 
 需要 Paseo 0.15.0+、Node.js 22.18+、npm，以及已在 daemon 主机完成登录的 agy CLI 1.5.3+。请先通过 agy 登录，再使用插件。Provider ID 为 `agy`，接受 Paseo 的命令和环境变量覆盖配置。模型、执行模式、思考选项及斜杠命令均来自 agy。插件不会安装 CLI、修改登录凭据或全局跳过审批。
 
-Linux 已通过冒烟测试，其他操作系统尚未验证。设置和使用说明见 [README](README.zh-CN.md)。
+Linux 已通过冒烟测试，其他操作系统尚未验证。设置和使用说明见 [README](https://github.com/fdkevin0/paseo-agy-acp/blob/main/README.zh-CN.md)。
 
 ## 支持能力与数据流向
 
