@@ -80,6 +80,26 @@ function terminalToolStatus(
   return 'completed'
 }
 
+/** A checkpoint takes a step index between a response and its GENERIC rows; shift expected rows past it. */
+export function shiftPendingPastCheckpoint(
+  pending: readonly { stepIndex: number }[],
+  checkpointStep: number,
+) {
+  for (const p of pending) if (p.stepIndex >= checkpointStep) p.stepIndex++
+}
+
+/** Match by stepIndex first so an unlogged WAITING ask_question never steals a sibling tool's GENERIC row. */
+export function takePendingForGeneric<
+  T extends { stepIndex: number; isQuestion?: boolean },
+>(pending: T[], genericStep: number): T | undefined {
+  let matchIndex = pending.findIndex((p) => p.stepIndex === genericStep)
+  if (matchIndex < 0) {
+    matchIndex = pending.findIndex((p) => !p.isQuestion)
+    if (matchIndex < 0) matchIndex = 0
+  }
+  return pending.splice(matchIndex, 1)[0]
+}
+
 /** Project transcript_full.jsonl steps and correlate tools with structured Brain metadata. */
 export class BrainTranscriptProjector {
   private pending: PendingTool[] = []
@@ -464,10 +484,7 @@ export class BrainTranscriptProjector {
         return []
       }
       case 'CHECKPOINT':
-        // A checkpoint takes a step index between a response and its GENERIC rows; shift expected rows past it.
-        for (const p of this.pending) {
-          if (p.stepIndex >= stepIndex) p.stepIndex++
-        }
+        shiftPendingPastCheckpoint(this.pending, stepIndex)
         return row.status === 'DONE'
           ? [
               {
@@ -493,15 +510,7 @@ export class BrainTranscriptProjector {
           },
         ]
       case 'GENERIC': {
-        // Match by stepIndex first so an unlogged WAITING ask_question never steals a sibling tool's GENERIC row.
-        let matchIndex = this.pending.findIndex(
-          (p) => p.stepIndex === stepIndex,
-        )
-        if (matchIndex < 0) {
-          matchIndex = this.pending.findIndex((p) => !p.isQuestion)
-          if (matchIndex < 0) matchIndex = 0
-        }
-        const [pending] = this.pending.splice(matchIndex, 1)
+        const pending = takePendingForGeneric(this.pending, stepIndex)
         if (!pending || pending.questionCompleted) return []
         if (!pending.callId && this.deferAnonymous) {
           pending.genericSeen = true

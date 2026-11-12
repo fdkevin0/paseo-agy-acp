@@ -1096,6 +1096,8 @@ async function createSession(
           readTranscriptRows(brainRoot, state.nativeId),
         ])
         subagents.rememberSubagents(subagentRecords)
+        // Drain ACP session/load notifications first so turnToolCallIds and acpToolSnapshots are complete;
+        // projector.project() below is purely synchronous and never triggers ACP notifications.
         await drain()
         collectingHistory = false
         const { alignedIds, verifiedAcpToolIds } = alignReplayTools(

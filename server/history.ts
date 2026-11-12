@@ -1,5 +1,9 @@
 import { isRestartNotice, isRetryWarning } from './brain-io.ts'
-import type { NativeToolIdentitySource } from './brain-projector.ts'
+import {
+  shiftPendingPastCheckpoint,
+  takePendingForGeneric,
+  type NativeToolIdentitySource,
+} from './brain-projector.ts'
 import { cleanToolName, isAskQuestionName, record } from './common.ts'
 import type { ProviderTimelineItem } from '@getpaseo/plugin/server/provider'
 
@@ -67,15 +71,10 @@ export function alignReplayTools(
         if (!isRetryWarning(row)) pending = []
         break
       case 'CHECKPOINT':
-        for (const p of pending) if (p.stepIndex >= stepIndex) p.stepIndex++
+        shiftPendingPastCheckpoint(pending, stepIndex)
         break
       case 'GENERIC': {
-        let idx = pending.findIndex((p) => p.stepIndex === stepIndex)
-        if (idx < 0) {
-          idx = pending.findIndex((p) => !p.isQuestion)
-          if (idx < 0) idx = 0
-        }
-        const [matched] = pending.splice(idx, 1)
+        const matched = takePendingForGeneric(pending, stepIndex)
         if (matched && row.status === 'INVALID') matched.invalid = true
         break
       }
@@ -125,6 +124,8 @@ export function alignReplayTools(
       }
       if (ok) matches.push(k)
     }
+    // Forked transcripts start at a non-zero step and retain a suffix of the parent trajectory (N - M);
+    // verifiedAcpToolIds still requires per-slot inputMatches below.
     aOffset = matches.length === 1 ? matches[0] : N - M
     count = M
   } else if (M > N && N > 0) {
@@ -146,7 +147,7 @@ export function alignReplayTools(
   }
   if (count === 0)
     return { alignedIds: acpToolCallIds, verifiedAcpToolIds: new Set() }
-  const alignedIds = new Array<string | undefined>(slots.length)
+  const alignedIds = new Array<string | undefined>(slots.length).fill(undefined)
   const verifiedAcpToolIds = new Set<string>()
   for (let j = 0; j < count; j++) {
     const s = valid[vOffset + j]
@@ -240,6 +241,8 @@ export function mergeCompactionHistory(
     ),
   )
   let cursor = 0
+  let localCursor = -1
+  let localAnchors: typeof candidates = []
   const insert = (index: number, entry: HistoryEntry) => {
     const entries = slots.get(index) ?? []
     entries.push(entry)
@@ -250,31 +253,32 @@ export function mergeCompactionHistory(
     let left = cursor > 0 ? anchors[cursor - 1].acp + 1 : 0
     let right = cursor < anchors.length ? anchors[cursor].acp : acp.length
     if (left < right && cursor > 0 && cursor < anchors.length) {
-      const bLo = anchors[cursor - 1].brain + 1
-      const bHi = anchors[cursor].brain
-      const aLo = left
-      const aHi = right
-      const localAcp = positions(acp.slice(aLo, aHi), 'acp')
-      const localBrain = positions(brain.slice(bLo, bHi), 'brain')
-      const localAnchors: typeof candidates = []
-      for (let i = 0; i < bHi - bLo; i++) {
-        const sub = brain[bLo + i]
-        const id = key(sub, 'brain')
-        const pos = id === undefined ? undefined : localAcp.get(id)
-        if (pos != null && localBrain.get(id!) === i)
-          localAnchors.push({
-            brain: bLo + i,
-            acp: aLo + pos,
-            tool: sub.item.type === 'tool_call',
-          })
+      if (localCursor !== cursor) {
+        localCursor = cursor
+        const bLo = anchors[cursor - 1].brain + 1
+        const bHi = anchors[cursor].brain
+        const localAcp = positions(acp.slice(left, right), 'acp')
+        const localBrain = positions(brain.slice(bLo, bHi), 'brain')
+        const found: typeof candidates = []
+        for (let i = 0; i < bHi - bLo; i++) {
+          const sub = brain[bLo + i]
+          const id = key(sub, 'brain')
+          const pos = id === undefined ? undefined : localAcp.get(id)
+          if (pos != null && localBrain.get(id!) === i)
+            found.push({
+              brain: bLo + i,
+              acp: left + pos,
+              tool: sub.item.type === 'tool_call',
+            })
+        }
+        localAnchors =
+          ordered(found) && found.length === right - left ? found : []
       }
-      if (ordered(localAnchors) && localAnchors.length === aHi - aLo) {
-        for (const a of localAnchors) {
-          if (a.brain < index) left = a.acp + 1
-          else if (a.brain > index) {
-            right = a.acp
-            break
-          }
+      for (const a of localAnchors) {
+        if (a.brain < index) left = a.acp + 1
+        else if (a.brain > index) {
+          right = a.acp
+          break
         }
       }
     }

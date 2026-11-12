@@ -8,6 +8,7 @@ import {
   ProviderEventSchema,
   type ProviderEvent,
 } from '@getpaseo/plugin/server/provider'
+import { alignReplayTools } from '../server/history.ts'
 import { Timeline } from '../server/mapping.ts'
 import { SessionManager } from '../server/session.ts'
 import { AgyUsageSource } from '../server/usage.ts'
@@ -1323,4 +1324,53 @@ test('real AGY transcript shapes locate checkpoints across anonymous tools, back
     timeline(events).filter(({ item }) => item.type === 'notification').length,
     0,
   )
+})
+
+test('alignReplayTools handles windowed ACP slices (M > N) and ambiguous window fallbacks', () => {
+  const row = (step_index: number, path: string) => ({
+    step_index,
+    type: 'PLANNER_RESPONSE',
+    status: 'DONE',
+    tool_calls: [{ name: 'default_api:read_file', args: { Path: path } }],
+  })
+  const snapshots = new Map<string, { rawInput?: unknown }>([
+    ['c1', { rawInput: { Path: '/b' } }],
+    ['c2', { rawInput: { Path: '/c' } }],
+  ])
+  // Unique M > N window: Brain has [/a, /b, /c, /d], ACP replays [/b, /c]
+  const uniqueWindow = alignReplayTools(
+    [row(0, '/a'), row(2, '/b'), row(4, '/c'), row(6, '/d')],
+    new Map(),
+    [],
+    ['c1', 'c2'],
+    snapshots,
+  )
+  assert.deepEqual(uniqueWindow.alignedIds, [undefined, 'c1', 'c2', undefined])
+  assert.deepEqual([...uniqueWindow.verifiedAcpToolIds], ['c1', 'c2'])
+
+  // Ambiguous M > N window: Brain has [/b, /c, /b, /c], ACP replays [/b, /c]
+  const ambiguousWindow = alignReplayTools(
+    [row(0, '/b'), row(2, '/c'), row(4, '/b'), row(6, '/c')],
+    new Map(),
+    [],
+    ['c1', 'c2'],
+    snapshots,
+  )
+  assert.deepEqual(ambiguousWindow.alignedIds, ['c1', 'c2'])
+  assert.equal(ambiguousWindow.verifiedAcpToolIds.size, 0)
+
+  // Ambiguous M < N forked suffix: ACP has 2 identical [/b] windows, Brain suffix at step 10 falls back to N - M
+  const suffixSnapshots = new Map<string, { rawInput?: unknown }>([
+    ['p1', { rawInput: { Path: '/b' } }],
+    ['p2', { rawInput: { Path: '/b' } }],
+  ])
+  const ambiguousSuffix = alignReplayTools(
+    [row(10, '/b')],
+    new Map(),
+    [],
+    ['p1', 'p2'],
+    suffixSnapshots,
+  )
+  assert.deepEqual(ambiguousSuffix.alignedIds, ['p2'])
+  assert.deepEqual([...ambiguousSuffix.verifiedAcpToolIds], ['p2'])
 })
