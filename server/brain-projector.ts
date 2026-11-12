@@ -26,7 +26,7 @@ import {
   type SubagentRecord,
 } from './brain-io.ts'
 
-export type NativeToolIdentitySource = 'tool_id' | 'step_metadata'
+export type NativeToolIdentitySource = 'tool_id' | 'step_metadata' | 'acp_input'
 
 export type PendingTool = {
   id: string
@@ -48,6 +48,7 @@ export type PendingTool = {
     text: string
   }
   questionCompleted?: boolean
+  startedItem?: ProviderTimelineItem
 }
 
 export type PendingQuestion = {
@@ -86,6 +87,7 @@ export class BrainTranscriptProjector {
     ProviderTimelineItem,
     NativeToolIdentitySource
   >()
+  private backgroundGenerics = new WeakSet<ProviderTimelineItem>()
   private background = new Map<string, PendingTool>()
   private daemons = new Map<string, number>()
   private touchedSubagents = new Set<string>()
@@ -95,7 +97,8 @@ export class BrainTranscriptProjector {
   private toolIndex = 0
   private deferAnonymous = false
   private retired: PendingTool[] = []
-  private acpToolCallIds: readonly string[] = []
+  private acpToolCallIds: readonly (string | undefined)[] = []
+  private verifiedAcpToolIds?: ReadonlySet<string>
   private lastErrorCallId?: string
   private sessionId: string
   private onQuestionSettledByGeneric?: (
@@ -120,9 +123,18 @@ export class BrainTranscriptProjector {
     return this.nativeIdentities.get(item)
   }
 
-  bindToolCallIds(ids: readonly string[], startIndex = 0) {
+  isBackgroundGeneric(item: ProviderTimelineItem): boolean {
+    return this.backgroundGenerics.has(item)
+  }
+
+  bindToolCallIds(
+    ids: readonly (string | undefined)[],
+    startIndex = 0,
+    verifiedAcpToolIds?: ReadonlySet<string>,
+  ) {
     this.acpToolCallIds = ids
     this.toolIndex = startIndex
+    this.verifiedAcpToolIds = verifiedAcpToolIds
   }
 
   syncMetadata(inbox: InboxState, subagents: readonly SubagentRecord[]) {
@@ -254,6 +266,7 @@ export class BrainTranscriptProjector {
     const text = typeof row.content === 'string' ? row.content : ''
     const stepIndex = Number(row.step_index)
     if (runningStepStatuses.has(String(row.status))) {
+      if (pending.startedItem) this.backgroundGenerics.add(pending.startedItem)
       const taskId = text.match(backgroundTaskPattern)?.[1]
       if (taskId) {
         if (pending.args.IsDaemon === true) {
@@ -322,6 +335,7 @@ export class BrainTranscriptProjector {
     }
     if (pending.nativeIdentitySource)
       this.nativeIdentities.set(item, pending.nativeIdentitySource)
+    pending.startedItem = item
     return item
   }
   /** Anonymous continuation tools wait for ACP/metadata identity; only the RPC boundary permits fallback. */
@@ -331,13 +345,16 @@ export class BrainTranscriptProjector {
     for (const pending of [...this.retired, ...this.pending]) {
       if (pending.callId) continue
       const stepId = this.stepCallIds.get(pending.stepIndex)
+      const acpId = this.acpToolCallIds[pending.acpIndex!]
       const callId =
-        stepId ??
-        this.acpToolCallIds[pending.acpIndex!] ??
-        (deferAnonymous ? undefined : pending.fallbackId)
+        stepId ?? acpId ?? (deferAnonymous ? undefined : pending.fallbackId)
       if (!callId) continue
       pending.callId = callId
-      pending.nativeIdentitySource = stepId ? 'step_metadata' : undefined
+      pending.nativeIdentitySource = stepId
+        ? 'step_metadata'
+        : acpId && this.verifiedAcpToolIds?.has(acpId)
+          ? 'acp_input'
+          : undefined
       pending.id = `${this.sessionId}:tool:${callId}`
       const retired = this.retired.includes(pending)
       if (retired) this.retired = this.retired.filter((p) => p !== pending)
@@ -529,7 +546,9 @@ export class BrainTranscriptProjector {
               ? 'tool_id'
               : stepId
                 ? 'step_metadata'
-                : undefined
+                : acpId && this.verifiedAcpToolIds?.has(acpId)
+                  ? 'acp_input'
+                  : undefined
             const cleanName = cleanToolName(String(tool.name ?? 'Tool'))
             const pending: PendingTool = {
               id: callId ? `${this.sessionId}:tool:${callId}` : '',
