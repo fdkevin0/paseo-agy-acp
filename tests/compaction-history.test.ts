@@ -8,6 +8,7 @@ import {
   ProviderEventSchema,
   type ProviderEvent,
 } from '@getpaseo/plugin/server/provider'
+import { alignReplayTools } from '../server/history.ts'
 import { Timeline } from '../server/mapping.ts'
 import { SessionManager } from '../server/session.ts'
 import { AgyUsageSource } from '../server/usage.ts'
@@ -231,11 +232,11 @@ test('duplicate full text, fragmented snapshots, partial text and missing native
     checkpoint(2),
     { ...response(3, 'Same'), thinking: 'separator' },
   ]
-  const missingIdRows = rows.map((row) =>
+  const unverifiedInputRows = rows.map((row) =>
     row === brainRead[0]
       ? {
           ...row,
-          tool_calls: [{ name: 'read_file', args: { Path: '/example' } }],
+          tool_calls: [{ name: 'read_file', args: { Path: '/different' } }],
         }
       : row,
   )
@@ -262,7 +263,11 @@ test('duplicate full text, fragmented snapshots, partial text and missing native
       [text('BEFORE (partial)'), read, text('AFTER')],
       ['BEFORE (partial)', 'AFTER'],
     ],
-    [missingIdRows, [text('BEFORE'), read, text('AFTER')], ['BEFORE', 'AFTER']],
+    [
+      unverifiedInputRows,
+      [text('BEFORE'), read, text('AFTER')],
+      ['BEFORE', 'AFTER'],
+    ],
     [[checkpoint(1)], [], []],
   ] as const) {
     const events = await replay([...historyRows], [...updates])
@@ -1184,4 +1189,188 @@ test('missing ACP input never permits recovered Brain detail to replace a suppli
       assert.equal(item.status, status)
       assert.equal(item.error, status === 'failed' ? 'ACP failure' : null)
     })
+})
+
+test('real AGY transcript shapes locate checkpoints across anonymous tools, background tasks, wrapped user input, local gaps and forked suffixes', async () => {
+  const userChunk = (value: string) => ({
+    sessionUpdate: 'user_message_chunk',
+    content: { type: 'text', text: value },
+  })
+  const thoughtChunk = (value: string) => ({
+    sessionUpdate: 'agent_thought_chunk',
+    content: { type: 'text', text: value },
+  })
+  const bgTool = {
+    sessionUpdate: 'tool_call',
+    toolCallId: 'call-bg',
+    title: 'run_command',
+    status: 'completed',
+    rawInput: { CommandLine: 'npm test', WaitMsBeforeAsync: 500 },
+    rawOutput: 'pass',
+  }
+  const nextTool = {
+    sessionUpdate: 'tool_call',
+    toolCallId: 'call-next',
+    title: 'read_file',
+    status: 'completed',
+    rawInput: { StartLine: 1, Path: '/example' },
+    rawOutput: 'ok',
+  }
+  const nativeRows = [
+    {
+      step_index: 10,
+      type: 'USER_INPUT',
+      status: 'DONE',
+      content:
+        '<USER_REQUEST>\nrun suite\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nlocal time\n</ADDITIONAL_METADATA>',
+    },
+    checkpoint(11),
+    {
+      step_index: 12,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      thinking: 'boilerplate thought',
+      tool_calls: [
+        {
+          name: 'default_api:run_command',
+          args: { WaitMsBeforeAsync: 500, CommandLine: 'npm test' },
+        },
+      ],
+    },
+    {
+      step_index: 13,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: 'Tool is running as a background task with task id: task-1',
+    },
+    checkpoint(14),
+    {
+      step_index: 15,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      thinking: 'boilerplate thought',
+      content: 'Waiting for background task.',
+    },
+    {
+      step_index: 16,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content:
+        '[Message] sender=task-1 content=Task id "task-1" finished with result:\npass\n</SYSTEM_MESSAGE>',
+    },
+    {
+      step_index: 17,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: ' edit_file', args: { Path: '/invalid' } }],
+    },
+    {
+      step_index: 18,
+      type: 'GENERIC',
+      status: 'INVALID',
+      content: 'Error invalid tool call',
+    },
+    {
+      step_index: 19,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          name: 'default_api:read_file',
+          args: { Path: '/example', StartLine: 1 },
+        },
+      ],
+    },
+    { step_index: 20, type: 'GENERIC', status: 'DONE', content: 'ok' },
+    checkpoint(21),
+  ]
+  const parentPrefixTool = {
+    sessionUpdate: 'tool_call',
+    toolCallId: 'call-parent-prefix',
+    title: 'read_file',
+    status: 'completed',
+    rawInput: { Path: '/parent-only' },
+    rawOutput: 'parent',
+  }
+  const events = await replay(
+    nativeRows,
+    [
+      parentPrefixTool,
+      userChunk('run suite'),
+      thoughtChunk('boilerplate thought'),
+      bgTool,
+      thoughtChunk('boilerplate thought'),
+      text('Waiting for background task.'),
+      nextTool,
+    ],
+    'replay',
+    undefined,
+    [{ stepIndex: 13, callId: 'call-bg' }],
+  )
+  assert.deepEqual(labels(events), [
+    'tool_call',
+    'user_message',
+    'compaction',
+    'reasoning',
+    'tool_call',
+    'compaction',
+    'reasoning',
+    'Waiting for background task.',
+    'tool_call',
+    'tool_call',
+    'compaction',
+  ])
+  assert.equal(
+    timeline(events).filter(({ item }) => item.type === 'notification').length,
+    0,
+  )
+})
+
+test('alignReplayTools handles windowed ACP slices (M > N) and ambiguous window fallbacks', () => {
+  const row = (step_index: number, path: string) => ({
+    step_index,
+    type: 'PLANNER_RESPONSE',
+    status: 'DONE',
+    tool_calls: [{ name: 'default_api:read_file', args: { Path: path } }],
+  })
+  const snapshots = new Map<string, { rawInput?: unknown }>([
+    ['c1', { rawInput: { Path: '/b' } }],
+    ['c2', { rawInput: { Path: '/c' } }],
+  ])
+  // Unique M > N window: Brain has [/a, /b, /c, /d], ACP replays [/b, /c]
+  const uniqueWindow = alignReplayTools(
+    [row(0, '/a'), row(2, '/b'), row(4, '/c'), row(6, '/d')],
+    new Map(),
+    [],
+    ['c1', 'c2'],
+    snapshots,
+  )
+  assert.deepEqual(uniqueWindow.alignedIds, [undefined, 'c1', 'c2', undefined])
+  assert.deepEqual([...uniqueWindow.verifiedAcpToolIds], ['c1', 'c2'])
+
+  // Ambiguous M > N window: Brain has [/b, /c, /b, /c], ACP replays [/b, /c]
+  const ambiguousWindow = alignReplayTools(
+    [row(0, '/b'), row(2, '/c'), row(4, '/b'), row(6, '/c')],
+    new Map(),
+    [],
+    ['c1', 'c2'],
+    snapshots,
+  )
+  assert.deepEqual(ambiguousWindow.alignedIds, ['c1', 'c2'])
+  assert.equal(ambiguousWindow.verifiedAcpToolIds.size, 0)
+
+  // Ambiguous M < N forked suffix: ACP has 2 identical [/b] windows, Brain suffix at step 10 falls back to N - M
+  const suffixSnapshots = new Map<string, { rawInput?: unknown }>([
+    ['p1', { rawInput: { Path: '/b' } }],
+    ['p2', { rawInput: { Path: '/b' } }],
+  ])
+  const ambiguousSuffix = alignReplayTools(
+    [row(10, '/b')],
+    new Map(),
+    [],
+    ['p1', 'p2'],
+    suffixSnapshots,
+  )
+  assert.deepEqual(ambiguousSuffix.alignedIds, ['p2'])
+  assert.deepEqual([...ambiguousSuffix.verifiedAcpToolIds], ['p2'])
 })

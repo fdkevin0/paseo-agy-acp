@@ -47,7 +47,11 @@ import {
   settleBrainTurn,
 } from './brain.ts'
 import { readLatestStepUsage } from './brain-io.ts'
-import { mergeCompactionHistory, type HistoryEntry } from './history.ts'
+import {
+  alignReplayTools,
+  mergeCompactionHistory,
+  type HistoryEntry,
+} from './history.ts'
 import { SubagentRegistry, isSubagentMessage } from './subagents.ts'
 import { dataDirectory, removeSessionArtifacts } from './preflight.ts'
 import { connectAcp } from './transport.ts'
@@ -1092,9 +1096,20 @@ async function createSession(
           readTranscriptRows(brainRoot, state.nativeId),
         ])
         subagents.rememberSubagents(subagentRecords)
+        // Drain ACP session/load notifications first so turnToolCallIds and acpToolSnapshots are complete;
+        // projector.project() below is purely synchronous and never triggers ACP notifications.
+        await drain()
+        collectingHistory = false
+        const { alignedIds, verifiedAcpToolIds } = alignReplayTools(
+          rows,
+          inbox.stepCallIds,
+          subagentRecords,
+          state.turnToolCallIds,
+          acpToolSnapshots,
+        )
         const projector = new BrainTranscriptProjector(id)
         projector.syncMetadata(inbox, subagentRecords)
-        projector.bindToolCallIds(state.turnToolCallIds)
+        projector.bindToolCallIds(alignedIds, 0, verifiedAcpToolIds)
         const brainHistory: HistoryEntry[] = []
         const hasCompletedCheckpoint = rows.some(
           (row) =>
@@ -1131,18 +1146,26 @@ async function createSession(
                 item = { ...item, detail }
               }
             }
+            const nativeToolIdentitySource =
+              row.type === 'GENERIC' ||
+              (row.type === 'PLANNER_RESPONSE' &&
+                projected.type === 'tool_call' &&
+                projected.status === 'running')
+                ? projector.nativeToolIdentitySource(projected)
+                : undefined
             brainHistory.push({
               item,
-              nativeToolIdentitySource:
-                projector.nativeToolIdentitySource(projected),
+              nativeToolIdentitySource,
               ...(typeof row.created_at === 'string'
                 ? { timestamp: row.created_at }
                 : {}),
             })
           }
         }
-        await drain()
-        collectingHistory = false
+        for (const entry of brainHistory) {
+          if (projector.isBackgroundGeneric(entry.item))
+            entry.backgroundGeneric = true
+        }
         for (const { item, timestamp } of mergeCompactionHistory(
           acpHistory.splice(0),
           brainHistory,

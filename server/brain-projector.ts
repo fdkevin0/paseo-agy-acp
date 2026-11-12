@@ -26,7 +26,7 @@ import {
   type SubagentRecord,
 } from './brain-io.ts'
 
-export type NativeToolIdentitySource = 'tool_id' | 'step_metadata'
+export type NativeToolIdentitySource = 'tool_id' | 'step_metadata' | 'acp_input'
 
 export type PendingTool = {
   id: string
@@ -48,6 +48,7 @@ export type PendingTool = {
     text: string
   }
   questionCompleted?: boolean
+  startedItem?: ProviderTimelineItem
 }
 
 export type PendingQuestion = {
@@ -79,6 +80,26 @@ function terminalToolStatus(
   return 'completed'
 }
 
+/** A checkpoint takes a step index between a response and its GENERIC rows; shift expected rows past it. */
+export function shiftPendingPastCheckpoint(
+  pending: readonly { stepIndex: number }[],
+  checkpointStep: number,
+) {
+  for (const p of pending) if (p.stepIndex >= checkpointStep) p.stepIndex++
+}
+
+/** Match by stepIndex first so an unlogged WAITING ask_question never steals a sibling tool's GENERIC row. */
+export function takePendingForGeneric<
+  T extends { stepIndex: number; isQuestion?: boolean },
+>(pending: T[], genericStep: number): T | undefined {
+  let matchIndex = pending.findIndex((p) => p.stepIndex === genericStep)
+  if (matchIndex < 0) {
+    matchIndex = pending.findIndex((p) => !p.isQuestion)
+    if (matchIndex < 0) matchIndex = 0
+  }
+  return pending.splice(matchIndex, 1)[0]
+}
+
 /** Project transcript_full.jsonl steps and correlate tools with structured Brain metadata. */
 export class BrainTranscriptProjector {
   private pending: PendingTool[] = []
@@ -86,6 +107,7 @@ export class BrainTranscriptProjector {
     ProviderTimelineItem,
     NativeToolIdentitySource
   >()
+  private backgroundGenerics = new WeakSet<ProviderTimelineItem>()
   private background = new Map<string, PendingTool>()
   private daemons = new Map<string, number>()
   private touchedSubagents = new Set<string>()
@@ -95,7 +117,8 @@ export class BrainTranscriptProjector {
   private toolIndex = 0
   private deferAnonymous = false
   private retired: PendingTool[] = []
-  private acpToolCallIds: readonly string[] = []
+  private acpToolCallIds: readonly (string | undefined)[] = []
+  private verifiedAcpToolIds?: ReadonlySet<string>
   private lastErrorCallId?: string
   private sessionId: string
   private onQuestionSettledByGeneric?: (
@@ -120,9 +143,18 @@ export class BrainTranscriptProjector {
     return this.nativeIdentities.get(item)
   }
 
-  bindToolCallIds(ids: readonly string[], startIndex = 0) {
+  isBackgroundGeneric(item: ProviderTimelineItem): boolean {
+    return this.backgroundGenerics.has(item)
+  }
+
+  bindToolCallIds(
+    ids: readonly (string | undefined)[],
+    startIndex = 0,
+    verifiedAcpToolIds?: ReadonlySet<string>,
+  ) {
     this.acpToolCallIds = ids
     this.toolIndex = startIndex
+    this.verifiedAcpToolIds = verifiedAcpToolIds
   }
 
   syncMetadata(inbox: InboxState, subagents: readonly SubagentRecord[]) {
@@ -254,6 +286,7 @@ export class BrainTranscriptProjector {
     const text = typeof row.content === 'string' ? row.content : ''
     const stepIndex = Number(row.step_index)
     if (runningStepStatuses.has(String(row.status))) {
+      if (pending.startedItem) this.backgroundGenerics.add(pending.startedItem)
       const taskId = text.match(backgroundTaskPattern)?.[1]
       if (taskId) {
         if (pending.args.IsDaemon === true) {
@@ -322,6 +355,7 @@ export class BrainTranscriptProjector {
     }
     if (pending.nativeIdentitySource)
       this.nativeIdentities.set(item, pending.nativeIdentitySource)
+    pending.startedItem = item
     return item
   }
   /** Anonymous continuation tools wait for ACP/metadata identity; only the RPC boundary permits fallback. */
@@ -331,13 +365,16 @@ export class BrainTranscriptProjector {
     for (const pending of [...this.retired, ...this.pending]) {
       if (pending.callId) continue
       const stepId = this.stepCallIds.get(pending.stepIndex)
+      const acpId = this.acpToolCallIds[pending.acpIndex!]
       const callId =
-        stepId ??
-        this.acpToolCallIds[pending.acpIndex!] ??
-        (deferAnonymous ? undefined : pending.fallbackId)
+        stepId ?? acpId ?? (deferAnonymous ? undefined : pending.fallbackId)
       if (!callId) continue
       pending.callId = callId
-      pending.nativeIdentitySource = stepId ? 'step_metadata' : undefined
+      pending.nativeIdentitySource = stepId
+        ? 'step_metadata'
+        : acpId && this.verifiedAcpToolIds?.has(acpId)
+          ? 'acp_input'
+          : undefined
       pending.id = `${this.sessionId}:tool:${callId}`
       const retired = this.retired.includes(pending)
       if (retired) this.retired = this.retired.filter((p) => p !== pending)
@@ -447,10 +484,7 @@ export class BrainTranscriptProjector {
         return []
       }
       case 'CHECKPOINT':
-        // A checkpoint takes a step index between a response and its GENERIC rows; shift expected rows past it.
-        for (const p of this.pending) {
-          if (p.stepIndex >= stepIndex) p.stepIndex++
-        }
+        shiftPendingPastCheckpoint(this.pending, stepIndex)
         return row.status === 'DONE'
           ? [
               {
@@ -476,15 +510,7 @@ export class BrainTranscriptProjector {
           },
         ]
       case 'GENERIC': {
-        // Match by stepIndex first so an unlogged WAITING ask_question never steals a sibling tool's GENERIC row.
-        let matchIndex = this.pending.findIndex(
-          (p) => p.stepIndex === stepIndex,
-        )
-        if (matchIndex < 0) {
-          matchIndex = this.pending.findIndex((p) => !p.isQuestion)
-          if (matchIndex < 0) matchIndex = 0
-        }
-        const [pending] = this.pending.splice(matchIndex, 1)
+        const pending = takePendingForGeneric(this.pending, stepIndex)
         if (!pending || pending.questionCompleted) return []
         if (!pending.callId && this.deferAnonymous) {
           pending.genericSeen = true
@@ -529,7 +555,9 @@ export class BrainTranscriptProjector {
               ? 'tool_id'
               : stepId
                 ? 'step_metadata'
-                : undefined
+                : acpId && this.verifiedAcpToolIds?.has(acpId)
+                  ? 'acp_input'
+                  : undefined
             const cleanName = cleanToolName(String(tool.name ?? 'Tool'))
             const pending: PendingTool = {
               id: callId ? `${this.sessionId}:tool:${callId}` : '',
