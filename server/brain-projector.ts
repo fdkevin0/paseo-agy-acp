@@ -28,6 +28,15 @@ import {
 
 export type NativeToolIdentitySource = 'tool_id' | 'step_metadata' | 'acp_input'
 
+export type ObservedToolSlot = {
+  slot: number
+  stepIndex: number
+  args: unknown
+  toolId?: string
+  isQuestion: boolean
+  invalid: boolean
+}
+
 export type PendingTool = {
   id: string
   callId: string
@@ -36,6 +45,7 @@ export type PendingTool = {
   args: Record<string, unknown>
   rawInput: unknown
   stepIndex: number
+  slotIndex: number
   isQuestion?: boolean
   questions?: NormalizedQuestion[]
   questionConsumed?: boolean
@@ -48,7 +58,6 @@ export type PendingTool = {
     text: string
   }
   questionCompleted?: boolean
-  startedItem?: ProviderTimelineItem
 }
 
 export type PendingQuestion = {
@@ -107,13 +116,20 @@ export class BrainTranscriptProjector {
     ProviderTimelineItem,
     NativeToolIdentitySource
   >()
-  private backgroundGenerics = new WeakSet<ProviderTimelineItem>()
+  private toolRawOutputs = new WeakMap<ProviderTimelineItem, unknown>()
+  private lastBackgroundGeneric?: {
+    callId: string
+    source: NativeToolIdentitySource
+  }
   private background = new Map<string, PendingTool>()
   private daemons = new Map<string, number>()
   private touchedSubagents = new Set<string>()
   private stepCallIds = new Map<number, string>()
   private stepSubagents = new Map<number, SubagentRecord>()
   private callSubagents = new Map<string, SubagentRecord>()
+  private observedSlots: ObservedToolSlot[] = []
+  private observedPending: ObservedToolSlot[] = []
+  private slotIndex = 0
   private toolIndex = 0
   private deferAnonymous = false
   private retired: PendingTool[] = []
@@ -143,8 +159,13 @@ export class BrainTranscriptProjector {
     return this.nativeIdentities.get(item)
   }
 
-  isBackgroundGeneric(item: ProviderTimelineItem): boolean {
-    return this.backgroundGenerics.has(item)
+  toolRawOutput(item: ProviderTimelineItem): unknown {
+    return this.toolRawOutputs.get(item)
+  }
+
+  backgroundGenericAnchor():
+    { callId: string; source: NativeToolIdentitySource } | undefined {
+    return this.lastBackgroundGeneric
   }
 
   bindToolCallIds(
@@ -155,6 +176,63 @@ export class BrainTranscriptProjector {
     this.acpToolCallIds = ids
     this.toolIndex = startIndex
     this.verifiedAcpToolIds = verifiedAcpToolIds
+  }
+
+  /** Pre-scan transcript rows so tool slots know their checkpoint-shifted GENERIC step indexes before projection. */
+  observeRows(
+    rows: readonly Record<string, unknown>[],
+  ): readonly ObservedToolSlot[] {
+    for (const raw of rows) {
+      const row = record(raw)
+      if (!Number.isInteger(row.step_index)) continue
+      const stepIndex = Number(row.step_index)
+      switch (row.type) {
+        case 'USER_INPUT':
+          this.observedPending = []
+          break
+        case 'SYSTEM_MESSAGE':
+          if (isRestartNotice(row)) this.observedPending = []
+          break
+        case 'ERROR_MESSAGE':
+          if (!isRetryWarning(row)) this.observedPending = []
+          break
+        case 'CHECKPOINT':
+          shiftPendingPastCheckpoint(this.observedPending, stepIndex)
+          break
+        case 'GENERIC': {
+          const matched = takePendingForGeneric(this.observedPending, stepIndex)
+          if (matched) {
+            matched.stepIndex = stepIndex
+            if (row.status === 'INVALID') matched.invalid = true
+          }
+          break
+        }
+        case 'PLANNER_RESPONSE':
+          this.observedPending = []
+          if (Array.isArray(row.tool_calls))
+            row.tool_calls.forEach((value, index) => {
+              const tool = record(value)
+              const cleanName = cleanToolName(String(tool.name ?? 'Tool'))
+              const slot: ObservedToolSlot = {
+                slot: this.observedSlots.length,
+                stepIndex: stepIndex + index + 1,
+                args: tool.args,
+                toolId:
+                  typeof tool.id === 'string' && tool.id ? tool.id : undefined,
+                isQuestion: isAskQuestionName(cleanName),
+                invalid: false,
+              }
+              this.observedSlots.push(slot)
+              this.observedPending.push(slot)
+            })
+          break
+      }
+    }
+    return this.observedSlots
+  }
+
+  private effectiveStepIndex(slotIndex: number, stepIndex: number): number {
+    return this.observedSlots[slotIndex]?.stepIndex ?? stepIndex
   }
 
   syncMetadata(inbox: InboxState, subagents: readonly SubagentRecord[]) {
@@ -276,6 +354,7 @@ export class BrainTranscriptProjector {
         : { ...base, status, error: null }
     if (pending.nativeIdentitySource)
       this.nativeIdentities.set(item, pending.nativeIdentitySource)
+    this.toolRawOutputs.set(item, output)
     return item
   }
 
@@ -286,7 +365,11 @@ export class BrainTranscriptProjector {
     const text = typeof row.content === 'string' ? row.content : ''
     const stepIndex = Number(row.step_index)
     if (runningStepStatuses.has(String(row.status))) {
-      if (pending.startedItem) this.backgroundGenerics.add(pending.startedItem)
+      if (pending.callId && pending.nativeIdentitySource)
+        this.lastBackgroundGeneric = {
+          callId: pending.callId,
+          source: pending.nativeIdentitySource,
+        }
       const taskId = text.match(backgroundTaskPattern)?.[1]
       if (taskId) {
         if (pending.args.IsDaemon === true) {
@@ -312,12 +395,9 @@ export class BrainTranscriptProjector {
     ) {
       this.forgetTask(pending.args.TaskId)
     }
-    const stepCallId = this.stepCallIds.get(stepIndex)
     const subagent =
       this.callSubagents.get(pending.callId) ??
-      (stepCallId ? this.callSubagents.get(stepCallId) : undefined) ??
-      this.stepSubagents.get(stepIndex) ??
-      this.stepSubagents.get(pending.stepIndex)
+      this.stepSubagents.get(stepIndex)
     const rawOutput =
       isNativeToolName(pending.name, 'invoke_subagent') &&
       subagent &&
@@ -355,8 +435,14 @@ export class BrainTranscriptProjector {
     }
     if (pending.nativeIdentitySource)
       this.nativeIdentities.set(item, pending.nativeIdentitySource)
-    pending.startedItem = item
     return item
+  }
+  private verifiedAcpId(acpIndex: number | undefined): string | undefined {
+    const id =
+      acpIndex === undefined ? undefined : this.acpToolCallIds[acpIndex]
+    return id && (!this.verifiedAcpToolIds || this.verifiedAcpToolIds.has(id))
+      ? id
+      : undefined
   }
   /** Anonymous continuation tools wait for ACP/metadata identity; only the RPC boundary permits fallback. */
   resolveToolIdentities(deferAnonymous: boolean): ProviderTimelineItem[] {
@@ -364,8 +450,10 @@ export class BrainTranscriptProjector {
     const items: ProviderTimelineItem[] = []
     for (const pending of [...this.retired, ...this.pending]) {
       if (pending.callId) continue
-      const stepId = this.stepCallIds.get(pending.stepIndex)
-      const acpId = this.acpToolCallIds[pending.acpIndex!]
+      const stepId = this.stepCallIds.get(
+        this.effectiveStepIndex(pending.slotIndex, pending.stepIndex),
+      )
+      const acpId = this.verifiedAcpId(pending.acpIndex)
       const callId =
         stepId ?? acpId ?? (deferAnonymous ? undefined : pending.fallbackId)
       if (!callId) continue
@@ -396,6 +484,7 @@ export class BrainTranscriptProjector {
     return items
   }
   project(value: unknown, continuingQuestion = false): ProviderTimelineItem[] {
+    this.lastBackgroundGeneric = undefined
     const row = record(value)
     if (!Number.isInteger(row.step_index)) return []
     const stepIndex = Number(row.step_index)
@@ -512,6 +601,7 @@ export class BrainTranscriptProjector {
       case 'GENERIC': {
         const pending = takePendingForGeneric(this.pending, stepIndex)
         if (!pending || pending.questionCompleted) return []
+        pending.stepIndex = stepIndex
         if (!pending.callId && this.deferAnonymous) {
           pending.genericSeen = true
           this.retired.push(pending)
@@ -541,11 +631,14 @@ export class BrainTranscriptProjector {
             const tool = record(value)
             const args = record(tool.args)
             const genericStep = stepIndex + index + 1
+            const slotIndex = this.slotIndex++
             const acpIndex = this.toolIndex++
-            const acpId = this.acpToolCallIds[acpIndex]
+            const acpId = this.verifiedAcpId(acpIndex)
             const toolId =
               typeof tool.id === 'string' && tool.id ? tool.id : undefined
-            const stepId = this.stepCallIds.get(genericStep)
+            const stepId = this.stepCallIds.get(
+              this.effectiveStepIndex(slotIndex, genericStep),
+            )
             const callId =
               toolId ??
               stepId ??
@@ -569,6 +662,7 @@ export class BrainTranscriptProjector {
               args,
               rawInput: tool.args,
               stepIndex: genericStep,
+              slotIndex,
               ...(isAskQuestionName(cleanName)
                 ? {
                     isQuestion: true,

@@ -1,10 +1,12 @@
-import { isRestartNotice, isRetryWarning } from './brain-io.ts'
+import { type InboxState, type SubagentRecord } from './brain-io.ts'
 import {
-  shiftPendingPastCheckpoint,
-  takePendingForGeneric,
+  BrainTranscriptProjector,
   type NativeToolIdentitySource,
+  type ObservedToolSlot,
 } from './brain-projector.ts'
-import { cleanToolName, isAskQuestionName, record } from './common.ts'
+import { record } from './common.ts'
+import { toolDetail } from './mapping.ts'
+import type { ToolCall } from '@agentclientprotocol/sdk'
 import type { ProviderTimelineItem } from '@getpaseo/plugin/server/provider'
 
 export interface HistoryEntry {
@@ -12,7 +14,7 @@ export interface HistoryEntry {
   timestamp?: string
   resultProvided?: boolean
   nativeToolIdentitySource?: NativeToolIdentitySource
-  backgroundGeneric?: boolean
+  toolAnchor?: 'running' | 'terminal' | false
 }
 
 const userRequestPattern =
@@ -38,6 +40,9 @@ export function alignReplayTools(
   subagents: readonly { spawnStepIndex: number; spawnCallId?: string }[],
   acpToolCallIds: readonly string[],
   acpToolSnapshots: ReadonlyMap<string, { rawInput?: unknown }>,
+  slots: readonly ObservedToolSlot[] = new BrainTranscriptProjector(
+    '',
+  ).observeRows(rows),
 ): {
   alignedIds: readonly (string | undefined)[]
   verifiedAcpToolIds: ReadonlySet<string>
@@ -45,57 +50,13 @@ export function alignReplayTools(
   const claimedIds = new Set<string>(stepCallIds.values())
   for (const sub of subagents)
     if (sub.spawnCallId) claimedIds.add(sub.spawnCallId)
-  type Slot = {
-    slot: number
-    stepIndex: number
-    args: unknown
-    isQuestion: boolean
-    invalid: boolean
-  }
-  const slots: Slot[] = []
-  let pending: Slot[] = []
+  for (const s of slots) if (s.toolId) claimedIds.add(s.toolId)
   let firstStepIndex: number | undefined
   for (const raw of rows) {
-    const row = record(raw)
-    if (!Number.isInteger(row.step_index)) continue
-    const stepIndex = Number(row.step_index)
-    firstStepIndex ??= stepIndex
-    switch (row.type) {
-      case 'USER_INPUT':
-        pending = []
-        break
-      case 'SYSTEM_MESSAGE':
-        if (isRestartNotice(row)) pending = []
-        break
-      case 'ERROR_MESSAGE':
-        if (!isRetryWarning(row)) pending = []
-        break
-      case 'CHECKPOINT':
-        shiftPendingPastCheckpoint(pending, stepIndex)
-        break
-      case 'GENERIC': {
-        const matched = takePendingForGeneric(pending, stepIndex)
-        if (matched && row.status === 'INVALID') matched.invalid = true
-        break
-      }
-      case 'PLANNER_RESPONSE':
-        pending = []
-        if (Array.isArray(row.tool_calls))
-          row.tool_calls.forEach((value, index) => {
-            const tool = record(value)
-            if (typeof tool.id === 'string' && tool.id) claimedIds.add(tool.id)
-            const cleanName = cleanToolName(String(tool.name ?? 'Tool'))
-            const s: Slot = {
-              slot: slots.length,
-              stepIndex: stepIndex + index + 1,
-              args: tool.args,
-              isQuestion: isAskQuestionName(cleanName),
-              invalid: false,
-            }
-            slots.push(s)
-            pending.push(s)
-          })
-        break
+    const stepIndex = Number(record(raw).step_index)
+    if (Number.isInteger(stepIndex)) {
+      firstStepIndex = stepIndex
+      break
     }
   }
   const valid = slots.filter((s) => !s.invalid)
@@ -146,7 +107,10 @@ export function alignReplayTools(
     }
   }
   if (count === 0)
-    return { alignedIds: acpToolCallIds, verifiedAcpToolIds: new Set() }
+    return {
+      alignedIds: acpToolCallIds,
+      verifiedAcpToolIds: new Set(),
+    }
   const alignedIds = new Array<string | undefined>(slots.length).fill(undefined)
   const verifiedAcpToolIds = new Set<string>()
   for (let j = 0; j < count; j++) {
@@ -164,28 +128,24 @@ export function mergeCompactionHistory(
   acp: readonly HistoryEntry[],
   brain: readonly HistoryEntry[],
 ): HistoryEntry[] {
-  if (!brain.some(({ item }) => item.type === 'compaction'))
-    return [
-      ...acp,
-      ...brain.filter(
-        ({ item }) => item.type === 'tool_call' && item.status !== 'running',
-      ),
-    ]
   const textIds = new Map<string, number>()
   for (const { item } of acp)
     if ('text' in item) textIds.set(item.id, (textIds.get(item.id) ?? 0) + 1)
   function key(
-    { item, nativeToolIdentitySource, backgroundGeneric }: HistoryEntry,
+    { item, nativeToolIdentitySource, toolAnchor }: HistoryEntry,
     source: 'acp' | 'brain',
   ): string | undefined {
     if (item.type === 'tool_call')
-      return source === 'acp' || nativeToolIdentitySource !== undefined
+      return source === 'acp' ||
+        (nativeToolIdentitySource !== undefined && toolAnchor !== false)
         ? JSON.stringify([
             'tool',
             item.callId,
-            item.status === 'running' && !backgroundGeneric
-              ? 'running'
-              : 'terminal',
+            source === 'brain' && toolAnchor
+              ? toolAnchor
+              : item.status === 'running'
+                ? 'running'
+                : 'terminal',
           ])
         : undefined
     if (
@@ -300,6 +260,7 @@ export function mergeCompactionHistory(
     } else if (item.type === 'tool_call' && item.status !== 'running') {
       const existing = acpTools.get(item.callId)
       if (existing) {
+        if (!entry.nativeToolIdentitySource) return
         if (existing.item.status === 'running')
           insert(existing.index + 1, entry)
         else if (!existing.resultProvided)
@@ -332,4 +293,108 @@ export function mergeCompactionHistory(
   return acp
     .flatMap((entry, index) => [...(slots.get(index) ?? []), entry])
     .concat(slots.get(acp.length) ?? [], trailing)
+}
+
+/** Project Brain transcript rows with verified ACP/metadata tool identities and merge into ACP replay history. */
+export function projectReplayHistory({
+  sessionId,
+  rows,
+  inbox,
+  subagents,
+  acpHistory,
+  acpToolCallIds,
+  acpToolSnapshots,
+  acpResultProvided,
+}: {
+  sessionId: string
+  rows: readonly Record<string, unknown>[]
+  inbox: InboxState
+  subagents: readonly SubagentRecord[]
+  acpHistory: readonly HistoryEntry[]
+  acpToolCallIds: readonly string[]
+  acpToolSnapshots: ReadonlyMap<string, Readonly<ToolCall>>
+  acpResultProvided: (callId: string) => boolean
+}): {
+  entries: HistoryEntry[]
+  lastKnownStepIndex: number
+} {
+  const projector = new BrainTranscriptProjector(sessionId)
+  projector.syncMetadata(inbox, subagents)
+  const slots = projector.observeRows(rows)
+  const { alignedIds, verifiedAcpToolIds } = alignReplayTools(
+    rows,
+    inbox.stepCallIds,
+    subagents,
+    acpToolCallIds,
+    acpToolSnapshots,
+    slots,
+  )
+  projector.bindToolCallIds(alignedIds, 0, verifiedAcpToolIds)
+  const brainHistory: HistoryEntry[] = []
+  let lastKnownStepIndex = -1
+  for (const row of rows) {
+    const stepIndex = Number(row.step_index)
+    if (Number.isInteger(stepIndex) && stepIndex > lastKnownStepIndex)
+      lastKnownStepIndex = stepIndex
+    const timestamp =
+      typeof row.created_at === 'string' ? row.created_at : undefined
+    for (const projected of projector.project(row)) {
+      let item = projected
+      const nativeToolIdentitySource =
+        projector.nativeToolIdentitySource(projected)
+      if (
+        nativeToolIdentitySource !== undefined &&
+        item.type === 'tool_call' &&
+        item.status !== 'running' &&
+        (row.type === 'GENERIC' || row.type === 'SYSTEM_MESSAGE') &&
+        !acpResultProvided(item.callId)
+      ) {
+        const snapshot = acpToolSnapshots.get(item.callId)
+        if (snapshot?.rawInput != null) {
+          const detail = toolDetail({
+            ...snapshot,
+            rawOutput: projector.toolRawOutput(projected),
+          })
+          if (detail.type === 'sub_agent' && item.detail.type === 'sub_agent')
+            detail.childSessionId ??= item.detail.childSessionId
+          item = { ...item, detail }
+        }
+      }
+      brainHistory.push({
+        item,
+        nativeToolIdentitySource,
+        toolAnchor:
+          row.type === 'GENERIC'
+            ? 'terminal'
+            : row.type === 'PLANNER_RESPONSE' &&
+                item.type === 'tool_call' &&
+                item.status === 'running'
+              ? 'running'
+              : false,
+        ...(timestamp ? { timestamp } : {}),
+      })
+    }
+    if (row.type === 'GENERIC') {
+      const bg = projector.backgroundGenericAnchor()
+      if (bg)
+        brainHistory.push({
+          item: {
+            type: 'tool_call',
+            id: `${sessionId}:tool:${bg.callId}`,
+            callId: bg.callId,
+            name: '',
+            detail: { type: 'unknown', input: null, output: null },
+            status: 'running',
+            error: null,
+          },
+          nativeToolIdentitySource: bg.source,
+          toolAnchor: 'terminal',
+          ...(timestamp ? { timestamp } : {}),
+        })
+    }
+  }
+  return {
+    entries: mergeCompactionHistory(acpHistory, brainHistory),
+    lastKnownStepIndex,
+  }
 }

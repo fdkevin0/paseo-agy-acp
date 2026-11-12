@@ -38,7 +38,6 @@ import {
   type NormalizedQuestion,
 } from './questions.ts'
 import {
-  BrainTranscriptProjector,
   hasActiveBackgroundWork,
   readInboxState,
   readSubagents,
@@ -47,11 +46,7 @@ import {
   settleBrainTurn,
 } from './brain.ts'
 import { readLatestStepUsage } from './brain-io.ts'
-import {
-  alignReplayTools,
-  mergeCompactionHistory,
-  type HistoryEntry,
-} from './history.ts'
+import { projectReplayHistory, type HistoryEntry } from './history.ts'
 import { SubagentRegistry, isSubagentMessage } from './subagents.ts'
 import { dataDirectory, removeSessionArtifacts } from './preflight.ts'
 import { connectAcp } from './transport.ts'
@@ -1097,79 +1092,22 @@ async function createSession(
         ])
         subagents.rememberSubagents(subagentRecords)
         // Drain ACP session/load notifications first so turnToolCallIds and acpToolSnapshots are complete;
-        // projector.project() below is purely synchronous and never triggers ACP notifications.
+        // projectReplayHistory() below is purely synchronous and never triggers ACP notifications.
         await drain()
         collectingHistory = false
-        const { alignedIds, verifiedAcpToolIds } = alignReplayTools(
+        const { entries, lastKnownStepIndex } = projectReplayHistory({
+          sessionId: id,
           rows,
-          inbox.stepCallIds,
-          subagentRecords,
-          state.turnToolCallIds,
+          inbox,
+          subagents: subagentRecords,
+          acpHistory: acpHistory.splice(0),
+          acpToolCallIds: state.turnToolCallIds,
           acpToolSnapshots,
-        )
-        const projector = new BrainTranscriptProjector(id)
-        projector.syncMetadata(inbox, subagentRecords)
-        projector.bindToolCallIds(alignedIds, 0, verifiedAcpToolIds)
-        const brainHistory: HistoryEntry[] = []
-        const hasCompletedCheckpoint = rows.some(
-          (row) =>
-            row.type === 'CHECKPOINT' &&
-            row.status === 'DONE' &&
-            Number.isInteger(row.step_index),
-        )
-        for (const row of rows) {
-          const stepIndex = Number(row.step_index)
-          if (
-            Number.isInteger(stepIndex) &&
-            stepIndex > state.lastKnownStepIndex
-          )
-            state.lastKnownStepIndex = stepIndex
-          for (const projected of projector.project(row)) {
-            let item = projected
-            if (
-              hasCompletedCheckpoint &&
-              item.type === 'tool_call' &&
-              row.type === 'GENERIC' &&
-              !acpResultProvided(item.callId)
-            ) {
-              const snapshot = acpToolSnapshots.get(item.callId)
-              if (snapshot?.rawInput != null) {
-                const detail = toolDetail({
-                  ...snapshot,
-                  rawOutput: row.content ?? row.error ?? null,
-                })
-                if (
-                  detail.type === 'sub_agent' &&
-                  item.detail.type === 'sub_agent'
-                )
-                  detail.childSessionId ??= item.detail.childSessionId
-                item = { ...item, detail }
-              }
-            }
-            const nativeToolIdentitySource =
-              row.type === 'GENERIC' ||
-              (row.type === 'PLANNER_RESPONSE' &&
-                projected.type === 'tool_call' &&
-                projected.status === 'running')
-                ? projector.nativeToolIdentitySource(projected)
-                : undefined
-            brainHistory.push({
-              item,
-              nativeToolIdentitySource,
-              ...(typeof row.created_at === 'string'
-                ? { timestamp: row.created_at }
-                : {}),
-            })
-          }
-        }
-        for (const entry of brainHistory) {
-          if (projector.isBackgroundGeneric(entry.item))
-            entry.backgroundGeneric = true
-        }
-        for (const { item, timestamp } of mergeCompactionHistory(
-          acpHistory.splice(0),
-          brainHistory,
-        )) {
+          acpResultProvided,
+        })
+        if (lastKnownStepIndex > state.lastKnownStepIndex)
+          state.lastKnownStepIndex = lastKnownStepIndex
+        for (const { item, timestamp } of entries) {
           await subagents.waitCurrentReady()
           emitItem(item, timestamp)
         }
