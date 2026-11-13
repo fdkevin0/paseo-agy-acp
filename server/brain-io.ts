@@ -52,8 +52,16 @@ export type InboxState = {
 const restartNoticePattern =
   /\bsender=system\b[^\n]*\scontent=\[Notice\] All your subagents and background tasks have been stopped/
 
-const planExecuteNoticePattern =
-  /(?:^|<SYSTEM_MESSAGE>\s*)(?:Plan mode is off: this turn runs on |\[plan review\] Plan mode is on: this turn runs on |\[plan review due\] )/
+// agy 1.5.7 cortex/planexecute handoff notices (Brain SYSTEM_MESSAGE rows carry no structured subtype).
+const PLAN_EXECUTE_NOTICE_PREFIXES = [
+  'Plan mode is off: this turn runs on ',
+  '\\[plan review\\] Plan mode is on: this turn runs on ',
+  '\\[plan review due\\] ',
+] as const
+
+const planExecuteNoticePattern = new RegExp(
+  `(?:^|<SYSTEM_MESSAGE>\\s*)(?:${PLAN_EXECUTE_NOTICE_PREFIXES.join('|')})`,
+)
 
 const rowMessageHeaderPattern =
   /(?:^|\n)(?:\d+\.\s+)?\[Message\]\s+(?:timestamp=\S+\s+)?sender=(\S+)(?:\s+priority=(\S+))?/g

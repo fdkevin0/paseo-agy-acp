@@ -4,10 +4,9 @@ import type {
   ProviderToolPolicy,
 } from '@getpaseo/plugin/server/provider'
 import {
+  classifyPlanModeTool,
   cleanToolName,
   isAskQuestionName,
-  isForeignToolIdentity,
-  planModeToolName,
   record,
   str,
 } from './common.ts'
@@ -85,10 +84,11 @@ export function permissionKind(
   if (isChooserRequest(request.options) || isAskQuestionName(identity))
     return 'question'
   if (
-    planModeToolName(explicitRawName, request.toolCall.title) !== undefined ||
-    (explicitRawName === undefined &&
-      !isForeignToolIdentity(explicitRawName, request.toolCall.title) &&
-      request.toolCall.kind === 'switch_mode')
+    classifyPlanModeTool(
+      explicitRawName,
+      request.toolCall.title,
+      str(request.toolCall.kind),
+    ) !== undefined
   )
     return 'mode'
   if (detail.type === 'plan') return 'plan'

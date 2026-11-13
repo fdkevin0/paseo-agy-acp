@@ -1253,11 +1253,37 @@ async function createSession(
   }
 }
 
+type NativeConfigKey = 'model' | 'thought_level' | 'mode'
+
+function selectedConfigValue(
+  current: ReturnType<typeof configState>,
+  key: NativeConfigKey,
+): string | undefined {
+  return key === 'model'
+    ? current.model
+    : key === 'mode'
+      ? current.mode
+      : current.thinkingOption
+}
+
+function isAdvertisedConfigOption(
+  metadata: SessionMetadata,
+  current: ReturnType<typeof configState>,
+  key: NativeConfigKey,
+): boolean {
+  return (
+    Boolean(
+      metadata.configOptions?.some((o) => o.id === key || o.category === key),
+    ) &&
+    (key !== 'thought_level' || current.thinkingOptions.length > 0)
+  )
+}
+
 async function applyNativeConfigOption(
   transport: ReturnType<typeof connectAcp>,
   nativeId: string,
   metadata: NewSessionResponse & SessionMetadata,
-  key: 'model' | 'mode' | 'thought_level',
+  key: NativeConfigKey,
   value: string | undefined,
   strict = false,
 ): Promise<boolean> {
@@ -1293,46 +1319,32 @@ async function configureSession(
   if (changes.settings && Object.keys(changes.settings).length)
     throw new Error('Custom settings are not supported')
   const strictThinking = options?.strictThinking ?? true
+  // Switching `model` dynamically adds or removes `thought_level` in `metadata.configOptions`
+  // via the native RPC, so `thought_level` must be re-evaluated after `model` is applied.
   const allowMissingThinking = !strictThinking || changes.model != null
   const entries = [
     ['model', changes.model],
     ['thought_level', changes.thinkingOption],
     ['mode', changes.mode],
   ] as const
+  const initial = configState(session.state.metadata)
   for (const [key, value] of entries) {
     if (value == null) continue
     if (key === 'mode' && value === FULL_ACCESS_MODE_ID) continue
     if (key === 'thought_level' && allowMissingThinking) continue
-    const current = configState(session.state.metadata)
-    const selected =
-      key === 'model'
-        ? current.model
-        : key === 'mode'
-          ? current.mode
-          : current.thinkingOption
-    if (value === selected) continue
-    const advertised =
-      session.state.metadata.configOptions?.some(
-        (o) => o.id === key || o.category === key,
-      ) &&
-      (key !== 'thought_level' || current.thinkingOptions.length > 0)
-    if (!advertised) throw new Error(`agy does not advertise ${key}`)
+    if (value === selectedConfigValue(initial, key)) continue
+    if (!isAdvertisedConfigOption(session.state.metadata, initial, key))
+      throw new Error(`agy does not advertise ${key}`)
   }
   let mutated = false
   try {
     for (const [key, value] of entries) {
       if (value == null) continue
       const current = configState(session.state.metadata)
-      const selected =
-        key === 'model'
-          ? current.model
-          : key === 'mode'
-            ? current.mode
-            : current.thinkingOption
-      if (value === selected) continue
-      if (key === 'thought_level' && current.thinkingOptions.length === 0) {
-        if (allowMissingThinking) continue
-        throw new Error('agy does not advertise thought_level')
+      if (value === selectedConfigValue(current, key)) continue
+      if (!isAdvertisedConfigOption(session.state.metadata, current, key)) {
+        if (key === 'thought_level' && allowMissingThinking) continue
+        throw new Error(`agy does not advertise ${key}`)
       }
       if (key === 'mode' && value === FULL_ACCESS_MODE_ID) {
         await session.relaunch(true)
@@ -1365,7 +1377,7 @@ async function configureSession(
         session.state.metadata,
         key,
         value,
-        key !== 'thought_level' || !allowMissingThinking,
+        true,
       )
       mutated ||= applied
     }
@@ -1740,11 +1752,8 @@ async function promptSession(
       lastStep = settled.lastStepUsage
       turnWokeUp = Boolean(settled.wokeUp)
       turnWakeupUsage = settled.wakeupUsage
-      nextCarriedWakeup = settled.continued
-        ? settled.carriedWakeupUsage
-        : turnWakeupUsage
-      if (settled.continued ? settled.pendingReplay : turnWokeUp)
-        session.state.wakeup.pendingReplay = true
+      nextCarriedWakeup = settled.carriedWakeupUsage
+      if (settled.pendingReplay) session.state.wakeup.pendingReplay = true
       if (
         settled.stalled &&
         !turnAbort.signal.aborted &&

@@ -34,24 +34,8 @@ export function isAskQuestionName(name: string): boolean {
 export type PlanModeToolName =
   'switch_mode' | 'exit_plan_mode' | 'enter_plan_mode'
 
-/** Resolve agy's mode/plan handoff tools across raw names, `contrib:`, and legacy `Run ` titles. */
-export function planModeToolName(
-  explicitRawName: string | undefined,
-  title: string | null | undefined,
-): PlanModeToolName | undefined {
-  const match =
-    explicitRawName !== undefined
-      ? cleanToolName(explicitRawName).match(
-          /^(?:contrib:)?(switch_mode|exit_plan_mode|enter_plan_mode)$/i,
-        )
-      : cleanToolName(title ?? '').match(
-          /^(?:Run )?(?:contrib:)?(switch_mode|exit_plan_mode|enter_plan_mode)$/i,
-        )
-  return match?.[1]?.toLowerCase() as PlanModeToolName | undefined
-}
-
 /** Whether a tool name or ACP title explicitly identifies a non-native MCP tool. */
-export function isForeignToolIdentity(
+function isForeignToolIdentity(
   explicitRawName: string | undefined,
   title: string | null | undefined,
 ): boolean {
@@ -68,6 +52,33 @@ export function isForeignToolIdentity(
     prefix !== 'default_api' &&
     /^[a-z0-9_-]+:[a-z0-9_.-]+$/i.test(raw)
   )
+}
+
+/**
+ * Classify agy's mode/plan handoff tools across raw names, `contrib:`, legacy `Run ` titles,
+ * and unnamed native `kind === 'switch_mode'` snapshots (rejecting foreign MCP identities).
+ */
+export function classifyPlanModeTool(
+  explicitRawName: string | undefined,
+  title: string | null | undefined,
+  kind?: string | null,
+): PlanModeToolName | undefined {
+  const match =
+    explicitRawName !== undefined
+      ? cleanToolName(explicitRawName).match(
+          /^(?:contrib:)?(switch_mode|exit_plan_mode|enter_plan_mode)$/i,
+        )
+      : cleanToolName(title ?? '').match(
+          /^(?:Run )?(?:contrib:)?(switch_mode|exit_plan_mode|enter_plan_mode)$/i,
+        )
+  if (match) return match[1].toLowerCase() as PlanModeToolName
+  if (
+    explicitRawName === undefined &&
+    kind === 'switch_mode' &&
+    !isForeignToolIdentity(explicitRawName, title)
+  )
+    return 'switch_mode'
+  return undefined
 }
 
 /** Narrow opaque protocol payloads before reading vendor fields. */

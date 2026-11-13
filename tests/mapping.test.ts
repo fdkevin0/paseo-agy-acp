@@ -831,6 +831,7 @@ test('configState resolves canonical per-model efforts independently of Orchestr
     name: 'Model',
     currentValue: 'gemini-pro-orchestrator',
     options: [
+      // Both Orchestrator (Carbon) and Orchestrator (Argon) come from the live agy 1.5.7 CCPA catalog.
       { value: 'gemini-pro-orchestrator', name: 'Orchestrator (Carbon)' },
       { value: 'gemini-pro-orchestrator-argon', name: 'Orchestrator (Argon)' },
       { value: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen' },
@@ -930,6 +931,45 @@ test('configState resolves canonical per-model efforts independently of Orchestr
   })
   assert.deepEqual(suppressedActive.thinkingOptions, [])
   assert.equal(suppressedActive.thinkingOption, undefined)
+
+  // Non-Ultra (e.g. AI Pro) catalogs omit Orchestrator while still exposing Hydrogen and Carbon.
+  const proCatalog = configState({
+    configOptions: [
+      {
+        ...modelSelect,
+        currentValue: 'gemini-4-carbon',
+        options: modelSelect.options.filter(
+          (o) => !o.value.includes('orchestrator'),
+        ),
+      },
+      {
+        type: 'select',
+        id: 'thought_level',
+        name: 'Thinking Level',
+        currentValue: 'medium',
+        options: [
+          { value: 'low', name: 'Low' },
+          { value: 'medium', name: 'Medium' },
+          { value: 'high', name: 'High' },
+        ],
+      },
+    ],
+    models: {
+      availableModels: availableModels.filter(
+        (m) => !m.modelId.includes('orchestrator'),
+      ),
+    },
+  })
+  assert.equal(
+    proCatalog.models.some((m) => m.id.includes('orchestrator')),
+    false,
+  )
+  assert.deepEqual(
+    proCatalog.models
+      .find((m) => m.id === 'gemini-4-hydrogen')
+      ?.thinkingOptions?.map((o) => o.id),
+    ['low', 'medium', 'high', 'xhigh'],
+  )
 })
 
 test('exit_plan_mode renders as a Markdown plan card across ACP variants and partial updates', () => {

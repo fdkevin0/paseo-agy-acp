@@ -18,10 +18,9 @@ import type {
   ProviderUsage,
 } from '@getpaseo/plugin/server/provider'
 import {
+  classifyPlanModeTool,
   cleanToolName,
   isAskQuestionName,
-  isForeignToolIdentity,
-  planModeToolName,
   sessionIdPattern,
   setBounded,
   record,
@@ -259,12 +258,13 @@ export function toolDetail(
       log: output ?? '',
     }
   }
-  const planModeTool = planModeToolName(explicitRawName, tool.title)
+  const planModeTool = classifyPlanModeTool(
+    explicitRawName,
+    tool.title,
+    tool.kind,
+  )
   const planText =
-    planModeTool === 'exit_plan_mode' ||
-    (explicitRawName === undefined &&
-      !isForeignToolIdentity(explicitRawName, tool.title) &&
-      tool.kind === 'switch_mode')
+    planModeTool === 'exit_plan_mode' || planModeTool === 'switch_mode'
       ? text(input.plan)
         ? str(input.plan)
         : undefined
@@ -497,6 +497,7 @@ export function configState(response: SessionMetadata): ProviderConfigState {
       : inventoried
         ? knownEfforts.filter((o) => offered.has(o.id))
         : thinkingOptions
+    // Matches agy 1.5.7 acp.(*modelFamily).defaultModel: active thought_level, else 'medium', else first.
     const defaultThinkingOptionId =
       efforts.length > 0
         ? m.id === modelId &&
@@ -619,7 +620,7 @@ export function contextUsage(update: UsageUpdate): ProviderUsage | undefined {
   }
 }
 
-/** Native model limits used when ACP does not report a context window size. */
+/** Native ACP model limits from agy 1.5.7 (observed usage_update size: 256000; 1M is TUI-only). */
 export function contextWindowForModel(modelId?: string): number {
   return modelId?.startsWith('gpt-oss') ? 131_072 : 256_000
 }
@@ -831,19 +832,26 @@ export class Timeline {
         update.sessionUpdate === 'tool_call_update' &&
         isTerminalToolStatus(oldStatus) &&
         !isTerminalToolStatus(incomingStatus)
-      const oldPlanTool = planModeToolName(undefined, old?.title)
+      const oldPlanTool =
+        old !== undefined
+          ? classifyPlanModeTool(str(record(old).name), old.title, old.kind)
+          : undefined
+      const nextPlanTool = classifyPlanModeTool(
+        str(record(update).name),
+        update.title,
+        'switch_mode',
+      )
       const preservePlanMode =
         update.sessionUpdate === 'tool_call_update' &&
-        old !== undefined &&
+        (oldPlanTool === 'exit_plan_mode' || oldPlanTool === 'switch_mode') &&
         str(record(old).name) === undefined &&
-        str(record(update).name) === undefined &&
-        !isForeignToolIdentity(undefined, old.title) &&
-        !isForeignToolIdentity(undefined, update.title) &&
-        (old.kind === 'switch_mode' ||
-          ((oldPlanTool === 'exit_plan_mode' ||
-            oldPlanTool === 'switch_mode') &&
-            update.title != null &&
-            planModeToolName(undefined, update.title) === undefined))
+        (nextPlanTool === 'exit_plan_mode' || nextPlanTool === 'switch_mode') &&
+        (update.kind == null ||
+          update.kind === 'other' ||
+          update.kind === 'switch_mode') &&
+        (old?.kind == null ||
+          old.kind === 'other' ||
+          old.kind === 'switch_mode')
       const tool = {
         ...old,
         // ACP v1 raw input/output null is equivalent to omission, not a clear.
@@ -851,13 +859,7 @@ export class Timeline {
           Object.entries(update).filter(([, value]) => value != null),
         ),
         ...(preserveStatus ? { status: old!.status } : {}),
-        ...(preservePlanMode &&
-        (update.kind == null || update.kind === 'other') &&
-        (old?.kind == null ||
-          old.kind === 'other' ||
-          old.kind === 'switch_mode')
-          ? { kind: 'switch_mode' as const }
-          : {}),
+        ...(preservePlanMode ? { kind: 'switch_mode' as const } : {}),
       } as ToolCall
       setBounded(this.tools, update.toolCallId, tool, TOOL_SNAPSHOT_LIMIT)
       const base = {

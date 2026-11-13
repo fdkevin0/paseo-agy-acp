@@ -704,17 +704,17 @@ export function activeChildIdsForTurn(
   return [...ids]
 }
 
+export type BrainPromptPhase =
+  'foreground' | 'foreground_active' | 'foreground_idle' | 'woken'
+
 export class BrainNode {
   readonly reader: TranscriptReader
   projector: BrainTranscriptProjector
   readonly children = new Map<string, BrainNode>()
   consumedMessages = 0
   turnStartStep = -1
-  seenPlannerResponse = false
-  foregroundIdleReached = false
+  promptPhase: BrainPromptPhase = 'foreground'
   wokeUp = false
-  /** Whether a post-RPC wakeup occurred after the most recent USER_INPUT (initial or continuation). */
-  wokeUpSinceLastPrompt = false
   continuingQuestion = false
   questionSettled = false
   abortedByDenial = false
@@ -764,15 +764,23 @@ export class BrainNode {
     this.resetPhase()
   }
 
+  get foregroundIdleReached(): boolean {
+    return (
+      this.promptPhase === 'foreground_idle' || this.promptPhase === 'woken'
+    )
+  }
+
+  get wokeUpSinceLastPrompt(): boolean {
+    return this.promptPhase === 'woken'
+  }
+
   /** Forget the wakeup phase: a new USER_INPUT, a transcript rewrite or (for hasActiveBackgroundWork) a runtime restart. */
   resetPhase() {
     this.retrySince = undefined
     this.retryError = undefined
     this.retryStep = -1
-    this.seenPlannerResponse = false
-    this.foregroundIdleReached = false
+    this.promptPhase = 'foreground'
     this.wokeUp = false
-    this.wokeUpSinceLastPrompt = false
     this.continuingQuestion = false
     this.questionSettled = false
     this.abortedByDenial = false
@@ -787,7 +795,7 @@ export class BrainNode {
     ) {
       this.projector.clearPending()
       this.abortedByDenial = true
-      this.foregroundIdleReached = true
+      this.promptPhase = 'foreground_idle'
     }
   }
 
@@ -795,11 +803,7 @@ export class BrainNode {
     this.continuingQuestion = true
     this.questionSettled = false
     this.wokeUp = true
-    if (syntheticPrompt) {
-      this.seenPlannerResponse = false
-      this.foregroundIdleReached = false
-      this.wokeUpSinceLastPrompt = false
-    }
+    if (syntheticPrompt) this.promptPhase = 'foreground'
     this.answeredQuestionStep = Number(this.lastStep?.step_index ?? -1)
   }
 
@@ -832,18 +836,16 @@ export class BrainNode {
     if (row.type === 'USER_INPUT') {
       if (this.continuingQuestion) {
         this.continuingQuestion = false
-        this.seenPlannerResponse = false
-        this.foregroundIdleReached = false
-        this.wokeUpSinceLastPrompt = false
+        this.promptPhase = 'foreground'
       } else this.resetPhase()
     } else if (
       row.type === 'SYSTEM_MESSAGE' &&
       !isRestartNotice(row) &&
       !isPlanExecuteNotice(row) &&
-      this.foregroundIdleReached
+      this.promptPhase === 'foreground_idle'
     ) {
+      this.promptPhase = 'woken'
       this.wokeUp = true
-      this.wokeUpSinceLastPrompt = true
     }
     if (isRetryWarning(row)) {
       const createdAt = Date.parse(String(row.created_at ?? ''))
@@ -878,18 +880,22 @@ export class BrainNode {
     this.consumedMessages += countRowMessages(row)
     const items = this.projector.project(row, continuingQuestion)
     if (row.type !== 'CHECKPOINT') this.lastStep = row
-    if (row.type === 'PLANNER_RESPONSE') this.seenPlannerResponse = true
-    if (
-      !this.wokeUpSinceLastPrompt &&
-      (isPlanExecuteNotice(row) || this.projector.hasPending())
-    ) {
-      this.foregroundIdleReached = false
-    } else if (
-      this.seenPlannerResponse &&
-      !this.projector.hasPending() &&
-      (isCompletePlannerResponse(row) || this.projector.hasBackground())
-    ) {
-      this.foregroundIdleReached = true
+    if (this.promptPhase !== 'woken') {
+      if (
+        this.promptPhase === 'foreground' &&
+        row.type === 'PLANNER_RESPONSE'
+      ) {
+        this.promptPhase = 'foreground_active'
+      }
+      if (isPlanExecuteNotice(row) || this.projector.hasPending()) {
+        if (this.promptPhase === 'foreground_idle')
+          this.promptPhase = 'foreground_active'
+      } else if (
+        this.promptPhase !== 'foreground' &&
+        (isCompletePlannerResponse(row) || this.projector.hasBackground())
+      ) {
+        this.promptPhase = 'foreground_idle'
+      }
     }
     return items
   }
