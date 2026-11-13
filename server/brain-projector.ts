@@ -131,10 +131,7 @@ export class BrainTranscriptProjector {
   }
   private background = new Map<string, PendingTool>()
   private daemons = new Map<string, number>()
-  private subagentTouches = new Map<
-    number,
-    { childId: string; stepIndex: number }
-  >()
+  private subagentTouches: { childId: string; stepIndex: number }[] = []
   private completedWakeups = new Map<number, string>()
   private initialPromptStep: number
   private lastRowSenders?: {
@@ -337,7 +334,7 @@ export class BrainTranscriptProjector {
 
   touchedSubagentIds(minStepIndex = -1): ReadonlySet<string> {
     const ids = new Set<string>()
-    for (const touch of this.subagentTouches.values()) {
+    for (const touch of this.subagentTouches) {
       if (touch.stepIndex > minStepIndex) ids.add(touch.childId)
     }
     for (const p of this.pending) {
@@ -462,7 +459,7 @@ export class BrainTranscriptProjector {
       base.detail.type === 'sub_agent' &&
       base.detail.childSessionId
     ) {
-      this.subagentTouches.set(pending.slotIndex, {
+      this.subagentTouches.push({
         childId: base.detail.childSessionId,
         stepIndex: pending.stepIndex,
       })
@@ -623,7 +620,7 @@ export class BrainTranscriptProjector {
         this.pending = []
         this.retired = []
         this.lastErrorCallId = undefined
-        if (!isContinuation) this.subagentTouches.clear()
+        if (!isContinuation) this.subagentTouches.length = 0
         return text ? [{ type: 'user_message', id, text }] : []
       }
       case 'SYSTEM_MESSAGE': {
@@ -634,7 +631,7 @@ export class BrainTranscriptProjector {
           this.retired = []
           this.background.clear()
           this.daemons.clear()
-          this.subagentTouches.clear()
+          this.subagentTouches.length = 0
           return []
         }
         const taskResults = [...text.matchAll(systemTaskResultPattern)]
@@ -723,7 +720,7 @@ export class BrainTranscriptProjector {
         this.lastErrorCallId = undefined
         this.background.clear()
         this.daemons.clear()
-        this.subagentTouches.clear()
+        this.subagentTouches.length = 0
         return [
           {
             type: 'error',

@@ -64,19 +64,31 @@ import {
   type TurnBoundaryCache,
 } from './brain-turns.ts'
 
-/** Determine whether the session has running background tasks or active subagents. Standing IsDaemon schedules are excluded by default so foreground interrupts do not kill them, and included when checking whether an idle runtime can stop. */
+type BackgroundWalk = {
+  /** Standing IsDaemon schedules are excluded unless the caller asks whether an idle runtime can stop. */
+  includeDaemons?: boolean
+  retryTimeoutMs?: number
+  /** Sessions already on the walk, so a child cycle cannot recurse forever. */
+  visiting?: Set<string>
+  /** A subagent's first read decides its own turn phase instead of the parent's. */
+  child?: boolean
+  /** The parent turn that spawned or woke this child. */
+  parent?: {
+    node: BrainNode
+    minStepIndex: number
+    subRecord?: SubagentRecord
+  }
+}
+
+/** Determine whether the session has running background tasks or active subagents. */
 export async function hasActiveBackgroundWork(
   root: string,
   nativeId: string,
-  options: { includeDaemons?: boolean; retryTimeoutMs?: number } = {},
-  visiting = new Set<string>(),
-  isChild = false,
-  parentContext?: {
-    parentNode: BrainNode
-    parentMinStepIndex: number
-    subRecord?: SubagentRecord
-  },
+  options: BackgroundWalk = {},
 ): Promise<boolean> {
+  const visiting = options.visiting ?? new Set<string>()
+  const isChild = options.child === true
+  const parentContext = options.parent
   if (!sessionIdPattern.test(nativeId) || visiting.has(nativeId)) return false
   visiting.add(nativeId)
   try {
@@ -106,8 +118,8 @@ export async function hasActiveBackgroundWork(
       return true
     const childTurn: ChildTurnState = parentContext
       ? resolveChildTurnState(
-          parentContext.parentNode,
-          parentContext.parentMinStepIndex,
+          parentContext.node,
+          parentContext.minStepIndex,
           parentContext.subRecord,
           node,
           inbox,
@@ -141,10 +153,11 @@ export async function hasActiveBackgroundWork(
     for (const childId of activeChildIds) {
       const subRecord = subagents.find((s) => s.conversationId === childId)
       if (
-        await hasActiveBackgroundWork(root, childId, options, visiting, true, {
-          parentNode: node,
-          parentMinStepIndex: nodeMinStep,
-          subRecord,
+        await hasActiveBackgroundWork(root, childId, {
+          ...options,
+          visiting,
+          child: true,
+          parent: { node, minStepIndex: nodeMinStep, subRecord },
         })
       )
         return true
@@ -155,21 +168,45 @@ export async function hasActiveBackgroundWork(
   }
 }
 
-async function settleChildren(
-  root: string,
+/** Resolve a child's turn phase against the parent turn that spawned or woke it. */
+function childTurnOf(
   parentNode: BrainNode,
-  parentInbox: InboxState,
-  activeChildIds: readonly string[],
-  parentSubagents: readonly SubagentRecord[],
   parentMinStepIndex: number,
-  visiting = new Set<string>(),
-  retryTimeoutMs = RETRY_IDLE_TIMEOUT_MS,
-): Promise<{ settled: boolean; error?: string; stalled?: boolean }> {
+  parentSubagents: readonly SubagentRecord[],
+  childId: string,
+  child: BrainNode,
+  childInbox: InboxState,
+): ChildTurnState {
+  return resolveChildTurnState(
+    parentNode,
+    parentMinStepIndex,
+    parentSubagents.find((s) => s.conversationId === childId),
+    child,
+    childInbox,
+  )
+}
+
+type ChildSettlement = { settled: boolean; error?: string; stalled?: boolean }
+
+async function settleChildren(options: {
+  root: string
+  parentNode: BrainNode
+  parentInbox: InboxState
+  activeChildIds: readonly string[]
+  parentSubagents: readonly SubagentRecord[]
+  parentMinStepIndex: number
+  visiting?: Set<string>
+  retryTimeoutMs?: number
+}): Promise<ChildSettlement> {
+  const { root, parentNode, parentInbox, parentSubagents, parentMinStepIndex } =
+    options
+  const visiting = options.visiting ?? new Set<string>()
+  const retryTimeoutMs = options.retryTimeoutMs ?? RETRY_IDLE_TIMEOUT_MS
   if (visiting.has(parentNode.nativeId)) return { settled: true }
   visiting.add(parentNode.nativeId)
   try {
     let settled = true
-    for (const childId of activeChildIds) {
+    for (const childId of options.activeChildIds) {
       if (!sessionIdPattern.test(childId) || visiting.has(childId)) continue
       let child = parentNode.children.get(childId)
       if (!child) {
@@ -189,13 +226,11 @@ async function settleChildren(
         for (const row of rows) child.ingest(row, observedAt)
       } catch (error) {
         if (isMissing(error)) {
-          const subRecord = parentSubagents.find(
-            (s) => s.conversationId === childId,
-          )
-          const childTurn = resolveChildTurnState(
+          const childTurn = childTurnOf(
             parentNode,
             parentMinStepIndex,
-            subRecord,
+            parentSubagents,
+            childId,
             child,
             childInbox,
           )
@@ -216,13 +251,11 @@ async function settleChildren(
         }
         throw error
       }
-      const subRecord = parentSubagents.find(
-        (s) => s.conversationId === childId,
-      )
-      const childTurn = resolveChildTurnState(
+      const childTurn = childTurnOf(
         parentNode,
         parentMinStepIndex,
-        subRecord,
+        parentSubagents,
+        childId,
         child,
         childInbox,
       )
@@ -255,16 +288,15 @@ async function settleChildren(
         child.projector,
         childMinStep,
       )
-      const nested = await settleChildren(
-        root,
-        child,
-        childInbox,
-        grandchildIds,
-        childSubagents,
-        childMinStep,
+      const nested = await settleChildren({
+        ...options,
         visiting,
-        retryTimeoutMs,
-      )
+        parentNode: child,
+        parentInbox: childInbox,
+        activeChildIds: grandchildIds,
+        parentSubagents: childSubagents,
+        parentMinStepIndex: childMinStep,
+      })
       if (nested.error) return nested
       if (!nested.settled) settled = false
       // This child's report must reach the parent's transcript before the child counts as settled.
@@ -988,16 +1020,15 @@ export async function settleBrainTurn(
         node.projector,
         childMinStep,
       )
-      const childStatus = await settleChildren(
+      const childStatus = await settleChildren({
         root,
-        node,
-        inbox,
+        parentNode: node,
+        parentInbox: inbox,
         activeChildIds,
-        subagents,
-        childMinStep,
-        new Set(),
+        parentSubagents: subagents,
+        parentMinStepIndex: childMinStep,
         retryTimeoutMs,
-      )
+      })
       if (signal?.aborted || checkedVersion !== foldVersion) continue
       if (childStatus.error)
         return {
@@ -1143,6 +1174,8 @@ export function watchBrain(
         node.reset(inbox, subagents)
         boundaryCache.clear()
       }
+      // The initial spawn message names the conversation that owns this session's turns; every
+      // correlation below keys off it so the inbox filter and the transcript-row sender check agree.
       const init = inbox.messages.find((m) =>
         isNativeToolName(m.tool?.name ?? '', 'invoke_subagent'),
       )
@@ -1171,6 +1204,9 @@ export function watchBrain(
           !isRestartNotice(row) &&
           Number.isInteger(stepIndex)
         ) {
+          // Only a wakeup from the spawning parent (or, without a spawn record, from any sender that
+          // is not a known descendant) may close the failed turn: a descendant's report must never
+          // clear its ancestor's own terminal failure.
           const senders = extractRowMessageSenders(row)
           const isParentWakeup = parentId
             ? senders.includes(parentId)
@@ -1265,16 +1301,15 @@ export function watchBrain(
         node.projector,
         childMinStep,
       )
-      const childStatus = await settleChildren(
+      const childStatus = await settleChildren({
         root,
-        node,
-        inbox,
+        parentNode: node,
+        parentInbox: inbox,
         activeChildIds,
-        subagents,
-        childMinStep,
-        new Set(),
+        parentSubagents: subagents,
+        parentMinStepIndex: childMinStep,
         retryTimeoutMs,
-      )
+      })
       if (childStatus.error) finishTurn('failed', childStatus.error)
       const hasPendingParentWakeup =
         parentWakeupMsgs.length > wakeupSteps.length &&

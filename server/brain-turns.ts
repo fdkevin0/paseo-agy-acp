@@ -57,8 +57,10 @@ async function readDirSignature(
       }),
     )
     return entries.join('|')
-  } catch {
-    return ''
+  } catch (error) {
+    // A missing metadata dir means the session has no inbox/subagents yet; anything else is a real fault.
+    if (isMissing(error)) return ''
+    throw error
   }
 }
 
