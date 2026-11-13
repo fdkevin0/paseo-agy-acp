@@ -408,7 +408,9 @@ export async function settleBrainTurn(
     onUsage,
     onWakeupState,
     isRpcActive,
+    mcpServerNames,
   }: {
+    mcpServerNames?: readonly string[]
     observation?: BrainTurnObservation
     onUsage?: (usage: StepUsage, wokeUp: boolean) => void
     onWakeupState?: (state: {
@@ -476,6 +478,7 @@ export async function settleBrainTurn(
     },
     reader: observation?.reader,
     allowInitialSpawnPrompt: false,
+    mcpServerNames,
   })
   const ownsObservation = !observation
   const stream =
@@ -957,11 +960,12 @@ export function watchBrain(
   resume?: { afterStep: number; turnSeq: number },
   onSubagents?: (subagents: readonly SubagentRecord[]) => void,
   retryTimeoutMs = RETRY_IDLE_TIMEOUT_MS,
+  mcpServerNames: readonly string[] = [],
 ): BrainWatchHandle {
   if (!sessionIdPattern.test(nativeId))
     throw new Error('Invalid Brain session ID')
-  const timeline = new Timeline(sessionId)
-  const node = new BrainNode(nativeId, sessionId)
+  const timeline = new Timeline(sessionId, mcpServerNames)
+  const node = new BrainNode(nativeId, sessionId, { mcpServerNames })
   let stopped = false
   let inflight: Promise<void> | undefined
   let cancelling: Promise<void> | undefined

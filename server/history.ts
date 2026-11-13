@@ -305,7 +305,9 @@ export function projectReplayHistory({
   acpToolCallIds,
   acpToolSnapshots,
   acpResultProvided,
+  mcpServerNames,
 }: {
+  mcpServerNames?: readonly string[]
   sessionId: string
   rows: readonly Record<string, unknown>[]
   inbox: InboxState
@@ -318,7 +320,12 @@ export function projectReplayHistory({
   entries: HistoryEntry[]
   lastKnownStepIndex: number
 } {
-  const projector = new BrainTranscriptProjector(sessionId, undefined, false)
+  const projector = new BrainTranscriptProjector(
+    sessionId,
+    undefined,
+    false,
+    mcpServerNames,
+  )
   projector.syncMetadata(inbox, subagents)
   const slots = projector.observeRows(rows)
   const { alignedIds, verifiedAcpToolIds } = alignReplayTools(

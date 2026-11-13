@@ -102,8 +102,9 @@ export function permissionKind(
 export function isPreapprovedMcpTool(
   call: { name?: unknown; title?: string | null; rawInput?: unknown },
   policy: ProviderToolPolicy | undefined,
+  serverNames: readonly string[] = [],
 ): boolean {
-  const identity = resolveMcpToolIdentity(call)
+  const identity = resolveMcpToolIdentity(call, serverNames)
   return (
     identity !== undefined &&
     policy?.preapproved.some(

@@ -157,6 +157,7 @@ export class BrainTranscriptProjector {
     tool: PendingTool,
   ) => void
 
+  private readonly mcpServerNames: readonly string[]
   constructor(
     sessionId: string,
     onQuestionSettledByGeneric?: (
@@ -164,7 +165,9 @@ export class BrainTranscriptProjector {
       tool: PendingTool,
     ) => void,
     allowInitialSpawnPrompt = true,
+    mcpServerNames: readonly string[] = [],
   ) {
+    this.mcpServerNames = mcpServerNames
     this.sessionId = sessionId
     this.onQuestionSettledByGeneric = onQuestionSettledByGeneric
     this.initialPromptStep = allowInitialSpawnPrompt ? 0 : -1
@@ -398,7 +401,10 @@ export class BrainTranscriptProjector {
       type: 'tool_call' as const,
       id: pending.id,
       callId: pending.callId,
-      name: toolDisplayName({ name: pending.name, rawInput: pending.rawInput }),
+      name: toolDisplayName(
+        { name: pending.name, rawInput: pending.rawInput },
+        this.mcpServerNames,
+      ),
       detail: toolDetail({
         title: pending.name,
         rawInput: pending.rawInput,
@@ -494,7 +500,10 @@ export class BrainTranscriptProjector {
       type: 'tool_call',
       id: pending.id,
       callId: pending.callId,
-      name: toolDisplayName({ name: pending.name, rawInput: pending.rawInput }),
+      name: toolDisplayName(
+        { name: pending.name, rawInput: pending.rawInput },
+        this.mcpServerNames,
+      ),
       detail: toolDetail({
         title: pending.name,
         rawInput: pending.rawInput,
@@ -784,6 +793,7 @@ export type BrainPromptPhase =
   'foreground' | 'foreground_active' | 'foreground_idle' | 'woken'
 
 export type BrainNodeOptions = {
+  mcpServerNames?: readonly string[]
   onQuestionSettled?: (
     questions: readonly NormalizedQuestion[],
     wokeUp: boolean,
@@ -811,6 +821,7 @@ export class BrainNode {
   private retrySince?: number
   private retryError?: string
   private retryStep = -1
+  private mcpServerNames: readonly string[]
   private allowInitialSpawnPrompt: boolean
   readonly nativeId: string
   readonly sessionId: string
@@ -825,6 +836,7 @@ export class BrainNode {
     sessionId = nativeId,
     options: BrainNodeOptions = {},
   ) {
+    this.mcpServerNames = options.mcpServerNames ?? []
     this.reader = options.reader ?? new TranscriptReader()
     this.nativeId = nativeId
     this.sessionId = sessionId
@@ -839,6 +851,7 @@ export class BrainNode {
       (questions, tool) =>
         this.onQuestionSettled?.(questions, this.wokeUp, tool.callId),
       this.allowInitialSpawnPrompt,
+      this.mcpServerNames,
     )
   }
 

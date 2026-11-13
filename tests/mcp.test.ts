@@ -80,6 +80,7 @@ test('explicit identity wins over descriptive titles and cannot widen grants', (
 test('ACP updates and Brain replay use the same MCP label and retain input/output/status', () => {
   for (const name of [
     'default_api:mcp__srv__lookup',
+    'default_api:mcp_srv_lookup',
     'default_api:call_mcp_tool',
   ]) {
     const input = {
@@ -91,7 +92,7 @@ test('ACP updates and Brain replay use the same MCP label and retain input/outpu
       isError: true,
       content: [{ type: 'text', text: 'reported error' }],
     }
-    const timeline = new Timeline('session')
+    const timeline = new Timeline('session', ['srv'])
     const start = timeline.update({
       sessionUpdate: 'tool_call',
       toolCallId: 'call',
@@ -109,7 +110,9 @@ test('ACP updates and Brain replay use the same MCP label and retain input/outpu
       rawOutput: output,
       status: 'completed',
     })
-    const projector = new BrainTranscriptProjector('session')
+    const projector = new BrainTranscriptProjector('session', undefined, true, [
+      'srv',
+    ])
     projector.bindToolCallIds(['call'])
     projector.project({
       step_index: 1,
@@ -127,4 +130,39 @@ test('ACP updates and Brain replay use the same MCP label and retain input/outpu
     assert.equal(live.status, 'completed')
     assert.deepEqual(live.detail, { type: 'unknown', input, output })
   }
+})
+
+// Format established from AGY 1.5.8 GetMcpToolNameWithPrefix; values are synthetic.
+test('native underscore names require a unique configured server, including collision with legacy encoding', () => {
+  const call = { title: 'Run default_api:mcp_srv_one_lookup_item' }
+  const grant = {
+    preapproved: [
+      { kind: 'mcp' as const, server: 'srv_one', tool: 'lookup_item' },
+    ],
+  }
+  assert.deepEqual(resolveMcpToolIdentity(call, ['srv_one']), {
+    server: 'srv_one',
+    tool: 'lookup_item',
+  })
+  assert.equal(toolDisplayName(call, ['srv_one']), 'srv_one.lookup_item')
+  assert.equal(isPreapprovedMcpTool(call, grant, ['srv_one']), true)
+  for (const servers of [[], ['other'], ['srv', 'srv_one']]) {
+    assert.equal(resolveMcpToolIdentity(call, servers), undefined)
+    assert.equal(isPreapprovedMcpTool(call, grant, servers), false)
+    assert.equal(toolDisplayName(call, servers), call.title)
+  }
+  assert.equal(
+    resolveMcpToolIdentity({ name: 'mcp__srv__lookup' }, ['_srv']),
+    undefined,
+  )
+  assert.deepEqual(
+    resolveMcpToolIdentity({ name: 'mcp__srv_lookup' }, ['_srv']),
+    { server: '_srv', tool: 'lookup' },
+  )
+  assert.equal(
+    isPreapprovedMcpTool({ name: 'mcp_srv_one_lookup_Item' }, grant, [
+      'srv_one',
+    ]),
+    false,
+  )
 })

@@ -11,6 +11,7 @@ type ToolIdentityInput = {
 /** Resolve protocol identities only; display labels must never become permission keys. */
 export function resolveMcpToolIdentity(
   call: ToolIdentityInput,
+  serverNames: readonly string[] = [],
 ): McpToolIdentity | undefined {
   const explicit = str(call.name)
   const name =
@@ -25,20 +26,31 @@ export function resolveMcpToolIdentity(
     const tool = str(input.ToolName ?? input.toolName ?? input.tool)
     return server && tool ? { server, tool } : undefined
   }
+  // AGY 1.5.8 mcpcore.GetMcpToolNameWithPrefix (0x8804e60) joins mcp/server/tool
+  // with single underscores; configured server names are needed to avoid guessing.
+  const candidates = [...new Set(serverNames)].flatMap((server) => {
+    const prefix = `mcp_${server}_`
+    return server && name.startsWith(prefix) && name.length > prefix.length
+      ? [{ server, tool: name.slice(prefix.length) }]
+      : []
+  })
   // Legacy adapter spellings; reject ambiguous boundaries rather than guessing.
-  const match = name.startsWith('mcp__')
+  const parts = name.startsWith('mcp__')
     ? name.slice(5).split('__')
     : name.split(':')
   if (
-    match.length !== 2 ||
-    !match.every((part) => /^[a-zA-Z0-9_.-]+$/.test(part))
+    parts.length === 2 &&
+    parts.every((part) => /^[a-zA-Z0-9_.-]+$/.test(part))
   )
-    return undefined
-  return { server: match[0], tool: match[1] }
+    candidates.push({ server: parts[0], tool: parts[1] })
+  return candidates.length === 1 ? candidates[0] : undefined
 }
 
-export function toolDisplayName(call: ToolIdentityInput): string {
-  const mcp = resolveMcpToolIdentity(call)
+export function toolDisplayName(
+  call: ToolIdentityInput,
+  serverNames: readonly string[] = [],
+): string {
+  const mcp = resolveMcpToolIdentity(call, serverNames)
   return mcp
     ? `${mcp.server}.${mcp.tool}`
     : cleanToolName(str(call.name) ?? call.title ?? 'Tool')

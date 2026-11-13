@@ -859,7 +859,7 @@ new AgentSideConnection((client) => {
           sessionId,
           toolCall: {
             toolCallId: 'mcp-direct',
-            name: 'default_api:mcp__rea__open_binary',
+            name: 'default_api:mcp_rea_open_binary',
             title: 'Open binary',
             rawInput: { path: '/bin/ls' },
           },

@@ -1187,6 +1187,7 @@ test('toolPolicy MCP preapprovals, allow_once default, deny interrupt, chooser q
       sessionId: 's',
       config: {
         ...h.config,
+        mcpServers: { rea: { type: 'stdio', command: 'fixture-mcp' } },
         toolPolicy: {
           preapproved: [{ kind: 'mcp', server: 'rea', tool: 'open_binary' }],
         },
