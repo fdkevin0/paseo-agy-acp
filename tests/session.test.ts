@@ -12,10 +12,15 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
-import type { ProviderEvent } from '@getpaseo/plugin/server/provider'
+import {
+  PROVIDER_CAPABILITIES,
+  type ProviderEvent,
+} from '@getpaseo/plugin/server/provider'
 import { readSubagents } from '../server/brain.ts'
+import { createProvider } from '../server/provider.ts'
 import { SessionManager } from '../server/session.ts'
 import { AgyUsageSource } from '../server/usage.ts'
+import { collectProviderEvents } from './helpers.ts'
 
 function manager(extraArgs: string[] = []) {
   return new SessionManager({
@@ -1274,3 +1279,417 @@ test('native compaction has stable live/history identity, command-only visibilit
     await rm(home, { recursive: true, force: true })
   }
 })
+
+test(
+  'Orchestrator catalog probe, session.open, bidirectional configure, relaunch models preservation and standalone thinking validation',
+  { timeout: 10000 },
+  async () => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-orchestrator-session-'))
+    const logPath = join(home, 'rpc.log')
+    const fixturePath = join(home, 'orchestrator-acp.mjs')
+    const sdkUrl = import.meta.resolve('@agentclientprotocol/sdk')
+    await writeFile(
+      fixturePath,
+      `
+import { AgentSideConnection, ndJsonStream } from ${JSON.stringify(sdkUrl)}
+import { appendFileSync } from 'node:fs'
+import { WritableStream } from 'node:stream/web'
+import { Readable, Writable } from 'node:stream'
+
+const log = (line) => {
+  if (process.env.AGY_TEST_LOG) appendFileSync(process.env.AGY_TEST_LOG, line + '\\n')
+}
+log('spawn:skip=' + process.argv.includes('--dangerously-skip-permissions'))
+
+let currentModel = 'gemini-pro-orchestrator'
+let currentThought = 'medium'
+let currentMode = 'default'
+let omitModelsNext = false
+
+function buildConfigOptions() {
+  const opts = [
+    {
+      id: 'model',
+      name: 'Model',
+      type: 'select',
+      currentValue: currentModel,
+      options: [
+        { value: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+        { value: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen' },
+        { value: 'gemini-pro-orchestrator', name: 'Orchestrator (Carbon)' },
+        { value: 'gemini-pro-orchestrator-argon', name: 'Orchestrator (Argon)' },
+        { value: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
+      ],
+    },
+  ]
+  if (currentModel === 'gemini-4-hydrogen') {
+    opts.push({
+      id: 'thought_level',
+      name: 'Thinking Level',
+      type: 'select',
+      currentValue: currentThought,
+      options: [
+        { value: 'low', name: 'Low' },
+        { value: 'medium', name: 'Medium' },
+        { value: 'high', name: 'High' },
+        { value: 'xhigh', name: 'Extra' },
+      ],
+    })
+  } else if (
+    currentModel === 'gemini-4-carbon' ||
+    currentModel === 'gpt-oss-120b-medium'
+  ) {
+    if (currentThought === 'xhigh') currentThought = 'high'
+    opts.push({
+      id: 'thought_level',
+      name: 'Thinking Level',
+      type: 'select',
+      currentValue: currentThought,
+      options: [
+        { value: 'low', name: 'Low' },
+        { value: 'medium', name: 'Medium' },
+        { value: 'high', name: 'High' },
+      ],
+    })
+  }
+  opts.push({
+    id: 'mode',
+    name: 'Mode',
+    category: 'mode',
+    type: 'select',
+    currentValue: currentMode,
+    options: [
+      { value: 'default', name: 'Default' },
+      { value: 'accept-edits', name: 'Accept Edits' },
+      { value: 'plan', name: 'Plan Mode' },
+    ],
+  })
+  return opts
+}
+
+const availableModels = [
+  { modelId: 'gemini-4-carbon-low' },
+  { modelId: 'gemini-4-carbon-medium' },
+  { modelId: 'gemini-4-carbon-high' },
+  { modelId: 'gemini-4-hydrogen-high' },
+  { modelId: 'gemini-4-hydrogen-xhigh' },
+  { modelId: 'gemini-4-hydrogen-medium' },
+  { modelId: 'gemini-4-hydrogen-low' },
+  { modelId: 'gemini-pro-orchestrator' },
+  { modelId: 'gemini-pro-orchestrator-argon' },
+  { modelId: 'gpt-oss-120b-medium' },
+]
+
+process.stdin.on('end', () => process.exit(0))
+const stream = ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin))
+const writer = stream.writable.getWriter()
+stream.writable = new WritableStream({
+  write(message) {
+    if (
+      'result' in message &&
+      message.result &&
+      typeof message.result === 'object' &&
+      'configOptions' in message.result
+    ) {
+      if (omitModelsNext) {
+        omitModelsNext = false
+      } else if ('sessionId' in message.result) {
+        message = {
+          ...message,
+          result: {
+            ...message.result,
+            models: { availableModels },
+          },
+        }
+      }
+    }
+    return writer.write(message)
+  },
+})
+
+new AgentSideConnection((client) => ({
+  async initialize() {
+    return { protocolVersion: 1, agentCapabilities: { loadSession: true } }
+  },
+  async authenticate() {
+    return {}
+  },
+  async newSession() {
+    const sessionId = '11111111-1111-4111-8111-111111111111'
+    setTimeout(() => {
+      void client.sessionUpdate({
+        sessionId,
+        update: { sessionUpdate: 'available_commands_update', availableCommands: [] },
+      })
+    }, 0)
+    return { sessionId, configOptions: buildConfigOptions() }
+  },
+  async loadSession({ sessionId }) {
+    omitModelsNext = true
+    setTimeout(() => {
+      void client.sessionUpdate({
+        sessionId,
+        update: { sessionUpdate: 'available_commands_update', availableCommands: [] },
+      })
+    }, 0)
+    return { configOptions: buildConfigOptions() }
+  },
+  async closeSession() {
+    return {}
+  },
+  async setSessionConfigOption({ configId, value }) {
+    log('set:' + configId + '=' + value)
+    const opts = buildConfigOptions()
+    const target = opts.find((o) => o.id === configId)
+    if (!target) throw new Error('unadvertised ' + configId)
+    if (!target.options.some((o) => o.value === value)) {
+      throw new Error('invalid ' + configId + '=' + value)
+    }
+    if (configId === 'model') currentModel = String(value)
+    else if (configId === 'thought_level') currentThought = String(value)
+    else if (configId === 'mode') currentMode = String(value)
+    return { configOptions: buildConfigOptions() }
+  },
+  async prompt() {
+    return { stopReason: 'end_turn' }
+  },
+  async cancel() {},
+}), stream)
+`,
+    )
+    const provider = await createProvider(new AgyUsageSource()).connect({
+      versions: [1],
+      capabilities: PROVIDER_CAPABILITIES,
+      launch: {
+        command: process.execPath,
+        args: [fixturePath],
+        env: {
+          HOME: home,
+          PATH: process.env.PATH ?? '',
+          AGY_TEST_LOG: logPath,
+        },
+      },
+    })
+    const { events, wait } = collectProviderEvents(provider)
+    try {
+      // 1. Catalog probe when native default is gemini-pro-orchestrator
+      await provider.send({ type: 'catalog', requestId: 'cat-1', cwd: home })
+      const catalogEvent = await wait(
+        (e) => e.type === 'catalog' && e.requestId === 'cat-1',
+      )
+      assert.equal(catalogEvent.type, 'catalog')
+      assert.equal(catalogEvent.catalog.defaultModel, 'gemini-pro-orchestrator')
+      assert.deepEqual(catalogEvent.catalog.thinkingOptions, [])
+      assert.equal(catalogEvent.catalog.defaultThinkingOption, undefined)
+      const hydrogen = catalogEvent.catalog.models.find(
+        (m) => m.id === 'gemini-4-hydrogen',
+      )
+      assert.deepEqual(hydrogen?.thinkingOptions, [
+        { id: 'low', label: 'Low' },
+        { id: 'medium', label: 'Medium' },
+        { id: 'high', label: 'High' },
+        { id: 'xhigh', label: 'Extra' },
+      ])
+      assert.equal(hydrogen?.defaultThinkingOptionId, 'medium')
+      assert.deepEqual(
+        catalogEvent.catalog.models.find(
+          (m) => m.id === 'gemini-pro-orchestrator',
+        )?.thinkingOptions,
+        [],
+      )
+
+      // 2. session.open on gemini-pro-orchestrator with host-normalized thinkingOption: 'medium'
+      events.length = 0
+      await provider.send({
+        type: 'session.open',
+        requestId: 'open-1',
+        sessionId: 's1',
+        history: 'skip',
+        config: {
+          cwd: home,
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: true,
+          model: 'gemini-pro-orchestrator',
+          thinkingOption: 'medium',
+        },
+      })
+      await wait((e) => e.type === 'session.ready' && e.sessionId === 's1')
+      let cfg = events.findLast(
+        (e) => e.type === 'session.config' && e.sessionId === 's1',
+      )
+      assert.ok(cfg?.type === 'session.config')
+      assert.equal(cfg.config.model, 'gemini-pro-orchestrator')
+      assert.equal(cfg.config.thinkingOption, undefined)
+
+      // 3. Whole-bundle session.configure while already on gemini-pro-orchestrator
+      events.length = 0
+      await provider.send({
+        type: 'session.configure',
+        requestId: 'cfg-orch',
+        sessionId: 's1',
+        changes: {
+          model: 'gemini-pro-orchestrator',
+          mode: 'plan',
+          thinkingOption: 'medium',
+        },
+      })
+      cfg = await wait(
+        (e) => e.type === 'session.config' && e.sessionId === 's1',
+      )
+      assert.equal(cfg.type, 'session.config')
+      assert.equal(cfg.config.model, 'gemini-pro-orchestrator')
+      assert.equal(cfg.config.mode, 'plan')
+      assert.equal(cfg.config.thinkingOption, undefined)
+
+      // 4. Orchestrator -> Hydrogen (xhigh) + full-access relaunch preserves models, model, and xhigh
+      events.length = 0
+      await provider.send({
+        type: 'session.configure',
+        requestId: 'cfg-h2',
+        sessionId: 's1',
+        changes: {
+          model: 'gemini-4-hydrogen',
+          thinkingOption: 'xhigh',
+          mode: 'full-access',
+        },
+      })
+      cfg = await wait(
+        (e) =>
+          e.type === 'session.config' &&
+          e.sessionId === 's1' &&
+          e.config.mode === 'full-access',
+      )
+      assert.equal(cfg.type, 'session.config')
+      assert.equal(cfg.config.model, 'gemini-4-hydrogen')
+      assert.equal(cfg.config.thinkingOption, 'xhigh')
+      assert.equal(cfg.config.mode, 'full-access')
+
+      // 5. Hydrogen -> Orchestrator after relaunch (where loadSession omitted models)
+      events.length = 0
+      await provider.send({
+        type: 'session.configure',
+        requestId: 'cfg-back',
+        sessionId: 's1',
+        changes: {
+          model: 'gemini-pro-orchestrator',
+          thinkingOption: 'medium',
+          mode: 'default',
+        },
+      })
+      cfg = await wait(
+        (e) =>
+          e.type === 'session.config' &&
+          e.sessionId === 's1' &&
+          e.config.mode === 'default',
+      )
+      assert.equal(cfg.type, 'session.config')
+      assert.equal(cfg.config.model, 'gemini-pro-orchestrator')
+      assert.equal(cfg.config.thinkingOption, undefined)
+      assert.equal(cfg.config.mode, 'default')
+
+      // 6. Standalone { mode: 'full-access', thinkingOption: 'high' } without model rejects before relaunching
+      const spawnsBefore = (await readFile(logPath, 'utf8'))
+        .trim()
+        .split('\n')
+        .filter((line) => line.startsWith('spawn:')).length
+      events.length = 0
+      await provider.send({
+        type: 'session.configure',
+        requestId: 'cfg-reject',
+        sessionId: 's1',
+        changes: {
+          mode: 'full-access',
+          thinkingOption: 'high',
+        },
+      })
+      const failed = await wait(
+        (e) => e.type === 'request.failed' && e.requestId === 'cfg-reject',
+      )
+      assert.equal(failed.type, 'request.failed')
+      assert.match(failed.error.message, /does not advertise thought_level/)
+      const spawnsAfter = (await readFile(logPath, 'utf8'))
+        .trim()
+        .split('\n')
+        .filter((line) => line.startsWith('spawn:')).length
+      assert.equal(
+        spawnsAfter,
+        spawnsBefore,
+        'standalone invalid thinkingOption must reject before spawning a relaunch',
+      )
+
+      // 7. Suffix-fixed model advertising thought_level ignores bundled thinkingOption and rejects standalone thinkingOption
+      events.length = 0
+      await provider.send({
+        type: 'session.configure',
+        requestId: 'cfg-gpt-oss',
+        sessionId: 's1',
+        changes: {
+          model: 'gpt-oss-120b-medium',
+          thinkingOption: 'xhigh',
+        },
+      })
+      cfg = await wait(
+        (e) =>
+          e.type === 'session.config' &&
+          e.sessionId === 's1' &&
+          e.config.model === 'gpt-oss-120b-medium',
+      )
+      assert.equal(cfg.type, 'session.config')
+      assert.equal(cfg.config.thinkingOption, undefined)
+
+      events.length = 0
+      await provider.send({
+        type: 'session.configure',
+        requestId: 'cfg-gpt-oss-reject',
+        sessionId: 's1',
+        changes: {
+          mode: 'full-access',
+          thinkingOption: 'high',
+        },
+      })
+      const gptFailed = await wait(
+        (e) =>
+          e.type === 'request.failed' && e.requestId === 'cfg-gpt-oss-reject',
+      )
+      assert.equal(gptFailed.type, 'request.failed')
+      assert.match(gptFailed.error.message, /does not advertise thought_level/)
+
+      // 8. Partial mutation { model: 'gemini-4-hydrogen', thinkingOption: 'invalid', mode: 'full-access' } publishes mutated model without relaunching
+      events.length = 0
+      await provider.send({
+        type: 'session.configure',
+        requestId: 'cfg-partial',
+        sessionId: 's1',
+        changes: {
+          model: 'gemini-4-hydrogen',
+          thinkingOption: 'invalid',
+          mode: 'full-access',
+        },
+      })
+      const partialFailed = await wait(
+        (e) => e.type === 'request.failed' && e.requestId === 'cfg-partial',
+      )
+      assert.equal(partialFailed.type, 'request.failed')
+      const partialCfg = events.findLast(
+        (e) => e.type === 'session.config' && e.sessionId === 's1',
+      )
+      assert.ok(partialCfg?.type === 'session.config')
+      assert.equal(partialCfg.config.model, 'gemini-4-hydrogen')
+      assert.equal(partialCfg.config.mode, 'default')
+      const spawnsFinal = (await readFile(logPath, 'utf8'))
+        .trim()
+        .split('\n')
+        .filter((line) => line.startsWith('spawn:')).length
+      assert.equal(
+        spawnsFinal,
+        spawnsBefore,
+        'invalid thought_level must abort before spawning a full-access relaunch',
+      )
+    } finally {
+      await provider.close()
+      await rm(home, { recursive: true, force: true })
+    }
+  },
+)

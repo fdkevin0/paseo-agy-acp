@@ -52,6 +52,9 @@ export type InboxState = {
 const restartNoticePattern =
   /\bsender=system\b[^\n]*\scontent=\[Notice\] All your subagents and background tasks have been stopped/
 
+const planExecuteNoticePattern =
+  /(?:^|<SYSTEM_MESSAGE>\s*)(?:Plan mode is off: this turn runs on |\[plan review\] Plan mode is on: this turn runs on |\[plan review due\] )/
+
 const rowMessageHeaderPattern =
   /(?:^|\n)(?:\d+\.\s+)?\[Message\]\s+(?:timestamp=\S+\s+)?sender=(\S+)(?:\s+priority=(\S+))?/g
 
@@ -98,6 +101,15 @@ export function isRestartNotice(
   return (
     row?.type === 'SYSTEM_MESSAGE' &&
     restartNoticePattern.test(String(row.content ?? ''))
+  )
+}
+
+export function isPlanExecuteNotice(
+  row: Record<string, unknown> | undefined,
+): boolean {
+  return (
+    row?.type === 'SYSTEM_MESSAGE' &&
+    planExecuteNoticePattern.test(String(row.content ?? ''))
   )
 }
 

@@ -807,3 +807,233 @@ test('write card classification ignores paths or non-write tools containing "wri
     'edit',
   )
 })
+
+test('configState resolves canonical per-model efforts independently of Orchestrator omitting thought_level', () => {
+  const availableModels = [
+    { modelId: 'gemini-pro-orchestrator', name: 'Orchestrator (Carbon)' },
+    { modelId: 'gemini-pro-orchestrator-argon', name: 'Orchestrator (Argon)' },
+    { modelId: 'gemini-4-hydrogen-high', name: 'Gemini 4 Hydrogen (High)' },
+    { modelId: 'gemini-4-hydrogen-xhigh', name: 'Gemini 4 Hydrogen (XHigh)' },
+    { modelId: 'gemini-4-hydrogen-medium', name: 'Gemini 4 Hydrogen (Medium)' },
+    { modelId: 'gemini-4-hydrogen-low', name: 'Gemini 4 Hydrogen (Low)' },
+    { modelId: 'gemini-4-carbon-low', name: 'Gemini 4 Carbon (Low)' },
+    { modelId: 'gemini-4-carbon-medium', name: 'Gemini 4 Carbon (Medium)' },
+    { modelId: 'gemini-4-carbon-high', name: 'Gemini 4 Carbon (High)' },
+    { modelId: 'model-pro-high', name: 'Model Pro (High)' },
+    { modelId: 'model-pro-max', name: 'Model Pro (Max)' },
+    { modelId: 'model-lite-low-effort', name: 'Model Lite (Low)' },
+    { modelId: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
+    { modelId: 'gemini-3.5-flash-extra-low', name: 'Gemini 3.5 Flash' },
+  ]
+  const modelSelect = {
+    type: 'select' as const,
+    id: 'model',
+    name: 'Model',
+    currentValue: 'gemini-pro-orchestrator',
+    options: [
+      { value: 'gemini-pro-orchestrator', name: 'Orchestrator (Carbon)' },
+      { value: 'gemini-pro-orchestrator-argon', name: 'Orchestrator (Argon)' },
+      { value: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen' },
+      { value: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+      { value: 'model-pro', name: 'Model Pro' },
+      { value: 'model-lite', name: 'Model Lite' },
+      { value: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
+      { value: 'gemini-3.5-flash-extra-low', name: 'Gemini 3.5 Flash' },
+    ],
+  }
+  const onOrchestrator = configState({
+    configOptions: [modelSelect],
+    models: { availableModels },
+  })
+  assert.equal(onOrchestrator.model, 'gemini-pro-orchestrator')
+  assert.deepEqual(onOrchestrator.thinkingOptions, [])
+  assert.equal(onOrchestrator.thinkingOption, undefined)
+
+  const byId = new Map(onOrchestrator.models.map((m) => [m.id, m]))
+  for (const id of [
+    'gemini-pro-orchestrator',
+    'gemini-pro-orchestrator-argon',
+    'gpt-oss-120b-medium',
+    'gemini-3.5-flash-extra-low',
+  ]) {
+    assert.deepEqual(byId.get(id)?.thinkingOptions, [])
+    assert.equal(byId.get(id)?.defaultThinkingOptionId, undefined)
+  }
+  assert.equal(
+    byId.get('gemini-pro-orchestrator')?.contextWindowMaxTokens,
+    256_000,
+  )
+  assert.deepEqual(byId.get('gemini-4-hydrogen')?.thinkingOptions, [
+    { id: 'low', label: 'Low' },
+    { id: 'medium', label: 'Medium' },
+    { id: 'high', label: 'High' },
+    { id: 'xhigh', label: 'Extra' },
+  ])
+  assert.equal(byId.get('gemini-4-hydrogen')?.defaultThinkingOptionId, 'medium')
+  assert.deepEqual(
+    byId.get('gemini-4-carbon')?.thinkingOptions?.map((o) => o.id),
+    ['low', 'medium', 'high'],
+  )
+  assert.deepEqual(byId.get('model-pro')?.thinkingOptions, [
+    { id: 'high', label: 'High' },
+    { id: 'max', label: 'Max' },
+  ])
+  assert.equal(byId.get('model-pro')?.defaultThinkingOptionId, 'high')
+  assert.deepEqual(byId.get('model-lite')?.thinkingOptions, [
+    { id: 'low', label: 'Low' },
+  ])
+  assert.equal(byId.get('model-lite')?.defaultThinkingOptionId, 'low')
+
+  // Active user preference in thought_level.currentValue is preserved on the active model,
+  // and hyphenated future effort IDs match longest-first rather than splitting at '-high'.
+  const onHydrogen = configState({
+    configOptions: [
+      { ...modelSelect, currentValue: 'gemini-4-hydrogen' },
+      {
+        type: 'select',
+        id: 'thought_level',
+        name: 'Thinking Level',
+        currentValue: 'xhigh',
+        options: [
+          { value: 'low', name: 'Low' },
+          { value: 'medium', name: 'Medium' },
+          { value: 'high', name: 'High' },
+          { value: 'xhigh', name: 'Extra' },
+          { value: 'extra-high', name: 'Ultra' },
+        ],
+      },
+    ],
+    models: {
+      availableModels: [
+        ...availableModels,
+        { modelId: 'gemini-4-hydrogen-extra-high' },
+      ],
+    },
+  })
+  const hydrogen = onHydrogen.models.find((m) => m.id === 'gemini-4-hydrogen')
+  assert.equal(hydrogen?.defaultThinkingOptionId, 'xhigh')
+  assert.deepEqual(
+    hydrogen?.thinkingOptions?.map((o) => o.id),
+    ['low', 'medium', 'high', 'xhigh', 'extra-high'],
+  )
+  assert.equal(
+    onHydrogen.models.find((m) => m.id === 'gemini-4-carbon')
+      ?.defaultThinkingOptionId,
+    'medium',
+  )
+
+  // If thought_level is omitted even when availableModels lists variants for the active model,
+  // active composer thinkingOptions stays empty so Paseo never renders an inoperable selector.
+  const suppressedActive = configState({
+    configOptions: [{ ...modelSelect, currentValue: 'gemini-4-hydrogen' }],
+    models: { availableModels },
+  })
+  assert.deepEqual(suppressedActive.thinkingOptions, [])
+  assert.equal(suppressedActive.thinkingOption, undefined)
+})
+
+test('exit_plan_mode renders as a Markdown plan card across ACP variants and partial updates', () => {
+  const md = '# Implementation Plan\n\n- Step 1\n'
+  for (const tool of [
+    { name: 'exit_plan_mode', rawInput: { plan: md } },
+    { name: 'contrib:exit_plan_mode', rawInput: { plan: md } },
+    {
+      title: 'Run contrib:exit_plan_mode',
+      kind: 'other' as const,
+      rawInput: { plan: md },
+    },
+    {
+      title: 'Run exit_plan_mode',
+      kind: 'other' as const,
+      rawInput: { plan: md },
+    },
+  ]) {
+    assert.deepEqual(toolDetail(tool as Parameters<typeof toolDetail>[0]), {
+      type: 'plan',
+      text: md,
+    })
+  }
+  assert.equal(
+    toolDetail({
+      title: 'Run contrib:exit_plan_mode',
+      rawInput: { plan: '   ' },
+    }).type,
+    'unknown',
+  )
+  assert.equal(
+    toolDetail({
+      title: 'Run contrib:enter_plan_mode',
+      rawInput: { reason: 'Need replanning' },
+    }).type,
+    'unknown',
+  )
+  assert.equal(
+    toolDetail({
+      name: 'mcp__srv__other',
+      title: 'exit_plan_mode',
+      rawInput: { plan: md },
+    } as unknown as Parameters<typeof toolDetail>[0]).type,
+    'unknown',
+  )
+  for (const foreignTitle of [
+    'Run mcp__srv__switch_mode',
+    'srv:switch_mode',
+    'Run call_mcp_tool',
+  ]) {
+    assert.equal(
+      toolDetail({
+        title: foreignTitle,
+        kind: 'switch_mode',
+        rawInput: { plan: md },
+      }).type,
+      'unknown',
+    )
+  }
+
+  const timeline = new Timeline('s')
+  const started = timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'exit-1',
+    title: 'Run contrib:exit_plan_mode',
+    kind: 'other',
+    status: 'in_progress',
+    rawInput: { plan: md },
+  })
+  assert.ok(started?.type === 'tool_call')
+  assert.deepEqual(started.detail, { type: 'plan', text: md })
+  const mid = timeline.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'exit-1',
+    title: 'Exiting plan mode...',
+  })
+  assert.ok(mid?.type === 'tool_call')
+  assert.deepEqual(mid.detail, { type: 'plan', text: md })
+  const finished = timeline.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'exit-1',
+    kind: 'other',
+    status: 'completed',
+    rawOutput: 'Plan mode is off.',
+  })
+  assert.ok(finished?.type === 'tool_call')
+  assert.equal(finished.status, 'completed')
+  assert.deepEqual(finished.detail, { type: 'plan', text: md })
+
+  // enter_plan_mode must never flip to a plan card when a partial update replaces its title
+  timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'enter-1',
+    title: 'Run contrib:enter_plan_mode',
+    kind: 'other',
+    status: 'in_progress',
+    rawInput: { plan: md, reason: 'Review' },
+  })
+  const entered = timeline.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'enter-1',
+    title: 'Entered plan mode',
+    status: 'completed',
+  })
+  assert.ok(entered?.type === 'tool_call')
+  assert.equal(entered.detail.type, 'unknown')
+})

@@ -31,6 +31,45 @@ export function isAskQuestionName(name: string): boolean {
   return /^ask_(?:question|user)$/i.test(cleanToolName(name))
 }
 
+export type PlanModeToolName =
+  'switch_mode' | 'exit_plan_mode' | 'enter_plan_mode'
+
+/** Resolve agy's mode/plan handoff tools across raw names, `contrib:`, and legacy `Run ` titles. */
+export function planModeToolName(
+  explicitRawName: string | undefined,
+  title: string | null | undefined,
+): PlanModeToolName | undefined {
+  const match =
+    explicitRawName !== undefined
+      ? cleanToolName(explicitRawName).match(
+          /^(?:contrib:)?(switch_mode|exit_plan_mode|enter_plan_mode)$/i,
+        )
+      : cleanToolName(title ?? '').match(
+          /^(?:Run )?(?:contrib:)?(switch_mode|exit_plan_mode|enter_plan_mode)$/i,
+        )
+  return match?.[1]?.toLowerCase() as PlanModeToolName | undefined
+}
+
+/** Whether a tool name or ACP title explicitly identifies a non-native MCP tool. */
+export function isForeignToolIdentity(
+  explicitRawName: string | undefined,
+  title: string | null | undefined,
+): boolean {
+  const raw = cleanToolName(explicitRawName ?? title ?? '').replace(
+    /^Run\s+/i,
+    '',
+  )
+  if (/^mcp__|^call_mcp_tool$/i.test(raw)) return true
+  const colon = raw.indexOf(':')
+  if (colon <= 0) return false
+  const prefix = raw.slice(0, colon).toLowerCase()
+  return (
+    prefix !== 'contrib' &&
+    prefix !== 'default_api' &&
+    /^[a-z0-9_-]+:[a-z0-9_.-]+$/i.test(raw)
+  )
+}
+
 /** Narrow opaque protocol payloads before reading vendor fields. */
 export function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)

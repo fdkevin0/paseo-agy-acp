@@ -16,6 +16,7 @@ import {
   TranscriptReader,
   countRowMessages,
   isCompletePlannerResponse,
+  isPlanExecuteNotice,
   isRetryWarning,
   RETRY_IDLE_TIMEOUT_MS,
   isRestartNotice,
@@ -712,6 +713,8 @@ export class BrainNode {
   seenPlannerResponse = false
   foregroundIdleReached = false
   wokeUp = false
+  /** Whether a post-RPC wakeup occurred after the most recent USER_INPUT (initial or continuation). */
+  wokeUpSinceLastPrompt = false
   continuingQuestion = false
   questionSettled = false
   abortedByDenial = false
@@ -769,6 +772,7 @@ export class BrainNode {
     this.seenPlannerResponse = false
     this.foregroundIdleReached = false
     this.wokeUp = false
+    this.wokeUpSinceLastPrompt = false
     this.continuingQuestion = false
     this.questionSettled = false
     this.abortedByDenial = false
@@ -787,10 +791,15 @@ export class BrainNode {
     }
   }
 
-  markQuestionContinuation() {
+  markQuestionContinuation(syntheticPrompt = false) {
     this.continuingQuestion = true
     this.questionSettled = false
     this.wokeUp = true
+    if (syntheticPrompt) {
+      this.seenPlannerResponse = false
+      this.foregroundIdleReached = false
+      this.wokeUpSinceLastPrompt = false
+    }
     this.answeredQuestionStep = Number(this.lastStep?.step_index ?? -1)
   }
 
@@ -821,14 +830,21 @@ export class BrainNode {
     const continuingQuestion =
       row.type === 'USER_INPUT' && this.continuingQuestion
     if (row.type === 'USER_INPUT') {
-      if (this.continuingQuestion) this.continuingQuestion = false
-      else this.resetPhase()
+      if (this.continuingQuestion) {
+        this.continuingQuestion = false
+        this.seenPlannerResponse = false
+        this.foregroundIdleReached = false
+        this.wokeUpSinceLastPrompt = false
+      } else this.resetPhase()
     } else if (
       row.type === 'SYSTEM_MESSAGE' &&
       !isRestartNotice(row) &&
+      !isPlanExecuteNotice(row) &&
       this.foregroundIdleReached
-    )
+    ) {
       this.wokeUp = true
+      this.wokeUpSinceLastPrompt = true
+    }
     if (isRetryWarning(row)) {
       const createdAt = Date.parse(String(row.created_at ?? ''))
       const step = Number(row.step_index)
@@ -864,11 +880,17 @@ export class BrainNode {
     if (row.type !== 'CHECKPOINT') this.lastStep = row
     if (row.type === 'PLANNER_RESPONSE') this.seenPlannerResponse = true
     if (
+      !this.wokeUpSinceLastPrompt &&
+      (isPlanExecuteNotice(row) || this.projector.hasPending())
+    ) {
+      this.foregroundIdleReached = false
+    } else if (
       this.seenPlannerResponse &&
       !this.projector.hasPending() &&
       (isCompletePlannerResponse(row) || this.projector.hasBackground())
-    )
+    ) {
       this.foregroundIdleReached = true
+    }
     return items
   }
 

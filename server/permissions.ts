@@ -3,7 +3,14 @@ import type {
   ProviderToolCallDetail,
   ProviderToolPolicy,
 } from '@getpaseo/plugin/server/provider'
-import { cleanToolName, isAskQuestionName, str } from './common.ts'
+import {
+  cleanToolName,
+  isAskQuestionName,
+  isForeignToolIdentity,
+  planModeToolName,
+  record,
+  str,
+} from './common.ts'
 
 /** Validate the permission fields consumed by the bridge before creating pending work. */
 export const RequestPermissionRequestSchema = z.object({
@@ -71,12 +78,17 @@ export function permissionKind(
   },
   detail: ProviderToolCallDetail,
 ): 'question' | 'mode' | 'plan' | 'tool' {
-  const title = cleanToolName(request.toolCall.title ?? '')
-  if (isChooserRequest(request.options) || isAskQuestionName(title))
+  const explicitRawName = str(record(request.toolCall).name)
+  const identity = cleanToolName(
+    explicitRawName ?? request.toolCall.title ?? '',
+  )
+  if (isChooserRequest(request.options) || isAskQuestionName(identity))
     return 'question'
   if (
-    request.toolCall.kind === 'switch_mode' ||
-    /^(?:switch_mode|exit_plan_mode)$/i.test(title)
+    planModeToolName(explicitRawName, request.toolCall.title) !== undefined ||
+    (explicitRawName === undefined &&
+      !isForeignToolIdentity(explicitRawName, request.toolCall.title) &&
+      request.toolCall.kind === 'switch_mode')
   )
     return 'mode'
   if (detail.type === 'plan') return 'plan'

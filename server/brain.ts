@@ -258,7 +258,10 @@ export async function settleBrainTurn(
   error?: string
   lastStepUsage?: StepUsage
   wokeUp?: true
+  continued?: true
+  pendingReplay?: true
   wakeupUsage?: StepUsage
+  carriedWakeupUsage?: StepUsage
 }> {
   if (!sessionIdPattern.test(nativeId)) return { status: 'completed' }
   const settledQuestions = new Map<
@@ -305,40 +308,61 @@ export async function settleBrainTurn(
   const continuations: {
     afterStep: number
     acpIndex: number
+    syntheticPrompt: boolean
     userStep?: number
   }[] = []
-  const beginContinuation = () => {
-    const boundary = {
-      afterStep: Number(node.lastStep?.step_index ?? -1),
-      acpIndex: acpToolCallIds.length,
-    }
-    continuations.push(boundary)
-    node.markQuestionContinuation()
-    node.projector.bindToolCallIds(acpToolCallIds, boundary.acpIndex)
-    stream.wokeUp = true
-  }
   let lastStepIndex = -1
   const dedupe = new StepDedupe()
   const wakeupSteps = new Map<number, StepUsage>()
+  const carriedWakeupSteps = new Map<number, StepUsage>()
+  const beginContinuation = (syntheticPrompt = false) => {
+    const boundary = {
+      afterStep: Number(node.lastStep?.step_index ?? -1),
+      acpIndex: acpToolCallIds.length,
+      syntheticPrompt,
+    }
+    continuations.push(boundary)
+    node.markQuestionContinuation(syntheticPrompt)
+    if (syntheticPrompt) carriedWakeupSteps.clear()
+    node.projector.bindToolCallIds(acpToolCallIds, boundary.acpIndex)
+    stream.wokeUp = true
+  }
   let inbox!: InboxState
   let subagents: SubagentRecord[] = []
   const finish = (
     status: 'completed' | 'canceled' | 'failed',
     error?: string,
-  ) => ({
-    status,
-    ...(error !== undefined ? { error } : {}),
-    lastStepUsage: stream.usage.latest,
-    ...(node.wokeUp ? { wokeUp: true as const } : {}),
-    ...(wakeupSteps.size
-      ? {
-          wakeupUsage: [...wakeupSteps.values()].reduce<StepUsage | undefined>(
-            (sum, usage) => addStepUsage(sum, usage),
-            undefined,
-          ),
-        }
-      : {}),
-  })
+  ) => {
+    const continued = continuations.some((c) => c.syntheticPrompt)
+    return {
+      status,
+      ...(error !== undefined ? { error } : {}),
+      lastStepUsage: stream.usage.latest,
+      ...(node.wokeUp ? { wokeUp: true as const } : {}),
+      ...(wakeupSteps.size
+        ? {
+            wakeupUsage: [...wakeupSteps.values()].reduce<
+              StepUsage | undefined
+            >((sum, usage) => addStepUsage(sum, usage), undefined),
+          }
+        : {}),
+      ...(continued
+        ? {
+            continued: true as const,
+            ...(node.wokeUpSinceLastPrompt
+              ? { pendingReplay: true as const }
+              : {}),
+            ...(carriedWakeupSteps.size
+              ? {
+                  carriedWakeupUsage: [...carriedWakeupSteps.values()].reduce<
+                    StepUsage | undefined
+                  >((sum, usage) => addStepUsage(sum, usage), undefined),
+                }
+              : {}),
+          }
+        : {}),
+    }
+  }
   const withinGrace = () => Date.now() - startedAt < transcriptGraceMs
   const stall = (timeoutMs = stallTimeoutMs) => {
     const error = `Stopped waiting for agy: transcript_full.jsonl was idle for ${Math.round(timeoutMs / 1000)}s without a final response.`
@@ -375,6 +399,8 @@ export async function settleBrainTurn(
       dedupe.prune(read.snapshotStepIndices)
       for (const step of wakeupSteps.keys())
         if (!read.snapshotStepIndices.has(step)) wakeupSteps.delete(step)
+      for (const step of carriedWakeupSteps.keys())
+        if (!read.snapshotStepIndices.has(step)) carriedWakeupSteps.delete(step)
     }
     if (read.reset) {
       initial = true
@@ -430,7 +456,8 @@ export async function settleBrainTurn(
         )
         if (boundary) {
           boundary.userStep = stepIndex
-          node.markQuestionContinuation()
+          node.markQuestionContinuation(boundary.syntheticPrompt)
+          if (boundary.syntheticPrompt) carriedWakeupSteps.clear()
           node.projector.bindToolCallIds(acpToolCallIds, boundary.acpIndex)
         }
       }
@@ -441,6 +468,9 @@ export async function settleBrainTurn(
         if (node.wokeUp && row.status === 'DONE')
           wakeupSteps.set(stepIndex, usage)
         else wakeupSteps.delete(stepIndex)
+        if (node.wokeUpSinceLastPrompt && row.status === 'DONE')
+          carriedWakeupSteps.set(stepIndex, usage)
+        else carriedWakeupSteps.delete(stepIndex)
       }
       if (Number.isInteger(stepIndex) && stepIndex > lastStepIndex) {
         lastStepIndex = stepIndex
@@ -544,7 +574,7 @@ export async function settleBrainTurn(
                       answerText,
                     ),
                   )
-                  beginContinuation()
+                  beginContinuation(true)
                 },
               })
             : { status: 'already_handled' }

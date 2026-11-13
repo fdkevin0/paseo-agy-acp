@@ -20,6 +20,8 @@ import type {
 import {
   cleanToolName,
   isAskQuestionName,
+  isForeignToolIdentity,
+  planModeToolName,
   sessionIdPattern,
   setBounded,
   record,
@@ -257,10 +259,19 @@ export function toolDetail(
       log: output ?? '',
     }
   }
+  const planModeTool = planModeToolName(explicitRawName, tool.title)
   const planText =
-    kind === 'edit' && record(input.ArtifactMetadata).RequestFeedback === true
-      ? str(input.Content ?? input.CodeContent ?? input.Replacement)
-      : undefined
+    planModeTool === 'exit_plan_mode' ||
+    (explicitRawName === undefined &&
+      !isForeignToolIdentity(explicitRawName, tool.title) &&
+      tool.kind === 'switch_mode')
+      ? text(input.plan)
+        ? str(input.plan)
+        : undefined
+      : kind === 'edit' &&
+          record(input.ArtifactMetadata).RequestFeedback === true
+        ? str(input.Content ?? input.CodeContent ?? input.Replacement)
+        : undefined
   if (planText) return { type: 'plan', text: planText }
   const diff = tool.content?.find((c) => c.type === 'diff')
   const nativeWriteContent = str(input.Content ?? input.CodeContent)
@@ -406,6 +417,28 @@ export type SessionMetadata = Pick<NewSessionResponse, 'configOptions'> & {
   fullAccess?: boolean
 }
 
+const CANONICAL_EFFORTS: ReadonlyArray<{ id: string; label: string }> = [
+  { id: 'low', label: 'Low' },
+  { id: 'medium', label: 'Medium' },
+  { id: 'high', label: 'High' },
+  { id: 'xhigh', label: 'Extra' },
+  { id: 'max', label: 'Max' },
+]
+
+function parseModelEffort(
+  modelId: string,
+  sortedEffortIds: readonly string[],
+): { base: string; effort: string } | undefined {
+  const stem = modelId.endsWith('-effort') ? modelId.slice(0, -7) : modelId
+  for (const effort of sortedEffortIds) {
+    const suffix = `-${effort}`
+    if (stem.length > suffix.length && stem.endsWith(suffix)) {
+      return { base: stem.slice(0, -suffix.length), effort }
+    }
+  }
+  return undefined
+}
+
 /** Convert native catalog options to Paseo's model-specific composer controls. */
 export function configState(response: SessionMetadata): ProviderConfigState {
   const options = (response.configOptions ?? []).filter(
@@ -426,7 +459,17 @@ export function configState(response: SessionMetadata): ProviderConfigState {
         description: v.description ?? undefined,
       })) ?? []
   const thinkingOptions = choices(thinking)
+  const advertisedById = new Map(thinkingOptions.map((o) => [o.id, o]))
+  const canonicalIds = new Set(CANONICAL_EFFORTS.map((e) => e.id))
+  const knownEfforts = [
+    ...CANONICAL_EFFORTS.map((e) => advertisedById.get(e.id) ?? e),
+    ...thinkingOptions.filter((o) => !canonicalIds.has(o.id)),
+  ]
+  const sortedEffortIds = knownEfforts
+    .map((o) => o.id)
+    .sort((a, b) => b.length - a.length)
   const available = response.models?.availableModels
+  const modelId = model?.currentValue ?? response.models?.currentModelId
   const models = (
     model
       ? choices(model)
@@ -436,18 +479,34 @@ export function configState(response: SessionMetadata): ProviderConfigState {
           description: m.description,
         })) ?? [])
   ).map((m) => {
-    const fixed = /-(low|medium|high)$/.test(m.id)
-    const offered = available
-      ?.filter((a) => a.modelId.startsWith(`${m.id}-`))
-      .map((a) => a.modelId.slice(m.id.length + 1))
-    const inventoried = available?.some(
-      (a) => a.modelId === m.id || a.modelId.startsWith(`${m.id}-`),
-    )
+    const fixed = parseModelEffort(m.id, sortedEffortIds) !== undefined
+    const offered = new Set<string>()
+    let hasDirect = false
+    for (const a of available ?? []) {
+      if (a.modelId === m.id) {
+        hasDirect = true
+        continue
+      }
+      const parsed = parseModelEffort(a.modelId, sortedEffortIds)
+      if (parsed?.base === m.id) offered.add(parsed.effort)
+    }
+    const inventoried =
+      available !== undefined && (hasDirect || offered.size > 0)
     const efforts = fixed
       ? []
       : inventoried
-        ? thinkingOptions.filter((o) => offered?.includes(o.id))
+        ? knownEfforts.filter((o) => offered.has(o.id))
         : thinkingOptions
+    const defaultThinkingOptionId =
+      efforts.length > 0
+        ? m.id === modelId &&
+          thinking?.currentValue &&
+          efforts.some((o) => o.id === thinking.currentValue)
+          ? thinking.currentValue
+          : efforts.some((o) => o.id === 'medium')
+            ? 'medium'
+            : efforts[0].id
+        : undefined
     return {
       ...m,
       description:
@@ -455,11 +514,12 @@ export function configState(response: SessionMetadata): ProviderConfigState {
         available?.find((a) => a.modelId === m.id)?.description,
       contextWindowMaxTokens: contextWindowForModel(m.id),
       thinkingOptions: efforts,
+      ...(defaultThinkingOptionId ? { defaultThinkingOptionId } : {}),
     }
   })
-  const modelId = model?.currentValue ?? response.models?.currentModelId
-  const currentThinking =
-    models.find((m) => m.id === modelId)?.thinkingOptions ?? thinkingOptions
+  const currentThinking = thinking
+    ? (models.find((m) => m.id === modelId)?.thinkingOptions ?? thinkingOptions)
+    : []
   const nativeModes = choices(mode)
     .filter((m) => m.id !== FULL_ACCESS_MODE_ID)
     .map((m) => ({ ...m, ...modeVisuals[m.id] }))
@@ -771,6 +831,19 @@ export class Timeline {
         update.sessionUpdate === 'tool_call_update' &&
         isTerminalToolStatus(oldStatus) &&
         !isTerminalToolStatus(incomingStatus)
+      const oldPlanTool = planModeToolName(undefined, old?.title)
+      const preservePlanMode =
+        update.sessionUpdate === 'tool_call_update' &&
+        old !== undefined &&
+        str(record(old).name) === undefined &&
+        str(record(update).name) === undefined &&
+        !isForeignToolIdentity(undefined, old.title) &&
+        !isForeignToolIdentity(undefined, update.title) &&
+        (old.kind === 'switch_mode' ||
+          ((oldPlanTool === 'exit_plan_mode' ||
+            oldPlanTool === 'switch_mode') &&
+            update.title != null &&
+            planModeToolName(undefined, update.title) === undefined))
       const tool = {
         ...old,
         // ACP v1 raw input/output null is equivalent to omission, not a clear.
@@ -778,6 +851,13 @@ export class Timeline {
           Object.entries(update).filter(([, value]) => value != null),
         ),
         ...(preserveStatus ? { status: old!.status } : {}),
+        ...(preservePlanMode &&
+        (update.kind == null || update.kind === 'other') &&
+        (old?.kind == null ||
+          old.kind === 'other' ||
+          old.kind === 'switch_mode')
+          ? { kind: 'switch_mode' as const }
+          : {}),
       } as ToolCall
       setBounded(this.tools, update.toolCallId, tool, TOOL_SNAPSHOT_LIMIT)
       const base = {
