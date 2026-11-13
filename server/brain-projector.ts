@@ -842,12 +842,9 @@ export class BrainNode {
         this.continuingQuestion = false
         this.promptPhase = 'foreground'
       } else this.resetPhase()
-    } else if (
-      row.type === 'SYSTEM_MESSAGE' &&
-      !isRestartNotice(row) &&
-      !purePlanExecuteNotice &&
-      this.promptPhase === 'foreground_idle'
-    ) {
+    } else if (this.promptPhase === 'foreground_idle' && rowMessages > 0) {
+      // agy drains MESSAGE_PRIORITY_LOW and pure planexecute notices into SYSTEM_MESSAGE with
+      // countRowMessages === 0; only actionable inbox messages (rowMessages > 0) enter 'woken'.
       this.promptPhase = 'woken'
       this.wokeUp = true
     }
@@ -894,11 +891,28 @@ export class BrainNode {
       if (purePlanExecuteNotice || this.projector.hasPending()) {
         if (this.promptPhase === 'foreground_idle')
           this.promptPhase = 'foreground_active'
-      } else if (
-        this.promptPhase !== 'foreground' &&
-        (isCompletePlannerResponse(row) || this.projector.hasBackground())
-      ) {
-        this.promptPhase = 'foreground_idle'
+      } else if (this.promptPhase !== 'foreground') {
+        // Foreground idle is not sticky for active continuations: synchronous tool loops and
+        // inline-answered ask_question GENERIC(DONE) rows resume 'foreground_active', whereas
+        // orphan GENERIC(DONE) or CANCELED/INTERRUPTED rows must not block a subsequent wakeup.
+        if (row.type === 'PLANNER_RESPONSE') {
+          this.promptPhase = isCompletePlannerResponse(row)
+            ? 'foreground_idle'
+            : 'foreground_active'
+        } else if (row.type === 'GENERIC') {
+          if (runningStepStatuses.has(String(row.status))) {
+            if (this.projector.hasBackground())
+              this.promptPhase = 'foreground_idle'
+          } else if (
+            // items.length > 0 proves project() settled a tracked pending tool/question
+            // (anonymous deferred tools set hasPending() via retired and hit the branch above).
+            items.length > 0 &&
+            row.status !== 'CANCELED' &&
+            row.status !== 'INTERRUPTED'
+          ) {
+            this.promptPhase = 'foreground_active'
+          }
+        }
       }
     }
     return items
