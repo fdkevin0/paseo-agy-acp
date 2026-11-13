@@ -1,6 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  appliesCarriedWakeup,
+  hasPositivePromptUsage,
   Timeline,
   toolDetail,
   configState,
@@ -1084,4 +1086,59 @@ test('exit_plan_mode renders as a Markdown plan card across ACP variants and par
   })
   assert.ok(entered?.type === 'tool_call')
   assert.equal(entered.detail.type, 'unknown')
+})
+
+test('hasPositivePromptUsage and appliesCarriedWakeup reject zero placeholders and underflowing cache counters', () => {
+  const zeroUsage = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedReadTokens: 0,
+    thoughtTokens: 0,
+    totalTokens: 0,
+  }
+  assert.equal(hasPositivePromptUsage(undefined), false)
+  assert.equal(hasPositivePromptUsage(null), false)
+  assert.equal(hasPositivePromptUsage(zeroUsage), false)
+  assert.equal(
+    hasPositivePromptUsage({ ...zeroUsage, cachedReadTokens: 12 }),
+    true,
+  )
+  assert.equal(hasPositivePromptUsage({ ...zeroUsage, thoughtTokens: 5 }), true)
+  const cacheOnlyDebt = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedReadTokens: 500,
+  }
+  assert.equal(appliesCarriedWakeup(zeroUsage, cacheOnlyDebt), false)
+  assert.equal(
+    appliesCarriedWakeup(
+      {
+        inputTokens: 10,
+        outputTokens: 2,
+        cachedReadTokens: 100,
+        totalTokens: 112,
+      },
+      cacheOnlyDebt,
+    ),
+    false,
+  )
+  assert.equal(
+    appliesCarriedWakeup(
+      {
+        inputTokens: 10,
+        outputTokens: 2,
+        cachedReadTokens: 600,
+        totalTokens: 612,
+      },
+      cacheOnlyDebt,
+    ),
+    true,
+  )
+  assert.equal(
+    appliesCarriedWakeup(
+      { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+      cacheOnlyDebt,
+    ),
+    true,
+  )
 })

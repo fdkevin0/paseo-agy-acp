@@ -647,6 +647,34 @@ export function addStepUsage(
   }
 }
 
+export function hasPositivePromptUsage(usage?: Usage | null): boolean {
+  if (!usage) return false
+  const raw = record(usage)
+  return (
+    (nonnegative(raw.inputTokens) && raw.inputTokens > 0) ||
+    (nonnegative(raw.outputTokens) && raw.outputTokens > 0) ||
+    (nonnegative(raw.cachedReadTokens) && raw.cachedReadTokens > 0) ||
+    (nonnegative(raw.thoughtTokens) && raw.thoughtTokens > 0) ||
+    (nonnegative(raw.totalTokens) && raw.totalTokens > 0)
+  )
+}
+
+export function appliesCarriedWakeup(
+  usage: Usage | null | undefined,
+  carriedWakeup: StepUsage | undefined,
+): carriedWakeup is StepUsage {
+  if (!carriedWakeup || !hasPositivePromptUsage(usage)) return false
+  const raw = record(usage)
+  return (
+    nonnegative(raw.inputTokens) &&
+    raw.inputTokens >= carriedWakeup.inputTokens &&
+    nonnegative(raw.outputTokens) &&
+    raw.outputTokens >= carriedWakeup.outputTokens &&
+    (!nonnegative(raw.cachedReadTokens) ||
+      raw.cachedReadTokens >= carriedWakeup.cachedReadTokens)
+  )
+}
+
 /** Combine ACP turn token counters with per-step context occupancy from transcript_full.jsonl when available. */
 export function promptUsage(
   usage?: Usage | null,
@@ -661,14 +689,9 @@ export function promptUsage(
 ): ProviderUsage {
   if (!usage && !options?.lastStep && !options?.wakeup) return {}
   const raw = record(usage)
-  const carried =
-    options?.carriedWakeup &&
-    nonnegative(raw.inputTokens) &&
-    raw.inputTokens >= options.carriedWakeup.inputTokens &&
-    nonnegative(raw.outputTokens) &&
-    raw.outputTokens >= options.carriedWakeup.outputTokens
-      ? options.carriedWakeup
-      : undefined
+  const carried = appliesCarriedWakeup(usage, options?.carriedWakeup)
+    ? options.carriedWakeup
+    : undefined
   const field = (
     rawVal: unknown,
     sub: number | undefined,
