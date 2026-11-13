@@ -37,8 +37,7 @@ export function isNativeToolName(
     | 'manage_task'
     | 'schedule',
 ): boolean {
-  const unwrapped = name.startsWith('Run ') ? name.slice(4) : name
-  return cleanToolName(unwrapped) === expected
+  return unwrapToolTitle(name) === expected
 }
 
 /** Whether a native tool name is agy's interactive question tool. */

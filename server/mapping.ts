@@ -839,6 +839,7 @@ export class Timeline {
       const nextPlanTool = classifyPlanModeTool(
         str(record(update).name),
         update.title,
+        // Permit unnamed updates; preservePlanMode below requires an existing plan tool.
         'switch_mode',
       )
       const preservePlanMode =

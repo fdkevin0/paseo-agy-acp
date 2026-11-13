@@ -714,6 +714,7 @@ export class BrainNode {
   consumedMessages = 0
   turnStartStep = -1
   promptPhase: BrainPromptPhase = 'foreground'
+  // Turn-wide projection ownership survives synthetic continuation resets of promptPhase.
   wokeUp = false
   continuingQuestion = false
   questionSettled = false
@@ -834,6 +835,7 @@ export class BrainNode {
     const continuingQuestion =
       row.type === 'USER_INPUT' && this.continuingQuestion
     const rowMessages = countRowMessages(row)
+    // shortcut: zero counts exclude user/low-priority headers; revisit if agy mixes headerless wakeups with handoffs.
     const purePlanExecuteNotice = isPlanExecuteNotice(row) && rowMessages === 0
     if (row.type === 'USER_INPUT') {
       if (this.continuingQuestion) {

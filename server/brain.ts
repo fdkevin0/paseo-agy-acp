@@ -313,6 +313,8 @@ export async function settleBrainTurn(
   let lastStepIndex = -1
   const dedupe = new StepDedupe()
   let seenSyntheticPrompt = false
+  // Carry cases: before synthetic prompt -> yes; its foreground -> no; later wakeup -> yes.
+  // Each synthetic prompt clears earlier carry; finish suppresses it if any prompt lacks a USER_INPUT anchor.
   const wakeupSteps = new Map<number, { usage: StepUsage; carried: boolean }>()
   const clearCarriedWakeup = () => {
     for (const entry of wakeupSteps.values()) entry.carried = false
