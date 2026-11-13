@@ -83,22 +83,20 @@ export async function hasActiveBackgroundWork(
     const node = new BrainNode(nativeId, nativeId, {
       allowInitialSpawnPrompt: isChild,
     })
-    const [{ inbox, subagents }, rows] = await Promise.all([
+    const [{ inbox, subagents }, { rows, mtimeMs }] = await Promise.all([
       node.pollMetadata(root),
-      readTranscriptRows(root, nativeId),
+      node.reader.read(root, nativeId).catch((error) => {
+        if (isMissing(error))
+          return { rows: [], reset: false, mtimeMs: undefined }
+        throw error
+      }),
     ])
     if (isChild && rows.length === 0) return true
-    const observedAt = await stat(
-      join(root, nativeId, '.system_generated/logs/transcript_full.jsonl'),
-    ).then(
-      (info) => info.mtimeMs,
-      () => Date.now(),
-    )
     node.projector.observeRows(rows)
     for (const row of rows) {
       // The restarted runtime left no woken turn running.
       if (isRestartNotice(row)) node.resetPhase()
-      node.ingest(row, observedAt)
+      node.ingest(row, mtimeMs)
     }
     if (inbox.unconsumedHighPriority.length > 0) return true
     if (
@@ -181,10 +179,14 @@ async function settleChildren(
       const { inbox: childInbox, subagents: childSubagents } =
         await child.pollMetadata(root)
       try {
-        const { rows, reset } = await child.reader.read(root, childId)
+        const { rows, reset, snapshotStepIndices, mtimeMs } =
+          await child.reader.read(root, childId)
+        const observedAt = child.initialReadDone ? undefined : mtimeMs
+        if (rows.length > 0) child.initialReadDone = true
+        if (snapshotStepIndices) child.pruneRetrySteps(snapshotStepIndices)
         if (reset) child.reset(childInbox, childSubagents)
         child.projector.observeRows(rows)
-        for (const row of rows) child.ingest(row)
+        for (const row of rows) child.ingest(row, observedAt)
       } catch (error) {
         if (isMissing(error)) {
           const subRecord = parentSubagents.find(
@@ -713,8 +715,10 @@ export async function settleBrainTurn(
       lastActivity = Date.now()
     }
     const rows = read.rows
+    const observedAt = node.initialReadDone ? undefined : read.mtimeMs
     if (read.snapshotStepIndices) {
       dedupe.prune(read.snapshotStepIndices)
+      node.pruneRetrySteps(read.snapshotStepIndices)
       for (const step of wakeupSteps.keys())
         if (!read.snapshotStepIndices.has(step)) wakeupSteps.delete(step)
       emitWakeupState()
@@ -772,6 +776,7 @@ export async function settleBrainTurn(
       node.projector.bindToolCallIds(acpToolCallIds)
       node.projector.resolveToolIdentities(isRpcActive?.() === true)
     }
+    if (slice.length > 0) node.initialReadDone = true
     for (const row of slice) {
       const stepIndex = Number(row.step_index)
       if (row.type === 'USER_INPUT') {
@@ -794,7 +799,10 @@ export async function settleBrainTurn(
         }
       }
       fgReconciler.observeRowMeta(row)
-      const items = node.ingest(row)
+      const items = node.ingest(
+        row,
+        read.observedAtByStep?.get(stepIndex) ?? observedAt,
+      )
       const usage = extractStepUsage(row)
       const postRpcStep = fgReconciler.reconcile(row, items, node.wokeUp)
       stream.wokeUp ||= fgReconciler.postRpc
@@ -1122,11 +1130,14 @@ export function watchBrain(
     try {
       const { inbox, subagents } = await node.pollMetadata(root)
       onSubagents?.(subagents)
-      const { rows, reset, snapshotStepIndices } = await node.reader.read(
-        root,
-        nativeId,
-      )
-      if (snapshotStepIndices) dedupe.prune(snapshotStepIndices)
+      const { rows, reset, snapshotStepIndices, mtimeMs } =
+        await node.reader.read(root, nativeId)
+      const observedAt = node.initialReadDone ? undefined : mtimeMs
+      if (rows.length > 0) node.initialReadDone = true
+      if (snapshotStepIndices) {
+        dedupe.prune(snapshotStepIndices)
+        node.pruneRetrySteps(snapshotStepIndices)
+      }
       if (reset) {
         node.reset(inbox, subagents)
         boundaryCache.clear()
@@ -1164,7 +1175,7 @@ export function watchBrain(
               )
           if (isParentWakeup) node.advanceTurnFloor(stepIndex - 1)
         }
-        const items = node.ingest(row)
+        const items = node.ingest(row, observedAt)
         if (replayed) continue
         if (
           !running &&

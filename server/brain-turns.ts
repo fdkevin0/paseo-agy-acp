@@ -106,6 +106,24 @@ export function resolveTurnWakeupStartStep(
   return turnTagged > 0 ? wakeupSteps[ingestedCount - turnTagged] : undefined
 }
 
+function countPriorWakeups(
+  tagged: readonly TaggedWakeupMessage[],
+  untaggedCount: number,
+  parentBoundary: number,
+  expectedTurnWakeups: number,
+  recordedPriorWakeups: number,
+): number {
+  const taggedPriorCount = tagged.filter(
+    (m) => m.tool.stepIndex <= parentBoundary,
+  ).length
+  const taggedTurnCount = tagged.length - taggedPriorCount
+  const untaggedPriorCount = Math.max(
+    0,
+    untaggedCount - Math.max(0, expectedTurnWakeups - taggedTurnCount),
+  )
+  return Math.max(recordedPriorWakeups, taggedPriorCount + untaggedPriorCount)
+}
+
 /**
  * Compute the child transcript step floor (`TurnFloor`) for the current parent turn, or `'pending'`
  * when the parent re-woke a child spawned in an earlier turn whose first wakeup step has not landed yet.
@@ -150,13 +168,12 @@ export function resolveChildTurnState(
   const taggedTurnCount = tagged.length - taggedPriorCount
   const requiredTurnWakeups = Math.max(taggedTurnCount, expectedTurnWakeups)
   if (requiredTurnWakeups === 0) return { status: 'pending' }
-  const untaggedPriorCount = Math.max(
-    0,
-    untaggedCount - Math.max(0, expectedTurnWakeups - taggedTurnCount),
-  )
-  const priorWakeups = Math.max(
+  const priorWakeups = countPriorWakeups(
+    tagged,
+    untaggedCount,
+    parentMinStepIndex,
+    expectedTurnWakeups,
     parentNode.countPriorWakeups(childNode.nativeId, parentMinStepIndex),
-    taggedPriorCount + untaggedPriorCount,
   )
   const wakeupSteps = childNode.wakeupStepsFrom(parentNode.nativeId)
   const startStep = wakeupSteps[priorWakeups]
@@ -172,7 +189,8 @@ export function resolveChildTurnState(
  * Resolve the last turn boundary step (`< beforeStep`) for `nodeId`, recursing up ancestor
  * subagent wakeup boundaries when `nodeId` is itself a re-woken child.
  *
- * Uses `TurnBoundaryCache` keyed by `transcript_full.jsonl` `(mtimeMs, size, beforeStep)` so missing,
+ * Uses `TurnBoundaryCache` keyed by node/cutoff and validated by transcript `(mtimeMs, size)` and
+ * inbox/subagent `metaSignature` so missing,
  * empty, or unchanged ancestor transcripts do not re-read inbox/subagents/transcripts on every poll tick.
  */
 export async function readTurnBoundaryBefore(
@@ -354,22 +372,16 @@ export async function readTurnBoundaryBefore(
             const beforeTagged = entry.tagged.filter(
               (m) => m.tool.stepIndex < grandBeforeStep,
             )
-            const taggedPriorCount = beforeTagged.filter(
-              (m) => m.tool.stepIndex <= grand.boundary,
-            ).length
-            const taggedTurnCount = beforeTagged.length - taggedPriorCount
             const untaggedBeforeCount = Math.max(
               0,
               Math.min(entry.untaggedCount, beforeCount - beforeTagged.length),
             )
-            const untaggedPriorCount = Math.max(
-              0,
-              untaggedBeforeCount -
-                Math.max(0, expectedTurnWakeups - taggedTurnCount),
-            )
-            const priorWakeups = Math.max(
+            const priorWakeups = countPriorWakeups(
+              beforeTagged,
+              untaggedBeforeCount,
+              grand.boundary,
+              expectedTurnWakeups,
               priorInGrand,
-              taggedPriorCount + untaggedPriorCount,
             )
             const startStep = entry.wakeupSteps[priorWakeups]
             if (startStep !== undefined)
