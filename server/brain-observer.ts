@@ -5,6 +5,7 @@ import {
   countRowMessages,
   extractStepUsage,
   isMissing,
+  stepErrorMessage,
 } from './brain-io.ts'
 import type { StepUsage } from './mapping.ts'
 
@@ -111,7 +112,10 @@ export class BrainTurnObservation {
   private buffered = new Map<number, Row>()
   private bufferReset = false
   private bufferSnapshot?: Set<number>
-  private bufferObservedAt = new Map<number, number>()
+  private bufferObservedAt = new Map<
+    number,
+    { error: string | undefined; observedAt: number }
+  >()
   private checkpoints = new StepDedupe()
   private drainingRead = false
   private mayPublish() {
@@ -206,7 +210,6 @@ export class BrainTurnObservation {
       this.buffered.clear()
       this.bufferReset = true
       this.bufferSnapshot = undefined
-      this.bufferObservedAt.clear()
       this.lastStepIndex = -1
       this.historicalMessages = 0
     }
@@ -229,14 +232,22 @@ export class BrainTurnObservation {
     if (this.consumer && this.acceptsRows() && this.callbacks.isCurrent())
       await this.consumer(next)
     else {
+      if (read.snapshotStepIndices && read.snapshotStepIndices.size > 0) {
+        for (const step of this.bufferObservedAt.keys()) {
+          if (!read.snapshotStepIndices.has(step))
+            this.bufferObservedAt.delete(step)
+        }
+      }
       for (const row of eligible) {
         const step = Number(row.step_index)
         this.buffered.set(step, row)
-        if (
-          read.mtimeMs !== undefined &&
-          (read.reset || !this.bufferObservedAt.has(step))
-        )
-          this.bufferObservedAt.set(step, read.mtimeMs)
+        if (read.mtimeMs !== undefined) {
+          const error = stepErrorMessage(row)
+          const existing = this.bufferObservedAt.get(step)
+          if (!existing || existing.error !== error) {
+            this.bufferObservedAt.set(step, { error, observedAt: read.mtimeMs })
+          }
+        }
       }
       if (read.snapshotStepIndices)
         this.bufferSnapshot = new Set(read.snapshotStepIndices)
@@ -289,7 +300,12 @@ export class BrainTurnObservation {
       this.buffered.clear()
       const observedAtByStep =
         this.bufferObservedAt.size > 0
-          ? new Map(this.bufferObservedAt)
+          ? new Map(
+              [...this.bufferObservedAt].map(([step, entry]) => [
+                step,
+                entry.observedAt,
+              ]),
+            )
           : undefined
       this.bufferObservedAt.clear()
       await consumer({

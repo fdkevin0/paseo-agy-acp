@@ -906,3 +906,111 @@ test('BrainTurnObservation pre-attach buffering tracks observedAt per step witho
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('BrainTurnObservation preserves retry observedAt across pre-attach empty O_TRUNC rewrites and refreshes on in-place mutation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'brain-retry-preattach-otrunc-'))
+  const s1 = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+  const s2 = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+  const transcriptPath = (sessionId: string) =>
+    join(root, sessionId, '.system_generated/logs/transcript_full.jsonl')
+  const writeRows = async (
+    sessionId: string,
+    rows: readonly Record<string, unknown>[],
+  ) => {
+    await mkdir(join(root, sessionId, '.system_generated/logs'), {
+      recursive: true,
+    })
+    await writeFile(
+      transcriptPath(sessionId),
+      rows.map((r) => JSON.stringify(r)).join('\n') + '\n',
+    )
+  }
+
+  let obs1: BrainTurnObservation | undefined
+  let obs2: BrainTurnObservation | undefined
+  try {
+    const expiredDate = new Date(Date.now() - 20 * 60_000)
+
+    // Case 1: Aged warning -> truncated empty -> identical rows restored with fresh mtimeMs -> still expires immediately.
+    const rows1 = [
+      { step_index: 0, type: 'USER_INPUT', content: 'start' },
+      warning(1, 1),
+    ]
+    await writeRows(s1, rows1)
+    await utimes(transcriptPath(s1), expiredDate, expiredDate)
+    obs1 = new BrainTurnObservation(
+      root,
+      s1,
+      'p1',
+      -1,
+      { isCurrent: () => true, onUsage: () => {}, onItem: () => {} },
+      10,
+    )
+    await obs1.poll()
+
+    await writeFile(transcriptPath(s1), '')
+    await obs1.poll()
+
+    await writeRows(s1, rows1)
+    await obs1.poll()
+
+    const settled1 = await settleBrainTurn(root, s1, 'p1', () => {}, {
+      minStepIndex: -1,
+      pollIntervalMs: 10,
+      observation: obs1,
+    })
+    assert.equal(settled1.status, 'failed')
+    assert.equal(settled1.stalled, true)
+    assert.match(settled1.error ?? '', /attempt 1/)
+
+    // Case 2: Aged warning -> truncated empty -> mutated warning at same step -> refreshes deadline.
+    await writeRows(s2, rows1)
+    await utimes(transcriptPath(s2), expiredDate, expiredDate)
+    obs2 = new BrainTurnObservation(
+      root,
+      s2,
+      'p2',
+      -1,
+      { isCurrent: () => true, onUsage: () => {}, onItem: () => {} },
+      10,
+    )
+    await obs2.poll()
+
+    await writeFile(transcriptPath(s2), '')
+    await obs2.poll()
+
+    await writeRows(s2, [
+      { step_index: 0, type: 'USER_INPUT', content: 'start' },
+      warning(1, 2),
+    ])
+    await obs2.poll()
+
+    obs2.start()
+    let settled2: { status: string } | undefined
+    const p2 = settleBrainTurn(root, s2, 'p2', () => {}, {
+      minStepIndex: -1,
+      pollIntervalMs: 10,
+      observation: obs2,
+    }).then((res) => {
+      settled2 = res
+      return res
+    })
+    await delay(50)
+    assert.equal(
+      settled2,
+      undefined,
+      'mutated warning at same step across pre-attach O_TRUNC must refresh observedAt',
+    )
+    await writeRows(s2, [
+      { step_index: 0, type: 'USER_INPUT', content: 'start' },
+      warning(1, 2),
+      quiet(2),
+    ])
+    const result2 = await p2
+    assert.equal(result2.status, 'completed')
+  } finally {
+    await obs1?.dispose()
+    await obs2?.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
+})
