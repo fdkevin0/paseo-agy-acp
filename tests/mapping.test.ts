@@ -1103,7 +1103,24 @@ test('hasPositivePromptUsage and appliesCarriedWakeup reject zero placeholders a
     hasPositivePromptUsage({ ...zeroUsage, cachedReadTokens: 12 }),
     true,
   )
+  assert.equal(
+    hasPositivePromptUsage({ ...zeroUsage, cachedWriteTokens: 7 }),
+    true,
+  )
   assert.equal(hasPositivePromptUsage({ ...zeroUsage, thoughtTokens: 5 }), true)
+  assert.deepEqual(promptUsage(zeroUsage), {})
+  assert.deepEqual(
+    promptUsage(zeroUsage, {
+      lastStep: { inputTokens: 20, outputTokens: 3, cachedReadTokens: 40 },
+    }),
+    {
+      inputTokens: 20,
+      outputTokens: 3,
+      cachedInputTokens: 40,
+      contextWindowUsedTokens: 63,
+      contextWindowMaxTokens: 256_000,
+    },
+  )
   const cacheOnlyDebt = {
     inputTokens: 0,
     outputTokens: 0,
@@ -1121,6 +1138,28 @@ test('hasPositivePromptUsage and appliesCarriedWakeup reject zero placeholders a
       cacheOnlyDebt,
     ),
     false,
+  )
+  const multiFieldDebt = {
+    inputTokens: 50,
+    outputTokens: 5,
+    cachedReadTokens: 500,
+  }
+  assert.deepEqual(
+    promptUsage(
+      {
+        inputTokens: 80,
+        outputTokens: 8,
+        cachedReadTokens: 100,
+        totalTokens: 188,
+      },
+      { carriedWakeup: multiFieldDebt },
+    ),
+    {
+      inputTokens: 80,
+      outputTokens: 8,
+      cachedInputTokens: 100,
+    },
+    'underflowing cachedReadTokens atomically skips all carriedWakeup deductions',
   )
   assert.equal(
     appliesCarriedWakeup(

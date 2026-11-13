@@ -20,7 +20,7 @@ import { readSubagents } from '../server/brain.ts'
 import { createProvider } from '../server/provider.ts'
 import { SessionManager } from '../server/session.ts'
 import { AgyUsageSource } from '../server/usage.ts'
-import { collectProviderEvents } from './helpers.ts'
+import { collectProviderEvents, writeBrainTranscript } from './helpers.ts'
 
 function manager(extraArgs: string[] = []) {
   return new SessionManager({
@@ -1767,16 +1767,9 @@ async function usageHarness(t: TestContext) {
       persist: true,
     },
   })
-  const path = join(
-    home,
-    '.gemini/antigravity-cli/brain',
-    session.state.nativeId,
-    '.system_generated/logs/transcript_full.jsonl',
-  )
-  const write = async (rows: object[]) => {
-    await mkdir(join(path, '..'), { recursive: true })
-    await writeFile(path, rows.map((r) => JSON.stringify(r) + '\n').join(''))
-  }
+  const write = (rows: Record<string, unknown>[]) =>
+    writeBrainTranscript(hBrainRoot(), session.state.nativeId, rows)
+  const hBrainRoot = () => session.brainRoot
   let sequence = 0
   const prompt = (text = 'synthetic') =>
     m.handle({
@@ -2046,4 +2039,286 @@ test('runtime relaunch during a turn deducts pre-relaunch carriedUsage while cle
     'fresh runtime after relaunch must not inherit dead-runtime wakeup debt',
   )
   assert.equal(h.session.state.wakeup.pendingReplay, false)
+})
+
+test('post-echo zero-usage cancellation clears pendingReplay while preserving carriedUsage', async (t) => {
+  const h = await usageHarness(t)
+  h.session.state.wakeup.carriedUsage = {
+    inputTokens: 50,
+    outputTokens: 5,
+    cachedReadTokens: 0,
+  }
+  h.session.state.wakeup.pendingReplay = true
+  const nativePrompt = h.session.transport.rpc.prompt.bind(
+    h.session.transport.rpc,
+  )
+  t.mock.method(h.session.transport.rpc, 'prompt', async () => {
+    const pending = nativePrompt({
+      sessionId: h.session.state.nativeId,
+      prompt: [{ type: 'text', text: 'wait' }],
+    })
+    for (let i = 0; i < 100 && h.session.state.wakeup.suppressEcho; i++) {
+      await delay(10)
+    }
+    await h.session.transport.rpc.cancel({
+      sessionId: h.session.state.nativeId,
+    })
+    await pending
+    return {
+      stopReason: 'cancelled' as const,
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        totalTokens: 0,
+      },
+    }
+  })
+  await h.prompt('post-echo-cancel')
+  assert.equal(
+    h.session.state.wakeup.pendingReplay,
+    false,
+    'user_message_chunk consumed pendingReplay even though result.usage was all zero',
+  )
+  assert.deepEqual(h.session.state.wakeup.carriedUsage, {
+    inputTokens: 50,
+    outputTokens: 5,
+    cachedReadTokens: 0,
+  })
+})
+
+test('zero-usage turn with its own wakeup accumulates carriedUsage via addStepUsage', async (t) => {
+  const h = await usageHarness(t)
+  h.session.state.wakeup.carriedUsage = {
+    inputTokens: 50,
+    outputTokens: 5,
+    cachedReadTokens: 10,
+  }
+  const sender = '33333333-3333-4333-8333-333333333333'
+  t.mock.method(h.session.transport.rpc, 'prompt', async () => {
+    await h.write([
+      { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'Foreground',
+      },
+      {
+        step_index: 2,
+        type: 'SYSTEM_MESSAGE',
+        content: `<SYSTEM_MESSAGE>\n[Message] sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=wake\n</SYSTEM_MESSAGE>`,
+      },
+      {
+        step_index: 3,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'Woken reply',
+        input_tokens: 30,
+        output_tokens: 3,
+        cache_read_tokens: 5,
+      },
+    ])
+    return {
+      stopReason: 'end_turn' as const,
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        totalTokens: 0,
+      },
+    }
+  })
+  await h.prompt('zero-rpc-with-wakeup')
+  assert.deepEqual(h.session.state.wakeup.carriedUsage, {
+    inputTokens: 80,
+    outputTokens: 8,
+    cachedReadTokens: 15,
+  })
+  assert.equal(h.latest().inputTokens, 30)
+  assert.equal(h.latest().outputTokens, 3)
+  assert.equal(h.latest().cachedInputTokens, 5)
+})
+
+test('underflowing positive usage skips carriedUsage deduction and clears stale carriedUsage', async (t) => {
+  const h = await usageHarness(t)
+  h.session.state.wakeup.carriedUsage = {
+    inputTokens: 50,
+    outputTokens: 5,
+    cachedReadTokens: 500,
+  }
+  t.mock.method(h.session.transport.rpc, 'prompt', async () => ({
+    stopReason: 'end_turn' as const,
+    usage: {
+      inputTokens: 80,
+      outputTokens: 8,
+      cachedReadTokens: 100,
+      totalTokens: 188,
+    },
+  }))
+  await h.prompt('underflow-turn')
+  assert.equal(h.latest().inputTokens, 80)
+  assert.equal(h.latest().outputTokens, 8)
+  assert.equal(h.latest().cachedInputTokens, 100)
+  assert.equal(
+    h.session.state.wakeup.carriedUsage,
+    undefined,
+    'positive usage turn must clear stale carriedUsage even on underflow',
+  )
+})
+
+test('post-waitPrompt settle failure still publishes positive result.usage and clears consumed carriedUsage', async (t) => {
+  const h = await usageHarness(t)
+  h.session.state.wakeup.carriedUsage = {
+    inputTokens: 40,
+    outputTokens: 4,
+    cachedReadTokens: 0,
+  }
+  t.mock.method(h.session.transport.rpc, 'prompt', async () => {
+    await h.write([{ step_index: 0, type: 'USER_INPUT', content: 'turn 1' }])
+    // Force observation/settle to fail after waitPrompt returns positive usage.
+    h.session.state.turnAbort?.abort(new Error('Post-prompt settle aborted'))
+    return {
+      stopReason: 'end_turn' as const,
+      usage: { inputTokens: 120, outputTokens: 12, totalTokens: 132 },
+    }
+  })
+  await h.prompt('post-prompt-error')
+  assert.equal(h.latest().inputTokens, 80)
+  assert.equal(h.latest().outputTokens, 8)
+  assert.equal(
+    h.session.state.wakeup.carriedUsage,
+    undefined,
+    'consumed carriedUsage must be cleared even when post-waitPrompt settling throws',
+  )
+})
+
+test('canceled synthetic ask_question continuation with zero usage preserves pre-continuation carriedUsage', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-f2-cont-cancel-'))
+  const events: ProviderEvent[] = []
+  const m = new SessionManager({
+    launch: {
+      command: process.execPath,
+      args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+      env: { HOME: home, PATH: process.env.PATH ?? '' },
+    },
+    usage: new AgyUsageSource(),
+    capabilities: ['prompt.message', 'permission'],
+    emit: (e) => events.push(structuredClone(e)),
+  })
+  t.after(async () => {
+    await m.close()
+    await rm(home, { recursive: true, force: true })
+  })
+  const start = m.start.bind(m)
+  let session!: Awaited<ReturnType<typeof m.start>>
+  t.mock.method(
+    m,
+    'start',
+    async (...args: Parameters<typeof start>) =>
+      (session = await start(...args)),
+  )
+  await m.open({
+    type: 'session.open',
+    requestId: 'open',
+    sessionId: 's',
+    history: 'skip',
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+  const sender = '44444444-4444-4444-8444-444444444444'
+  let rpcCount = 0
+  t.mock.method(session.transport.rpc, 'prompt', async () => {
+    rpcCount++
+    if (rpcCount === 1) {
+      await writeBrainTranscript(session.brainRoot, session.state.nativeId, [
+        { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
+        {
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: 'Foreground',
+          input_tokens: 100,
+          output_tokens: 10,
+        },
+        {
+          step_index: 2,
+          type: 'SYSTEM_MESSAGE',
+          content: `<SYSTEM_MESSAGE>\n[Message] sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=wake\n</SYSTEM_MESSAGE>`,
+        },
+        {
+          step_index: 3,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          input_tokens: 40,
+          output_tokens: 4,
+          tool_calls: [
+            {
+              id: 'ask-1',
+              name: 'ask_question',
+              args: {
+                questions: [
+                  {
+                    question: 'Proceed?',
+                    options: [{ label: 'Yes' }, { label: 'No' }],
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ])
+      return {
+        stopReason: 'end_turn' as const,
+        usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
+      }
+    }
+    return {
+      stopReason: 'cancelled' as const,
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        totalTokens: 0,
+      },
+    }
+  })
+
+  const promptPromise = m.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId: 'p-f2',
+      delivery: 'auto',
+      input: { type: 'message', content: [{ type: 'text', text: 'turn 1' }] },
+    },
+  })
+  // Wait for the woken ask_question permission request, then answer it.
+  let permissionId: string | undefined
+  for (let i = 0; i < 100 && !permissionId; i++) {
+    const req = events.find((e) => e.type === 'session.permission')
+    if (req?.type === 'session.permission') permissionId = req.request.id
+    else await delay(10)
+  }
+  assert.ok(permissionId, 'woken ask_question must emit session.permission')
+  await m.handle({
+    type: 'session.permission',
+    sessionId: 's',
+    permissionId,
+    response: {
+      behavior: 'allow',
+      updatedInput: { answers: { 'Proceed?': 'Yes' } },
+    },
+  })
+  await promptPromise
+  assert.deepEqual(
+    session.state.wakeup.carriedUsage,
+    { inputTokens: 40, outputTokens: 4, cachedReadTokens: 0 },
+    'canceled zero-usage continuation must preserve pre-continuation wakeup carriedUsage',
+  )
 })

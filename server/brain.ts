@@ -504,10 +504,24 @@ export async function settleBrainTurn(
   const dedupe = new StepDedupe()
   let seenSyntheticPrompt = false
   // Carry cases: before synthetic prompt -> yes; its foreground -> no; later wakeup -> yes.
-  // Each synthetic prompt clears earlier carry; finish suppresses it if any prompt lacks a USER_INPUT anchor.
+  // Each synthetic prompt clears earlier carry; finish suppresses it if any prompt lacks a USER_INPUT anchor
+  // unless an unbilled canceled continuation preserved pre-continuation wakeup carry.
   const wakeupSteps = new Map<number, { usage: StepUsage; carried: boolean }>()
+  let preContinuationCarriedSteps: number[] = []
+  let preservedPreContinuationCarry = false
   const clearCarriedWakeup = () => {
-    for (const entry of wakeupSteps.values()) entry.carried = false
+    preContinuationCarriedSteps = []
+    for (const [step, entry] of wakeupSteps) {
+      if (entry.carried) preContinuationCarriedSteps.push(step)
+      entry.carried = false
+    }
+  }
+  const restoreCarriedWakeup = () => {
+    preservedPreContinuationCarry = true
+    for (const step of preContinuationCarriedSteps) {
+      const entry = wakeupSteps.get(step)
+      if (entry) entry.carried = true
+    }
   }
   const beginContinuation = (syntheticPrompt = false) => {
     const boundary = {
@@ -531,9 +545,9 @@ export async function settleBrainTurn(
     status: 'completed' | 'canceled' | 'failed',
     error?: string,
   ) => {
-    const unanchoredSynthetic = continuations.some(
-      (c) => c.syntheticPrompt && c.userStep === undefined,
-    )
+    const unanchoredSynthetic =
+      !preservedPreContinuationCarry &&
+      continuations.some((c) => c.syntheticPrompt && c.userStep === undefined)
     let wakeupUsage: StepUsage | undefined
     let carriedWakeupUsage: StepUsage | undefined
     for (const entry of wakeupSteps.values()) {
@@ -790,6 +804,9 @@ export async function settleBrainTurn(
               })
             : { status: 'already_handled' }
         if (signal?.aborted || outcome.status === 'canceled') {
+          if (outcome.status === 'canceled' && outcome.preserveCarriedWakeup) {
+            restoreCarriedWakeup()
+          }
           onItem(
             node.projector.completePendingQuestion(
               question.tool,

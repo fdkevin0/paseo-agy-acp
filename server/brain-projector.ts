@@ -70,7 +70,7 @@ export type PendingQuestion = {
 
 export type QuestionOutcome =
   | { status: 'answered' | 'already_handled'; answerText?: string }
-  | { status: 'canceled' }
+  | { status: 'canceled'; preserveCarriedWakeup?: boolean }
 
 const backgroundTaskPattern =
   /Tool is running as a background task with task id:\s*(\S+)/

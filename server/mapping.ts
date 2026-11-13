@@ -654,6 +654,7 @@ export function hasPositivePromptUsage(usage?: Usage | null): boolean {
     (nonnegative(raw.inputTokens) && raw.inputTokens > 0) ||
     (nonnegative(raw.outputTokens) && raw.outputTokens > 0) ||
     (nonnegative(raw.cachedReadTokens) && raw.cachedReadTokens > 0) ||
+    (nonnegative(raw.cachedWriteTokens) && raw.cachedWriteTokens > 0) ||
     (nonnegative(raw.thoughtTokens) && raw.thoughtTokens > 0) ||
     (nonnegative(raw.totalTokens) && raw.totalTokens > 0)
   )
@@ -687,9 +688,10 @@ export function promptUsage(
     wakeup?: StepUsage
   },
 ): ProviderUsage {
-  if (!usage && !options?.lastStep && !options?.wakeup) return {}
-  const raw = record(usage)
-  const carried = appliesCarriedWakeup(usage, options?.carriedWakeup)
+  const effective = hasPositivePromptUsage(usage) ? usage : undefined
+  if (!effective && !options?.lastStep && !options?.wakeup) return {}
+  const raw = record(effective)
+  const carried = appliesCarriedWakeup(effective, options?.carriedWakeup)
     ? options.carriedWakeup
     : undefined
   const field = (
