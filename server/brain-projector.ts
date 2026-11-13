@@ -76,6 +76,8 @@ const backgroundTaskPattern =
   /Tool is running as a background task with task id:\s*(\S+)/
 const systemTaskResultPattern =
   /\bsender=(\S+)[^\n]*\scontent=Task id "([^"]+)" (finished|was canceled|failed) with result:\n([\s\S]*?)(?:\nLog: file:\/\/\S+)?(?=\n(?:\d+\.\s+)?\[Message\]\s+|\s*<\/SYSTEM_MESSAGE>|\s*$)/g
+const hasSystemTaskResult = (text: string) =>
+  new RegExp(systemTaskResultPattern.source).test(text)
 const messageHeaderSenderPattern =
   /(?:^|\n)(?:\d+\.\s+)?\[Message\]\s+(?:timestamp=\S+\s+)?sender=(\S+)/g
 
@@ -111,9 +113,6 @@ export function takePendingForGeneric<
 }
 
 /** Project transcript_full.jsonl steps and correlate tools with structured Brain metadata. */
-const hasSystemTaskResult = (text: string) =>
-  new RegExp(systemTaskResultPattern.source).test(text)
-
 export class BrainTranscriptProjector {
   private pending: PendingTool[] = []
   private nativeIdentities = new WeakMap<
@@ -299,7 +298,10 @@ export class BrainTranscriptProjector {
   }
 
   hasPendingQuestion(): boolean {
-    return Boolean(this.pending.find((p) => !p.questionConsumed)?.isQuestion)
+    // shortcut: JSONL has no cancel marker for an unlogged ask_question immediately followed by USER_INPUT, so replay treats it as a continuation.
+    return this.pending.some((p) =>
+      Boolean(p.isQuestion && !p.questionConsumed && !p.questionCompleted),
+    )
   }
 
   consumePendingQuestion() {
@@ -395,7 +397,10 @@ export class BrainTranscriptProjector {
       stepIndex === this.initialPromptStep &&
       row.type === 'SYSTEM_MESSAGE' &&
       !isRestartNotice(row) &&
-      !hasSystemTaskResult(String(row.content ?? ''))
+      !(
+        this.background.size > 0 &&
+        hasSystemTaskResult(String(row.content ?? ''))
+      )
     ) {
       const initIdx = senders.findIndex((s) => sessionIdPattern.test(s))
       if (initIdx >= 0) {
@@ -678,11 +683,15 @@ export class BrainTranscriptProjector {
               ...this.finishOrDefer(pending, output, status, output),
             )
           }
-          if (completed.length > 0 || taskResults.length > 0) return completed
+          if (
+            completed.length > 0 ||
+            (!isInitialPrompt && taskResults.length > 0)
+          )
+            return completed
         }
         if (isInitialPrompt) {
           const promptMatch = text.match(
-            /\bcontent=([\s\S]*?)(?:\s*<\/SYSTEM_MESSAGE>)?\s*$/,
+            /\bcontent=([\s\S]*?)(?=\n(?:\d+\.\s+)?\[Message\]\s+|\s*<\/SYSTEM_MESSAGE>|\s*$)/,
           )
           const promptText = promptMatch?.[1]?.trim()
           return promptText
@@ -968,10 +977,12 @@ export class BrainNode {
   }
 
   markQuestionContinuation(syntheticPrompt = false) {
-    this.continuingQuestion = true
     this.questionSettled = false
     this.wokeUp = true
-    if (syntheticPrompt) this.promptPhase = 'foreground'
+    if (syntheticPrompt) {
+      this.continuingQuestion = true
+      this.promptPhase = 'foreground'
+    }
     this.answeredQuestionStep = Number(this.lastStep?.step_index ?? -1)
   }
 
@@ -1003,21 +1014,21 @@ export class BrainNode {
     const stepIndex = Number(row.step_index)
     this.questionSettled = false
     this.abortedByDenial = false
+    const continuingQuestion = this.isQuestionContinuationInput(row)
     if (
-      (row.type === 'USER_INPUT' && !this.isQuestionContinuationInput(row)) ||
+      (row.type === 'USER_INPUT' && !continuingQuestion) ||
       isRestartNotice(row)
     )
       this.turnStartStep = stepIndex
     // A restart notice or a question-continuation USER_INPUT does not end a woken turn:
     // the rows after it are still Brain's to project.
-    const liveQuestionContinuation =
-      row.type === 'USER_INPUT' && this.continuingQuestion
+    const liveQuestionContinuation = continuingQuestion
     const msgSenders = this.projector.consumeRowMessageSenders(row)
     const rowMessages = msgSenders.length
     // shortcut: zero counts exclude user/low-priority headers; revisit if agy mixes headerless wakeups with handoffs.
     const purePlanExecuteNotice = isPlanExecuteNotice(row) && rowMessages === 0
     if (row.type === 'USER_INPUT') {
-      if (this.continuingQuestion) {
+      if (continuingQuestion) {
         this.continuingQuestion = false
         this.promptPhase = 'foreground'
       } else this.resetPhase()

@@ -219,10 +219,14 @@ export function extractRowMessageSenders(
   return senders
 }
 
-export function countRowMessages(row: Record<string, unknown>): number {
+export function countRowMessages(
+  row: Record<string, unknown>,
+  allowInitialSpawnPrompt = true,
+): number {
   const senders = extractRowMessageSenders(row)
   if (senders.length === 0) return 0
   if (
+    allowInitialSpawnPrompt &&
     Number(row.step_index) === 0 &&
     senders.some((sender) => sessionIdPattern.test(sender))
   ) {

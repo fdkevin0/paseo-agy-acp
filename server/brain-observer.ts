@@ -226,7 +226,7 @@ export class BrainTurnObservation {
       if (Number.isInteger(index))
         this.lastStepIndex = Math.max(this.lastStepIndex, index)
       if (index <= this.minStepIndex) {
-        this.historicalMessages += countRowMessages(row)
+        this.historicalMessages += countRowMessages(row, false)
         historicalRows.push(row)
       }
     }
