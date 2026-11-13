@@ -14,7 +14,7 @@ import {
 import {
   SUBAGENT_ALIVE,
   TranscriptReader,
-  countRowMessages,
+  extractRowMessageSenders,
   isCompletePlannerResponse,
   isPlanExecuteNotice,
   isRetryWarning,
@@ -76,6 +76,8 @@ const backgroundTaskPattern =
   /Tool is running as a background task with task id:\s*(\S+)/
 const systemTaskResultPattern =
   /\bsender=(\S+)[^\n]*\scontent=Task id "([^"]+)" (finished|was canceled|failed) with result:\n([\s\S]*?)(?:\nLog: file:\/\/\S+)?(?=\n(?:\d+\.\s+)?\[Message\]\s+|\s*<\/SYSTEM_MESSAGE>|\s*$)/g
+const hasSystemTaskResult = (text: string) =>
+  new RegExp(systemTaskResultPattern.source).test(text)
 const messageHeaderSenderPattern =
   /(?:^|\n)(?:\d+\.\s+)?\[Message\]\s+(?:timestamp=\S+\s+)?sender=(\S+)/g
 
@@ -138,6 +140,12 @@ export class BrainTranscriptProjector {
   private verifiedAcpToolIds?: ReadonlySet<string>
   private lastErrorCallId?: string
   private sessionId: string
+  private initialPromptStep: number
+  private lastEvaluatedRow?: {
+    row: Record<string, unknown>
+    senders: string[]
+    isInitialPrompt: boolean
+  }
   private onQuestionSettledByGeneric?: (
     questions: readonly NormalizedQuestion[],
     tool: PendingTool,
@@ -149,9 +157,11 @@ export class BrainTranscriptProjector {
       questions: readonly NormalizedQuestion[],
       tool: PendingTool,
     ) => void,
+    allowInitialSpawnPrompt = true,
   ) {
     this.sessionId = sessionId
     this.onQuestionSettledByGeneric = onQuestionSettledByGeneric
+    this.initialPromptStep = allowInitialSpawnPrompt ? 0 : -1
   }
 
   nativeToolIdentitySource(
@@ -281,6 +291,48 @@ export class BrainTranscriptProjector {
 
   hasDaemons(): boolean {
     return this.daemons.size > 0
+  }
+
+  hasPendingQuestion(): boolean {
+    return Boolean(this.pending.find((p) => !p.questionConsumed)?.isQuestion)
+  }
+
+  private evaluateRowMessages(row: Record<string, unknown>): {
+    senders: string[]
+    isInitialPrompt: boolean
+  } {
+    if (this.lastEvaluatedRow?.row === row) return this.lastEvaluatedRow
+    const senders = extractRowMessageSenders(row)
+    let isInitialPrompt = false
+    if (Number.isInteger(row.step_index)) {
+      const stepIndex = Number(row.step_index)
+      if (
+        stepIndex === this.initialPromptStep &&
+        row.type === 'SYSTEM_MESSAGE' &&
+        !isRestartNotice(row) &&
+        !hasSystemTaskResult(String(row.content ?? ''))
+      ) {
+        const initIdx = senders.findIndex((s) => sessionIdPattern.test(s))
+        if (initIdx >= 0) {
+          senders.splice(initIdx, 1)
+          isInitialPrompt = true
+          this.initialPromptStep = -1
+        } else if (senders.length === 0) {
+          this.initialPromptStep = stepIndex + 1
+        } else {
+          this.initialPromptStep = -1
+        }
+      } else {
+        this.initialPromptStep = -1
+      }
+    }
+    const result = { row, senders, isInitialPrompt }
+    this.lastEvaluatedRow = result
+    return result
+  }
+
+  consumeRowMessageSenders(row: Record<string, unknown>): string[] {
+    return this.evaluateRowMessages(row).senders
   }
 
   consumePendingQuestion() {
@@ -493,15 +545,19 @@ export class BrainTranscriptProjector {
     const row = record(value)
     if (!Number.isInteger(row.step_index)) return []
     const stepIndex = Number(row.step_index)
+    const { isInitialPrompt } = this.evaluateRowMessages(row)
+    this.lastEvaluatedRow = undefined
     const id = `${this.sessionId}:step:${stepIndex}`
     const text = typeof row.content === 'string' ? row.content : ''
     switch (row.type) {
-      case 'USER_INPUT':
+      case 'USER_INPUT': {
+        const isContinuation = continuingQuestion || this.hasPendingQuestion()
         this.pending = []
         this.retired = []
         this.lastErrorCallId = undefined
-        if (!continuingQuestion) this.touchedSubagents.clear()
+        if (!isContinuation) this.touchedSubagents.clear()
         return text ? [{ type: 'user_message', id, text }] : []
+      }
       case 'SYSTEM_MESSAGE': {
         this.lastErrorCallId = undefined
         if (isRestartNotice(row)) {
@@ -566,7 +622,7 @@ export class BrainTranscriptProjector {
           }
           if (completed.length > 0 || taskResults.length > 0) return completed
         }
-        if (stepIndex === 0 && /\bsender=[a-f0-9-]{36}(?=\s|$)/i.test(text)) {
+        if (isInitialPrompt) {
           const promptMatch = text.match(
             /\bcontent=([\s\S]*?)(?:\s*<\/SYSTEM_MESSAGE>)?\s*$/,
           )
@@ -707,6 +763,16 @@ export function activeChildIdsForTurn(
 export type BrainPromptPhase =
   'foreground' | 'foreground_active' | 'foreground_idle' | 'woken'
 
+export type BrainNodeOptions = {
+  onQuestionSettled?: (
+    questions: readonly NormalizedQuestion[],
+    wokeUp: boolean,
+    occurrence: string,
+  ) => void
+  reader?: TranscriptReader
+  allowInitialSpawnPrompt?: boolean
+}
+
 export class BrainNode {
   readonly reader: TranscriptReader
   projector: BrainTranscriptProjector
@@ -725,6 +791,7 @@ export class BrainNode {
   private retrySince?: number
   private retryError?: string
   private retryStep = -1
+  private allowInitialSpawnPrompt: boolean
   readonly nativeId: string
   readonly sessionId: string
   private onQuestionSettled?: (
@@ -736,23 +803,22 @@ export class BrainNode {
   constructor(
     nativeId: string,
     sessionId = nativeId,
-    onQuestionSettled?: (
-      questions: readonly NormalizedQuestion[],
-      wokeUp: boolean,
-      occurrence: string,
-    ) => void,
-    reader = new TranscriptReader(),
+    options: BrainNodeOptions = {},
   ) {
-    this.reader = reader
+    this.reader = options.reader ?? new TranscriptReader()
     this.nativeId = nativeId
     this.sessionId = sessionId
-    this.onQuestionSettled = onQuestionSettled
+    this.onQuestionSettled = options.onQuestionSettled
+    this.allowInitialSpawnPrompt = options.allowInitialSpawnPrompt ?? true
     this.projector = this.createProjector()
   }
 
   private createProjector() {
-    return new BrainTranscriptProjector(this.sessionId, (questions, tool) =>
-      this.onQuestionSettled?.(questions, this.wokeUp, tool.callId),
+    return new BrainTranscriptProjector(
+      this.sessionId,
+      (questions, tool) =>
+        this.onQuestionSettled?.(questions, this.wokeUp, tool.callId),
+      this.allowInitialSpawnPrompt,
     )
   }
 
@@ -821,6 +887,13 @@ export class BrainNode {
     return { inbox, subagents }
   }
 
+  private isQuestionContinuationInput(row: Record<string, unknown>): boolean {
+    return (
+      row.type === 'USER_INPUT' &&
+      (this.continuingQuestion || this.projector.hasPendingQuestion())
+    )
+  }
+
   /** Fold one transcript row into wakeup phase, message accounting, projection and the last step. */
   ingest(
     row: Record<string, unknown>,
@@ -828,13 +901,16 @@ export class BrainNode {
   ): ProviderTimelineItem[] {
     this.questionSettled = false
     this.abortedByDenial = false
-    if (row.type === 'USER_INPUT' || isRestartNotice(row))
+    if (
+      (row.type === 'USER_INPUT' && !this.isQuestionContinuationInput(row)) ||
+      isRestartNotice(row)
+    )
       this.turnStartStep = Number(row.step_index)
     // A restart notice or a question-continuation USER_INPUT does not end a woken turn:
     // the rows after it are still Brain's to project.
     const continuingQuestion =
       row.type === 'USER_INPUT' && this.continuingQuestion
-    const rowMessages = countRowMessages(row)
+    const rowMessages = this.projector.consumeRowMessageSenders(row).length
     // shortcut: zero counts exclude user/low-priority headers; revisit if agy mixes headerless wakeups with handoffs.
     const purePlanExecuteNotice = isPlanExecuteNotice(row) && rowMessages === 0
     if (row.type === 'USER_INPUT') {

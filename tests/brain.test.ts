@@ -17,6 +17,7 @@ import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
   advanceForegroundCursor,
+  BrainNode,
   BrainTranscriptProjector,
   countRowMessages,
   hasActiveBackgroundWork,
@@ -4316,4 +4317,200 @@ test('advanceForegroundCursor handles partial offsets, allowSkip boundaries, and
     ),
     undefined,
   )
+})
+
+test('child initial spawn prompt after step-0 system reminder projects user_message without inflating consumedMessages', async () => {
+  const f = await fixture()
+  const abort = new AbortController()
+  let handle: BrainWatchHandle | undefined
+  let running: Promise<unknown> | undefined
+  try {
+    const reminder = {
+      step_index: 0,
+      type: 'SYSTEM_MESSAGE',
+      content:
+        '<SYSTEM_MESSAGE>\nPlugin environment reminder\n</SYSTEM_MESSAGE>',
+    }
+    const childNode = new BrainNode(child, 'child')
+    assert.deepEqual(childNode.ingest(reminder), [])
+    assert.equal(childNode.consumedMessages, 0)
+    const spawnItems = childNode.ingest(message(1, parent, 'Audit repository'))
+    assert.deepEqual(spawnItems, [
+      {
+        type: 'user_message',
+        id: 'child:step:1',
+        text: 'Audit repository',
+      },
+    ])
+    assert.equal(childNode.consumedMessages, 0)
+
+    await f.put(parent, invoke(child))
+    await f.subagent(parent, child)
+    await f.subagent(child, grandchild, 'SUBAGENT_STATE_ALIVE', 3, 'sub-invoke')
+    await f.put(child, [
+      reminder,
+      message(1, parent, 'Audit repository'),
+      {
+        step_index: 2,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ id: 'sub-invoke', name: 'invoke_subagent', args: {} }],
+      },
+      {
+        step_index: 3,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: JSON.stringify({ conversationId: grandchild }),
+      },
+      done(4, 'waiting for grandchild'),
+    ])
+    await f.put(grandchild, [
+      message(0, child, 'check details'),
+      ...report(child, 'grandchild report', 1),
+    ])
+    // Grandchild report is marked read in child inbox before child flushes its wakeup step.
+    await f.deliver(child, grandchild, 'grandchild report', true, 'gc-report')
+
+    const childEvents: ProviderEvent[] = []
+    handle = watchBrain(f.root, child, 'child', (e) => childEvents.push(e), 5)
+    await handle.ready
+    assert.ok(
+      childEvents.some(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'user_message' &&
+          e.item.id === 'child:step:1' &&
+          e.item.text === 'Audit repository',
+      ),
+    )
+    assert.equal(
+      handle.isRunning(),
+      true,
+      'step-1 spawn prompt must not count as a consumed wakeup message',
+    )
+
+    let parentSettled = false
+    running = settleBrainTurn(f.root, parent, 'p', () => {}, {
+      signal: abort.signal,
+      minStepIndex: -1,
+      pollIntervalMs: 5,
+    }).then((res) => {
+      parentSettled = true
+      return res
+    })
+    await delay(30)
+    assert.equal(parentSettled, false)
+
+    await appendFile(
+      f.path(child),
+      encode([
+        message(5, grandchild, 'grandchild report'),
+        ...report(parent, 'child final report', 6),
+      ]),
+    )
+    await f.deliver(parent, child, 'child final report', true, 'c-report')
+    await appendFile(
+      f.path(parent),
+      encode([message(5, child, 'child final report'), done(6, 'all done')]),
+    )
+    await waitUntil(() => parentSettled)
+    assert.equal(((await running) as { status: string }).status, 'completed')
+
+    // Root session (allowInitialSpawnPrompt = false) treats a step-0 UUID [Message] as a wakeup, not an initial spawn prompt.
+    const rootNode = new BrainNode(parent, 'p', {
+      allowInitialSpawnPrompt: false,
+    })
+    assert.deepEqual(rootNode.ingest(message(0, child, 'child wakeup')), [])
+    assert.equal(rootNode.consumedMessages, 1)
+    const rootProjector = new BrainTranscriptProjector(parent, undefined, false)
+    assert.deepEqual(
+      rootProjector.project(message(0, child, 'child wakeup')),
+      [],
+    )
+  } finally {
+    abort.abort()
+    await running
+    handle?.()
+    await f.close()
+  }
+})
+
+test('question-continuation USER_INPUT preserves turnStartStep and touchedSubagents across replay and live continuation', () => {
+  const spawnAndAsk = (startStep: number): Row[] => [
+    { step_index: startStep, type: 'USER_INPUT', content: 'start turn' },
+    {
+      step_index: startStep + 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        { id: 'spawn-1', name: 'invoke_subagent', args: {} },
+        {
+          id: 'ask-1',
+          name: 'ask_question',
+          args: { questions: [{ question: 'Proceed?', options: ['Yes'] }] },
+        },
+      ],
+    },
+    {
+      step_index: startStep + 2,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: JSON.stringify({ conversationId: child }),
+    },
+  ]
+
+  // 1. Replay path (hasPendingQuestion() === true without markQuestionContinuation):
+  const replayNode = new BrainNode(parent, 'p', {
+    allowInitialSpawnPrompt: false,
+  })
+  for (const row of spawnAndAsk(10)) replayNode.ingest(row)
+  assert.equal(replayNode.turnStartStep, 10)
+  assert.equal(replayNode.projector.hasPendingQuestion(), true)
+  assert.deepEqual([...replayNode.projector.touchedSubagentIds()], [child])
+
+  replayNode.ingest({
+    step_index: 13,
+    type: 'USER_INPUT',
+    content: 'Yes',
+  })
+  assert.equal(
+    replayNode.turnStartStep,
+    10,
+    'question-continuation USER_INPUT must preserve turnStartStep when pending question is unconsumed',
+  )
+  assert.deepEqual(
+    [...replayNode.projector.touchedSubagentIds()],
+    [child],
+    'question-continuation USER_INPUT must preserve touchedSubagents',
+  )
+
+  // A subsequent new turn USER_INPUT advances turnStartStep and clears touchedSubagents.
+  replayNode.ingest(done(14, 'done'))
+  replayNode.ingest({
+    step_index: 15,
+    type: 'USER_INPUT',
+    content: 'new turn',
+  })
+  assert.equal(replayNode.turnStartStep, 15)
+  assert.deepEqual([...replayNode.projector.touchedSubagentIds()], [])
+
+  // 2. Live continuation path (consumePendingQuestion() + markQuestionContinuation(true)):
+  const liveNode = new BrainNode(parent, 'p', {
+    allowInitialSpawnPrompt: false,
+  })
+  for (const row of spawnAndAsk(20)) liveNode.ingest(row)
+  assert.ok(liveNode.projector.consumePendingQuestion())
+  assert.equal(liveNode.projector.hasPendingQuestion(), false)
+  liveNode.markQuestionContinuation(true)
+  liveNode.ingest({
+    step_index: 23,
+    type: 'USER_INPUT',
+    content: 'Yes',
+  })
+  assert.equal(
+    liveNode.turnStartStep,
+    20,
+    'live synthetic question continuation must preserve turnStartStep',
+  )
+  assert.deepEqual([...liveNode.projector.touchedSubagentIds()], [child])
 })
