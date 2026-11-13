@@ -66,11 +66,16 @@ export type PendingQuestion = {
   questions: NormalizedQuestion[]
   wokeUp: boolean
   beginContinuation?: (answerText: string) => void
+  restoreContinuationCarry?: (preservePendingReplay: boolean) => void
 }
 
 export type QuestionOutcome =
   | { status: 'answered' | 'already_handled'; answerText?: string }
-  | { status: 'canceled' }
+  | {
+      status: 'canceled'
+      preserveCarriedWakeup?: boolean
+      preservePendingReplay?: boolean
+    }
 
 const backgroundTaskPattern =
   /Tool is running as a background task with task id:\s*(\S+)/
