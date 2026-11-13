@@ -511,6 +511,7 @@ export async function settleBrainTurn(
   const wakeupSteps = new Map<number, { usage: StepUsage; carried: boolean }>()
   let preContinuationCarriedSteps: number[] = []
   let preservedPreContinuationCarry = false
+  let preservedPreContinuationReplay = false
   const clearCarriedWakeup = () => {
     preContinuationCarriedSteps = []
     for (const [step, entry] of wakeupSteps) {
@@ -557,8 +558,9 @@ export async function settleBrainTurn(
       if (entry.carried && !unanchoredSynthetic)
         carriedWakeupUsage = addStepUsage(carriedWakeupUsage, entry.usage)
     }
-    const pendingReplay =
-      seenSyntheticPrompt || unanchoredSynthetic
+    const pendingReplay = preservedPreContinuationReplay
+      ? fgReconciler.postRpc
+      : seenSyntheticPrompt || unanchoredSynthetic
         ? !unanchoredSynthetic &&
           node.wokeUpSinceLastPrompt &&
           fgReconciler.postRpc
@@ -806,8 +808,10 @@ export async function settleBrainTurn(
               })
             : { status: 'already_handled' }
         if (signal?.aborted || outcome.status === 'canceled') {
-          if (outcome.status === 'canceled' && outcome.preserveCarriedWakeup) {
-            restoreCarriedWakeup()
+          if (outcome.status === 'canceled') {
+            if (outcome.preserveCarriedWakeup) restoreCarriedWakeup()
+            if (outcome.preservePendingReplay)
+              preservedPreContinuationReplay = true
           }
           onItem(
             node.projector.completePendingQuestion(

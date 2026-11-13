@@ -1835,6 +1835,7 @@ async function promptSession(
                   preserveCarriedWakeup: !hasPositivePromptUsage(
                     contResult.usage,
                   ),
+                  preservePendingReplay: !session.state.continuationEchoSeen,
                 }
               }
             } finally {

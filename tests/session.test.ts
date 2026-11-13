@@ -2193,132 +2193,154 @@ test('post-waitPrompt settle failure still publishes positive result.usage and c
   )
 })
 
-test('canceled synthetic ask_question continuation with zero usage preserves pre-continuation carriedUsage', async (t) => {
-  const home = await mkdtemp(join(tmpdir(), 'agy-f2-cont-cancel-'))
-  const events: ProviderEvent[] = []
-  const m = new SessionManager({
-    launch: {
-      command: process.execPath,
-      args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-      env: { HOME: home, PATH: process.env.PATH ?? '' },
-    },
-    usage: new AgyUsageSource(),
-    capabilities: ['prompt.message', 'permission'],
-    emit: (e) => events.push(structuredClone(e)),
-  })
-  t.after(async () => {
-    await m.close()
-    await rm(home, { recursive: true, force: true })
-  })
-  const start = m.start.bind(m)
-  let session!: Awaited<ReturnType<typeof m.start>>
-  t.mock.method(
-    m,
-    'start',
-    async (...args: Parameters<typeof start>) =>
-      (session = await start(...args)),
-  )
-  await m.open({
-    type: 'session.open',
-    requestId: 'open',
-    sessionId: 's',
-    history: 'skip',
-    config: {
-      cwd: home,
-      env: {},
-      mcpServers: {},
-      settings: {},
-      persist: true,
-    },
-  })
-  const sender = '44444444-4444-4444-8444-444444444444'
-  let rpcCount = 0
-  t.mock.method(session.transport.rpc, 'prompt', async () => {
-    rpcCount++
-    if (rpcCount === 1) {
-      await writeBrainTranscript(session.brainRoot, session.state.nativeId, [
-        { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-        {
-          step_index: 1,
-          type: 'PLANNER_RESPONSE',
-          status: 'DONE',
-          content: 'Foreground',
-          input_tokens: 100,
-          output_tokens: 10,
-        },
-        {
-          step_index: 2,
-          type: 'SYSTEM_MESSAGE',
-          content: `<SYSTEM_MESSAGE>\n[Message] sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=wake\n</SYSTEM_MESSAGE>`,
-        },
-        {
-          step_index: 3,
-          type: 'PLANNER_RESPONSE',
-          status: 'DONE',
-          input_tokens: 40,
-          output_tokens: 4,
-          tool_calls: [
-            {
-              id: 'ask-1',
-              name: 'ask_question',
-              args: {
-                questions: [
-                  {
-                    question: 'Proceed?',
-                    options: [{ label: 'Yes' }, { label: 'No' }],
-                  },
-                ],
-              },
-            },
-          ],
-        },
-      ])
-      return {
-        stopReason: 'end_turn' as const,
-        usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
-      }
-    }
-    return {
-      stopReason: 'cancelled' as const,
-      usage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        totalTokens: 0,
+for (const postEcho of [false, true])
+  test(`canceled synthetic ask_question continuation with zero usage preserves carriedUsage (postEcho: ${postEcho})`, async (t) => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-f2-cont-cancel-'))
+    const events: ProviderEvent[] = []
+    const m = new SessionManager({
+      launch: {
+        command: process.execPath,
+        args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+        env: { HOME: home, PATH: process.env.PATH ?? '' },
       },
-    }
-  })
+      usage: new AgyUsageSource(),
+      capabilities: ['prompt.message', 'permission'],
+      emit: (e) => events.push(structuredClone(e)),
+    })
+    t.after(async () => {
+      await m.close()
+      await rm(home, { recursive: true, force: true })
+    })
+    const start = m.start.bind(m)
+    let session!: Awaited<ReturnType<typeof m.start>>
+    t.mock.method(
+      m,
+      'start',
+      async (...args: Parameters<typeof start>) =>
+        (session = await start(...args)),
+    )
+    await m.open({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'skip',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    const sender = '44444444-4444-4444-8444-444444444444'
+    const nativePrompt = session.transport.rpc.prompt.bind(
+      session.transport.rpc,
+    )
+    let rpcCount = 0
+    t.mock.method(session.transport.rpc, 'prompt', async () => {
+      rpcCount++
+      if (rpcCount === 1) {
+        await writeBrainTranscript(session.brainRoot, session.state.nativeId, [
+          { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Foreground',
+            input_tokens: 100,
+            output_tokens: 10,
+          },
+          {
+            step_index: 2,
+            type: 'SYSTEM_MESSAGE',
+            content: `<SYSTEM_MESSAGE>\n[Message] sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=wake\n</SYSTEM_MESSAGE>`,
+          },
+          {
+            step_index: 3,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            input_tokens: 40,
+            output_tokens: 4,
+            tool_calls: [
+              {
+                id: 'ask-1',
+                name: 'ask_question',
+                args: {
+                  questions: [
+                    {
+                      question: 'Proceed?',
+                      options: [{ label: 'Yes' }, { label: 'No' }],
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        ])
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
+        }
+      }
+      if (postEcho) {
+        const pending = nativePrompt({
+          sessionId: session.state.nativeId,
+          prompt: [{ type: 'text', text: 'wait' }],
+        })
+        for (let i = 0; i < 100 && !session.state.continuationEchoSeen; i++) {
+          await delay(10)
+        }
+        await session.transport.rpc.cancel({
+          sessionId: session.state.nativeId,
+        })
+        await pending
+      }
+      return {
+        stopReason: 'cancelled' as const,
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          cachedReadTokens: 0,
+          totalTokens: 0,
+        },
+      }
+    })
 
-  const promptPromise = m.handle({
-    type: 'session.prompt',
-    sessionId: 's',
-    prompt: {
-      clientMessageId: 'p-f2',
-      delivery: 'auto',
-      input: { type: 'message', content: [{ type: 'text', text: 'turn 1' }] },
-    },
+    const promptPromise = m.handle({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'p-f2',
+        delivery: 'auto',
+        input: { type: 'message', content: [{ type: 'text', text: 'turn 1' }] },
+      },
+    })
+    // Wait for the woken ask_question permission request, then answer it.
+    let permissionId: string | undefined
+    for (let i = 0; i < 100 && !permissionId; i++) {
+      const req = events.find((e) => e.type === 'session.permission')
+      if (req?.type === 'session.permission') permissionId = req.request.id
+      else await delay(10)
+    }
+    assert.ok(permissionId, 'woken ask_question must emit session.permission')
+    await m.handle({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId,
+      response: {
+        behavior: 'allow',
+        updatedInput: { answers: { 'Proceed?': 'Yes' } },
+      },
+    })
+    await promptPromise
+    assert.deepEqual(
+      session.state.wakeup.carriedUsage,
+      { inputTokens: 40, outputTokens: 4, cachedReadTokens: 0 },
+      'canceled zero-usage continuation must preserve pre-continuation wakeup carriedUsage',
+    )
+    assert.equal(
+      session.state.wakeup.pendingReplay,
+      !postEcho,
+      'pre-echo canceled continuation must preserve pendingReplay while post-echo clears it',
+    )
   })
-  // Wait for the woken ask_question permission request, then answer it.
-  let permissionId: string | undefined
-  for (let i = 0; i < 100 && !permissionId; i++) {
-    const req = events.find((e) => e.type === 'session.permission')
-    if (req?.type === 'session.permission') permissionId = req.request.id
-    else await delay(10)
-  }
-  assert.ok(permissionId, 'woken ask_question must emit session.permission')
-  await m.handle({
-    type: 'session.permission',
-    sessionId: 's',
-    permissionId,
-    response: {
-      behavior: 'allow',
-      updatedInput: { answers: { 'Proceed?': 'Yes' } },
-    },
-  })
-  await promptPromise
-  assert.deepEqual(
-    session.state.wakeup.carriedUsage,
-    { inputTokens: 40, outputTokens: 4, cachedReadTokens: 0 },
-    'canceled zero-usage continuation must preserve pre-continuation wakeup carriedUsage',
-  )
-})
