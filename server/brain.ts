@@ -41,6 +41,7 @@ import {
 } from './brain-projector.ts'
 
 export {
+  BrainNode,
   BrainTranscriptProjector,
   countRowMessages,
   readInboxState,
@@ -61,7 +62,9 @@ export async function hasActiveBackgroundWork(
   if (!sessionIdPattern.test(nativeId) || visiting.has(nativeId)) return false
   visiting.add(nativeId)
   try {
-    const node = new BrainNode(nativeId)
+    const node = new BrainNode(nativeId, nativeId, {
+      allowInitialSpawnPrompt: isChild,
+    })
     const [{ inbox, subagents }, { rows, mtimeMs }] = await Promise.all([
       node.pollMetadata(root),
       node.reader.read(root, nativeId).catch((error) => {
@@ -461,15 +464,14 @@ export async function settleBrainTurn(
   >()
   const deliveredQuestions = new Set<string>()
   const questionAnswers = new Map<string, QuestionOutcome>()
-  const node = new BrainNode(
-    nativeId,
-    sessionId,
-    (questions, _wokeUp, key) => {
+  const node = new BrainNode(nativeId, sessionId, {
+    onQuestionSettled: (questions, _wokeUp, key) => {
       if (!deliveredQuestions.has(key))
         settledQuestions.set(key, { questions, wokeUp: fgReconciler.postRpc })
     },
-    observation?.reader,
-  )
+    reader: observation?.reader,
+    allowInitialSpawnPrompt: false,
+  })
   const ownsObservation = !observation
   const stream =
     observation ??
@@ -517,12 +519,12 @@ export async function settleBrainTurn(
       acpIndex: acpToolCallIds.length,
       syntheticPrompt,
     }
-    continuations.push(boundary)
-    node.markQuestionContinuation(syntheticPrompt)
     if (syntheticPrompt) {
+      continuations.push(boundary)
       seenSyntheticPrompt = true
       clearCarriedWakeup()
     }
+    node.markQuestionContinuation(syntheticPrompt)
     node.projector.bindToolCallIds(acpToolCallIds, boundary.acpIndex)
     fgReconciler.markPostRpcWakeup()
     stream.wokeUp = true
@@ -637,7 +639,7 @@ export async function settleBrainTurn(
       initial = false
       anchored = true
       for (const row of preamble.slice(0, start))
-        node.consumedMessages += countRowMessages(row)
+        node.consumedMessages += countRowMessages(row, false)
       slice = preamble.slice(start)
       preamble = []
       node.projector.observeRows(slice)

@@ -318,7 +318,7 @@ export function projectReplayHistory({
   entries: HistoryEntry[]
   lastKnownStepIndex: number
 } {
-  const projector = new BrainTranscriptProjector(sessionId)
+  const projector = new BrainTranscriptProjector(sessionId, undefined, false)
   projector.syncMetadata(inbox, subagents)
   const slots = projector.observeRows(rows)
   const { alignedIds, verifiedAcpToolIds } = alignReplayTools(
