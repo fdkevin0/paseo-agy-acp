@@ -4513,4 +4513,65 @@ test('question-continuation USER_INPUT preserves turnStartStep and touchedSubage
     'live synthetic question continuation must preserve turnStartStep',
   )
   assert.deepEqual([...liveNode.projector.touchedSubagentIds()], [child])
+
+  // 3. Stateless replay of woken ask_question preserves node.wokeUp and works when a sibling tool precedes ask_question.
+  const wokenReplayNode = new BrainNode(parent, 'p', {
+    allowInitialSpawnPrompt: false,
+  })
+  for (const row of [
+    { step_index: 30, type: 'USER_INPUT', content: 'start' },
+    done(31, 'waiting'),
+    message(32, child, 'child finished'),
+    {
+      step_index: 33,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        { id: 'bg-1', name: 'run_command', args: { CommandLine: 'echo ok' } },
+        {
+          id: 'ask-2',
+          name: 'ask_question',
+          args: { questions: [{ question: 'Continue?', options: ['Yes'] }] },
+        },
+      ],
+    },
+  ] satisfies Row[]) {
+    wokenReplayNode.ingest(row)
+  }
+  assert.equal(wokenReplayNode.wokeUp, true)
+  assert.equal(wokenReplayNode.projector.hasPendingQuestion(), true)
+  wokenReplayNode.ingest({
+    step_index: 34,
+    type: 'USER_INPUT',
+    content: 'Yes',
+  })
+  assert.equal(wokenReplayNode.turnStartStep, 30)
+  assert.equal(
+    wokenReplayNode.wokeUp,
+    true,
+    'stateless replay of woken question continuation must preserve node.wokeUp',
+  )
+})
+
+test('initial spawn prompt quoting task results or batched with a followup message projects only the initial prompt', () => {
+  const childNode = new BrainNode(child, 'c')
+  const quotedContent =
+    'Analyze this log:\nsender=task-1 content=Task id "task-1" finished with result:\nok'
+  const batchedRow: Row = {
+    step_index: 0,
+    type: 'SYSTEM_MESSAGE',
+    content: `<SYSTEM_MESSAGE>\n1. [Message] timestamp=2026-11-08T17:00:00Z sender=${parent} priority=MESSAGE_PRIORITY_HIGH content=${quotedContent}\n2. [Message] timestamp=2026-11-08T17:00:01Z sender=${parent} priority=MESSAGE_PRIORITY_HIGH content=followup\n</SYSTEM_MESSAGE>`,
+  }
+  const items = childNode.ingest(batchedRow)
+  assert.deepEqual(items, [
+    {
+      type: 'user_message',
+      id: 'c:step:0',
+      text: quotedContent,
+    },
+  ])
+  assert.equal(childNode.consumedMessages, 1)
+
+  // Root countRowMessages(row, false) counts step-0 UUID wakeup without subtracting 1.
+  assert.equal(countRowMessages(message(0, child, 'root wakeup'), false), 1)
 })

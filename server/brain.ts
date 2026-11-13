@@ -517,12 +517,12 @@ export async function settleBrainTurn(
       acpIndex: acpToolCallIds.length,
       syntheticPrompt,
     }
-    continuations.push(boundary)
-    node.markQuestionContinuation(syntheticPrompt)
     if (syntheticPrompt) {
+      continuations.push(boundary)
       seenSyntheticPrompt = true
       clearCarriedWakeup()
     }
+    node.markQuestionContinuation(syntheticPrompt)
     node.projector.bindToolCallIds(acpToolCallIds, boundary.acpIndex)
     fgReconciler.markPostRpcWakeup()
     stream.wokeUp = true
@@ -635,7 +635,7 @@ export async function settleBrainTurn(
       initial = false
       anchored = true
       for (const row of preamble.slice(0, start))
-        node.consumedMessages += countRowMessages(row)
+        node.consumedMessages += countRowMessages(row, false)
       slice = preamble.slice(start)
       preamble = []
       node.projector.observeRows(slice)

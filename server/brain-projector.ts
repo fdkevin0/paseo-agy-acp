@@ -294,37 +294,43 @@ export class BrainTranscriptProjector {
   }
 
   hasPendingQuestion(): boolean {
-    return Boolean(this.pending.find((p) => !p.questionConsumed)?.isQuestion)
+    return this.pending.some((p) =>
+      Boolean(p.isQuestion && !p.questionConsumed && !p.questionCompleted),
+    )
   }
 
   private evaluateRowMessages(row: Record<string, unknown>): {
     senders: string[]
     isInitialPrompt: boolean
   } {
+    if (!Number.isInteger(row.step_index)) {
+      return { senders: extractRowMessageSenders(row), isInitialPrompt: false }
+    }
     if (this.lastEvaluatedRow?.row === row) return this.lastEvaluatedRow
     const senders = extractRowMessageSenders(row)
     let isInitialPrompt = false
-    if (Number.isInteger(row.step_index)) {
-      const stepIndex = Number(row.step_index)
-      if (
-        stepIndex === this.initialPromptStep &&
-        row.type === 'SYSTEM_MESSAGE' &&
-        !isRestartNotice(row) &&
-        !hasSystemTaskResult(String(row.content ?? ''))
-      ) {
-        const initIdx = senders.findIndex((s) => sessionIdPattern.test(s))
-        if (initIdx >= 0) {
-          senders.splice(initIdx, 1)
-          isInitialPrompt = true
-          this.initialPromptStep = -1
-        } else if (senders.length === 0) {
-          this.initialPromptStep = stepIndex + 1
-        } else {
-          this.initialPromptStep = -1
-        }
+    const stepIndex = Number(row.step_index)
+    if (
+      stepIndex === this.initialPromptStep &&
+      row.type === 'SYSTEM_MESSAGE' &&
+      !isRestartNotice(row) &&
+      !(
+        this.background.size > 0 &&
+        hasSystemTaskResult(String(row.content ?? ''))
+      )
+    ) {
+      const initIdx = senders.findIndex((s) => sessionIdPattern.test(s))
+      if (initIdx >= 0) {
+        senders.splice(initIdx, 1)
+        isInitialPrompt = true
+        this.initialPromptStep = -1
+      } else if (senders.length === 0) {
+        this.initialPromptStep = stepIndex + 1
       } else {
         this.initialPromptStep = -1
       }
+    } else {
+      this.initialPromptStep = -1
     }
     const result = { row, senders, isInitialPrompt }
     this.lastEvaluatedRow = result
@@ -542,10 +548,13 @@ export class BrainTranscriptProjector {
   }
   project(value: unknown, continuingQuestion = false): ProviderTimelineItem[] {
     this.lastBackgroundGeneric = undefined
+    const cached = this.lastEvaluatedRow
+    this.lastEvaluatedRow = undefined
     const row = record(value)
     if (!Number.isInteger(row.step_index)) return []
     const stepIndex = Number(row.step_index)
-    const { isInitialPrompt } = this.evaluateRowMessages(row)
+    const { isInitialPrompt } =
+      cached?.row === row ? cached : this.evaluateRowMessages(row)
     this.lastEvaluatedRow = undefined
     const id = `${this.sessionId}:step:${stepIndex}`
     const text = typeof row.content === 'string' ? row.content : ''
@@ -620,11 +629,15 @@ export class BrainTranscriptProjector {
               ...this.finishOrDefer(pending, output, status, output),
             )
           }
-          if (completed.length > 0 || taskResults.length > 0) return completed
+          if (
+            completed.length > 0 ||
+            (!isInitialPrompt && taskResults.length > 0)
+          )
+            return completed
         }
         if (isInitialPrompt) {
           const promptMatch = text.match(
-            /\bcontent=([\s\S]*?)(?:\s*<\/SYSTEM_MESSAGE>)?\s*$/,
+            /\bcontent=([\s\S]*?)(?=\n(?:\d+\.\s+)?\[Message\]\s+|\s*<\/SYSTEM_MESSAGE>|\s*$)/,
           )
           const promptText = promptMatch?.[1]?.trim()
           return promptText
@@ -867,10 +880,12 @@ export class BrainNode {
   }
 
   markQuestionContinuation(syntheticPrompt = false) {
-    this.continuingQuestion = true
     this.questionSettled = false
     this.wokeUp = true
-    if (syntheticPrompt) this.promptPhase = 'foreground'
+    if (syntheticPrompt) {
+      this.continuingQuestion = true
+      this.promptPhase = 'foreground'
+    }
     this.answeredQuestionStep = Number(this.lastStep?.step_index ?? -1)
   }
 
@@ -901,20 +916,19 @@ export class BrainNode {
   ): ProviderTimelineItem[] {
     this.questionSettled = false
     this.abortedByDenial = false
+    const continuingQuestion = this.isQuestionContinuationInput(row)
     if (
-      (row.type === 'USER_INPUT' && !this.isQuestionContinuationInput(row)) ||
+      (row.type === 'USER_INPUT' && !continuingQuestion) ||
       isRestartNotice(row)
     )
       this.turnStartStep = Number(row.step_index)
     // A restart notice or a question-continuation USER_INPUT does not end a woken turn:
     // the rows after it are still Brain's to project.
-    const continuingQuestion =
-      row.type === 'USER_INPUT' && this.continuingQuestion
     const rowMessages = this.projector.consumeRowMessageSenders(row).length
     // shortcut: zero counts exclude user/low-priority headers; revisit if agy mixes headerless wakeups with handoffs.
     const purePlanExecuteNotice = isPlanExecuteNotice(row) && rowMessages === 0
     if (row.type === 'USER_INPUT') {
-      if (this.continuingQuestion) {
+      if (continuingQuestion) {
         this.continuingQuestion = false
         this.promptPhase = 'foreground'
       } else this.resetPhase()
