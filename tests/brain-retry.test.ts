@@ -1015,7 +1015,7 @@ test('BrainTurnObservation preserves retry observedAt across pre-attach empty O_
   }
 })
 
-test('retry replay deadlines survive resets while turn floors isolate terminal failures and reports', (t) => {
+test('turn floors drop replayed retry warnings and terminal failures below them', (t) => {
   t.mock.timers.enable({ apis: ['Date'], now: 2_000_000 })
   const node = new BrainNode(id)
   const oldWarning = warning(2, 1)
@@ -1024,30 +1024,29 @@ test('retry replay deadlines survive resets while turn floors isolate terminal f
   node.advanceTurnFloor(2)
   node.reset(inbox, [])
   node.ingest(oldWarning)
-  assert.equal(
-    node.failure(),
-    undefined,
-    'replayed old retries stay below the floor',
-  )
+  assert.equal(node.failure(), undefined)
+})
+
+test('a current-turn terminal failure survives a later report row', (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 2_000_000 })
+  const node = new BrainNode(id)
   node.ingest({ step_index: 3, type: 'ERROR_MESSAGE', content: 'fatal' })
   node.ingest({
     step_index: 4,
     type: 'SYSTEM_MESSAGE',
     content: 'background report',
   })
-  assert.equal(
-    node.failure(),
-    'fatal',
-    'reports preserve current terminal failure',
-  )
+  assert.equal(node.failure(), 'fatal')
   node.advanceTurnFloor(4)
   assert.equal(node.failure(), undefined)
+})
+
+test('a retry above the turn floor starts its own deadline', (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 2_000_000 })
+  const node = new BrainNode(id)
+  node.advanceTurnFloor(4)
   node.ingest(warning(5, 2))
-  assert.equal(
-    node.failure(),
-    undefined,
-    'new turn retries receive a fresh deadline',
-  )
+  assert.equal(node.failure(), undefined)
   t.mock.timers.tick(RETRY_IDLE_TIMEOUT_MS)
   assert.match(node.failure()!, /attempt 2.*No retry recovery/)
 })

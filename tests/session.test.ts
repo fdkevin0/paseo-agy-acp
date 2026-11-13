@@ -1734,117 +1734,146 @@ new AgentSideConnection((client) => ({
   },
 )
 
+type ChildSession = {
+  interrupt: (mode: 'cancel' | 'relaunch') => Promise<void>
+  transport: { rpc: { prompt: (...args: unknown[]) => Promise<unknown> } }
+}
+
+/** An opened session whose child subagents live in a synthetic `brain` tree. */
+async function childSession(retryTimeoutMs?: number) {
+  const home = await mkdtemp(join(tmpdir(), 'agy-child-session-'))
+  const logPath = join(home, 'agy.log')
+  const events: ProviderEvent[] = []
+  const m = new SessionManager({
+    launch: {
+      command: process.execPath,
+      args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+      env: {
+        HOME: home,
+        PATH: process.env.PATH ?? '',
+        AGY_TEST_LOG: logPath,
+        AGY_TEST_LOG_LOAD: '1',
+      },
+    },
+    usage: new AgyUsageSource(),
+    capabilities: ['prompt.message', 'session.subsession'],
+    retryTimeoutMs,
+    emit: (event) => events.push(structuredClone(event)),
+  })
+  await m.open({
+    type: 'session.open',
+    requestId: 'open',
+    sessionId: 's',
+    history: 'skip',
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+  const opened = events.find(
+    (e) => e.type === 'session.opened' && e.sessionId === 's',
+  )
+  assert.ok(opened?.type === 'session.opened')
+  const nativeId = (opened.persistence!.data as { sessionId: string }).sessionId
+  const brainRoot = join(home, '.gemini/antigravity-cli/brain')
+  const writeJsonl = async (id: string, rows: unknown[]) => {
+    const dir = join(brainRoot, id, '.system_generated/logs')
+    await mkdir(dir, { recursive: true })
+    await writeFile(
+      join(dir, 'transcript_full.jsonl'),
+      rows.map((r) => JSON.stringify(r) + '\n').join(''),
+    )
+  }
+  const writeSubagent = async (
+    id: string,
+    spawnStepIndex: number,
+    callId: string,
+    content = 'work',
+  ) => {
+    const subDir = join(brainRoot, nativeId, '.system_generated/subagents')
+    await mkdir(subDir, { recursive: true })
+    await writeFile(
+      join(subDir, `${id}.json`),
+      JSON.stringify({
+        conversationId: id,
+        spawnStepIndex,
+        state: 'SUBAGENT_STATE_ALIVE',
+      }),
+    )
+    const msgDir = join(brainRoot, id, '.system_generated/messages')
+    await mkdir(msgDir, { recursive: true })
+    await writeFile(
+      join(msgDir, 'init.json'),
+      JSON.stringify({
+        id: 'init',
+        sender: nativeId,
+        recipient: id,
+        priority: 'MESSAGE_PRIORITY_HIGH',
+        content,
+        sourceMetadata: {
+          tool: {
+            conversationId: nativeId,
+            stepIndex: spawnStepIndex,
+            toolCall: {
+              id: callId,
+              name: 'invoke_subagent',
+              argumentsJson: '{}',
+            },
+          },
+        },
+      }),
+    )
+    await writeFile(join(msgDir, 'read.json'), JSON.stringify({ init: true }))
+  }
+  const session = (
+    m as unknown as { sessions: Map<string, ChildSession> }
+  ).sessions.get('s')!
+  const prompt = (clientMessageId: string, text: string) =>
+    m.handle({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId,
+        delivery: 'auto',
+        input: { type: 'message', content: [{ type: 'text', text }] },
+      },
+    })
+  return {
+    logPath,
+    prompt,
+    events,
+    nativeId,
+    brainRoot,
+    writeJsonl,
+    writeSubagent,
+    session,
+    close: async () => {
+      await m.close()
+      await rm(home, { recursive: true, force: true })
+    },
+  }
+}
+
 test(
   'parallel child crash flushes failed child state, cancels running sibling watcher, and relaunches runtime',
   { timeout: 10_000 },
   async (t) => {
-    const home = await mkdtemp(join(tmpdir(), 'agy-sibling-crash-'))
-    const logPath = join(home, 'agy.log')
-    const events: ProviderEvent[] = []
-    const m = new SessionManager({
-      launch: {
-        command: process.execPath,
-        args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-        env: {
-          HOME: home,
-          PATH: process.env.PATH ?? '',
-          AGY_TEST_LOG: logPath,
-          AGY_TEST_LOG_LOAD: '1',
-        },
-      },
-      usage: new AgyUsageSource(),
-      capabilities: ['prompt.message', 'session.subsession'],
-      emit: (event) => events.push(structuredClone(event)),
-    })
+    const {
+      logPath,
+      events,
+      nativeId,
+      prompt,
+      writeJsonl,
+      writeSubagent,
+      session,
+      close,
+    } = await childSession(40)
+    const childA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const childB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
     try {
-      await m.open({
-        type: 'session.open',
-        requestId: 'open',
-        sessionId: 's',
-        history: 'skip',
-        config: {
-          cwd: home,
-          env: {},
-          mcpServers: {},
-          settings: {},
-          persist: true,
-        },
-      })
-      const opened = events.find(
-        (e) => e.type === 'session.opened' && e.sessionId === 's',
-      )
-      assert.ok(opened?.type === 'session.opened')
-      const nativeId = (opened.persistence!.data as { sessionId: string })
-        .sessionId
-      const brainRoot = join(home, '.gemini/antigravity-cli/brain')
-      const childA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-      const childB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
-
-      const writeJsonl = async (id: string, rows: unknown[]) => {
-        const dir = join(brainRoot, id, '.system_generated/logs')
-        await mkdir(dir, { recursive: true })
-        await writeFile(
-          join(dir, 'transcript_full.jsonl'),
-          rows.map((r) => JSON.stringify(r) + '\n').join(''),
-        )
-      }
-      const writeSubagent = async (
-        id: string,
-        spawnStepIndex: number,
-        callId: string,
-      ) => {
-        const subDir = join(brainRoot, nativeId, '.system_generated/subagents')
-        await mkdir(subDir, { recursive: true })
-        await writeFile(
-          join(subDir, `${id}.json`),
-          JSON.stringify({
-            conversationId: id,
-            spawnStepIndex,
-            state: 'SUBAGENT_STATE_ALIVE',
-          }),
-        )
-        const msgDir = join(brainRoot, id, '.system_generated/messages')
-        await mkdir(msgDir, { recursive: true })
-        await writeFile(
-          join(msgDir, 'init.json'),
-          JSON.stringify({
-            id: 'init',
-            sender: nativeId,
-            recipient: id,
-            priority: 'MESSAGE_PRIORITY_HIGH',
-            content: 'work',
-            sourceMetadata: {
-              tool: {
-                conversationId: nativeId,
-                stepIndex: spawnStepIndex,
-                toolCall: {
-                  id: callId,
-                  name: 'invoke_subagent',
-                  argumentsJson: '{}',
-                },
-              },
-            },
-          }),
-        )
-        await writeFile(
-          join(msgDir, 'read.json'),
-          JSON.stringify({ init: true }),
-        )
-      }
-
-      const sessions = (
-        m as unknown as {
-          sessions: Map<
-            string,
-            {
-              transport: {
-                rpc: { prompt: (...args: unknown[]) => Promise<unknown> }
-              }
-            }
-          >
-        }
-      ).sessions
-      const session = sessions.get('s')!
       t.mock.method(session.transport.rpc, 'prompt', async () => {
         await writeSubagent(childA, 2, 'spawn-a')
         await writeSubagent(childB, 3, 'spawn-b')
@@ -1932,18 +1961,7 @@ test(
         }
       })
 
-      await m.handle({
-        type: 'session.prompt',
-        sessionId: 's',
-        prompt: {
-          clientMessageId: 'p1',
-          delivery: 'auto',
-          input: {
-            type: 'message',
-            content: [{ type: 'text', text: 'parallel work' }],
-          },
-        },
-      })
+      await prompt('p1', 'parallel work')
 
       const rootFailed = events.find(
         (e) =>
@@ -1987,8 +2005,7 @@ test(
         'runtime must relaunch to terminate leaked sibling subagent work',
       )
     } finally {
-      await m.close()
-      await rm(home, { recursive: true, force: true })
+      await close()
     }
   },
 )
@@ -1997,115 +2014,19 @@ test(
   're-woken idle child crash and child retry-timeout stall both flush child watcher to failed instead of canceled',
   { timeout: 10_000 },
   async (t) => {
-    const home = await mkdtemp(join(tmpdir(), 'agy-rewoken-flush-'))
-    const logPath = join(home, 'agy.log')
-    const events: ProviderEvent[] = []
-    const m = new SessionManager({
-      launch: {
-        command: process.execPath,
-        args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-        env: {
-          HOME: home,
-          PATH: process.env.PATH ?? '',
-          AGY_TEST_LOG: logPath,
-          AGY_TEST_LOG_LOAD: '1',
-        },
-      },
-      usage: new AgyUsageSource(),
-      capabilities: ['prompt.message', 'session.subsession'],
-      retryTimeoutMs: 40,
-      emit: (event) => events.push(structuredClone(event)),
-    })
+    const {
+      brainRoot,
+      events,
+      nativeId,
+      prompt,
+      writeJsonl,
+      writeSubagent,
+      session,
+      close,
+    } = await childSession(40)
+    const childA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const childB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
     try {
-      await m.open({
-        type: 'session.open',
-        requestId: 'open',
-        sessionId: 's',
-        history: 'skip',
-        config: {
-          cwd: home,
-          env: {},
-          mcpServers: {},
-          settings: {},
-          persist: true,
-        },
-      })
-      const opened = events.find(
-        (e) => e.type === 'session.opened' && e.sessionId === 's',
-      )
-      assert.ok(opened?.type === 'session.opened')
-      const nativeId = (opened.persistence!.data as { sessionId: string })
-        .sessionId
-      const brainRoot = join(home, '.gemini/antigravity-cli/brain')
-      const childA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-      const childB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
-
-      const writeJsonl = async (id: string, rows: unknown[]) => {
-        const dir = join(brainRoot, id, '.system_generated/logs')
-        await mkdir(dir, { recursive: true })
-        await writeFile(
-          join(dir, 'transcript_full.jsonl'),
-          rows.map((r) => JSON.stringify(r) + '\n').join(''),
-        )
-      }
-      const writeSubagent = async (
-        id: string,
-        spawnStepIndex: number,
-        callId: string,
-      ) => {
-        const subDir = join(brainRoot, nativeId, '.system_generated/subagents')
-        await mkdir(subDir, { recursive: true })
-        await writeFile(
-          join(subDir, `${id}.json`),
-          JSON.stringify({
-            conversationId: id,
-            spawnStepIndex,
-            state: 'SUBAGENT_STATE_ALIVE',
-          }),
-        )
-        const msgDir = join(brainRoot, id, '.system_generated/messages')
-        await mkdir(msgDir, { recursive: true })
-        await writeFile(
-          join(msgDir, 'init.json'),
-          JSON.stringify({
-            id: 'init',
-            sender: nativeId,
-            recipient: id,
-            priority: 'MESSAGE_PRIORITY_HIGH',
-            content: 'work',
-            sourceMetadata: {
-              tool: {
-                conversationId: nativeId,
-                stepIndex: spawnStepIndex,
-                toolCall: {
-                  id: callId,
-                  name: 'invoke_subagent',
-                  argumentsJson: '{}',
-                },
-              },
-            },
-          }),
-        )
-        await writeFile(
-          join(msgDir, 'read.json'),
-          JSON.stringify({ init: true }),
-        )
-      }
-
-      const sessions = (
-        m as unknown as {
-          sessions: Map<
-            string,
-            {
-              transport: {
-                rpc: { prompt: (...args: unknown[]) => Promise<unknown> }
-              }
-            }
-          >
-        }
-      ).sessions
-      const session = sessions.get('s')!
-
       // Turn 1: spawn childA, which completes cleanly (so childA watcher becomes !isRunning()).
       let turn = 0
       t.mock.method(session.transport.rpc, 'prompt', async () => {
@@ -2257,30 +2178,8 @@ test(
         }
       })
 
-      await m.handle({
-        type: 'session.prompt',
-        sessionId: 's',
-        prompt: {
-          clientMessageId: 'p1',
-          delivery: 'auto',
-          input: {
-            type: 'message',
-            content: [{ type: 'text', text: 'turn 1' }],
-          },
-        },
-      })
-      await m.handle({
-        type: 'session.prompt',
-        sessionId: 's',
-        prompt: {
-          clientMessageId: 'p2',
-          delivery: 'auto',
-          input: {
-            type: 'message',
-            content: [{ type: 'text', text: 'turn 2' }],
-          },
-        },
-      })
+      await prompt('p1', 'turn 1')
+      await prompt('p2', 'turn 2')
 
       const childATurns = events.flatMap((e) =>
         e.type === 'session.turn' && e.sessionId === `s:child:${childA}`
@@ -2340,18 +2239,7 @@ test(
         }
       })
 
-      await m.handle({
-        type: 'session.prompt',
-        sessionId: 's',
-        prompt: {
-          clientMessageId: 'p3',
-          delivery: 'auto',
-          input: {
-            type: 'message',
-            content: [{ type: 'text', text: 'turn 3' }],
-          },
-        },
-      })
+      await prompt('p3', 'turn 3')
 
       const childBTurns = events.flatMap((e) =>
         e.type === 'session.turn' && e.sessionId === `s:child:${childB}`
@@ -2363,8 +2251,7 @@ test(
         `s:child:${childB}:turn:1:failed`,
       ])
     } finally {
-      await m.close()
-      await rm(home, { recursive: true, force: true })
+      await close()
     }
   },
 )
@@ -2373,71 +2260,10 @@ test(
   'parent turn failure after child already completed flushes child without interrupting or relaunching runtime',
   { timeout: 10_000 },
   async (t) => {
-    const home = await mkdtemp(join(tmpdir(), 'agy-finished-child-fail-'))
-    const logPath = join(home, 'agy.log')
-    const events: ProviderEvent[] = []
-    const m = new SessionManager({
-      launch: {
-        command: process.execPath,
-        args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-        env: {
-          HOME: home,
-          PATH: process.env.PATH ?? '',
-          AGY_TEST_LOG: logPath,
-          AGY_TEST_LOG_LOAD: '1',
-        },
-      },
-      usage: new AgyUsageSource(),
-      capabilities: ['prompt.message', 'session.subsession'],
-      retryTimeoutMs: 40,
-      emit: (event) => events.push(structuredClone(event)),
-    })
+    const { brainRoot, events, nativeId, prompt, writeJsonl, session, close } =
+      await childSession(40)
+    const childDone = 'eeeeeeee-1111-4111-8111-111111111111'
     try {
-      await m.open({
-        type: 'session.open',
-        requestId: 'open',
-        sessionId: 's',
-        history: 'skip',
-        config: {
-          cwd: home,
-          env: {},
-          mcpServers: {},
-          settings: {},
-          persist: true,
-        },
-      })
-      const opened = events.find(
-        (e) => e.type === 'session.opened' && e.sessionId === 's',
-      )
-      assert.ok(opened?.type === 'session.opened')
-      const nativeId = (opened.persistence!.data as { sessionId: string })
-        .sessionId
-      const brainRoot = join(home, '.gemini/antigravity-cli/brain')
-      const childDone = 'eeeeeeee-1111-4111-8111-111111111111'
-
-      const writeJsonl = async (id: string, rows: unknown[]) => {
-        const dir = join(brainRoot, id, '.system_generated/logs')
-        await mkdir(dir, { recursive: true })
-        await writeFile(
-          join(dir, 'transcript_full.jsonl'),
-          rows.map((r) => JSON.stringify(r) + '\n').join(''),
-        )
-      }
-
-      const sessions = (
-        m as unknown as {
-          sessions: Map<
-            string,
-            {
-              interrupt: (mode: 'cancel' | 'relaunch') => Promise<void>
-              transport: {
-                rpc: { prompt: (...args: unknown[]) => Promise<unknown> }
-              }
-            }
-          >
-        }
-      ).sessions
-      const session = sessions.get('s')!
       const interruptMock = t.mock.method(session, 'interrupt')
 
       t.mock.method(session.transport.rpc, 'prompt', async () => {
@@ -2521,18 +2347,7 @@ test(
         }
       })
 
-      await m.handle({
-        type: 'session.prompt',
-        sessionId: 's',
-        prompt: {
-          clientMessageId: 'p1',
-          delivery: 'auto',
-          input: {
-            type: 'message',
-            content: [{ type: 'text', text: 'go' }],
-          },
-        },
-      })
+      await prompt('p1', 'go')
 
       const childTurns = events.flatMap((e) =>
         e.type === 'session.turn' && e.sessionId === `s:child:${childDone}`
@@ -2549,8 +2364,7 @@ test(
         'failed turn with only an already-completed child must not interrupt or relaunch the runtime',
       )
     } finally {
-      await m.close()
-      await rm(home, { recursive: true, force: true })
+      await close()
     }
   },
 )

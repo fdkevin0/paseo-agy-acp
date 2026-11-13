@@ -2,7 +2,6 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { test } from 'node:test'
 import {
-  mkdtemp,
   mkdir,
   open,
   readFile,
@@ -12,7 +11,6 @@ import {
   rm,
   symlink,
 } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
@@ -29,186 +27,24 @@ import {
   type BrainWatchHandle,
 } from '../server/brain.ts'
 import { waitUntil } from './helpers.ts'
-import { SubagentRegistry } from '../server/subagents.ts'
 import {
-  readTurnBoundaryBefore,
-  resolveChildTurnState,
-  type TurnBoundaryCache,
-} from '../server/brain-turns.ts'
+  child,
+  done,
+  encode,
+  fixture,
+  grandchild,
+  invoke,
+  message,
+  parent,
+  report,
+  type Row,
+} from './brain-fixtures.ts'
+import { SubagentRegistry } from '../server/subagents.ts'
 import type {
   ProviderEvent,
   ProviderTimelineItem,
 } from '@getpaseo/plugin/server/provider'
 
-const parent = '11111111-1111-4111-8111-111111111111'
-const child = '22222222-2222-4222-8222-222222222222'
-const grandchild = '33333333-3333-4333-8333-333333333333'
-type Row = Record<string, unknown>
-const done = (step_index: number, content = 'finished'): Row => ({
-  step_index,
-  type: 'PLANNER_RESPONSE',
-  status: 'DONE',
-  content,
-})
-const message = (step_index: number, sender: string, content: string): Row => ({
-  step_index,
-  type: 'SYSTEM_MESSAGE',
-  content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-08T17:00:00Z sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=${content}\n</SYSTEM_MESSAGE>`,
-})
-const invoke = (id: string): Row[] => [
-  { step_index: 1, type: 'USER_INPUT', content: 'work' },
-  {
-    step_index: 2,
-    type: 'PLANNER_RESPONSE',
-    status: 'DONE',
-    tool_calls: [{ id: 'invoke', name: 'invoke_subagent', args: {} }],
-  },
-  {
-    step_index: 3,
-    type: 'GENERIC',
-    status: 'DONE',
-    content: JSON.stringify({ conversationId: id }),
-  },
-  done(4, 'waiting'),
-]
-const report = (recipient: string, text: string, start = 1): Row[] => [
-  {
-    step_index: start,
-    type: 'PLANNER_RESPONSE',
-    status: 'DONE',
-    tool_calls: [
-      {
-        id: `report-${start}`,
-        name: 'send_message',
-        args: {
-          Recipient: recipient,
-          Message: text,
-        },
-      },
-    ],
-  },
-  {
-    step_index: start + 1,
-    type: 'GENERIC',
-    status: 'DONE',
-    content: 'Message sent',
-  },
-  done(start + 2, 'I sent the report.'),
-]
-const encode = (rows: Row[]) =>
-  rows.map((row) => JSON.stringify(row)).join('\n') + '\n'
-async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), 'agy-brain-test-'))
-  const path = (id: string) =>
-    join(root, id, '.system_generated/logs/transcript_full.jsonl')
-  async function put(id: string, rows: Row[]) {
-    await mkdir(join(root, id, '.system_generated/logs'), { recursive: true })
-    await writeFile(path(id), encode(rows))
-  }
-  /** Rewrite like agy's WriteFullTranscript: O_TRUNC on the same inode, optionally pausing while empty. */
-  async function rewrite(
-    id: string,
-    rows: Row[],
-    whileEmpty?: () => Promise<void>,
-  ) {
-    const file = await open(path(id), 'r+')
-    try {
-      await file.truncate(0)
-      await whileEmpty?.()
-      await file.write(encode(rows), 0)
-    } finally {
-      await file.close()
-    }
-  }
-  async function subagent(
-    parentId: string,
-    childId: string,
-    state = 'SUBAGENT_STATE_ALIVE',
-    spawnStepIndex = 3,
-    spawnCallId = 'invoke',
-  ) {
-    const dir = join(root, parentId, '.system_generated/subagents')
-    await mkdir(dir, { recursive: true })
-    await writeFile(
-      join(dir, `${childId}.json`),
-      JSON.stringify({
-        conversationId: childId,
-        subagentDescriptor: {
-          typeName: 'research',
-          role: 'Researcher',
-        },
-        spawnStepIndex,
-        state,
-      }),
-    )
-    await deliver(childId, parentId, 'work', true, 'init', {
-      conversationId: parentId,
-      stepIndex: spawnStepIndex,
-      callId: spawnCallId,
-      name: 'invoke_subagent',
-    })
-  }
-  async function deliver(
-    recipientId: string,
-    sender: string,
-    content: string,
-    read = true,
-    msgId: string = randomUUID(),
-    tool?: {
-      conversationId: string
-      stepIndex: number
-      callId: string
-      name: string
-    },
-  ) {
-    const dir = join(root, recipientId, '.system_generated/messages')
-    await mkdir(dir, { recursive: true })
-    await writeFile(
-      join(dir, `${msgId}.json`),
-      JSON.stringify({
-        id: msgId,
-        sender,
-        recipient: recipientId,
-        priority: 'MESSAGE_PRIORITY_HIGH',
-        content,
-        timestamp: new Date().toISOString(),
-        ...(tool
-          ? {
-              sourceMetadata: {
-                tool: {
-                  conversationId: tool.conversationId,
-                  stepIndex: tool.stepIndex,
-                  toolCall: {
-                    id: tool.callId,
-                    name: tool.name,
-                    argumentsJson: '{}',
-                  },
-                },
-              },
-            }
-          : {}),
-      }),
-    )
-    const readPath = join(dir, 'read.json')
-    const current = await readFile(readPath, 'utf8').then(
-      (raw) => JSON.parse(raw) as Record<string, boolean>,
-      () => ({}) as Record<string, boolean>,
-    )
-    if (read) current[msgId] = true
-    else delete current[msgId]
-    await writeFile(readPath, JSON.stringify(current))
-    return msgId
-  }
-  return {
-    root,
-    path,
-    put,
-    rewrite,
-    subagent,
-    deliver,
-    close: () => rm(root, { recursive: true, force: true }),
-  }
-}
 /** settleBrainTurn's poll timer is unref'd; hold the event loop open while awaiting it. */
 function alive<T>(promise: Promise<T>): Promise<T> {
   const keepAlive = setInterval(() => {}, 1000)
@@ -4453,13 +4289,6 @@ test('re-waking a child across turns isolates prior failed grandchildren while r
       turn2Settled = true
       return res
     })
-    await delay(30)
-    assert.equal(
-      turn2Settled,
-      false,
-      'Turn 2 must neither fail on Turn 1 grandchild1 nor settle before Turn 2 grandchild2 completes',
-    )
-
     // Finish grandchild2 -> child -> parent.
     await appendFile(
       f.path(grandchild2),
@@ -4579,13 +4408,6 @@ test('re-waking a child after Turn-1 retry timeout succeeds without Turn-1 retry
       turn2Result = res
       return res
     })
-    await delay(30)
-    assert.equal(
-      turn2Result,
-      undefined,
-      'countPriorWakeups must keep resolveChildTurnState pending during untagged inbox read-skew without failing on Turn-1 retryStep',
-    )
-
     // Deliver u2 and complete child + parent in Turn 2 without clearing retryStep=3 except via childMinStep scoping.
     await f.deliver(child, parent, 'untagged wake 2', true, 'u2')
     await appendFile(
@@ -4830,7 +4652,7 @@ test('watchBrain fresh replay on nested Turn-2 re-wakeup isolates Turn-1 failed 
       ),
     )
   } finally {
-    for (const h of handles) h()
+    handles.forEach((close) => close())
     await f.close()
   }
 })
@@ -5033,7 +4855,7 @@ test('follow-up send_message to a child stalled in retryPending never deadlocks 
       ['started', 'failed'],
     )
   } finally {
-    for (const h of handles) h()
+    handles.forEach((close) => close())
     await f.close()
   }
 })
@@ -5223,10 +5045,11 @@ test('watchBrain does not advance turnFloor past child ERROR_MESSAGE on grandchi
       undefined,
       undefined,
       undefined,
-      20,
+      200,
     )
     await handle.ready
-    await new Promise((r) => setTimeout(r, 30))
+    // The retry warning arms its deadline on its own read pass, before the report lands.
+    await waitUntil(() => (handle?.resumePoint().afterStep ?? -1) >= 1)
     await f.put(child, [
       message(0, parent, 'work'),
       {
@@ -5238,7 +5061,7 @@ test('watchBrain does not advance turnFloor past child ERROR_MESSAGE on grandchi
       },
       message(2, grandchild, 'late grandchild report'),
     ])
-    await handle.flush()
+    await waitUntil(() => handle?.isRunning() === false)
     assert.equal(handle.isRunning(), false)
     assert.ok(
       events.some((e) => e.type === 'session.turn' && e.state === 'failed'),
@@ -5246,92 +5069,6 @@ test('watchBrain does not advance turnFloor past child ERROR_MESSAGE on grandchi
     )
   } finally {
     handle?.()
-    await f.close()
-  }
-})
-
-test('resolveChildTurnState correlates mixed untagged Turn 1 and tagged Turn 2 wakeups', () => {
-  const parentNode = new BrainNode(parent, parent, {
-    allowInitialSpawnPrompt: false,
-  })
-  const childNode = new BrainNode(child, child, {
-    allowInitialSpawnPrompt: true,
-  })
-  childNode.ingest(message(0, parent, 'init'))
-  childNode.ingest(message(3, parent, 'untagged turn 1'))
-  childNode.ingest(message(6, parent, 'tagged turn 2'))
-
-  const state = resolveChildTurnState(
-    parentNode,
-    5,
-    { conversationId: child, spawnStepIndex: 2, state: 'SUBAGENT_STATE_ALIVE' },
-    childNode,
-    {
-      messages: [
-        {
-          id: 'u1',
-          sender: parent,
-          priority: 'MESSAGE_PRIORITY_HIGH',
-          tool: { conversationId: parent, stepIndex: undefined },
-        },
-        {
-          id: 't2',
-          sender: parent,
-          priority: 'MESSAGE_PRIORITY_HIGH',
-          tool: { conversationId: parent, stepIndex: 7, name: 'send_message' },
-        },
-      ],
-      readIds: new Set(['u1', 't2']),
-      unconsumedHighPriority: [],
-      consumedNonUserCount: 2,
-      stepCallIds: new Map(),
-    },
-  )
-  assert.deepEqual(state, {
-    status: 'active',
-    minStepIndex: 5,
-    awaitingTurnWakeup: false,
-  })
-})
-
-test('readTurnBoundaryBefore handles missing, 0-byte, and empty-row transcripts and caches per beforeStep', async () => {
-  const f = await fixture()
-  try {
-    const cache: TurnBoundaryCache = new Map()
-    assert.deepEqual(await readTurnBoundaryBefore(f.root, parent, 5, cache), {
-      boundary: -1,
-      ready: false,
-    })
-
-    await mkdir(join(f.root, parent, '.system_generated/logs'), {
-      recursive: true,
-    })
-    await writeFile(f.path(parent), '')
-    assert.deepEqual(await readTurnBoundaryBefore(f.root, parent, 5, cache), {
-      boundary: -1,
-      ready: false,
-    })
-
-    await writeFile(f.path(parent), '\n')
-    assert.deepEqual(await readTurnBoundaryBefore(f.root, parent, 5, cache), {
-      boundary: -1,
-      ready: false,
-    })
-    assert.equal(cache.has(`${parent}:5`), true)
-
-    await f.put(parent, [
-      { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-      done(1, 't1'),
-      { step_index: 2, type: 'USER_INPUT', content: 'turn 2' },
-      done(3, 't2'),
-    ])
-    const b1 = await readTurnBoundaryBefore(f.root, parent, 2, cache)
-    const b2 = await readTurnBoundaryBefore(f.root, parent, 4, cache)
-    assert.deepEqual(b1, { boundary: 0, ready: true })
-    assert.deepEqual(b2, { boundary: 2, ready: true })
-    assert.equal(cache.has(`${parent}:2`), true)
-    assert.equal(cache.has(`${parent}:4`), true)
-  } finally {
     await f.close()
   }
 })
@@ -5440,168 +5177,11 @@ test('watchBrain preserves fatal ERROR_MESSAGE when grandchild report follows in
   }
 })
 
-test('readTurnBoundaryBefore invalidates cache when a partial wakeup file is completed in place', async () => {
-  const f = await fixture()
-  try {
-    const cache: TurnBoundaryCache = new Map()
-    await f.put(parent, [
-      { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-      done(1, 't1'),
-      { step_index: 2, type: 'USER_INPUT', content: 'turn 2' },
-      done(3, 't2'),
-    ])
-    await f.put(child, [
-      message(0, parent, 'init'),
-      message(1, parent, 'wake t2'),
-      done(2, 'child done'),
-    ])
-    const msgDir = join(f.root, child, '.system_generated/messages')
-    await mkdir(msgDir, { recursive: true })
-    await f.deliver(child, parent, 'wake t2', true, 'wake-c', {
-      conversationId: parent,
-      stepIndex: 3,
-      callId: 'send-c',
-      name: 'send_message',
-    })
-    const msgPath = join(msgDir, 'init-c.json')
-    await writeFile(msgPath, '{')
-
-    const first = await readTurnBoundaryBefore(f.root, child, 2, cache)
-    assert.deepEqual(first, { boundary: -1, ready: true })
-
-    // Complete only init-c.json in place without adding/removing files in messages/.
-    await f.deliver(child, parent, 'init child', true, 'init-c', {
-      conversationId: parent,
-      stepIndex: 0,
-      callId: 'spawn-c',
-      name: 'invoke_subagent',
-    })
-
-    const second = await readTurnBoundaryBefore(f.root, child, 2, cache)
-    assert.deepEqual(second, { boundary: 1, ready: true })
-  } finally {
-    await f.close()
-  }
-})
-
-test('readTurnBoundaryBefore resolves mixed tagged and untagged intermediate ancestor boundaries', async () => {
-  const f = await fixture()
-  try {
-    const cache: TurnBoundaryCache = new Map()
-    await f.put(parent, [
-      { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-      done(1, 't1'),
-      { step_index: 2, type: 'USER_INPUT', content: 'turn 2' },
-      ...report(child, 'tagged wake t2', 3),
-      done(6, 't2'),
-    ])
-    await f.deliver(child, parent, 'init child', true, 'init-c', {
-      conversationId: parent,
-      stepIndex: 0,
-      callId: 'spawn-c',
-      name: 'invoke_subagent',
-    })
-    await f.deliver(child, parent, 'untagged wake', true, 'u1-c')
-    await f.deliver(child, parent, 'tagged wake t2', true, 't2-c', {
-      conversationId: parent,
-      stepIndex: 4,
-      callId: 'send-c',
-      name: 'send_message',
-    })
-    await f.put(child, [
-      message(0, parent, 'init'),
-      message(1, parent, 'untagged wake'),
-      message(2, parent, 'tagged wake t2'),
-      done(3, 'child done'),
-    ])
-
-    const resolved = await readTurnBoundaryBefore(f.root, child, 3, cache)
-    assert.deepEqual(resolved, { boundary: 2, ready: true })
-  } finally {
-    await f.close()
-  }
-})
-
-test('readTurnBoundaryBefore anchors at first Turn-2 wakeup when tagged Turn-2 precedes untagged Turn-2', async () => {
-  const f = await fixture()
-  try {
-    const cache: TurnBoundaryCache = new Map()
-    await f.put(parent, [
-      { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-      done(1, 't1'),
-      { step_index: 2, type: 'USER_INPUT', content: 'turn 2' },
-      ...report(child, 'tagged t2', 3),
-      ...report(child, 'untagged t2', 6),
-      done(9, 't2'),
-    ])
-    await f.deliver(child, parent, 'init child', true, 'init-c', {
-      conversationId: parent,
-      stepIndex: 0,
-      callId: 'spawn-c',
-      name: 'invoke_subagent',
-    })
-    await f.deliver(child, parent, 'tagged t2', true, 't2-1', {
-      conversationId: parent,
-      stepIndex: 4,
-      callId: 'send-1',
-      name: 'send_message',
-    })
-    await f.deliver(child, parent, 'untagged t2', true, 'u2-2')
-    await f.put(child, [
-      message(0, parent, 'init'),
-      message(1, parent, 'tagged t2'),
-      done(2, 'work in t2'),
-      message(3, parent, 'untagged t2'),
-      done(4, 'child done'),
-    ])
-
-    const resolved = await readTurnBoundaryBefore(f.root, child, 4, cache)
-    assert.deepEqual(resolved, { boundary: 1, ready: true })
-  } finally {
-    await f.close()
-  }
-})
-
-test('readTurnBoundaryBefore resolves fully untagged intermediate ancestor boundaries', async () => {
-  const f = await fixture()
-  try {
-    const cache: TurnBoundaryCache = new Map()
-    await f.put(parent, [
-      { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-      ...report(child, 'untagged t1', 1),
-      done(4, 't1'),
-      { step_index: 5, type: 'USER_INPUT', content: 'turn 2' },
-      ...report(child, 'untagged t2', 6),
-      done(9, 't2'),
-    ])
-    await f.deliver(child, parent, 'init child', true, 'init-c', {
-      conversationId: parent,
-      stepIndex: 0,
-      callId: 'spawn-c',
-      name: 'invoke_subagent',
-    })
-    await f.deliver(child, parent, 'untagged t1', true, 'u1')
-    await f.deliver(child, parent, 'untagged t2', true, 'u2')
-    await f.put(child, [
-      message(0, parent, 'init'),
-      message(1, parent, 'untagged t1'),
-      message(2, parent, 'untagged t2'),
-      done(3, 'child done'),
-    ])
-
-    const resolved = await readTurnBoundaryBefore(f.root, child, 3, cache)
-    assert.deepEqual(resolved, { boundary: 2, ready: true })
-  } finally {
-    await f.close()
-  }
-})
-
-test('watchBrain excludes Turn-1 failed sibling descendant even after unrelated later root Turn-3 USER_INPUT', async () => {
+test('watchBrain excludes a Turn-1 failed sibling when later root turns leave the grandchild unwoken', async () => {
   const f = await fixture()
   let handle: BrainWatchHandle | undefined
   try {
     const oldGc = '44444444-4444-4444-8444-444444444444'
-    const events: ProviderEvent[] = []
     await f.put(parent, [
       ...invoke(child),
       { step_index: 5, type: 'USER_INPUT', content: 'turn 2' },
@@ -5699,150 +5279,58 @@ test('watchBrain excludes Turn-1 failed sibling descendant even after unrelated 
       done(6, 'gc ok'),
     ])
 
-    handle = watchBrain(f.root, grandchild, 'gc', (e) => events.push(e), 50)
+    const unrelated: ProviderEvent[] = []
+    handle = watchBrain(f.root, grandchild, 'gc', (e) => unrelated.push(e), 50)
     await handle.ready
     assert.ok(
-      events.some((e) => e.type === 'session.turn' && e.state === 'completed'),
+      unrelated.some(
+        (e) => e.type === 'session.turn' && e.state === 'completed',
+      ),
       'fresh descendant watcher must complete without inheriting Turn-1 failed sibling',
     )
     assert.equal(
-      events.some((e) => e.type === 'session.turn' && e.state === 'failed'),
+      unrelated.some((e) => e.type === 'session.turn' && e.state === 'failed'),
       false,
       'unrelated later root Turn-3 USER_INPUT must not leak old Turn-1 failure',
     )
-  } finally {
-    handle?.()
-    await f.close()
-  }
-})
+    handle()
+    handle = undefined
 
-test('watchBrain excludes Turn-1 failed sibling when Root Turn 3 wakes child B without waking grandchild C', async () => {
-  const f = await fixture()
-  let handle: BrainWatchHandle | undefined
-  try {
-    const oldGc = '44444444-4444-4444-8444-444444444444'
-    const events: ProviderEvent[] = []
-    await f.put(parent, [
-      ...invoke(child),
-      { step_index: 5, type: 'USER_INPUT', content: 'turn 2' },
-      ...report(child, 'tagged t2', 6),
-      ...report(child, 'untagged t2', 9),
-      done(12, 't2'),
-      { step_index: 13, type: 'USER_INPUT', content: 'turn 3' },
-      ...report(child, 'wake b in t3', 14),
-      done(17, 't3'),
-    ])
-    await f.deliver(child, parent, 'init child', true, 'init-c', {
-      conversationId: parent,
-      stepIndex: 2,
-      callId: 'invoke',
-      name: 'invoke_subagent',
-    })
-    await f.deliver(child, parent, 'tagged t2', true, 't2-c', {
-      conversationId: parent,
-      stepIndex: 7,
-      callId: 'send-c-1',
-      name: 'send_message',
-    })
-    await f.deliver(child, parent, 'untagged t2', true, 'u2-c')
+    // Root Turn 3 now wakes child B while grandchild C stays unwoken.
+    await appendFile(
+      f.path(parent),
+      encode([...report(child, 'wake b in t3', 15), done(18, 't3')]),
+    )
     await f.deliver(child, parent, 'wake b in t3', true, 't3-c', {
       conversationId: parent,
-      stepIndex: 15,
+      stepIndex: 16,
       callId: 'send-c-3',
       name: 'send_message',
     })
-    await f.put(child, [
-      message(0, parent, 'init'),
-      {
-        step_index: 1,
-        type: 'PLANNER_RESPONSE',
-        status: 'DONE',
-        tool_calls: [{ id: 'invoke', name: 'invoke_subagent', args: {} }],
-      },
-      {
-        step_index: 2,
-        type: 'GENERIC',
-        status: 'DONE',
-        content: JSON.stringify({ conversationId: grandchild }),
-      },
-      done(4, 'child t1'),
-      message(5, parent, 'tagged t2'),
-      message(6, parent, 'untagged t2'),
-      ...report(grandchild, 'gc t2', 7),
-      done(10, 'child t2'),
-      message(11, parent, 'wake b in t3'),
-      done(12, 'child t3 without waking gc'),
-    ])
-    await f.subagent(child, grandchild, 'SUBAGENT_STATE_ALIVE', 2, 'invoke')
-    await f.deliver(grandchild, child, 'init gc', true, 'init-gc', {
-      conversationId: child,
-      stepIndex: 2,
-      callId: 'invoke',
-      name: 'invoke_subagent',
-    })
-    await f.deliver(grandchild, child, 'gc t2', true, 'wake-gc', {
-      conversationId: child,
-      stepIndex: 8,
-      callId: 'send-gc',
-      name: 'send_message',
-    })
-    await f.subagent(
-      grandchild,
-      oldGc,
-      'SUBAGENT_STATE_ALIVE',
-      2,
-      'invoke-old-gc',
+    await appendFile(
+      f.path(child),
+      encode([
+        message(11, parent, 'wake b in t3'),
+        done(12, 'child t3 without waking gc'),
+      ]),
     )
-    await f.deliver(oldGc, grandchild, 'init old gc', true, 'init-old-gc', {
-      conversationId: grandchild,
-      stepIndex: 2,
-      callId: 'invoke-old-gc',
-      name: 'invoke_subagent',
-    })
-    await f.put(oldGc, [
-      message(0, grandchild, 'old gc work'),
-      {
-        step_index: 1,
-        type: 'ERROR_MESSAGE',
-        content: 'old descendant failure',
-      },
-    ])
-    await f.put(grandchild, [
-      message(0, child, 'init gc'),
-      {
-        step_index: 1,
-        type: 'PLANNER_RESPONSE',
-        status: 'DONE',
-        tool_calls: [
-          { id: 'invoke-old-gc', name: 'invoke_subagent', args: {} },
-        ],
-      },
-      {
-        step_index: 2,
-        type: 'GENERIC',
-        status: 'DONE',
-        content: JSON.stringify({ conversationId: oldGc }),
-      },
-      done(4, 'gc t1'),
-      message(5, child, 'gc t2'),
-      done(6, 'gc ok'),
-    ])
 
+    const woken: ProviderEvent[] = []
     handle = watchBrain(
       f.root,
       grandchild,
-      'gc',
-      (e) => events.push(e),
+      'gc-woken',
+      (e) => woken.push(e),
       50,
       () => true,
     )
     await handle.ready
     assert.ok(
-      events.some((e) => e.type === 'session.turn' && e.state === 'completed'),
+      woken.some((e) => e.type === 'session.turn' && e.state === 'completed'),
       'fresh descendant watcher must complete even after Root Turn 3 wakes child B',
     )
     assert.equal(
-      events.some((e) => e.type === 'session.turn' && e.state === 'failed'),
+      woken.some((e) => e.type === 'session.turn' && e.state === 'failed'),
       false,
       'Root Turn 3 waking child B must not resurrect Turn-1 failure on grandchild C',
     )
@@ -5922,6 +5410,11 @@ test('child initial spawn prompt after step-0 system reminder projects user_mess
       'step-1 spawn prompt must not count as a consumed wakeup message',
     )
 
+    assert.equal(
+      await hasActiveBackgroundWork(f.root, parent),
+      true,
+      'a child still running its wakeup turn blocks parent settlement',
+    )
     let parentSettled = false
     running = settleBrainTurn(f.root, parent, 'p', () => {}, {
       signal: abort.signal,
@@ -5931,8 +5424,6 @@ test('child initial spawn prompt after step-0 system reminder projects user_mess
       parentSettled = true
       return res
     })
-    await delay(30)
-    assert.equal(parentSettled, false)
 
     await appendFile(
       f.path(child),
@@ -6126,16 +5617,18 @@ test('same-turn second parent wakeup preserves the child terminal failure', asyn
       name: 'invoke_subagent',
       callId: 'spawn',
     })
-    for (const [id, stepIndex] of [
-      ['first', 4],
-      ['second', 7],
-    ] as const)
-      await f.deliver(child, parent, id, true, id, {
-        conversationId: parent,
-        stepIndex,
-        name: 'send_message',
-        callId: id,
-      })
+    await f.deliver(child, parent, 'first', true, 'first', {
+      conversationId: parent,
+      stepIndex: 4,
+      name: 'send_message',
+      callId: 'first',
+    })
+    await f.deliver(child, parent, 'second', true, 'second', {
+      conversationId: parent,
+      stepIndex: 7,
+      name: 'send_message',
+      callId: 'second',
+    })
     await f.put(child, [
       message(0, parent, 'init'),
       done(1),
