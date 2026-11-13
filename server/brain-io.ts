@@ -148,6 +148,9 @@ export function isRetryWarning(
     message ===
       'The stream was interrupted. Please continue the task you were working on.' ||
     /^API error \(attempt [1-9]\d*\): [\s\S]+$/.test(message) ||
+    /^Your previous response (?:contained an improperly formatted function call|was blocked by content safety filters):(?: [\s\S]*)?\r?\nRetries remaining: [1-9]\d*$/.test(
+      message,
+    ) ||
     message ===
       'model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again'
   )
@@ -711,10 +714,12 @@ export class StepDedupe {
       .update(
         JSON.stringify([
           row.type,
+          row.source ?? '',
           row.status ?? '',
           row.content ?? '',
           row.thinking ?? '',
           row.tool_calls ?? null,
+          row.error ?? null,
         ]),
       )
       .digest('base64')
