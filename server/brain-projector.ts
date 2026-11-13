@@ -904,6 +904,8 @@ export class BrainNode {
             if (this.projector.hasBackground())
               this.promptPhase = 'foreground_idle'
           } else if (
+            // items.length > 0 proves project() settled a tracked pending tool/question
+            // (anonymous deferred tools set hasPending() via retired and hit the branch above).
             items.length > 0 &&
             row.status !== 'CANCELED' &&
             row.status !== 'INTERRUPTED'

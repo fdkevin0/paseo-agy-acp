@@ -197,9 +197,9 @@ export type ForegroundAcpSegment =
   | { type: 'assistant_message'; text: string }
   | { type: 'tool_call'; callId: string }
 
-type ForegroundCursor = { index: number; offset: number }
+export type ForegroundCursor = { index: number; offset: number }
 
-type ForegroundMatchableItem = Extract<
+export type ForegroundMatchableItem = Extract<
   ProviderTimelineItem,
   { type: 'reasoning' | 'assistant_message' | 'tool_call' }
 >
@@ -214,7 +214,7 @@ function isMatchableForegroundItem(
   )
 }
 
-function advanceForegroundCursor(
+export function advanceForegroundCursor(
   segments: readonly ForegroundAcpSegment[],
   cursor: ForegroundCursor,
   item: ForegroundMatchableItem,

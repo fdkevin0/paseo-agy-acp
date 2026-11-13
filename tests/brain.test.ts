@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
+  advanceForegroundCursor,
   BrainTranscriptProjector,
   countRowMessages,
   hasActiveBackgroundWork,
@@ -4213,4 +4214,106 @@ test('in-RPC high-priority continuation is suppressed and excluded from wakeupUs
   } finally {
     await f3.close()
   }
+})
+
+test('advanceForegroundCursor handles partial offsets, allowSkip boundaries, and tool_call offsets', () => {
+  const segments = [
+    { type: 'assistant_message' as const, text: 'AlphaBetaGamma' },
+    { type: 'tool_call' as const, callId: 'call-1' },
+    { type: 'assistant_message' as const, text: 'OK' },
+    { type: 'assistant_message' as const, text: 'OK' },
+  ]
+  const msg = (text: string): ProviderTimelineItem => ({
+    type: 'assistant_message',
+    id: 'm',
+    text,
+  })
+  const tool = (callId: string): ProviderTimelineItem => ({
+    type: 'tool_call',
+    id: 't',
+    callId,
+    name: 'read_file',
+    status: 'running',
+    error: null,
+    detail: { type: 'unknown', input: null, output: null },
+  })
+
+  // Partial-offset matches advance sequentially through a merged segment.
+  const c1 = advanceForegroundCursor(
+    segments,
+    { index: 0, offset: 0 },
+    msg('Alpha') as Extract<
+      ProviderTimelineItem,
+      { type: 'assistant_message' }
+    >,
+    false,
+  )
+  assert.deepEqual(c1, { index: 0, offset: 5 })
+
+  // allowSkip=false rejects mid-segment mismatch, while allowSkip=true finds the later substring.
+  assert.equal(
+    advanceForegroundCursor(
+      segments,
+      c1!,
+      msg('Gamma') as Extract<
+        ProviderTimelineItem,
+        { type: 'assistant_message' }
+      >,
+      false,
+    ),
+    undefined,
+  )
+  const c2 = advanceForegroundCursor(
+    segments,
+    c1!,
+    msg('Gamma') as Extract<
+      ProviderTimelineItem,
+      { type: 'assistant_message' }
+    >,
+    true,
+  )
+  assert.deepEqual(c2, { index: 1, offset: 0 })
+
+  // tool_call requires offset === 0 when allowSkip=false, but can skip ahead when allowSkip=true.
+  assert.equal(
+    advanceForegroundCursor(
+      segments,
+      { index: 0, offset: 5 },
+      tool('call-1') as Extract<ProviderTimelineItem, { type: 'tool_call' }>,
+      false,
+    ),
+    undefined,
+  )
+  const c3 = advanceForegroundCursor(
+    segments,
+    { index: 0, offset: 5 },
+    tool('call-1') as Extract<ProviderTimelineItem, { type: 'tool_call' }>,
+    true,
+  )
+  assert.deepEqual(c3, { index: 2, offset: 0 })
+
+  // Repeated identical text consumes one segment at a time and stops after exhaustion.
+  const c4 = advanceForegroundCursor(
+    segments,
+    c3!,
+    msg('OK') as Extract<ProviderTimelineItem, { type: 'assistant_message' }>,
+    false,
+  )
+  assert.deepEqual(c4, { index: 3, offset: 0 })
+  const c5 = advanceForegroundCursor(
+    segments,
+    c4!,
+    msg('OK') as Extract<ProviderTimelineItem, { type: 'assistant_message' }>,
+    false,
+  )
+  assert.deepEqual(c5, { index: 4, offset: 0 })
+  assert.equal(
+    advanceForegroundCursor(
+      segments,
+      c5!,
+      msg('OK') as Extract<ProviderTimelineItem, { type: 'assistant_message' }>,
+      false,
+    ),
+    undefined,
+  )
 })
