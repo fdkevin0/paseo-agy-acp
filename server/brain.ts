@@ -72,6 +72,7 @@ export async function hasActiveBackgroundWork(
       (info) => info.mtimeMs,
       () => Date.now(),
     )
+    node.projector.observeRows(rows)
     for (const row of rows) {
       // The restarted runtime left no woken turn running.
       if (isRestartNotice(row)) node.resetPhase()
@@ -134,6 +135,7 @@ async function settleChildren(
       try {
         const { rows, reset } = await child.reader.read(root, childId)
         if (reset) child.reset(childInbox, childSubagents)
+        child.projector.observeRows(rows)
         for (const row of rows) child.ingest(row)
       } catch (error) {
         if (isMissing(error)) {
@@ -368,11 +370,6 @@ export async function settleBrainTurn(
       foldVersion++
       lastActivity = Date.now()
     }
-    const identities = node.projector.resolveToolIdentities(
-      isRpcActive?.() === true,
-    )
-    if (identities.length) foldVersion++
-    for (const item of identities) onItem(item)
     const rows = read.rows
     if (read.snapshotStepIndices) {
       dedupe.prune(read.snapshotStepIndices)
@@ -385,6 +382,12 @@ export async function settleBrainTurn(
       node.reset(inbox, subagents)
       appliedHistoricalMessages = 0
     }
+    if (!initial) node.projector.observeRows(rows)
+    const identities = node.projector.resolveToolIdentities(
+      isRpcActive?.() === true,
+    )
+    if (identities.length) foldVersion++
+    for (const item of identities) onItem(item)
     const historicalDelta =
       stream.historicalMessages - appliedHistoricalMessages
     node.consumedMessages += historicalDelta
@@ -411,10 +414,11 @@ export async function settleBrainTurn(
       anchored = true
       for (const row of preamble.slice(0, start))
         node.consumedMessages += countRowMessages(row)
-      node.projector.bindToolCallIds(acpToolCallIds)
-      node.projector.resolveToolIdentities(isRpcActive?.() === true)
       slice = preamble.slice(start)
       preamble = []
+      node.projector.observeRows(slice)
+      node.projector.bindToolCallIds(acpToolCallIds)
+      node.projector.resolveToolIdentities(isRpcActive?.() === true)
     }
     for (const row of slice) {
       const stepIndex = Number(row.step_index)
@@ -732,6 +736,7 @@ export function watchBrain(
       if (reset) {
         node.reset(inbox, subagents)
       }
+      node.projector.observeRows(rows)
       for (const row of rows) {
         if (stopped) return
         const stepIndex = Number(row.step_index)
