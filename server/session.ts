@@ -880,8 +880,7 @@ async function createSession(
       const detail = toolDetail(request.toolCall)
       const kind = permissionKind(request, detail)
       const preapproved = isPreapprovedMcpTool(
-        request.toolCall.title,
-        input.data,
+        request.toolCall,
         config?.toolPolicy,
       )
       if (kind !== 'question' && (state.metadata.fullAccess || preapproved)) {

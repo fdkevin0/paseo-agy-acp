@@ -132,3 +132,9 @@ Use progressive disclosure:
 - Maintain `README.zh-CN.md` and `OVERVIEW.zh-CN.md` as complete translations of `README.md` and `OVERVIEW.md`; keep the rest of the project documentation in English.
 - Link to deeper explanations instead of duplicating them, and include every linked user document in the package's `files` list.
 - Use sample identities and paths; never commit account logs, local credentials or personal workstation paths.
+
+## MCP parity evidence
+
+The comparison baseline is Paseo v0.15.4 (`b2f00c7d3214257201040bcc8af5a3a3e21e21a5`), matching the pinned SDK. Its Codex `tool-call-mapper.ts` builds `server.tool` labels and `splitCodexMcpToolResultImages` replaces image content with placeholders; `codex-app-server-agent.ts` emits those images separately in live and restored timelines. This does not establish the installed daemon/app version or AGY result payloads.
+
+`tests/mcp.test.ts` and the mock ACP permission flow cover adapter compatibility boundaries, not captured MCP traffic. They verify explicit identity precedence, exact grants, descriptive-title rejection, ambiguous-name rejection, retained input/output, incremental updates and Brain replay. A completed result containing `isError: true` remains completed until upstream evidence justifies another rule. No shared daemon configuration or plugin reload is needed for the offline checks.

@@ -1,3 +1,4 @@
+import { resolveMcpToolIdentity, toolDisplayName } from './mcp.ts'
 import { z } from 'zod'
 import type {
   SessionUpdate,
@@ -179,11 +180,13 @@ export function toolDetail(
     explicitRawName === undefined && Object.hasOwn(nativeToolKinds, legacyName)
       ? legacyName
       : rawName.toLowerCase()
-  const kind = Object.hasOwn(nativeToolKinds, name)
-    ? nativeToolKinds[name]
-    : explicitRawName === undefined
-      ? tool.kind
-      : undefined
+  const kind = resolveMcpToolIdentity({ ...tool, name: explicitRawName })
+    ? undefined
+    : Object.hasOwn(nativeToolKinds, name)
+      ? nativeToolKinds[name]
+      : explicitRawName === undefined
+        ? tool.kind
+        : undefined
   if (isAskQuestionName(name)) {
     const questions = normalizeAskQuestionInput(input)
     if (questions.length > 0) {
@@ -867,13 +870,7 @@ export class Timeline {
         type: 'tool_call' as const,
         id: `${this.prefix}:tool:${tool.toolCallId}`,
         callId: tool.toolCallId,
-        name: cleanToolName(
-          str(record(tool).name) ??
-            tool.title ??
-            str(record(old).name) ??
-            old?.title ??
-            'Tool',
-        ),
+        name: toolDisplayName({ ...tool, name: record(tool).name }),
         detail: toolDetail(tool),
       }
       const rawStatus = str((tool as { status?: unknown }).status)

@@ -1,3 +1,4 @@
+import { toolDisplayName } from './mcp.ts'
 import {
   cleanToolName,
   isNativeToolName,
@@ -392,7 +393,7 @@ export class BrainTranscriptProjector {
       type: 'tool_call' as const,
       id: pending.id,
       callId: pending.callId,
-      name: pending.name,
+      name: toolDisplayName({ name: pending.name, rawInput: pending.rawInput }),
       detail: toolDetail({
         title: pending.name,
         rawInput: pending.rawInput,
@@ -488,7 +489,7 @@ export class BrainTranscriptProjector {
       type: 'tool_call',
       id: pending.id,
       callId: pending.callId,
-      name: pending.name,
+      name: toolDisplayName({ name: pending.name, rawInput: pending.rawInput }),
       detail: toolDetail({
         title: pending.name,
         rawInput: pending.rawInput,
