@@ -846,7 +846,7 @@ new AgentSideConnection((client) => {
           sessionId,
           toolCall: {
             toolCallId: 'mcp-lazy',
-            title: 'call_mcp_tool',
+            title: 'Run default_api:call_mcp_tool',
             rawInput: { ServerName: 'rea', ToolName: 'open_binary' },
           },
           options: [
@@ -859,7 +859,8 @@ new AgentSideConnection((client) => {
           sessionId,
           toolCall: {
             toolCallId: 'mcp-direct',
-            title: 'mcp__rea__open_binary',
+            name: 'default_api:mcp_rea_open_binary',
+            title: 'Open binary',
             rawInput: { path: '/bin/ls' },
           },
           options: [

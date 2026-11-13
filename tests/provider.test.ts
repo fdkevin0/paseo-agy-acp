@@ -1187,6 +1187,7 @@ test('toolPolicy MCP preapprovals, allow_once default, deny interrupt, chooser q
       sessionId: 's',
       config: {
         ...h.config,
+        mcpServers: { rea: { type: 'stdio', command: 'fixture-mcp' } },
         toolPolicy: {
           preapproved: [{ kind: 'mcp', server: 'rea', tool: 'open_binary' }],
         },
@@ -1207,7 +1208,7 @@ test('toolPolicy MCP preapprovals, allow_once default, deny interrupt, chooser q
     )
     assert.ok(idleStop.type === 'session.can_stop_runtime' && idleStop.canStop)
 
-    // Preapproved MCP tools (both call_mcp_tool and mcp__rea__open_binary) auto-approve with allow_once ('yes')
+    // Wrapped MCP titles and explicit raw names with descriptive titles auto-approve with allow_once ('yes')
     await h.provider.send({
       type: 'session.prompt',
       sessionId: 's',

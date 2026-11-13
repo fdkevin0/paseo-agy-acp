@@ -24,6 +24,7 @@ export interface SubagentRegistryOptions {
   isLoading: () => boolean
   isUnavailable: () => boolean
   retryTimeoutMs?: number
+  mcpServerNames?: readonly string[]
 }
 
 /** Own child sub-session watchers, parent-child ownership, and resumption for one root session. */
@@ -156,6 +157,7 @@ export class SubagentRegistry {
       resume,
       (subagents) => this.rememberSubagents(subagents, nativeId),
       this.opts.retryTimeoutMs,
+      this.opts.mcpServerNames,
     )
     this.children.set(childId, child)
     void child.ready.then(() => {

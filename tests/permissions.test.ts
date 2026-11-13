@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import elicitationFixtures from './fixtures/elicitation-form.json' with { type: 'json' }
 import {
-  isPreapprovedMcpTool,
+  isPreapprovedMcpTool as preapprovedMcpCall,
   permissionKind,
   pickPermissionOption,
 } from '../server/permissions.ts'
@@ -125,6 +125,12 @@ test('permissionKind classifies questions, mode switches, plans and tools', () =
   assert.equal(kind('write_to_file', 'plan', 'edit'), 'plan')
   assert.equal(kind('run_command', 'plain_text', 'execute'), 'tool')
 })
+
+const isPreapprovedMcpTool = (
+  title: string,
+  rawInput: Record<string, unknown>,
+  policy: Parameters<typeof preapprovedMcpCall>[1],
+) => preapprovedMcpCall({ title, rawInput }, policy)
 
 test('isPreapprovedMcpTool matches exact direct and lazy MCP grants only', () => {
   const policy = {

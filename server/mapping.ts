@@ -1,3 +1,4 @@
+import { toolDisplayName } from './mcp.ts'
 import { z } from 'zod'
 import type {
   SessionUpdate,
@@ -757,7 +758,9 @@ export class Timeline {
     Extract<ProviderTimelineItem, { type: 'tool_call' }>
   >()
   private prefix: string
-  constructor(prefix: string) {
+  private readonly mcpServerNames: readonly string[]
+  constructor(prefix: string, mcpServerNames: readonly string[] = []) {
+    this.mcpServerNames = mcpServerNames
     this.prefix = prefix
   }
   boundary() {
@@ -892,12 +895,9 @@ export class Timeline {
         type: 'tool_call' as const,
         id: `${this.prefix}:tool:${tool.toolCallId}`,
         callId: tool.toolCallId,
-        name: cleanToolName(
-          str(record(tool).name) ??
-            tool.title ??
-            str(record(old).name) ??
-            old?.title ??
-            'Tool',
+        name: toolDisplayName(
+          { ...tool, name: record(tool).name },
+          this.mcpServerNames,
         ),
         detail: toolDetail(tool),
       }
