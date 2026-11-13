@@ -5,7 +5,11 @@ import {
 } from './brain-observer.ts'
 import { stat } from 'node:fs/promises'
 import { join } from 'node:path'
-import { formatErrorMessage, sessionIdPattern } from './common.ts'
+import {
+  formatErrorMessage,
+  isNativeToolName,
+  sessionIdPattern,
+} from './common.ts'
 import {
   Timeline,
   addStepUsage,
@@ -20,6 +24,7 @@ import type { NormalizedQuestion } from './questions.ts'
 import {
   StepDedupe,
   countRowMessages,
+  extractRowMessageSenders,
   extractStepUsage,
   isMissing,
   isRestartNotice,
@@ -50,6 +55,14 @@ export {
   readTranscriptRows,
   type SubagentRecord,
 }
+import {
+  readTurnBoundaryBefore,
+  resolveChildTurnState,
+  resolveTurnWakeupStartStep,
+  selectParentWakeups,
+  type ChildTurnState,
+  type TurnBoundaryCache,
+} from './brain-turns.ts'
 
 /** Determine whether the session has running background tasks or active subagents. Standing IsDaemon schedules are excluded by default so foreground interrupts do not kill them, and included when checking whether an idle runtime can stop. */
 export async function hasActiveBackgroundWork(
@@ -58,6 +71,11 @@ export async function hasActiveBackgroundWork(
   options: { includeDaemons?: boolean; retryTimeoutMs?: number } = {},
   visiting = new Set<string>(),
   isChild = false,
+  parentContext?: {
+    parentNode: BrainNode
+    parentMinStepIndex: number
+    subRecord?: SubagentRecord
+  },
 ): Promise<boolean> {
   if (!sessionIdPattern.test(nativeId) || visiting.has(nativeId)) return false
   visiting.add(nativeId)
@@ -86,12 +104,29 @@ export async function hasActiveBackgroundWork(
       (options.includeDaemons && node.projector.hasDaemons())
     )
       return true
+    const childTurn: ChildTurnState = parentContext
+      ? resolveChildTurnState(
+          parentContext.parentNode,
+          parentContext.parentMinStepIndex,
+          parentContext.subRecord,
+          node,
+          inbox,
+        )
+      : {
+          status: 'active',
+          minStepIndex: node.turnStartStep,
+          awaitingTurnWakeup: false,
+        }
+    if (childTurn.status === 'pending') return true
+    const nodeMinStep = childTurn.minStepIndex
     // A timed-out model retry does not stop tracked processes or descendants.
-    if (!node.failure(options.retryTimeoutMs)) {
-      if (node.retryPending()) return true
+    if (!node.failure(options.retryTimeoutMs, nodeMinStep)) {
+      if (node.retryPending(nodeMinStep)) return true
       if (
         isChild
-          ? node.hasUnprocessedMessages(inbox) || !node.isSettled(inbox)
+          ? childTurn.awaitingTurnWakeup ||
+            node.hasUnprocessedMessages(inbox) ||
+            !node.isSettled(inbox, nodeMinStep)
           : (node.foregroundIdleReached &&
               node.hasUnprocessedMessages(inbox)) ||
             node.isWokenWorking()
@@ -101,10 +136,17 @@ export async function hasActiveBackgroundWork(
     const activeChildIds = activeChildIdsForTurn(
       subagents,
       node.projector,
-      isChild ? -1 : node.turnStartStep,
+      nodeMinStep,
     )
     for (const childId of activeChildIds) {
-      if (await hasActiveBackgroundWork(root, childId, options, visiting, true))
+      const subRecord = subagents.find((s) => s.conversationId === childId)
+      if (
+        await hasActiveBackgroundWork(root, childId, options, visiting, true, {
+          parentNode: node,
+          parentMinStepIndex: nodeMinStep,
+          subRecord,
+        })
+      )
         return true
     }
     return false
@@ -118,6 +160,8 @@ async function settleChildren(
   parentNode: BrainNode,
   parentInbox: InboxState,
   activeChildIds: readonly string[],
+  parentSubagents: readonly SubagentRecord[],
+  parentMinStepIndex: number,
   visiting = new Set<string>(),
   retryTimeoutMs = RETRY_IDLE_TIMEOUT_MS,
 ): Promise<{ settled: boolean; error?: string; stalled?: boolean }> {
@@ -145,40 +189,79 @@ async function settleChildren(
         for (const row of rows) child.ingest(row, observedAt)
       } catch (error) {
         if (isMissing(error)) {
-          const failure = child.failure(retryTimeoutMs)
-          if (failure)
-            return {
-              settled: false,
-              error: `Subagent ${childId} failed: ${failure}`,
-              stalled: child.retryPending(),
-            }
+          const subRecord = parentSubagents.find(
+            (s) => s.conversationId === childId,
+          )
+          const childTurn = resolveChildTurnState(
+            parentNode,
+            parentMinStepIndex,
+            subRecord,
+            child,
+            childInbox,
+          )
+          if (childTurn.status === 'active') {
+            const failure = child.failure(
+              retryTimeoutMs,
+              childTurn.minStepIndex,
+            )
+            if (failure)
+              return {
+                settled: false,
+                error: `Subagent ${childId} failed: ${failure}`,
+                stalled: child.retryPending(childTurn.minStepIndex),
+              }
+          }
           settled = false
           continue
         }
         throw error
       }
-      if (!child.retryPending() && child.hasUnprocessedMessages(childInbox)) {
+      const subRecord = parentSubagents.find(
+        (s) => s.conversationId === childId,
+      )
+      const childTurn = resolveChildTurnState(
+        parentNode,
+        parentMinStepIndex,
+        subRecord,
+        child,
+        childInbox,
+      )
+      if (childTurn.status === 'pending') {
         settled = false
         continue
       }
-      const failure = child.failure(retryTimeoutMs)
-      if (failure)
-        return {
-          settled: false,
-          error: `Subagent ${childId} failed: ${failure}`,
-          stalled: child.retryPending(),
-        }
-      if (!child.isSettled(childInbox)) settled = false
+      const childMinStep = childTurn.minStepIndex
+      const waitingForWakeup =
+        !child.retryPending(childMinStep) &&
+        (childTurn.awaitingTurnWakeup ||
+          child.hasUnprocessedMessages(childInbox))
+      if (!waitingForWakeup) {
+        const failure = child.failure(retryTimeoutMs, childMinStep)
+        if (failure)
+          return {
+            settled: false,
+            error: `Subagent ${childId} failed: ${failure}`,
+            stalled: child.retryPending(childMinStep),
+          }
+      }
+      if (
+        waitingForWakeup ||
+        childTurn.awaitingTurnWakeup ||
+        !child.isSettled(childInbox, childMinStep)
+      )
+        settled = false
       const grandchildIds = activeChildIdsForTurn(
         childSubagents,
         child.projector,
-        -1,
+        childMinStep,
       )
       const nested = await settleChildren(
         root,
         child,
         childInbox,
         grandchildIds,
+        childSubagents,
+        childMinStep,
         visiting,
         retryTimeoutMs,
       )
@@ -678,7 +761,14 @@ export async function settleBrainTurn(
       if (start < 0) return
       initial = false
       anchored = true
-      for (const row of preamble.slice(0, start))
+      const preambleSlice = preamble.slice(0, start)
+      node.recordPreambleWakeups(
+        preambleSlice,
+        inbox,
+        subagents,
+        stream.historicalWakeups(),
+      )
+      for (const row of preambleSlice)
         node.consumedMessages += countRowMessages(row, false)
       slice = preamble.slice(start)
       preamble = []
@@ -792,7 +882,7 @@ export async function settleBrainTurn(
       if (initial) {
         if (
           stream.missing &&
-          !node.retryPending() &&
+          !node.retryPending(minStepIndex) &&
           (!withinGrace() || !(await sessionDirExists()))
         )
           return { status: 'completed' }
@@ -802,12 +892,11 @@ export async function settleBrainTurn(
         await stream.wait(revision, signal)
         continue
       }
-      if (signal?.aborted) continue
-      const failure = node.failure(retryTimeoutMs)
+      const failure = node.failure(retryTimeoutMs, minStepIndex)
       if (failure)
         return {
           ...finish('failed', failure),
-          ...(node.retryPending() ? { stalled: true } : {}),
+          ...(node.retryPending(minStepIndex) ? { stalled: true } : {}),
         }
       node.settleAbortedDenial(deniedToolCallIds)
       let continuedQuestion = false
@@ -892,16 +981,19 @@ export async function settleBrainTurn(
       }
       if (continuedQuestion) continue
       const checkedVersion = foldVersion
+      const childMinStep = Math.max(minStepIndex, node.turnStartStep)
       const activeChildIds = activeChildIdsForTurn(
         subagents,
         node.projector,
-        minStepIndex,
+        childMinStep,
       )
       const childStatus = await settleChildren(
         root,
         node,
         inbox,
         activeChildIds,
+        subagents,
+        childMinStep,
         new Set(),
         retryTimeoutMs,
       )
@@ -911,7 +1003,7 @@ export async function settleBrainTurn(
           ...finish('failed', childStatus.error),
           ...(childStatus.stalled ? { stalled: true } : {}),
         }
-      if (childStatus.settled && node.isSettled(inbox)) {
+      if (childStatus.settled && node.isSettled(inbox, minStepIndex)) {
         if (activeChildIds.length > 0) {
           if (node.hasUnprocessedMessages(await readInboxState(root, nativeId)))
             continue
@@ -928,7 +1020,7 @@ export async function settleBrainTurn(
       const idleLimitMs = node.isWokenWorking()
         ? wokenStallTimeoutMs
         : stallTimeoutMs
-      if (tracking || node.retryPending()) lastActivity = Date.now()
+      if (tracking || node.retryPending(minStepIndex)) lastActivity = Date.now()
       else if (Date.now() - lastActivity >= idleLimitMs) {
         return stall(idleLimitMs)
       }
@@ -942,6 +1034,8 @@ export async function settleBrainTurn(
 export type BrainWatchHandle = (() => void) & {
   /** Drain rows written so far, then end the active child turn as canceled. */
   cancel: () => Promise<void>
+  /** Poll once immediately so terminal child states are observed before sibling cleanup. */
+  flush: () => Promise<void>
   isRunning: () => boolean
   /** Stopped or canceled: no further rows are read. */
   isStopped: () => boolean
@@ -969,7 +1063,9 @@ export function watchBrain(
   if (!sessionIdPattern.test(nativeId))
     throw new Error('Invalid Brain session ID')
   const timeline = new Timeline(sessionId)
-  const node = new BrainNode(nativeId, sessionId)
+  const node = new BrainNode(nativeId, sessionId, {
+    turnFloor: resume?.afterStep ?? -1,
+  })
   let stopped = false
   let inflight: Promise<void> | undefined
   let cancelling: Promise<void> | undefined
@@ -979,6 +1075,7 @@ export function watchBrain(
   let turnSeq = resume?.turnSeq ?? 1
   let turnId = `${sessionId}:turn:${turnSeq}`
   let lastStepIndex = resume?.afterStep ?? -1
+  const boundaryCache: TurnBoundaryCache = new Map()
   const dedupe = new StepDedupe()
   const childUsage = new ModelUsageObserver(
     resume?.afterStep ?? -1,
@@ -1043,7 +1140,17 @@ export function watchBrain(
       }
       if (reset) {
         node.reset(inbox, subagents)
+        boundaryCache.clear()
       }
+      const init = inbox.messages.find((m) =>
+        isNativeToolName(m.tool?.name ?? '', 'invoke_subagent'),
+      )
+      const parentId = init?.tool?.conversationId
+      const {
+        messages: parentWakeupMsgs,
+        tagged,
+        allTagged,
+      } = selectParentWakeups(inbox, parentId)
       node.projector.observeRows(rows)
       for (const row of rows) {
         if (stopped) return
@@ -1054,6 +1161,25 @@ export function watchBrain(
           (resume !== undefined && stepIndex <= resume.afterStep)
         if (Number.isInteger(stepIndex) && stepIndex > lastStepIndex)
           lastStepIndex = stepIndex
+        // Tagged wakeups use the canonical parent-turn boundary below; a second send in
+        // the same turn must never move the floor past that turn's terminal error.
+        if (
+          !allTagged &&
+          node.failure(retryTimeoutMs) !== undefined &&
+          row.type === 'SYSTEM_MESSAGE' &&
+          !isRestartNotice(row) &&
+          Number.isInteger(stepIndex)
+        ) {
+          const senders = extractRowMessageSenders(row)
+          const isParentWakeup = parentId
+            ? senders.includes(parentId)
+            : senders.some(
+                (s) =>
+                  sessionIdPattern.test(s) &&
+                  !subagents.some((sub) => sub.conversationId === s),
+              )
+          if (isParentWakeup) node.advanceTurnFloor(stepIndex - 1)
+        }
         const items = node.ingest(row, observedAt)
         if (replayed) continue
         if (
@@ -1063,6 +1189,7 @@ export function watchBrain(
             row.type === 'SYSTEM_MESSAGE' ||
             row.type === 'PLANNER_RESPONSE')
         ) {
+          if (Number.isInteger(stepIndex)) node.advanceTurnFloor(stepIndex - 1)
           running = true
           turnId = `${sessionId}:turn:${++turnSeq}`
           turnStartedEmitted = true
@@ -1088,23 +1215,77 @@ export function watchBrain(
         }
       }
       childUsage.observe({ rows, reset, snapshotStepIndices })
+      const wakeupSteps = parentId ? node.wakeupStepsFrom(parentId) : []
+      let awaitingCrossTurnEntry = false
+      if (
+        parentId &&
+        init?.tool?.stepIndex !== undefined &&
+        parentWakeupMsgs.length > 0
+      ) {
+        if (allTagged) {
+          const latestWakeParentStep = tagged[tagged.length - 1].tool.stepIndex
+          const resolved = await readTurnBoundaryBefore(
+            root,
+            parentId,
+            latestWakeParentStep,
+            boundaryCache,
+          )
+          if (!resolved.ready) {
+            awaitingCrossTurnEntry = isParentTurnActive?.() !== false
+          } else if (
+            resolved.boundary >= 0 &&
+            init.tool.stepIndex <= resolved.boundary
+          ) {
+            const ingestedCount = Math.min(tagged.length, wakeupSteps.length)
+            const startStep = resolveTurnWakeupStartStep(
+              tagged,
+              wakeupSteps,
+              resolved.boundary,
+              ingestedCount,
+            )
+            if (startStep !== undefined) {
+              node.advanceTurnFloor(startStep - 1)
+            } else if (
+              parentWakeupMsgs.length > wakeupSteps.length &&
+              isParentTurnActive?.() !== false
+            ) {
+              awaitingCrossTurnEntry = true
+            }
+          }
+        } else if (
+          parentWakeupMsgs.length > wakeupSteps.length &&
+          isParentTurnActive?.() !== false &&
+          node.turnFloor < 0 &&
+          !node.retryPending()
+        ) {
+          awaitingCrossTurnEntry = true
+        }
+      }
+      if (awaitingCrossTurnEntry) return
+      const childMinStep = node.currentTurnFloor()
       const activeChildIds = activeChildIdsForTurn(
         subagents,
         node.projector,
-        -1,
+        childMinStep,
       )
       const childStatus = await settleChildren(
         root,
         node,
         inbox,
         activeChildIds,
+        subagents,
+        childMinStep,
         new Set(),
         retryTimeoutMs,
       )
       if (childStatus.error) finishTurn('failed', childStatus.error)
+      const hasPendingParentWakeup =
+        parentWakeupMsgs.length > wakeupSteps.length &&
+        isParentTurnActive?.() !== false
       if (
         running &&
-        (node.retryPending() || !node.hasUnprocessedMessages(inbox))
+        (node.retryPending() ||
+          (!hasPendingParentWakeup && !node.hasUnprocessedMessages(inbox)))
       ) {
         const failure = node.failure(retryTimeoutMs)
         if (failure) {
@@ -1163,6 +1344,12 @@ export function watchBrain(
       },
       resumePoint() {
         return { afterStep: lastStepIndex, turnSeq }
+      },
+      async flush() {
+        if (stopped || cancelling) return
+        await inflight?.catch(() => undefined)
+        if (stopped || cancelling) return
+        await poll().catch(() => undefined)
       },
       cancel() {
         if (stopped) return Promise.resolve()

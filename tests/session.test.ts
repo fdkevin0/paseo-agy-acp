@@ -658,19 +658,24 @@ new AgentSideConnection((client) => ({
       },
     })
     // Seed an unconsumed high-priority inbox message so hasActiveBackgroundWork would be true if reached.
-    const inboxDir = join(
+    const msgDir = join(
       home,
       '.gemini',
       'antigravity-cli',
       'brain',
       '11111111-1111-4111-8111-111111111111',
       '.system_generated',
-      'inbox',
+      'messages',
     )
-    await mkdir(inboxDir, { recursive: true })
+    await mkdir(msgDir, { recursive: true })
     await writeFile(
-      join(inboxDir, 'msg-1.json'),
-      JSON.stringify({ priority: 'MESSAGE_PRIORITY_HIGH', consumed: false }),
+      join(msgDir, 'msg-1.json'),
+      JSON.stringify({
+        id: 'msg-1',
+        sender: '22222222-2222-4222-8222-222222222222',
+        priority: 'MESSAGE_PRIORITY_HIGH',
+        content: 'wake',
+      }),
     )
 
     await m.handle({
@@ -1724,6 +1729,827 @@ new AgentSideConnection((client) => ({
       )
     } finally {
       await provider.close()
+      await rm(home, { recursive: true, force: true })
+    }
+  },
+)
+
+test(
+  'parallel child crash flushes failed child state, cancels running sibling watcher, and relaunches runtime',
+  { timeout: 10_000 },
+  async (t) => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-sibling-crash-'))
+    const logPath = join(home, 'agy.log')
+    const events: ProviderEvent[] = []
+    const m = new SessionManager({
+      launch: {
+        command: process.execPath,
+        args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+        env: {
+          HOME: home,
+          PATH: process.env.PATH ?? '',
+          AGY_TEST_LOG: logPath,
+          AGY_TEST_LOG_LOAD: '1',
+        },
+      },
+      usage: new AgyUsageSource(),
+      capabilities: ['prompt.message', 'session.subsession'],
+      emit: (event) => events.push(structuredClone(event)),
+    })
+    try {
+      await m.open({
+        type: 'session.open',
+        requestId: 'open',
+        sessionId: 's',
+        history: 'skip',
+        config: {
+          cwd: home,
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: true,
+        },
+      })
+      const opened = events.find(
+        (e) => e.type === 'session.opened' && e.sessionId === 's',
+      )
+      assert.ok(opened?.type === 'session.opened')
+      const nativeId = (opened.persistence!.data as { sessionId: string })
+        .sessionId
+      const brainRoot = join(home, '.gemini/antigravity-cli/brain')
+      const childA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+      const childB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+
+      const writeJsonl = async (id: string, rows: unknown[]) => {
+        const dir = join(brainRoot, id, '.system_generated/logs')
+        await mkdir(dir, { recursive: true })
+        await writeFile(
+          join(dir, 'transcript_full.jsonl'),
+          rows.map((r) => JSON.stringify(r) + '\n').join(''),
+        )
+      }
+      const writeSubagent = async (
+        id: string,
+        spawnStepIndex: number,
+        callId: string,
+      ) => {
+        const subDir = join(brainRoot, nativeId, '.system_generated/subagents')
+        await mkdir(subDir, { recursive: true })
+        await writeFile(
+          join(subDir, `${id}.json`),
+          JSON.stringify({
+            conversationId: id,
+            spawnStepIndex,
+            state: 'SUBAGENT_STATE_ALIVE',
+          }),
+        )
+        const msgDir = join(brainRoot, id, '.system_generated/messages')
+        await mkdir(msgDir, { recursive: true })
+        await writeFile(
+          join(msgDir, 'init.json'),
+          JSON.stringify({
+            id: 'init',
+            sender: nativeId,
+            recipient: id,
+            priority: 'MESSAGE_PRIORITY_HIGH',
+            content: 'work',
+            sourceMetadata: {
+              tool: {
+                conversationId: nativeId,
+                stepIndex: spawnStepIndex,
+                toolCall: {
+                  id: callId,
+                  name: 'invoke_subagent',
+                  argumentsJson: '{}',
+                },
+              },
+            },
+          }),
+        )
+        await writeFile(
+          join(msgDir, 'read.json'),
+          JSON.stringify({ init: true }),
+        )
+      }
+
+      const sessions = (
+        m as unknown as {
+          sessions: Map<
+            string,
+            {
+              transport: {
+                rpc: { prompt: (...args: unknown[]) => Promise<unknown> }
+              }
+            }
+          >
+        }
+      ).sessions
+      const session = sessions.get('s')!
+      t.mock.method(session.transport.rpc, 'prompt', async () => {
+        await writeSubagent(childA, 2, 'spawn-a')
+        await writeSubagent(childB, 3, 'spawn-b')
+        // Start childB running and childA initially running, then childA crashes after 40ms
+        // (well before childA's 1000ms watcher interval, exercising flushRunningChildren).
+        await writeJsonl(childA, [
+          {
+            step_index: 0,
+            type: 'SYSTEM_MESSAGE',
+            content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=work A\n</SYSTEM_MESSAGE>`,
+          },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'RUNNING',
+            thinking: 'working',
+          },
+        ])
+        await writeJsonl(childB, [
+          {
+            step_index: 0,
+            type: 'SYSTEM_MESSAGE',
+            content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=work B\n</SYSTEM_MESSAGE>`,
+          },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            tool_calls: [
+              {
+                id: 'long-cmd',
+                name: 'run_command',
+                args: { CommandLine: 'sleep 60' },
+              },
+            ],
+          },
+        ])
+        await writeJsonl(nativeId, [
+          { step_index: 0, type: 'USER_INPUT', content: 'parallel work' },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            tool_calls: [
+              { id: 'spawn-a', name: 'invoke_subagent', args: { Role: 'A' } },
+              { id: 'spawn-b', name: 'invoke_subagent', args: { Role: 'B' } },
+            ],
+          },
+          {
+            step_index: 2,
+            type: 'GENERIC',
+            status: 'DONE',
+            content: JSON.stringify({ conversationId: childA }),
+          },
+          {
+            step_index: 3,
+            type: 'GENERIC',
+            status: 'DONE',
+            content: JSON.stringify({ conversationId: childB }),
+          },
+          {
+            step_index: 4,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Waiting for both subagents.',
+          },
+        ])
+        setTimeout(() => {
+          void writeJsonl(childA, [
+            {
+              step_index: 0,
+              type: 'SYSTEM_MESSAGE',
+              content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=work A\n</SYSTEM_MESSAGE>`,
+            },
+            {
+              step_index: 1,
+              type: 'ERROR_MESSAGE',
+              content: 'Child A crashed fatally',
+            },
+          ])
+        }, 40)
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 120, outputTokens: 12, totalTokens: 132 },
+        }
+      })
+
+      await m.handle({
+        type: 'session.prompt',
+        sessionId: 's',
+        prompt: {
+          clientMessageId: 'p1',
+          delivery: 'auto',
+          input: {
+            type: 'message',
+            content: [{ type: 'text', text: 'parallel work' }],
+          },
+        },
+      })
+
+      const rootFailed = events.find(
+        (e) =>
+          e.type === 'session.turn' &&
+          e.sessionId === 's' &&
+          e.state === 'failed',
+      )
+      assert.ok(rootFailed?.type === 'session.turn')
+      assert.match(rootFailed.error?.message ?? '', /Child A crashed fatally/)
+
+      const childATerminal = events.find(
+        (e) =>
+          e.type === 'session.turn' &&
+          e.sessionId === `s:child:${childA}` &&
+          e.state !== 'started',
+      )
+      assert.ok(childATerminal?.type === 'session.turn')
+      assert.equal(
+        childATerminal.state,
+        'failed',
+        'flushRunningChildren must observe childA failure before sibling cancellation runs',
+      )
+
+      const childBTerminal = events.find(
+        (e) =>
+          e.type === 'session.turn' &&
+          e.sessionId === `s:child:${childB}` &&
+          e.state !== 'started',
+      )
+      assert.ok(childBTerminal?.type === 'session.turn')
+      assert.equal(
+        childBTerminal.state,
+        'canceled',
+        'active sibling childB must be canceled when the root turn fails',
+      )
+
+      const logLines = (await readFile(logPath, 'utf8')).trim().split('\n')
+      assert.ok(logLines.includes('cancel'))
+      assert.ok(
+        logLines.includes('load'),
+        'runtime must relaunch to terminate leaked sibling subagent work',
+      )
+    } finally {
+      await m.close()
+      await rm(home, { recursive: true, force: true })
+    }
+  },
+)
+
+test(
+  're-woken idle child crash and child retry-timeout stall both flush child watcher to failed instead of canceled',
+  { timeout: 10_000 },
+  async (t) => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-rewoken-flush-'))
+    const logPath = join(home, 'agy.log')
+    const events: ProviderEvent[] = []
+    const m = new SessionManager({
+      launch: {
+        command: process.execPath,
+        args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+        env: {
+          HOME: home,
+          PATH: process.env.PATH ?? '',
+          AGY_TEST_LOG: logPath,
+          AGY_TEST_LOG_LOAD: '1',
+        },
+      },
+      usage: new AgyUsageSource(),
+      capabilities: ['prompt.message', 'session.subsession'],
+      retryTimeoutMs: 40,
+      emit: (event) => events.push(structuredClone(event)),
+    })
+    try {
+      await m.open({
+        type: 'session.open',
+        requestId: 'open',
+        sessionId: 's',
+        history: 'skip',
+        config: {
+          cwd: home,
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: true,
+        },
+      })
+      const opened = events.find(
+        (e) => e.type === 'session.opened' && e.sessionId === 's',
+      )
+      assert.ok(opened?.type === 'session.opened')
+      const nativeId = (opened.persistence!.data as { sessionId: string })
+        .sessionId
+      const brainRoot = join(home, '.gemini/antigravity-cli/brain')
+      const childA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+      const childB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+
+      const writeJsonl = async (id: string, rows: unknown[]) => {
+        const dir = join(brainRoot, id, '.system_generated/logs')
+        await mkdir(dir, { recursive: true })
+        await writeFile(
+          join(dir, 'transcript_full.jsonl'),
+          rows.map((r) => JSON.stringify(r) + '\n').join(''),
+        )
+      }
+      const writeSubagent = async (
+        id: string,
+        spawnStepIndex: number,
+        callId: string,
+      ) => {
+        const subDir = join(brainRoot, nativeId, '.system_generated/subagents')
+        await mkdir(subDir, { recursive: true })
+        await writeFile(
+          join(subDir, `${id}.json`),
+          JSON.stringify({
+            conversationId: id,
+            spawnStepIndex,
+            state: 'SUBAGENT_STATE_ALIVE',
+          }),
+        )
+        const msgDir = join(brainRoot, id, '.system_generated/messages')
+        await mkdir(msgDir, { recursive: true })
+        await writeFile(
+          join(msgDir, 'init.json'),
+          JSON.stringify({
+            id: 'init',
+            sender: nativeId,
+            recipient: id,
+            priority: 'MESSAGE_PRIORITY_HIGH',
+            content: 'work',
+            sourceMetadata: {
+              tool: {
+                conversationId: nativeId,
+                stepIndex: spawnStepIndex,
+                toolCall: {
+                  id: callId,
+                  name: 'invoke_subagent',
+                  argumentsJson: '{}',
+                },
+              },
+            },
+          }),
+        )
+        await writeFile(
+          join(msgDir, 'read.json'),
+          JSON.stringify({ init: true }),
+        )
+      }
+
+      const sessions = (
+        m as unknown as {
+          sessions: Map<
+            string,
+            {
+              transport: {
+                rpc: { prompt: (...args: unknown[]) => Promise<unknown> }
+              }
+            }
+          >
+        }
+      ).sessions
+      const session = sessions.get('s')!
+
+      // Turn 1: spawn childA, which completes cleanly (so childA watcher becomes !isRunning()).
+      let turn = 0
+      t.mock.method(session.transport.rpc, 'prompt', async () => {
+        turn++
+        if (turn === 1) {
+          await writeSubagent(childA, 2, 'spawn-a')
+          await writeJsonl(childA, [
+            {
+              step_index: 0,
+              type: 'SYSTEM_MESSAGE',
+              content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=work A\n</SYSTEM_MESSAGE>`,
+            },
+            {
+              step_index: 1,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'Child A turn 1 done',
+            },
+          ])
+          await writeJsonl(nativeId, [
+            { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
+            {
+              step_index: 1,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              tool_calls: [
+                { id: 'spawn-a', name: 'invoke_subagent', args: { Role: 'A' } },
+              ],
+            },
+            {
+              step_index: 2,
+              type: 'GENERIC',
+              status: 'DONE',
+              content: JSON.stringify({ conversationId: childA }),
+            },
+            {
+              step_index: 3,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'Turn 1 complete.',
+            },
+          ])
+          return {
+            stopReason: 'end_turn' as const,
+            usage: { inputTokens: 50, outputTokens: 5, totalTokens: 55 },
+          }
+        }
+        // Turn 2: re-wake idle childA (crashes in < 1000ms) AND spawn childB (stalls on retry warning -> settled.stalled = true).
+        const msgDirA = join(brainRoot, childA, '.system_generated/messages')
+        await writeFile(
+          join(msgDirA, 'wake2.json'),
+          JSON.stringify({
+            id: 'wake2',
+            sender: nativeId,
+            recipient: childA,
+            priority: 'MESSAGE_PRIORITY_HIGH',
+            content: 'wake A',
+            sourceMetadata: {
+              tool: {
+                conversationId: nativeId,
+                stepIndex: 6,
+                toolCall: {
+                  id: 'wake-a',
+                  name: 'send_message',
+                  argumentsJson: '{}',
+                },
+              },
+            },
+          }),
+        )
+        await writeFile(
+          join(msgDirA, 'read.json'),
+          JSON.stringify({ init: true, wake2: true }),
+        )
+        await writeJsonl(childA, [
+          {
+            step_index: 0,
+            type: 'SYSTEM_MESSAGE',
+            content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=work A\n</SYSTEM_MESSAGE>`,
+          },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Child A turn 1 done',
+          },
+          {
+            step_index: 2,
+            type: 'SYSTEM_MESSAGE',
+            content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=wake A\n</SYSTEM_MESSAGE>`,
+          },
+          {
+            step_index: 3,
+            type: 'ERROR_MESSAGE',
+            content: 'Re-woken childA crashed immediately',
+          },
+        ])
+        await writeJsonl(nativeId, [
+          { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            tool_calls: [
+              { id: 'spawn-a', name: 'invoke_subagent', args: { Role: 'A' } },
+            ],
+          },
+          {
+            step_index: 2,
+            type: 'GENERIC',
+            status: 'DONE',
+            content: JSON.stringify({ conversationId: childA }),
+          },
+          {
+            step_index: 3,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Turn 1 complete.',
+          },
+          { step_index: 4, type: 'USER_INPUT', content: 'turn 2' },
+          {
+            step_index: 5,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            tool_calls: [
+              {
+                id: 'wake-a',
+                name: 'send_message',
+                args: { Recipient: childA, Message: 'wake A' },
+              },
+            ],
+          },
+          {
+            step_index: 6,
+            type: 'GENERIC',
+            status: 'DONE',
+            content: 'Message sent',
+          },
+          {
+            step_index: 7,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Waiting on woken childA.',
+          },
+        ])
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
+        }
+      })
+
+      await m.handle({
+        type: 'session.prompt',
+        sessionId: 's',
+        prompt: {
+          clientMessageId: 'p1',
+          delivery: 'auto',
+          input: {
+            type: 'message',
+            content: [{ type: 'text', text: 'turn 1' }],
+          },
+        },
+      })
+      await m.handle({
+        type: 'session.prompt',
+        sessionId: 's',
+        prompt: {
+          clientMessageId: 'p2',
+          delivery: 'auto',
+          input: {
+            type: 'message',
+            content: [{ type: 'text', text: 'turn 2' }],
+          },
+        },
+      })
+
+      const childATurns = events.flatMap((e) =>
+        e.type === 'session.turn' && e.sessionId === `s:child:${childA}`
+          ? [`${e.turnId}:${e.state}`]
+          : [],
+      )
+      assert.deepEqual(childATurns, [
+        `s:child:${childA}:turn:1:started`,
+        `s:child:${childA}:turn:1:completed`,
+        `s:child:${childA}:turn:2:started`,
+        `s:child:${childA}:turn:2:failed`,
+      ])
+
+      // Turn 3: spawn childB which expires on retry warning (settled.stalled === true); flushActiveChildren must mark childB failed before interrupt relaunches.
+      t.mock.method(session.transport.rpc, 'prompt', async () => {
+        await writeSubagent(childB, 10, 'spawn-b')
+        await writeJsonl(childB, [
+          {
+            step_index: 0,
+            type: 'SYSTEM_MESSAGE',
+            content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=work B\n</SYSTEM_MESSAGE>`,
+          },
+          {
+            step_index: 1,
+            type: 'ERROR_MESSAGE',
+            status: 'DONE',
+            content:
+              'Error: The stream was interrupted. Please continue the task you were working on.',
+          },
+        ])
+        await writeJsonl(nativeId, [
+          { step_index: 8, type: 'USER_INPUT', content: 'turn 3' },
+          {
+            step_index: 9,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            tool_calls: [
+              { id: 'spawn-b', name: 'invoke_subagent', args: { Role: 'B' } },
+            ],
+          },
+          {
+            step_index: 10,
+            type: 'GENERIC',
+            status: 'DONE',
+            content: JSON.stringify({ conversationId: childB }),
+          },
+          {
+            step_index: 11,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Waiting on childB.',
+          },
+        ])
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 150, outputTokens: 15, totalTokens: 165 },
+        }
+      })
+
+      await m.handle({
+        type: 'session.prompt',
+        sessionId: 's',
+        prompt: {
+          clientMessageId: 'p3',
+          delivery: 'auto',
+          input: {
+            type: 'message',
+            content: [{ type: 'text', text: 'turn 3' }],
+          },
+        },
+      })
+
+      const childBTurns = events.flatMap((e) =>
+        e.type === 'session.turn' && e.sessionId === `s:child:${childB}`
+          ? [`${e.turnId}:${e.state}`]
+          : [],
+      )
+      assert.deepEqual(childBTurns, [
+        `s:child:${childB}:turn:1:started`,
+        `s:child:${childB}:turn:1:failed`,
+      ])
+    } finally {
+      await m.close()
+      await rm(home, { recursive: true, force: true })
+    }
+  },
+)
+
+test(
+  'parent turn failure after child already completed flushes child without interrupting or relaunching runtime',
+  { timeout: 10_000 },
+  async (t) => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-finished-child-fail-'))
+    const logPath = join(home, 'agy.log')
+    const events: ProviderEvent[] = []
+    const m = new SessionManager({
+      launch: {
+        command: process.execPath,
+        args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+        env: {
+          HOME: home,
+          PATH: process.env.PATH ?? '',
+          AGY_TEST_LOG: logPath,
+          AGY_TEST_LOG_LOAD: '1',
+        },
+      },
+      usage: new AgyUsageSource(),
+      capabilities: ['prompt.message', 'session.subsession'],
+      retryTimeoutMs: 40,
+      emit: (event) => events.push(structuredClone(event)),
+    })
+    try {
+      await m.open({
+        type: 'session.open',
+        requestId: 'open',
+        sessionId: 's',
+        history: 'skip',
+        config: {
+          cwd: home,
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: true,
+        },
+      })
+      const opened = events.find(
+        (e) => e.type === 'session.opened' && e.sessionId === 's',
+      )
+      assert.ok(opened?.type === 'session.opened')
+      const nativeId = (opened.persistence!.data as { sessionId: string })
+        .sessionId
+      const brainRoot = join(home, '.gemini/antigravity-cli/brain')
+      const childDone = 'eeeeeeee-1111-4111-8111-111111111111'
+
+      const writeJsonl = async (id: string, rows: unknown[]) => {
+        const dir = join(brainRoot, id, '.system_generated/logs')
+        await mkdir(dir, { recursive: true })
+        await writeFile(
+          join(dir, 'transcript_full.jsonl'),
+          rows.map((r) => JSON.stringify(r) + '\n').join(''),
+        )
+      }
+
+      const sessions = (
+        m as unknown as {
+          sessions: Map<
+            string,
+            {
+              interrupt: (mode: 'cancel' | 'relaunch') => Promise<void>
+              transport: {
+                rpc: { prompt: (...args: unknown[]) => Promise<unknown> }
+              }
+            }
+          >
+        }
+      ).sessions
+      const session = sessions.get('s')!
+      const interruptMock = t.mock.method(session, 'interrupt')
+
+      t.mock.method(session.transport.rpc, 'prompt', async () => {
+        const subDir = join(brainRoot, nativeId, '.system_generated/subagents')
+        await mkdir(subDir, { recursive: true })
+        await writeFile(
+          join(subDir, `${childDone}.json`),
+          JSON.stringify({
+            conversationId: childDone,
+            spawnStepIndex: 2,
+            state: 'SUBAGENT_STATE_ALIVE',
+          }),
+        )
+        const msgDir = join(brainRoot, childDone, '.system_generated/messages')
+        await mkdir(msgDir, { recursive: true })
+        await writeFile(
+          join(msgDir, 'init.json'),
+          JSON.stringify({
+            id: 'init',
+            sender: nativeId,
+            recipient: childDone,
+            priority: 'MESSAGE_PRIORITY_HIGH',
+            content: 'finish quickly',
+            sourceMetadata: {
+              tool: {
+                conversationId: nativeId,
+                stepIndex: 2,
+                toolCall: {
+                  id: 'c-done',
+                  name: 'invoke_subagent',
+                  argumentsJson: '{}',
+                },
+              },
+            },
+          }),
+        )
+        await writeFile(
+          join(msgDir, 'read.json'),
+          JSON.stringify({ init: true }),
+        )
+        await writeJsonl(childDone, [
+          {
+            step_index: 0,
+            type: 'SYSTEM_MESSAGE',
+            content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} priority=MESSAGE_PRIORITY_HIGH content=finish quickly\n</SYSTEM_MESSAGE>`,
+          },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Done.',
+          },
+        ])
+        await writeJsonl(nativeId, [
+          { step_index: 0, type: 'USER_INPUT', content: 'go' },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            tool_calls: [
+              { id: 'c-done', name: 'invoke_subagent', args: { Role: 'Done' } },
+            ],
+          },
+          {
+            step_index: 2,
+            type: 'GENERIC',
+            status: 'DONE',
+            content: JSON.stringify({ conversationId: childDone }),
+          },
+          {
+            step_index: 3,
+            type: 'ERROR_MESSAGE',
+            status: 'ERROR',
+            source: 'MODEL',
+            error: 'Parent fatal model error after child finished',
+          },
+        ])
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 80, outputTokens: 10, totalTokens: 90 },
+        }
+      })
+
+      await m.handle({
+        type: 'session.prompt',
+        sessionId: 's',
+        prompt: {
+          clientMessageId: 'p1',
+          delivery: 'auto',
+          input: {
+            type: 'message',
+            content: [{ type: 'text', text: 'go' }],
+          },
+        },
+      })
+
+      const childTurns = events.flatMap((e) =>
+        e.type === 'session.turn' && e.sessionId === `s:child:${childDone}`
+          ? [`${e.turnId}:${e.state}`]
+          : [],
+      )
+      assert.deepEqual(childTurns, [
+        `s:child:${childDone}:turn:1:started`,
+        `s:child:${childDone}:turn:1:completed`,
+      ])
+      assert.equal(
+        interruptMock.mock.callCount(),
+        0,
+        'failed turn with only an already-completed child must not interrupt or relaunch the runtime',
+      )
+    } finally {
+      await m.close()
       await rm(home, { recursive: true, force: true })
     }
   },
