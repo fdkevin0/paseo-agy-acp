@@ -1536,6 +1536,7 @@ async function promptSession(
   let turnWakeupUsage: StepUsage | undefined
   let nextCarriedWakeup: StepUsage | undefined
   let settledPendingReplay = false
+  let hasWakeupState = false
   const settleTurnUsageAndWakeup = (isError: boolean) => {
     const runtimeRelaunched = session.transport !== initialTransport
     const replayStillPending =
@@ -1553,6 +1554,7 @@ async function promptSession(
         settledPendingReplay ||
         (isError &&
           turnWokeUp &&
+          !hasWakeupState &&
           !session.state.closing &&
           !session.state.failed) ||
         (replayStillPending && !effectiveUsage && !turnWokeUp),
@@ -1728,6 +1730,13 @@ async function promptSession(
           onSubagents: session.rememberSubagents,
           minStepIndex,
           acpToolCallIds: session.state.turnToolCallIds,
+          onWakeupState: (wakeup) => {
+            hasWakeupState = true
+            turnWokeUp = wakeup.wokeUp
+            turnWakeupUsage = wakeup.wakeupUsage
+            nextCarriedWakeup = wakeup.carriedWakeupUsage
+            settledPendingReplay = Boolean(wakeup.pendingReplay)
+          },
           foregroundAcp: suppressedForeground
             ? []
             : [...session.state.turnForegroundAcp],
@@ -1838,6 +1847,11 @@ async function promptSession(
                   preservePendingReplay: !session.state.continuationEchoSeen,
                 }
               }
+            } catch (error) {
+              pendingQuestion.restoreContinuationCarry?.(
+                !session.state.continuationEchoSeen,
+              )
+              throw error
             } finally {
               continuationActive = false
               if (observation?.acceptsRows()) observation.phase = 'settling'

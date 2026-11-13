@@ -406,10 +406,17 @@ export async function settleBrainTurn(
     onSubagents,
     observation,
     onUsage,
+    onWakeupState,
     isRpcActive,
   }: {
     observation?: BrainTurnObservation
     onUsage?: (usage: StepUsage, wokeUp: boolean) => void
+    onWakeupState?: (state: {
+      wokeUp: boolean
+      wakeupUsage?: StepUsage
+      carriedWakeupUsage?: StepUsage
+      pendingReplay?: boolean
+    }) => void
     isRpcActive?: () => boolean
     onSubagents?: (subagents: readonly SubagentRecord[]) => void
     signal?: AbortSignal
@@ -512,10 +519,10 @@ export async function settleBrainTurn(
   let preContinuationCarriedSteps: number[] = []
   let preservedPreContinuationCarry = false
   let preservedPreContinuationReplay = false
-  const clearCarriedWakeup = () => {
-    preContinuationCarriedSteps = []
+  const clearCarriedWakeup = (snapshot = false) => {
+    if (snapshot) preContinuationCarriedSteps = []
     for (const [step, entry] of wakeupSteps) {
-      if (entry.carried) preContinuationCarriedSteps.push(step)
+      if (snapshot && entry.carried) preContinuationCarriedSteps.push(step)
       entry.carried = false
     }
   }
@@ -526,28 +533,9 @@ export async function settleBrainTurn(
       if (entry) entry.carried = true
     }
   }
-  const beginContinuation = (syntheticPrompt = false) => {
-    const boundary = {
-      afterStep: Number(node.lastStep?.step_index ?? -1),
-      acpIndex: acpToolCallIds.length,
-      syntheticPrompt,
-    }
-    if (syntheticPrompt) {
-      continuations.push(boundary)
-      seenSyntheticPrompt = true
-      clearCarriedWakeup()
-    }
-    node.markQuestionContinuation(syntheticPrompt)
-    node.projector.bindToolCallIds(acpToolCallIds, boundary.acpIndex)
-    fgReconciler.markPostRpcWakeup()
-    stream.wokeUp = true
-  }
-  let inbox!: InboxState
-  let subagents: SubagentRecord[] = []
-  const finish = (
-    status: 'completed' | 'canceled' | 'failed',
-    error?: string,
-  ) => {
+  const computeWakeupState = () => {
+    // restoreCarriedWakeup() is only invoked on the single exit path of a canceled/errored
+    // unbilled continuation, so !preservedPreContinuationCarry safely guards unanchoredSynthetic.
     const unanchoredSynthetic =
       !preservedPreContinuationCarry &&
       continuations.some((c) => c.syntheticPrompt && c.userStep === undefined)
@@ -566,10 +554,45 @@ export async function settleBrainTurn(
           fgReconciler.postRpc
         : fgReconciler.postRpc
     return {
+      wokeUp: fgReconciler.postRpc,
+      wakeupUsage,
+      carriedWakeupUsage,
+      pendingReplay,
+    }
+  }
+  const emitWakeupState = () => {
+    onWakeupState?.(computeWakeupState())
+  }
+  const beginContinuation = (syntheticPrompt = false) => {
+    const boundary = {
+      afterStep: Number(node.lastStep?.step_index ?? -1),
+      acpIndex: acpToolCallIds.length,
+      syntheticPrompt,
+    }
+    if (syntheticPrompt) {
+      continuations.push(boundary)
+      seenSyntheticPrompt = true
+      clearCarriedWakeup(true)
+    }
+    node.markQuestionContinuation(syntheticPrompt)
+    node.projector.bindToolCallIds(acpToolCallIds, boundary.acpIndex)
+    fgReconciler.markPostRpcWakeup()
+    stream.wokeUp = true
+    emitWakeupState()
+  }
+  let inbox!: InboxState
+  let subagents: SubagentRecord[] = []
+  const finish = (
+    status: 'completed' | 'canceled' | 'failed',
+    error?: string,
+  ) => {
+    const { wokeUp, wakeupUsage, carriedWakeupUsage, pendingReplay } =
+      computeWakeupState()
+    return {
       status,
       ...(error !== undefined ? { error } : {}),
       lastStepUsage: stream.usage.latest,
-      ...(fgReconciler.postRpc ? { wokeUp: true as const } : {}),
+      ...(wokeUp ? { wokeUp: true as const } : {}),
       ...(pendingReplay ? { pendingReplay: true as const } : {}),
       ...(wakeupUsage ? { wakeupUsage } : {}),
       ...(carriedWakeupUsage ? { carriedWakeupUsage } : {}),
@@ -611,6 +634,7 @@ export async function settleBrainTurn(
       dedupe.prune(read.snapshotStepIndices)
       for (const step of wakeupSteps.keys())
         if (!read.snapshotStepIndices.has(step)) wakeupSteps.delete(step)
+      emitWakeupState()
     }
     if (read.reset) {
       initial = true
@@ -671,7 +695,7 @@ export async function settleBrainTurn(
           node.markQuestionContinuation(boundary.syntheticPrompt)
           if (boundary.syntheticPrompt) {
             seenSyntheticPrompt = true
-            clearCarriedWakeup()
+            clearCarriedWakeup(false)
           }
           node.projector.bindToolCallIds(acpToolCallIds, boundary.acpIndex)
           fgReconciler.markPostRpcWakeup()
@@ -693,6 +717,9 @@ export async function settleBrainTurn(
         } else {
           wakeupSteps.delete(stepIndex)
         }
+        emitWakeupState()
+      } else if (fgReconciler.postRpc) {
+        emitWakeupState()
       }
       if (Number.isInteger(stepIndex) && stepIndex > lastStepIndex) {
         lastStepIndex = stepIndex
@@ -804,6 +831,12 @@ export async function settleBrainTurn(
                     ),
                   )
                   beginContinuation(true)
+                },
+                restoreContinuationCarry: (preservePendingReplay) => {
+                  restoreCarriedWakeup()
+                  if (preservePendingReplay)
+                    preservedPreContinuationReplay = true
+                  emitWakeupState()
                 },
               })
             : { status: 'already_handled' }

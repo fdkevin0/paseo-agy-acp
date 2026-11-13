@@ -66,6 +66,7 @@ export type PendingQuestion = {
   questions: NormalizedQuestion[]
   wokeUp: boolean
   beginContinuation?: (answerText: string) => void
+  restoreContinuationCarry?: (preservePendingReplay: boolean) => void
 }
 
 export type QuestionOutcome =
