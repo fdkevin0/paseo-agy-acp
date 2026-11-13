@@ -58,7 +58,7 @@ export {
 import {
   readTurnBoundaryBefore,
   resolveChildTurnState,
-  resolveTurnWakeupStartStep,
+  resolveReWokenTurn,
   selectParentWakeups,
   type ChildTurnState,
   type TurnBoundaryCache,
@@ -114,7 +114,7 @@ export async function hasActiveBackgroundWork(
         )
       : {
           status: 'active',
-          minStepIndex: node.turnStartStep,
+          minStepIndex: node.currentTurnFloor(),
           awaitingTurnWakeup: false,
         }
     if (childTurn.status === 'pending') return true
@@ -561,6 +561,7 @@ export async function settleBrainTurn(
     },
     reader: observation?.reader,
     allowInitialSpawnPrompt: false,
+    turnFloor: minStepIndex,
   })
   const ownsObservation = !observation
   const stream =
@@ -882,7 +883,7 @@ export async function settleBrainTurn(
       if (initial) {
         if (
           stream.missing &&
-          !node.retryPending(minStepIndex) &&
+          !node.retryPending() &&
           (!withinGrace() || !(await sessionDirExists()))
         )
           return { status: 'completed' }
@@ -892,11 +893,11 @@ export async function settleBrainTurn(
         await stream.wait(revision, signal)
         continue
       }
-      const failure = node.failure(retryTimeoutMs, minStepIndex)
+      const failure = node.failure(retryTimeoutMs)
       if (failure)
         return {
           ...finish('failed', failure),
-          ...(node.retryPending(minStepIndex) ? { stalled: true } : {}),
+          ...(node.retryPending() ? { stalled: true } : {}),
         }
       node.settleAbortedDenial(deniedToolCallIds)
       let continuedQuestion = false
@@ -981,7 +982,7 @@ export async function settleBrainTurn(
       }
       if (continuedQuestion) continue
       const checkedVersion = foldVersion
-      const childMinStep = Math.max(minStepIndex, node.turnStartStep)
+      const childMinStep = node.currentTurnFloor()
       const activeChildIds = activeChildIdsForTurn(
         subagents,
         node.projector,
@@ -1003,7 +1004,7 @@ export async function settleBrainTurn(
           ...finish('failed', childStatus.error),
           ...(childStatus.stalled ? { stalled: true } : {}),
         }
-      if (childStatus.settled && node.isSettled(inbox, minStepIndex)) {
+      if (childStatus.settled && node.isSettled(inbox)) {
         if (activeChildIds.length > 0) {
           if (node.hasUnprocessedMessages(await readInboxState(root, nativeId)))
             continue
@@ -1020,7 +1021,7 @@ export async function settleBrainTurn(
       const idleLimitMs = node.isWokenWorking()
         ? wokenStallTimeoutMs
         : stallTimeoutMs
-      if (tracking || node.retryPending(minStepIndex)) lastActivity = Date.now()
+      if (tracking || node.retryPending()) lastActivity = Date.now()
       else if (Date.now() - lastActivity >= idleLimitMs) {
         return stall(idleLimitMs)
       }
@@ -1216,6 +1217,7 @@ export function watchBrain(
       }
       childUsage.observe({ rows, reset, snapshotStepIndices })
       const wakeupSteps = parentId ? node.wakeupStepsFrom(parentId) : []
+      const parentTurnActive = isParentTurnActive?.() !== false
       let awaitingCrossTurnEntry = false
       if (
         parentId &&
@@ -1231,30 +1233,25 @@ export function watchBrain(
             boundaryCache,
           )
           if (!resolved.ready) {
-            awaitingCrossTurnEntry = isParentTurnActive?.() !== false
-          } else if (
-            resolved.boundary >= 0 &&
-            init.tool.stepIndex <= resolved.boundary
-          ) {
-            const ingestedCount = Math.min(tagged.length, wakeupSteps.length)
-            const startStep = resolveTurnWakeupStartStep(
+            awaitingCrossTurnEntry = parentTurnActive
+          } else {
+            const turn = resolveReWokenTurn(
               tagged,
               wakeupSteps,
               resolved.boundary,
-              ingestedCount,
+              init.tool.stepIndex,
             )
-            if (startStep !== undefined) {
-              node.advanceTurnFloor(startStep - 1)
-            } else if (
-              parentWakeupMsgs.length > wakeupSteps.length &&
-              isParentTurnActive?.() !== false
-            ) {
-              awaitingCrossTurnEntry = true
-            }
+            if (turn.status === 're-woken')
+              node.advanceTurnFloor(turn.startStep - 1)
+            else
+              awaitingCrossTurnEntry =
+                turn.status === 'awaiting-row' &&
+                parentTurnActive &&
+                parentWakeupMsgs.length > wakeupSteps.length
           }
         } else if (
           parentWakeupMsgs.length > wakeupSteps.length &&
-          isParentTurnActive?.() !== false &&
+          parentTurnActive &&
           node.turnFloor < 0 &&
           !node.retryPending()
         ) {

@@ -94,34 +94,73 @@ export function selectParentWakeups(inbox: InboxState, parentId?: string) {
   }
 }
 
-export function resolveTurnWakeupStartStep(
-  tagged: readonly TaggedWakeupMessage[],
-  wakeupSteps: readonly number[],
-  parentBoundary: number,
-  ingestedCount: number,
-): number | undefined {
-  const turnTagged = tagged
-    .slice(0, ingestedCount)
-    .filter((m) => m.tool.stepIndex > parentBoundary).length
-  return turnTagged > 0 ? wakeupSteps[ingestedCount - turnTagged] : undefined
+export type WakeupSplit = {
+  /** Wakeups the child ingested in earlier parent turns. */
+  prior: number
+  /** Wakeups the child ingested in the active parent turn; `0` until this turn's first wakeup lands. */
+  turn: number
 }
 
-function countPriorWakeups(
+/**
+ * Split a re-woken child's parent wakeups into prior-turn and active-turn groups.
+ *
+ * A tagged wakeup carries the parent's `stepIndex`, so `<= parentBoundary` is unambiguous. Untagged
+ * wakeups (legacy or synthetic fixtures) can only be attributed to the active turn up to the number of
+ * sends the parent recorded for it; the remainder must be earlier sends.
+ */
+export function splitParentWakeups(
   tagged: readonly TaggedWakeupMessage[],
   untaggedCount: number,
   parentBoundary: number,
   expectedTurnWakeups: number,
   recordedPriorWakeups: number,
-): number {
+): WakeupSplit {
   const taggedPriorCount = tagged.filter(
     (m) => m.tool.stepIndex <= parentBoundary,
   ).length
   const taggedTurnCount = tagged.length - taggedPriorCount
-  const untaggedPriorCount = Math.max(
-    0,
-    untaggedCount - Math.max(0, expectedTurnWakeups - taggedTurnCount),
-  )
-  return Math.max(recordedPriorWakeups, taggedPriorCount + untaggedPriorCount)
+  const untaggedTurnCount = Math.max(0, expectedTurnWakeups - taggedTurnCount)
+  return {
+    prior: Math.max(
+      recordedPriorWakeups,
+      taggedPriorCount + Math.max(0, untaggedCount - untaggedTurnCount),
+    ),
+    turn: taggedTurnCount + untaggedTurnCount,
+  }
+}
+
+export type ReWokenTurn =
+  /** The child was spawned inside the active parent turn, so nothing earlier needs skipping. */
+  | { status: 'spawned-in-turn' }
+  /** The parent re-woke the child, but this turn's wakeup rows have not landed in the transcript yet. */
+  | { status: 'awaiting-row' }
+  /** The child was spawned in an earlier turn and re-woken into the active one. */
+  | { status: 're-woken'; startStep: number }
+
+/**
+ * Classify a child wakeup against the parent turn boundary and resolve where the active turn starts.
+ *
+ * `parentBoundary` is the parent's last turn boundary step (`-1` when it has no earlier turn). A wakeup
+ * tagged at or before it belongs to a turn the child already ran; the child must resume at the first
+ * wakeup step tagged after it, or the earlier turn's failure would be re-attributed to this one.
+ */
+export function resolveReWokenTurn(
+  tagged: readonly TaggedWakeupMessage[],
+  wakeupSteps: readonly number[],
+  parentBoundary: number,
+  initStepIndex: number,
+): ReWokenTurn {
+  if (parentBoundary < 0 || initStepIndex > parentBoundary)
+    return { status: 'spawned-in-turn' }
+  const ingestedCount = Math.min(tagged.length, wakeupSteps.length)
+  const turnTaggedCount = tagged
+    .slice(0, ingestedCount)
+    .filter((m) => m.tool.stepIndex > parentBoundary).length
+  if (turnTaggedCount === 0) return { status: 'awaiting-row' }
+  return {
+    status: 're-woken',
+    startStep: wakeupSteps[ingestedCount - turnTaggedCount],
+  }
 }
 
 /**
@@ -145,7 +184,7 @@ export function resolveChildTurnState(
   if (!spawnedBeforeTurn) {
     return {
       status: 'active',
-      minStepIndex: childNode.turnStartStep,
+      minStepIndex: childNode.currentTurnFloor(),
       awaitingTurnWakeup: false,
     }
   }
@@ -162,13 +201,7 @@ export function resolveChildTurnState(
     childInbox,
     parentNode.nativeId,
   )
-  const taggedPriorCount = tagged.filter(
-    (m) => m.tool.stepIndex <= parentMinStepIndex,
-  ).length
-  const taggedTurnCount = tagged.length - taggedPriorCount
-  const requiredTurnWakeups = Math.max(taggedTurnCount, expectedTurnWakeups)
-  if (requiredTurnWakeups === 0) return { status: 'pending' }
-  const priorWakeups = countPriorWakeups(
+  const { prior, turn } = splitParentWakeups(
     tagged,
     untaggedCount,
     parentMinStepIndex,
@@ -176,12 +209,12 @@ export function resolveChildTurnState(
     parentNode.countPriorWakeups(childNode.nativeId, parentMinStepIndex),
   )
   const wakeupSteps = childNode.wakeupStepsFrom(parentNode.nativeId)
-  const startStep = wakeupSteps[priorWakeups]
-  if (startStep === undefined) return { status: 'pending' }
+  const startStep = wakeupSteps[prior]
+  if (turn === 0 || startStep === undefined) return { status: 'pending' }
   return {
     status: 'active',
-    minStepIndex: Math.max(childNode.turnStartStep, startStep - 1),
-    awaitingTurnWakeup: wakeupSteps.length < priorWakeups + requiredTurnWakeups,
+    minStepIndex: Math.max(childNode.currentTurnFloor(), startStep - 1),
+    awaitingTurnWakeup: wakeupSteps.length < prior + turn,
   }
 }
 
@@ -322,16 +355,14 @@ export async function readTurnBoundaryBefore(
             visiting,
           )
           ready = grand.ready
-          if (grand.boundary >= 0 && entry.initStepIndex <= grand.boundary) {
-            const startStep = resolveTurnWakeupStartStep(
-              entry.tagged,
-              entry.wakeupSteps,
-              grand.boundary,
-              ingestedCount,
-            )
-            if (startStep !== undefined)
-              boundary = Math.max(boundary, startStep)
-          }
+          const turn = resolveReWokenTurn(
+            entry.tagged,
+            entry.wakeupSteps,
+            grand.boundary,
+            entry.initStepIndex,
+          )
+          if (turn.status === 're-woken')
+            boundary = Math.max(boundary, turn.startStep)
         }
       } else {
         const beforeCount = entry.wakeupSteps.length
@@ -376,13 +407,13 @@ export async function readTurnBoundaryBefore(
               0,
               Math.min(entry.untaggedCount, beforeCount - beforeTagged.length),
             )
-            const priorWakeups = countPriorWakeups(
+            const priorWakeups = splitParentWakeups(
               beforeTagged,
               untaggedBeforeCount,
               grand.boundary,
               expectedTurnWakeups,
               priorInGrand,
-            )
+            ).prior
             const startStep = entry.wakeupSteps[priorWakeups]
             if (startStep !== undefined)
               boundary = Math.max(boundary, startStep)

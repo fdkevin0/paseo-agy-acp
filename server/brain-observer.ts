@@ -7,7 +7,7 @@ import {
   isMissing,
   stepErrorMessage,
 } from './brain-io.ts'
-import { BrainTranscriptProjector } from './brain-projector.ts'
+import { completedWakeupsFromRows } from './brain-projector.ts'
 import type { StepUsage } from './mapping.ts'
 
 type Row = Record<string, unknown>
@@ -87,13 +87,9 @@ export class BrainTurnObservation {
   }
   lastStepIndex = -1
   historicalMessages = 0
-  private historicalProjector = new BrainTranscriptProjector(
-    '',
-    undefined,
-    false,
-  )
+  private historicalWakeupSteps = new Map<number, string>()
   historicalWakeups(): ReadonlyMap<number, string> {
-    return this.historicalProjector.completedWakeupsByStep()
+    return this.historicalWakeupSteps
   }
   revision = 0
   private waiters = new Set<() => void>()
@@ -221,11 +217,7 @@ export class BrainTurnObservation {
       this.bufferSnapshot = undefined
       this.lastStepIndex = -1
       this.historicalMessages = 0
-      this.historicalProjector = new BrainTranscriptProjector(
-        '',
-        undefined,
-        false,
-      )
+      this.historicalWakeupSteps.clear()
     }
     const historicalRows: Row[] = []
     for (const row of read.rows) {
@@ -237,10 +229,12 @@ export class BrainTurnObservation {
         historicalRows.push(row)
       }
     }
-    if (historicalRows.length > 0) {
-      this.historicalProjector.observeRows(historicalRows)
-      for (const row of historicalRows) this.historicalProjector.project(row)
-    }
+    if (historicalRows.length > 0)
+      for (const [stepIndex, childId] of completedWakeupsFromRows(
+        '',
+        historicalRows,
+      ))
+        this.historicalWakeupSteps.set(stepIndex, childId)
     if (this.mayPublish())
       this.callbacks.onBoundary?.(
         this.lastStepIndex,
