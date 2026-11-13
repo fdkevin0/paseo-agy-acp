@@ -45,6 +45,7 @@ import {
   readTranscriptRows,
   readLastStepIndex,
   settleBrainTurn,
+  type ForegroundAcpSegment,
 } from './brain.ts'
 import { readLatestStepUsage } from './brain-io.ts'
 import {
@@ -71,6 +72,7 @@ import {
   toolDetail,
   promptContent,
   contextUsage,
+  netPromptInputTokens,
   promptUsage,
   type SessionMetadata,
   type StepUsage,
@@ -254,6 +256,7 @@ export class SessionManager {
           }
         }
         session.state.turnToolCallIds = []
+        session.state.turnForegroundAcp = []
         await configureSession(session, input.config)
         await session.drain()
         if (input.persistence) await session.restoreUsage()
@@ -411,6 +414,7 @@ async function createSession(
         }
       | undefined,
     turnToolCallIds: [] as string[],
+    turnForegroundAcp: [] as ForegroundAcpSegment[],
     deniedToolCallIds: new Set<string>(),
     lastKnownStepIndex: -1,
     wakeup: {
@@ -626,15 +630,42 @@ async function createSession(
       }
       if (u.sessionUpdate === 'user_message_chunk' && !state.loading) {
         state.wakeup.suppressEcho = false
+        state.turnToolCallIds = []
+        state.turnForegroundAcp = []
         timeline.boundary()
         return
       }
       if (state.wakeup.suppressEcho) return
-      if (
+      const isNewToolCall =
         u.sessionUpdate === 'tool_call' &&
         !state.turnToolCallIds.includes(u.toolCallId)
-      )
-        state.turnToolCallIds.push(u.toolCallId)
+      if (isNewToolCall) state.turnToolCallIds.push(u.toolCallId)
+      if (!state.loading && state.turn && !state.inSettle) {
+        if (
+          (u.sessionUpdate === 'agent_message_chunk' ||
+            u.sessionUpdate === 'agent_thought_chunk') &&
+          u.content.type === 'text' &&
+          u.content.text.length > 0
+        ) {
+          const segType =
+            u.sessionUpdate === 'agent_message_chunk'
+              ? 'assistant_message'
+              : 'reasoning'
+          const last =
+            state.turnForegroundAcp[state.turnForegroundAcp.length - 1]
+          if (last && last.type === segType) last.text += u.content.text
+          else
+            state.turnForegroundAcp.push({
+              type: segType,
+              text: u.content.text,
+            })
+        } else if (isNewToolCall) {
+          state.turnForegroundAcp.push({
+            type: 'tool_call',
+            callId: u.toolCallId,
+          })
+        }
+      }
       if (
         state.turn &&
         (u.sessionUpdate === 'agent_message_chunk' ||
@@ -1018,6 +1049,7 @@ async function createSession(
           carriedUsage: undefined,
         }
         state.turnToolCallIds = []
+        state.turnForegroundAcp = []
         state.loading = false
         state.replay = true
       }
@@ -1487,6 +1519,7 @@ async function promptSession(
   session.state.suppressContinuationAcp = false
   session.state.preStagedQuestion = undefined
   session.state.turnToolCallIds = []
+  session.state.turnForegroundAcp = []
   session.state.deniedToolCallIds.clear()
   session.state.wakeup.suppressEcho =
     session.state.wakeup.pendingReplay && expectsUserEcho
@@ -1670,6 +1703,13 @@ async function promptSession(
           onSubagents: session.rememberSubagents,
           minStepIndex,
           acpToolCallIds: session.state.turnToolCallIds,
+          foregroundAcp: suppressedForeground
+            ? []
+            : [...session.state.turnForegroundAcp],
+          foregroundInputTokens: netPromptInputTokens(
+            result.usage,
+            session.state.wakeup.carriedUsage,
+          ),
           deniedToolCallIds: session.state.deniedToolCallIds,
           emitForeground: suppressedForeground,
           shouldEmitPreWakeupTool: (item) =>

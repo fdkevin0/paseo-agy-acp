@@ -725,12 +725,11 @@ export class BrainNode {
     if (row.type === 'USER_INPUT') {
       if (this.continuingQuestion) this.continuingQuestion = false
       else this.resetPhase()
-    } else if (
-      row.type === 'SYSTEM_MESSAGE' &&
-      !isRestartNotice(row) &&
-      this.foregroundIdleReached
-    )
+    } else if (this.foregroundIdleReached && countRowMessages(row) > 0) {
+      // agy drains MESSAGE_PRIORITY_LOW notices (e.g. task-kill) into SYSTEM_MESSAGE with
+      // hideFromUser=true; only actionable inbox messages (countRowMessages > 0) enter Reactive Wakeup.
       this.wokeUp = true
+    }
     if (isRetryWarning(row)) {
       const createdAt = Date.parse(String(row.created_at ?? ''))
       const step = Number(row.step_index)
@@ -764,13 +763,24 @@ export class BrainNode {
     this.consumedMessages += countRowMessages(row)
     const items = this.projector.project(row, continuingQuestion)
     if (row.type !== 'CHECKPOINT') this.lastStep = row
-    if (row.type === 'PLANNER_RESPONSE') this.seenPlannerResponse = true
-    if (
-      this.seenPlannerResponse &&
-      !this.projector.hasPending() &&
-      (isCompletePlannerResponse(row) || this.projector.hasBackground())
-    )
-      this.foregroundIdleReached = true
+    if (row.type === 'PLANNER_RESPONSE') {
+      this.seenPlannerResponse = true
+      if (!this.wokeUp) {
+        // Foreground idle is not sticky: synchronous tool loops and inline-answered ask_question
+        // GENERIC(DONE) rows resume foreground ownership until the next idle response or background handoff.
+        this.foregroundIdleReached =
+          !this.projector.hasPending() && isCompletePlannerResponse(row)
+      }
+    } else if (
+      row.type === 'GENERIC' &&
+      !this.wokeUp &&
+      this.seenPlannerResponse
+    ) {
+      this.foregroundIdleReached =
+        runningStepStatuses.has(String(row.status)) &&
+        !this.projector.hasPending() &&
+        this.projector.hasBackground()
+    }
     return items
   }
 

@@ -1070,6 +1070,112 @@ test('background task wakeup settles before completing turn and deduplicates nex
   }
 })
 
+test('Incident B: in-RPC high-priority continuation is emitted once and does not double-bill Turn 1 or steal Turn 2 usage', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-inrpc-cont-'))
+  const h = await harness({ HOME: home })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      config: h.config,
+      history: 'skip',
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's')
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'inrpc-1',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'in-rpc-continuation' }],
+        },
+      },
+    })
+    await h.wait(
+      (e) =>
+        e.type === 'session.turn' &&
+        e.sessionId === 's' &&
+        e.state === 'completed',
+    )
+    const turn1Items = h.events.flatMap((e) =>
+      e.type === 'timeline.item' ? [e.item] : [],
+    )
+    assert.equal(
+      turn1Items.filter(
+        (i) =>
+          i.type === 'assistant_message' && i.text === 'Final in-RPC reply.',
+      ).length,
+      1,
+      'Final in-RPC reply must be emitted exactly once',
+    )
+    assert.equal(
+      turn1Items.filter(
+        (i) =>
+          i.type === 'reasoning' &&
+          i.text === 'In-RPC reasoning after HIGH wakeup',
+      ).length,
+      1,
+      'In-RPC reasoning must be emitted exactly once',
+    )
+    assert.ok(
+      turn1Items.some(
+        (i) =>
+          i.type === 'tool_call' &&
+          i.callId === 'inrpc-bg' &&
+          i.status === 'completed' &&
+          i.detail.type === 'shell' &&
+          i.detail.output?.includes('inrpc-ok'),
+      ),
+      'Unstreamed background tool completion must still be surfaced once',
+    )
+    const turn1Usage = h.events.findLast((e) => e.type === 'session.usage')
+    assert.ok(turn1Usage?.type === 'session.usage')
+    assert.deepEqual(turn1Usage.usage, {
+      inputTokens: 55,
+      outputTokens: 13,
+      cachedInputTokens: 15,
+      contextWindowUsedTokens: 48,
+      contextWindowMaxTokens: 256_000,
+    })
+
+    // Turn 2: must NOT subtract Turn 1's step 6 tokens (30/10/8) via carriedUsage even though Turn 2 > 30/8.
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'inrpc-2',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'after-in-rpc-continuation' }],
+        },
+      },
+    })
+    await h.wait(
+      (e) =>
+        e.type === 'session.turn' &&
+        e.sessionId === 's' &&
+        e.state === 'completed',
+    )
+    const turn2Usage = h.events.findLast((e) => e.type === 'session.usage')
+    assert.ok(turn2Usage?.type === 'session.usage')
+    assert.deepEqual(turn2Usage.usage, {
+      inputTokens: 40,
+      outputTokens: 10,
+      cachedInputTokens: 0,
+      contextWindowUsedTokens: 50,
+      contextWindowMaxTokens: 256_000,
+    })
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('toolPolicy MCP preapprovals, allow_once default, deny interrupt, chooser question kind, and can_stop_runtime', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-permissions-layer-a-'))
   const log = join(home, 'calls')

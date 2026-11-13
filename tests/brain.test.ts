@@ -3788,3 +3788,369 @@ test('a completed checkpoint retains background and daemon task tracking', async
     assert.equal(projector.hasDaemons(), IsDaemon)
   }
 })
+
+test('Incident A: low-priority kill notice during foreground loop or after inline ask_question does not trigger wakeup', async () => {
+  // Case 1: ad0fa4c8 shape — backgrounded task, continued synchronous tools, manage_task(kill), LOW SYSTEM_MESSAGE, final reply.
+  const f1 = await fixture()
+  try {
+    const taskId = `${parent}/task-3`
+    const msgDir = join(f1.root, parent, '.system_generated/messages')
+    await mkdir(msgDir, { recursive: true })
+    await writeFile(
+      join(msgDir, 'msg-low-kill.json'),
+      JSON.stringify({
+        id: 'msg-low-kill',
+        sender: taskId,
+        recipient: parent,
+        priority: 'MESSAGE_PRIORITY_LOW',
+        hideFromUser: true,
+        content: `Task id "${taskId}" was canceled with result:\ncanceled`,
+        timestamp: new Date().toISOString(),
+      }),
+    )
+    await writeFile(
+      join(msgDir, 'read.json'),
+      JSON.stringify({ 'msg-low-kill': true }),
+    )
+    await f1.put(parent, [
+      { step_index: 1, type: 'USER_INPUT', content: 'investigate' },
+      {
+        step_index: 2,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          {
+            id: 'fg-bg',
+            name: 'run_command',
+            args: { CommandLine: 'sleep 30' },
+          },
+        ],
+      },
+      {
+        step_index: 3,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: `Tool is running as a background task with task id: ${taskId}\n`,
+      },
+      {
+        step_index: 4,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          { id: 'fg-read', name: 'read_file', args: { Path: '/a.ts' } },
+        ],
+      },
+      {
+        step_index: 5,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'file content',
+      },
+      {
+        step_index: 6,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          {
+            id: 'fg-kill',
+            name: 'manage_task',
+            args: { Action: 'kill', TaskId: taskId },
+          },
+        ],
+      },
+      {
+        step_index: 7,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: `Killed task ${taskId}`,
+      },
+      {
+        step_index: 8,
+        type: 'SYSTEM_MESSAGE',
+        content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-13T04:00:00Z sender=${taskId} priority=MESSAGE_PRIORITY_LOW content=Task id "${taskId}" was canceled with result:\ncanceled\n</SYSTEM_MESSAGE>`,
+      },
+      {
+        ...done(9, 'Final foreground answer.'),
+        input_tokens: 100,
+        cache_read_tokens: 50,
+        output_tokens: 20,
+      },
+    ])
+    const itemsA: ProviderTimelineItem[] = []
+    const resA = await settleBrainTurn(
+      f1.root,
+      parent,
+      'p',
+      (item) => itemsA.push(item),
+      {
+        minStepIndex: 0,
+        shouldEmitPreWakeupTool: () => false,
+      },
+    )
+    assert.equal(resA.status, 'completed')
+    assert.equal(resA.wokeUp, undefined)
+    assert.equal(resA.wakeupUsage, undefined)
+    assert.equal(
+      itemsA.some((i) => i.type === 'assistant_message'),
+      false,
+      'foreground final reply after low-priority cancellation must not be re-emitted',
+    )
+  } finally {
+    await f1.close()
+  }
+
+  // Case 2: Inline-answered foreground ask_question followed by LOW SYSTEM_MESSAGE and final foreground reply.
+  const f2 = await fixture()
+  try {
+    await f2.put(parent, [
+      { step_index: 10, type: 'USER_INPUT', content: 'ask and continue' },
+      {
+        step_index: 11,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          {
+            id: 'ask-fg',
+            name: 'ask_question',
+            args: { questions: [{ question: 'Pick?', options: ['A', 'B'] }] },
+          },
+        ],
+      },
+      {
+        step_index: 12,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: '{"action":"accept","content":{"q1":"A"}}',
+      },
+      {
+        step_index: 13,
+        type: 'SYSTEM_MESSAGE',
+        content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-13T04:01:00Z sender=bg priority=MESSAGE_PRIORITY_LOW content=background info\n</SYSTEM_MESSAGE>`,
+      },
+      done(14, 'Foreground answer after inline question.'),
+    ])
+    const itemsQ: ProviderTimelineItem[] = []
+    const resQ = await settleBrainTurn(
+      f2.root,
+      parent,
+      'p',
+      (item) => itemsQ.push(item),
+      {
+        minStepIndex: 9,
+        shouldEmitPreWakeupTool: () => false,
+      },
+    )
+    assert.equal(resQ.status, 'completed')
+    assert.equal(resQ.wokeUp, undefined)
+    assert.equal(
+      itemsQ.some((i) => i.type === 'assistant_message'),
+      false,
+    )
+  } finally {
+    await f2.close()
+  }
+})
+
+test('Incident B: in-RPC high-priority continuation is suppressed and excluded from wakeupUsage while genuine post-RPC wakeup is emitted', async () => {
+  // Subcase 1: Covered in-RPC continuation with tool calls, retry warning, and foreground reasoning/text.
+  const f1 = await fixture()
+  try {
+    const taskId = `${parent}/task-196`
+    await f1.deliver(
+      parent,
+      taskId,
+      `Task id "${taskId}" finished with result:\n42`,
+      true,
+      'msg-196',
+      {
+        conversationId: parent,
+        stepIndex: 3,
+        callId: 'bg-196',
+        name: 'run_command',
+      },
+    )
+    await f1.put(parent, [
+      { step_index: 1, type: 'USER_INPUT', content: 'run and wait' },
+      {
+        step_index: 2,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          {
+            id: 'bg-196',
+            name: 'run_command',
+            args: { CommandLine: 'echo 42' },
+          },
+        ],
+        input_tokens: 10,
+        output_tokens: 2,
+      },
+      {
+        step_index: 3,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: `Tool is running as a background task with task id: ${taskId}\n`,
+      },
+      {
+        ...done(4, 'OK'),
+        input_tokens: 20,
+        output_tokens: 3,
+      },
+      message(5, taskId, `Task id "${taskId}" finished with result:\n42`),
+      {
+        step_index: 6,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          { id: 'fg-read', name: 'read_file', args: { Path: '/out.txt' } },
+        ],
+        input_tokens: 30,
+        output_tokens: 4,
+      },
+      {
+        step_index: 7,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'out',
+      },
+      {
+        step_index: 8,
+        source: 'SYSTEM',
+        type: 'ERROR_MESSAGE',
+        status: 'DONE',
+        error:
+          'The stream was interrupted. Please continue the task you were working on.',
+      },
+      {
+        step_index: 9,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        thinking: 'Summarizing',
+        content: 'Done: 42.',
+        input_tokens: 40,
+        output_tokens: 5,
+      },
+    ])
+    const items1: ProviderTimelineItem[] = []
+    const res1 = await settleBrainTurn(
+      f1.root,
+      parent,
+      'p',
+      (item) => items1.push(item),
+      {
+        minStepIndex: 0,
+        acpToolCallIds: ['bg-196', 'fg-read'],
+        shouldEmitPreWakeupTool: (item) => item.callId === 'bg-196',
+        foregroundAcp: [
+          { type: 'tool_call', callId: 'bg-196' },
+          { type: 'assistant_message', text: 'OK' },
+          { type: 'tool_call', callId: 'fg-read' },
+          { type: 'reasoning', text: 'partialSummarizing' },
+          { type: 'assistant_message', text: 'Done: 42.' },
+        ],
+        foregroundInputTokens: 100,
+      },
+    )
+    assert.equal(res1.status, 'completed')
+    assert.equal(res1.wokeUp, undefined)
+    assert.equal(res1.wakeupUsage, undefined)
+    assert.deepEqual(
+      items1.map((i) =>
+        i.type === 'tool_call'
+          ? `${i.type}:${i.callId}:${i.status}`
+          : `${i.type}:${'text' in i ? i.text : ''}`,
+      ),
+      ['tool_call:bg-196:completed'],
+      'in-RPC continuation must emit only unstreamed background tool completion',
+    )
+  } finally {
+    await f1.close()
+  }
+
+  // Subcase 2: Silent DONE step after in-RPC continuation covered by net foregroundInputTokens (when no retry/checkpoint).
+  const f2 = await fixture()
+  try {
+    await f2.deliver(parent, 'bg-silent', 'ping', true)
+    await f2.put(parent, [
+      { step_index: 1, type: 'USER_INPUT', content: 'silent' },
+      { ...done(2, 'Start'), input_tokens: 20, output_tokens: 2 },
+      message(3, 'bg-silent', 'ping'),
+      { ...done(4, 'Middle'), input_tokens: 30, output_tokens: 3 },
+      {
+        step_index: 5,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+        input_tokens: 15,
+        output_tokens: 1,
+      },
+    ])
+    const itemsS: ProviderTimelineItem[] = []
+    const resS = await settleBrainTurn(
+      f2.root,
+      parent,
+      'p',
+      (item) => itemsS.push(item),
+      {
+        minStepIndex: 0,
+        foregroundAcp: [{ type: 'assistant_message', text: 'StartMiddle' }],
+        foregroundInputTokens: 65,
+      },
+    )
+    assert.equal(resS.status, 'completed')
+    assert.equal(resS.wokeUp, undefined)
+    assert.equal(resS.wakeupUsage, undefined)
+    assert.deepEqual(itemsS, [])
+  } finally {
+    await f2.close()
+  }
+
+  // Subcase 3: Hybrid turn with identical text ("OK") — first OK is in-RPC (covered), second OK is genuine post-RPC wakeup.
+  const f3 = await fixture()
+  try {
+    await f3.deliver(parent, 'other-1', 'first msg', true)
+    await f3.deliver(parent, 'other-2', 'second msg', true)
+    await f3.put(parent, [
+      { step_index: 20, type: 'USER_INPUT', content: 'hybrid' },
+      done(21, 'Start'),
+      message(22, 'other-1', 'first msg'),
+      {
+        ...done(23, 'OK'),
+        input_tokens: 30,
+        cache_read_tokens: 5,
+        output_tokens: 4,
+      },
+      message(24, 'other-2', 'second msg'),
+      {
+        ...done(25, 'OK'),
+        input_tokens: 50,
+        cache_read_tokens: 10,
+        output_tokens: 6,
+      },
+    ])
+    const items2: ProviderTimelineItem[] = []
+    const res2 = await settleBrainTurn(
+      f3.root,
+      parent,
+      'p',
+      (item) => items2.push(item),
+      {
+        minStepIndex: 19,
+        foregroundAcp: [{ type: 'assistant_message', text: 'StartOK' }],
+      },
+    )
+    assert.equal(res2.status, 'completed')
+    assert.equal(res2.wokeUp, true)
+    assert.deepEqual(res2.wakeupUsage, {
+      inputTokens: 50,
+      cachedReadTokens: 10,
+      outputTokens: 6,
+    })
+    assert.deepEqual(
+      items2.map((i) => `${i.type}:${'text' in i ? i.text : ''}`),
+      ['assistant_message:OK'],
+    )
+  } finally {
+    await f3.close()
+  }
+})

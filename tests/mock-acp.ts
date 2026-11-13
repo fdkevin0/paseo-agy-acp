@@ -476,6 +476,209 @@ new AgentSideConnection((client) => {
           },
         }
       }
+      if (text === 'in-rpc-continuation') {
+        const sys = join(
+          process.env.HOME ?? '/tmp',
+          '.gemini/antigravity-cli/brain',
+          sessionId,
+          '.system_generated',
+        )
+        const logs = join(sys, 'logs')
+        const messagesDir = join(sys, 'messages')
+        mkdirSync(logs, { recursive: true })
+        mkdirSync(messagesDir, { recursive: true })
+        const file = join(logs, 'transcript_full.jsonl')
+        const taskId = `${sessionId}/task-inrpc`
+        const rows = [
+          {
+            step_index: 1,
+            type: 'USER_INPUT',
+            content: '<USER_REQUEST>in-rpc-continuation</USER_REQUEST>',
+          },
+          {
+            step_index: 2,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Starting background check...',
+            tool_calls: [
+              {
+                id: 'inrpc-bg',
+                name: 'run_command',
+                args: { CommandLine: 'sleep 1' },
+              },
+            ],
+            input_tokens: 10,
+            cache_read_tokens: 0,
+            output_tokens: 2,
+          },
+          {
+            step_index: 3,
+            type: 'GENERIC',
+            status: 'RUNNING',
+            content: `Tool is running as a background task with task id: ${taskId}\n`,
+          },
+          {
+            step_index: 4,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Waiting for background check...',
+            input_tokens: 15,
+            cache_read_tokens: 5,
+            output_tokens: 3,
+          },
+          {
+            step_index: 5,
+            type: 'SYSTEM_MESSAGE',
+            content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-13T05:00:00Z sender=${taskId} priority=MESSAGE_PRIORITY_HIGH content=Task id "${taskId}" finished with result:\nCommand exited with code 0.\n\nCommand output:\ninrpc-ok\n</SYSTEM_MESSAGE>`,
+          },
+          {
+            step_index: 6,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            thinking: 'In-RPC reasoning after HIGH wakeup',
+            content: 'Final in-RPC reply.',
+            input_tokens: 30,
+            cache_read_tokens: 10,
+            output_tokens: 8,
+          },
+        ]
+        writeFileSync(
+          join(messagesDir, 'msg-inrpc.json'),
+          JSON.stringify({
+            id: 'msg-inrpc',
+            sender: taskId,
+            recipient: sessionId,
+            priority: 'MESSAGE_PRIORITY_HIGH',
+            content: `Task id "${taskId}" finished with result:\nCommand exited with code 0.\n\nCommand output:\ninrpc-ok`,
+            timestamp: '2026-11-13T05:00:00Z',
+            sourceMetadata: {
+              tool: {
+                conversationId: sessionId,
+                stepIndex: 3,
+                toolCall: {
+                  id: 'inrpc-bg',
+                  name: 'run_command',
+                  argumentsJson: '{"CommandLine":"sleep 1"}',
+                },
+              },
+            },
+          }),
+        )
+        writeFileSync(
+          join(messagesDir, 'read.json'),
+          JSON.stringify({ 'msg-inrpc': true }),
+        )
+        writeFileSync(file, rows.map((r) => JSON.stringify(r) + '\n').join(''))
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'user_message_chunk',
+            content: { type: 'text', text: 'in-rpc-continuation' },
+          },
+        })
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'Starting background check...' },
+          },
+        })
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'inrpc-bg',
+            title: 'run_command',
+            status: 'in_progress',
+            rawInput: { CommandLine: 'sleep 1' },
+          },
+        })
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'Waiting for background check...' },
+          },
+        })
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_thought_chunk',
+            content: {
+              type: 'text',
+              text: 'In-RPC reasoning after HIGH wakeup',
+            },
+          },
+        })
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'Final in-RPC reply.' },
+          },
+        })
+        return {
+          stopReason: 'end_turn' as const,
+          usage: {
+            inputTokens: 55,
+            outputTokens: 13,
+            totalTokens: 83,
+            cachedReadTokens: 15,
+          },
+        }
+      }
+      if (text === 'after-in-rpc-continuation') {
+        const logs = join(
+          process.env.HOME ?? '/tmp',
+          '.gemini/antigravity-cli/brain',
+          sessionId,
+          '.system_generated/logs',
+        )
+        const file = join(logs, 'transcript_full.jsonl')
+        appendFileSync(
+          file,
+          [
+            {
+              step_index: 7,
+              type: 'USER_INPUT',
+              content: '<USER_REQUEST>after-in-rpc-continuation</USER_REQUEST>',
+            },
+            {
+              step_index: 8,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'Turn 2 reply.',
+              input_tokens: 40,
+              output_tokens: 10,
+            },
+          ]
+            .map((r) => JSON.stringify(r) + '\n')
+            .join(''),
+        )
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'user_message_chunk',
+            content: { type: 'text', text },
+          },
+        })
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'Turn 2 reply.' },
+          },
+        })
+        return {
+          stopReason: 'end_turn' as const,
+          usage: {
+            inputTokens: 40,
+            outputTokens: 10,
+            totalTokens: 50,
+            cachedReadTokens: 0,
+          },
+        }
+      }
       await client.sessionUpdate({
         sessionId,
         update: {
