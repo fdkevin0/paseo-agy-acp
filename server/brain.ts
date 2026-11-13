@@ -669,7 +669,10 @@ export async function settleBrainTurn(
         }
       }
       fgReconciler.observeRowMeta(row)
-      const items = node.ingest(row, observedAt)
+      const items = node.ingest(
+        row,
+        read.observedAtByStep?.get(stepIndex) ?? observedAt,
+      )
       const usage = extractStepUsage(row)
       const postRpcStep = fgReconciler.reconcile(row, items, node.wokeUp)
       stream.wokeUp ||= fgReconciler.postRpc

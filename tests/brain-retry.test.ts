@@ -799,3 +799,110 @@ test('StepDedupe.fresh re-delivers steps when error or source mutates in place',
     'mutating row.source must re-deliver the step',
   )
 })
+
+test('BrainTurnObservation pre-attach buffering tracks observedAt per step without cross-poll contamination', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'brain-retry-per-step-'))
+  const s1 = '88888888-8888-4888-8888-888888888888'
+  const s2 = '99999999-9999-4999-8999-999999999999'
+  const transcriptPath = (sessionId: string) =>
+    join(root, sessionId, '.system_generated/logs/transcript_full.jsonl')
+  const writeRows = async (
+    sessionId: string,
+    rows: readonly Record<string, unknown>[],
+  ) => {
+    await mkdir(join(root, sessionId, '.system_generated/logs'), {
+      recursive: true,
+    })
+    await writeFile(
+      transcriptPath(sessionId),
+      rows.map((r) => JSON.stringify(r)).join('\n') + '\n',
+    )
+  }
+
+  let obs1: BrainTurnObservation | undefined
+  let obs2: BrainTurnObservation | undefined
+  try {
+    const expiredDate = new Date(Date.now() - 20 * 60_000)
+
+    // Case 1: Poll 1 reads aged USER_INPUT (20m ago); Poll 2 appends fresh warning -> must NOT immediately expire.
+    await writeRows(s1, [
+      { step_index: 0, type: 'USER_INPUT', content: 'start' },
+    ])
+    await utimes(transcriptPath(s1), expiredDate, expiredDate)
+    obs1 = new BrainTurnObservation(
+      root,
+      s1,
+      'p1',
+      -1,
+      { isCurrent: () => true, onUsage: () => {}, onItem: () => {} },
+      10,
+    )
+    await obs1.poll()
+
+    await writeRows(s1, [
+      { step_index: 0, type: 'USER_INPUT', content: 'start' },
+      warning(1, 1),
+    ])
+    await obs1.poll()
+
+    obs1.start()
+    let settled1: { status: string } | undefined
+    const p1 = settleBrainTurn(root, s1, 'p1', () => {}, {
+      minStepIndex: -1,
+      pollIntervalMs: 10,
+      observation: obs1,
+    }).then((res) => {
+      settled1 = res
+      return res
+    })
+    await delay(50)
+    assert.equal(
+      settled1,
+      undefined,
+      'freshly appended warning must not inherit earlier USER_INPUT aged mtimeMs',
+    )
+    await writeRows(s1, [
+      { step_index: 0, type: 'USER_INPUT', content: 'start' },
+      warning(1, 1),
+      quiet(2),
+    ])
+    const result1 = await p1
+    assert.equal(result1.status, 'completed')
+
+    // Case 2: Poll 1 reads aged warning (20m ago); Poll 2 appends fresh RUNNING row -> still expires immediately.
+    await writeRows(s2, [
+      { step_index: 0, type: 'USER_INPUT', content: 'start' },
+      warning(1, 1),
+    ])
+    await utimes(transcriptPath(s2), expiredDate, expiredDate)
+    obs2 = new BrainTurnObservation(
+      root,
+      s2,
+      'p2',
+      -1,
+      { isCurrent: () => true, onUsage: () => {}, onItem: () => {} },
+      10,
+    )
+    await obs2.poll()
+
+    await writeRows(s2, [
+      { step_index: 0, type: 'USER_INPUT', content: 'start' },
+      warning(1, 1),
+      { ...quiet(2), status: 'RUNNING' },
+    ])
+    await obs2.poll()
+
+    const settled2 = await settleBrainTurn(root, s2, 'p2', () => {}, {
+      minStepIndex: -1,
+      pollIntervalMs: 10,
+      observation: obs2,
+    })
+    assert.equal(settled2.status, 'failed')
+    assert.equal(settled2.stalled, true)
+    assert.match(settled2.error ?? '', /attempt 1/)
+  } finally {
+    await obs1?.dispose()
+    await obs2?.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
+})

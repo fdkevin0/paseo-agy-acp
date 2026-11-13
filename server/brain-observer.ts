@@ -9,7 +9,9 @@ import {
 import type { StepUsage } from './mapping.ts'
 
 type Row = Record<string, unknown>
-export type BrainRead = Awaited<ReturnType<TranscriptReader['read']>>
+export type BrainRead = Awaited<ReturnType<TranscriptReader['read']>> & {
+  observedAtByStep?: ReadonlyMap<number, number>
+}
 
 /** Numeric observations are independent of text/tool dedupe and never accumulate consumption. */
 export class ModelUsageObserver {
@@ -109,7 +111,7 @@ export class BrainTurnObservation {
   private buffered = new Map<number, Row>()
   private bufferReset = false
   private bufferSnapshot?: Set<number>
-  private bufferMtimeMs?: number
+  private bufferObservedAt = new Map<number, number>()
   private checkpoints = new StepDedupe()
   private drainingRead = false
   private mayPublish() {
@@ -204,7 +206,7 @@ export class BrainTurnObservation {
       this.buffered.clear()
       this.bufferReset = true
       this.bufferSnapshot = undefined
-      this.bufferMtimeMs = undefined
+      this.bufferObservedAt.clear()
       this.lastStepIndex = -1
       this.historicalMessages = 0
     }
@@ -227,13 +229,15 @@ export class BrainTurnObservation {
     if (this.consumer && this.acceptsRows() && this.callbacks.isCurrent())
       await this.consumer(next)
     else {
-      for (const row of eligible) this.buffered.set(Number(row.step_index), row)
-      if (
-        eligible.length > 0 &&
-        read.mtimeMs !== undefined &&
-        (read.reset || this.bufferMtimeMs === undefined)
-      )
-        this.bufferMtimeMs = read.mtimeMs
+      for (const row of eligible) {
+        const step = Number(row.step_index)
+        this.buffered.set(step, row)
+        if (
+          read.mtimeMs !== undefined &&
+          (read.reset || !this.bufferObservedAt.has(step))
+        )
+          this.bufferObservedAt.set(step, read.mtimeMs)
+      }
       if (read.snapshotStepIndices)
         this.bufferSnapshot = new Set(read.snapshotStepIndices)
       if (this.bufferSnapshot)
@@ -283,15 +287,19 @@ export class BrainTurnObservation {
         (a, b) => Number(a.step_index) - Number(b.step_index),
       )
       this.buffered.clear()
+      const observedAtByStep =
+        this.bufferObservedAt.size > 0
+          ? new Map(this.bufferObservedAt)
+          : undefined
+      this.bufferObservedAt.clear()
       await consumer({
         rows,
         reset: this.bufferReset,
         snapshotStepIndices: this.bufferSnapshot,
-        mtimeMs: this.bufferMtimeMs,
+        observedAtByStep,
       })
       this.bufferReset = false
       this.bufferSnapshot = undefined
-      this.bufferMtimeMs = undefined
     })()
       .catch((error) => {
         this.failure = error
