@@ -1,4 +1,5 @@
-import { stat } from 'node:fs/promises'
+import { readdir, stat } from 'node:fs/promises'
+import { join } from 'node:path'
 import { isNativeToolName, sessionIdPattern } from './common.ts'
 import {
   isMissing,
@@ -28,13 +29,37 @@ export type TaggedWakeupMessage = InboxMessage & {
 type CachedNodeBoundary = {
   mtimeMs: number
   size: number
+  metaSignature: string
   beforeStep: number
   emptyRows?: boolean
   localBoundary: number
   grandParentId?: string
   initStepIndex?: number
   tagged: readonly TaggedWakeupMessage[]
+  untaggedCount: number
   wakeupSteps: readonly number[]
+  allWakeupCount: number
+  node?: BrainNode
+}
+
+async function readDirSignature(
+  root: string,
+  nodeId: string,
+  subdir: string,
+): Promise<string> {
+  try {
+    const dir = await resolveBrainPath(root, nodeId, subdir)
+    const names = (await readdir(dir)).sort()
+    const entries = await Promise.all(
+      names.map(async (name) => {
+        const s = await stat(join(dir, name)).catch(() => undefined)
+        return s ? `${name}:${s.size}:${s.mtimeMs}` : `${name}:missing`
+      }),
+    )
+    return entries.join('|')
+  } catch {
+    return ''
+  }
 }
 
 export type TurnBoundaryCache = Map<string, CachedNodeBoundary>
@@ -115,21 +140,20 @@ export function resolveChildTurnState(
       childNode.nativeId,
       parentMinStepIndex,
     )
-  const { messages, tagged, untaggedCount } = selectParentWakeups(
+  const { tagged, untaggedCount } = selectParentWakeups(
     childInbox,
     parentNode.nativeId,
   )
   const taggedPriorCount = tagged.filter(
     (m) => m.tool.stepIndex <= parentMinStepIndex,
   ).length
-  const taggedTurnCount =
-    untaggedCount === 0 ? tagged.length - taggedPriorCount : 0
+  const taggedTurnCount = tagged.length - taggedPriorCount
   const requiredTurnWakeups = Math.max(taggedTurnCount, expectedTurnWakeups)
   if (requiredTurnWakeups === 0) return { status: 'pending' }
-  const untaggedPriorCount =
-    untaggedCount > 0
-      ? Math.max(0, messages.length - expectedTurnWakeups - taggedPriorCount)
-      : 0
+  const untaggedPriorCount = Math.max(
+    0,
+    untaggedCount - Math.max(0, expectedTurnWakeups - taggedTurnCount),
+  )
   const priorWakeups = Math.max(
     parentNode.countPriorWakeups(childNode.nativeId, parentMinStepIndex),
     taggedPriorCount + untaggedPriorCount,
@@ -162,13 +186,13 @@ export async function readTurnBoundaryBefore(
     return { boundary: -1, ready: true }
   visiting.add(nodeId)
   try {
-    const transcriptPath = await resolveBrainPath(
-      root,
-      nodeId,
-      'logs/transcript_full.jsonl',
-    )
     let fileStat: { mtimeMs: number; size: number }
     try {
+      const transcriptPath = await resolveBrainPath(
+        root,
+        nodeId,
+        'logs/transcript_full.jsonl',
+      )
       const s = await stat(transcriptPath)
       fileStat = { mtimeMs: s.mtimeMs, size: s.size }
     } catch (error) {
@@ -176,11 +200,14 @@ export async function readTurnBoundaryBefore(
       throw error
     }
     if (fileStat.size === 0) return { boundary: -1, ready: false }
-    let entry = cache?.get(nodeId)
+    const metaSignature = `${await readDirSignature(root, nodeId, 'messages')}||${await readDirSignature(root, nodeId, 'subagents')}`
+    const cacheKey = `${nodeId}:${beforeStep}`
+    let entry = cache?.get(cacheKey)
     if (
       !entry ||
       entry.mtimeMs !== fileStat.mtimeMs ||
       entry.size !== fileStat.size ||
+      entry.metaSignature !== metaSignature ||
       entry.beforeStep !== beforeStep
     ) {
       const [inbox, subagents, rows] = await Promise.all([
@@ -189,80 +216,174 @@ export async function readTurnBoundaryBefore(
         readTranscriptRows(root, nodeId).catch(() => []),
       ])
       if (rows.length === 0) {
-        cache?.set(nodeId, {
+        cache?.set(cacheKey, {
           mtimeMs: fileStat.mtimeMs,
           size: fileStat.size,
+          metaSignature,
           beforeStep,
           emptyRows: true,
           localBoundary: -1,
           tagged: [],
+          untaggedCount: 0,
           wakeupSteps: [],
+          allWakeupCount: 0,
         })
         return { boundary: -1, ready: false }
       }
       const init = inbox.messages.find((m) =>
         isNativeToolName(m.tool?.name ?? '', 'invoke_subagent'),
       )
+      const grandParentId = init?.tool?.conversationId
       const node = new BrainNode(nodeId, nodeId, {
         allowInitialSpawnPrompt: Boolean(init),
       })
       node.projector.syncMetadata(inbox, subagents)
       node.projector.observeRows(rows)
+      let localBoundary = -1
+      let wakeupSteps: readonly number[] = []
+      let capturedBefore = false
       for (const row of rows) {
         const stepIndex = Number(row.step_index)
-        if (!Number.isInteger(stepIndex) || stepIndex >= beforeStep) continue
+        if (!Number.isInteger(stepIndex)) continue
+        if (!capturedBefore && stepIndex >= beforeStep) {
+          localBoundary = node.turnStartStep
+          wakeupSteps = grandParentId
+            ? [...node.wakeupStepsFrom(grandParentId)]
+            : []
+          capturedBefore = true
+        }
         node.ingest(row)
       }
-      const grandParentId = init?.tool?.conversationId
-      const { tagged, allTagged } = selectParentWakeups(inbox, grandParentId)
-      const wakeupSteps = grandParentId
-        ? node.wakeupStepsFrom(grandParentId).filter((s) => s < beforeStep)
-        : []
+      if (!capturedBefore) {
+        localBoundary = node.turnStartStep
+        wakeupSteps = grandParentId
+          ? [...node.wakeupStepsFrom(grandParentId)]
+          : []
+      }
+      const { tagged, untaggedCount } = selectParentWakeups(
+        inbox,
+        grandParentId,
+      )
+      const allWakeupCount = grandParentId
+        ? node.wakeupStepsFrom(grandParentId).length
+        : 0
       entry = {
         mtimeMs: fileStat.mtimeMs,
         size: fileStat.size,
+        metaSignature,
         beforeStep,
-        localBoundary: node.turnStartStep,
-        grandParentId: allTagged ? grandParentId : undefined,
+        localBoundary,
+        grandParentId,
         initStepIndex: init?.tool?.stepIndex,
-        tagged: allTagged ? tagged : [],
+        tagged,
+        untaggedCount,
         wakeupSteps,
+        allWakeupCount,
+        node,
       }
-      if (!grandParentId || allTagged) {
-        cache?.set(nodeId, entry)
-      }
+      cache?.set(cacheKey, entry)
     } else if (entry.emptyRows) {
       return { boundary: -1, ready: false }
     }
     let boundary = entry.localBoundary
     let ready = true
-    if (
-      entry.grandParentId &&
-      entry.initStepIndex !== undefined &&
-      entry.tagged.length > 0 &&
-      entry.wakeupSteps.length > 0
-    ) {
-      const ingestedCount = Math.min(
-        entry.tagged.length,
-        entry.wakeupSteps.length,
-      )
-      const lastWakeParentStep = entry.tagged[ingestedCount - 1].tool.stepIndex
-      const grand = await readTurnBoundaryBefore(
-        root,
-        entry.grandParentId,
-        lastWakeParentStep,
-        cache,
-        visiting,
-      )
-      ready = grand.ready
-      if (grand.boundary >= 0 && entry.initStepIndex <= grand.boundary) {
-        const startStep = resolveTurnWakeupStartStep(
-          entry.tagged,
-          entry.wakeupSteps,
-          grand.boundary,
-          ingestedCount,
+    if (entry.grandParentId && entry.initStepIndex !== undefined) {
+      if (entry.untaggedCount === 0) {
+        if (entry.tagged.length > 0 && entry.wakeupSteps.length > 0) {
+          const ingestedCount = Math.min(
+            entry.tagged.length,
+            entry.wakeupSteps.length,
+          )
+          const lastWakeParentStep =
+            entry.tagged[ingestedCount - 1].tool.stepIndex
+          const grand = await readTurnBoundaryBefore(
+            root,
+            entry.grandParentId,
+            lastWakeParentStep,
+            cache,
+            visiting,
+          )
+          ready = grand.ready
+          if (grand.boundary >= 0 && entry.initStepIndex <= grand.boundary) {
+            const startStep = resolveTurnWakeupStartStep(
+              entry.tagged,
+              entry.wakeupSteps,
+              grand.boundary,
+              ingestedCount,
+            )
+            if (startStep !== undefined)
+              boundary = Math.max(boundary, startStep)
+          }
+        }
+      } else {
+        const beforeCount = entry.wakeupSteps.length
+        if (
+          entry.allWakeupCount === beforeCount &&
+          entry.allWakeupCount < entry.tagged.length + entry.untaggedCount
         )
-        if (startStep !== undefined) boundary = Math.max(boundary, startStep)
+          return { boundary, ready: false }
+        let grandBeforeStep = Number.MAX_SAFE_INTEGER
+        const grandCache = cache ?? new Map<string, CachedNodeBoundary>()
+        while (true) {
+          const grand = await readTurnBoundaryBefore(
+            root,
+            entry.grandParentId,
+            grandBeforeStep,
+            grandCache,
+            visiting,
+          )
+          if (!grand.ready) return { boundary, ready: false }
+          ready = grand.ready
+          if (grand.boundary < 0 || entry.initStepIndex > grand.boundary) break
+          const grandNode = grandCache.get(
+            `${entry.grandParentId}:${grandBeforeStep}`,
+          )?.node
+          if (!grandNode) return { boundary, ready: false }
+          const priorInGrand = grandNode.countPriorWakeups(
+            nodeId,
+            grand.boundary,
+          )
+          if (priorInGrand >= beforeCount) {
+            grandBeforeStep = grand.boundary
+            continue
+          }
+          const expectedTurnWakeups =
+            grandNode.projector.countCompletedWakeups(nodeId, grand.boundary) +
+            grandNode.projector.countPendingWakeups(nodeId, grand.boundary)
+          if (expectedTurnWakeups > 0) {
+            const beforeTagged = entry.tagged.filter(
+              (m) => m.tool.stepIndex < grandBeforeStep,
+            )
+            const taggedPriorCount = beforeTagged.filter(
+              (m) => m.tool.stepIndex <= grand.boundary,
+            ).length
+            const taggedTurnCount = beforeTagged.length - taggedPriorCount
+            const untaggedBeforeCount = Math.max(
+              0,
+              Math.min(entry.untaggedCount, beforeCount - beforeTagged.length),
+            )
+            const untaggedPriorCount = Math.max(
+              0,
+              untaggedBeforeCount -
+                Math.max(0, expectedTurnWakeups - taggedTurnCount),
+            )
+            const priorWakeups = Math.max(
+              priorInGrand,
+              taggedPriorCount + untaggedPriorCount,
+            )
+            const startStep = entry.wakeupSteps[priorWakeups]
+            if (startStep !== undefined)
+              boundary = Math.max(boundary, startStep)
+            break
+          }
+          // Step back past an unrelated later ancestor turn that did not wake nodeId.
+          if (priorInGrand === 0) {
+            if (entry.tagged.length > 0 || entry.untaggedCount > 0)
+              return { boundary, ready: false }
+            break
+          }
+          grandBeforeStep = grand.boundary
+        }
       }
     }
     return { boundary, ready }

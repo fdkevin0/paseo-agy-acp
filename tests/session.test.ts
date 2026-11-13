@@ -658,19 +658,24 @@ new AgentSideConnection((client) => ({
       },
     })
     // Seed an unconsumed high-priority inbox message so hasActiveBackgroundWork would be true if reached.
-    const inboxDir = join(
+    const msgDir = join(
       home,
       '.gemini',
       'antigravity-cli',
       'brain',
       '11111111-1111-4111-8111-111111111111',
       '.system_generated',
-      'inbox',
+      'messages',
     )
-    await mkdir(inboxDir, { recursive: true })
+    await mkdir(msgDir, { recursive: true })
     await writeFile(
-      join(inboxDir, 'msg-1.json'),
-      JSON.stringify({ priority: 'MESSAGE_PRIORITY_HIGH', consumed: false }),
+      join(msgDir, 'msg-1.json'),
+      JSON.stringify({
+        id: 'msg-1',
+        sender: '22222222-2222-4222-8222-222222222222',
+        priority: 'MESSAGE_PRIORITY_HIGH',
+        content: 'wake',
+      }),
     )
 
     await m.handle({

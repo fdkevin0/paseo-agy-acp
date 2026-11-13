@@ -841,7 +841,6 @@ export async function settleBrainTurn(
         await stream.wait(revision, signal)
         continue
       }
-      if (signal?.aborted) continue
       const failure = node.failure(retryTimeoutMs, minStepIndex)
       if (failure)
         return {
@@ -1078,6 +1077,10 @@ export function watchBrain(
         node.reset(inbox, subagents)
         boundaryCache.clear()
       }
+      const init = inbox.messages.find((m) =>
+        isNativeToolName(m.tool?.name ?? '', 'invoke_subagent'),
+      )
+      const parentId = init?.tool?.conversationId
       node.projector.observeRows(rows)
       for (const row of rows) {
         if (stopped) return
@@ -1088,16 +1091,24 @@ export function watchBrain(
           (resume !== undefined && stepIndex <= resume.afterStep)
         if (Number.isInteger(stepIndex) && stepIndex > lastStepIndex)
           lastStepIndex = stepIndex
-        // If the child's prior turn ended in ERROR_MESSAGE or retry timeout and a new wakeup
-        // SYSTEM_MESSAGE arrives before or across poll boundaries, advance turnFloor past the failed step.
+        // If the child's prior turn ended in ERROR_MESSAGE or retry timeout and a new parent
+        // wakeup SYSTEM_MESSAGE arrives before or across poll boundaries, advance turnFloor past the failed step.
+        // Exclude grandchild reports and task notifications so they never erase a child's failure.
         if (
           node.failure(retryTimeoutMs) !== undefined &&
           row.type === 'SYSTEM_MESSAGE' &&
           !isRestartNotice(row) &&
-          extractRowMessageSenders(row).length > 0 &&
           Number.isInteger(stepIndex)
         ) {
-          node.advanceTurnFloor(stepIndex - 1)
+          const senders = extractRowMessageSenders(row)
+          const isParentWakeup = parentId
+            ? senders.includes(parentId)
+            : senders.some(
+                (s) =>
+                  sessionIdPattern.test(s) &&
+                  !subagents.some((sub) => sub.conversationId === s),
+              )
+          if (isParentWakeup) node.advanceTurnFloor(stepIndex - 1)
         }
         const items = node.ingest(row)
         if (replayed) continue
@@ -1134,10 +1145,6 @@ export function watchBrain(
         }
       }
       childUsage.observe({ rows, reset, snapshotStepIndices })
-      const init = inbox.messages.find((m) =>
-        isNativeToolName(m.tool?.name ?? '', 'invoke_subagent'),
-      )
-      const parentId = init?.tool?.conversationId
       const {
         messages: parentWakeupMsgs,
         tagged,
@@ -1159,9 +1166,7 @@ export function watchBrain(
             boundaryCache,
           )
           if (!resolved.ready) {
-            awaitingCrossTurnEntry =
-              parentWakeupMsgs.length > wakeupSteps.length &&
-              isParentTurnActive?.() !== false
+            awaitingCrossTurnEntry = isParentTurnActive?.() !== false
           } else if (
             resolved.boundary >= 0 &&
             init.tool.stepIndex <= resolved.boundary
@@ -1278,6 +1283,7 @@ export function watchBrain(
       async flush() {
         if (stopped || cancelling) return
         await inflight?.catch(() => undefined)
+        if (stopped || cancelling) return
         await poll().catch(() => undefined)
       },
       cancel() {

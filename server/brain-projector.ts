@@ -854,6 +854,8 @@ export class BrainNode {
   private retrySince?: number
   private retryError?: string
   private retryStep = -1
+  private terminalError?: string
+  private terminalErrorStep = -1
   private wakeupStepsBySender = new Map<string, number[]>()
   private allowInitialSpawnPrompt: boolean
   readonly nativeId: string
@@ -943,6 +945,8 @@ export class BrainNode {
     this.retrySince = undefined
     this.retryError = undefined
     this.retryStep = -1
+    this.terminalError = undefined
+    this.terminalErrorStep = -1
     this.promptPhase = 'foreground'
     this.wokeUp = false
     this.continuingQuestion = false
@@ -1051,6 +1055,13 @@ export class BrainNode {
     ) {
       this.retrySince = undefined
       this.retryError = undefined
+      if (row.type === 'ERROR_MESSAGE') {
+        this.terminalError = stepErrorMessage(row)
+        this.terminalErrorStep = Number.isInteger(stepIndex) ? stepIndex : -1
+      } else if (isRestartNotice(row) || row.type === 'PLANNER_RESPONSE') {
+        this.terminalError = undefined
+        this.terminalErrorStep = -1
+      }
     }
     this.consumedMessages += rowMessages
     if (Number.isInteger(stepIndex)) {
@@ -1116,11 +1127,10 @@ export class BrainNode {
     )
       return `${this.retryError} No retry recovery was observed for ${Math.round(timeoutMs / 1000)}s; stopped waiting locally.`
     if (
-      this.lastStep?.type === 'ERROR_MESSAGE' &&
-      !isRetryWarning(this.lastStep) &&
-      Number(this.lastStep.step_index ?? -1) > minStepIndex
+      this.terminalError !== undefined &&
+      this.terminalErrorStep > minStepIndex
     )
-      return stepErrorMessage(this.lastStep)
+      return this.terminalError
     return undefined
   }
 
