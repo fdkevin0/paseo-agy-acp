@@ -1615,3 +1615,111 @@ test('background completion recovers missing results without becoming a second h
     assert.equal(recovered.detail.output, 'pass')
   }
 })
+
+test('Orchestrator contrib planexecute handoffs align across CHECKPOINT history replay and preserve plan cards', async () => {
+  const planMd = '# Plan\n- Inspect\n- Patch\n'
+  const nativeRows = [
+    {
+      step_index: 0,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      content: 'Planning',
+      tool_calls: [
+        {
+          id: 'exit-1',
+          name: 'contrib:exit_plan_mode',
+          args: { plan: planMd },
+        },
+      ],
+    },
+    {
+      step_index: 1,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: 'Plan mode is off.',
+    },
+    {
+      step_index: 2,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content:
+        '<SYSTEM_MESSAGE>\nPlan mode is off: this turn runs on the execution model.\n</SYSTEM_MESSAGE>',
+    },
+    checkpoint(3),
+    {
+      step_index: 4,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      content: 'Executing',
+      tool_calls: [
+        {
+          id: 'enter-1',
+          name: 'contrib:enter_plan_mode',
+          args: { reason: 'Ready for review' },
+        },
+      ],
+    },
+    {
+      step_index: 5,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: 'Plan mode is on.',
+    },
+    {
+      step_index: 6,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content:
+        '<SYSTEM_MESSAGE>\n[plan review] Plan mode is on: this turn runs on the planning model.\n</SYSTEM_MESSAGE>',
+    },
+    response(7, 'Reviewed'),
+  ]
+  const events = await replay(nativeRows, [
+    text('Planning'),
+    {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'exit-1',
+      title: 'Run contrib:exit_plan_mode',
+      kind: 'other',
+      status: 'completed',
+      rawInput: { plan: planMd },
+      rawOutput: null,
+    },
+    text('Executing'),
+    {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'enter-1',
+      title: 'Run contrib:enter_plan_mode',
+      kind: 'other',
+      status: 'completed',
+      rawInput: { reason: 'Ready for review' },
+      rawOutput: 'Plan mode is on.',
+    },
+    text('Reviewed'),
+  ])
+  assert.deepEqual(labels(events), [
+    'Planning',
+    'tool_call',
+    'tool_call',
+    'compaction',
+    'Executing',
+    'tool_call',
+    'Reviewed',
+  ])
+  const tools = timeline(events).filter(({ item }) => item.type === 'tool_call')
+  // exit-1 has rawOutput: null in ACP, so Brain result recovery emits a second update before compaction;
+  // both snapshots retain { type: 'plan', text: planMd }.
+  const exitItems = tools.filter(
+    ({ item }) => item.type === 'tool_call' && item.callId === 'exit-1',
+  )
+  assert.equal(exitItems.length, 2)
+  for (const { item } of exitItems) {
+    assert.ok(item.type === 'tool_call')
+    assert.deepEqual(item.detail, { type: 'plan', text: planMd })
+  }
+  const enterItem = tools.findLast(
+    ({ item }) => item.type === 'tool_call' && item.callId === 'enter-1',
+  )?.item
+  assert.ok(enterItem?.type === 'tool_call')
+  assert.equal(enterItem.detail.type, 'unknown')
+})

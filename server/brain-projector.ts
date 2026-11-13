@@ -16,6 +16,7 @@ import {
   TranscriptReader,
   countRowMessages,
   isCompletePlannerResponse,
+  isPlanExecuteNotice,
   isRetryWarning,
   RETRY_IDLE_TIMEOUT_MS,
   isRestartNotice,
@@ -703,14 +704,17 @@ export function activeChildIdsForTurn(
   return [...ids]
 }
 
+export type BrainPromptPhase =
+  'foreground' | 'foreground_active' | 'foreground_idle' | 'woken'
+
 export class BrainNode {
   readonly reader: TranscriptReader
   projector: BrainTranscriptProjector
   readonly children = new Map<string, BrainNode>()
   consumedMessages = 0
   turnStartStep = -1
-  seenPlannerResponse = false
-  foregroundIdleReached = false
+  promptPhase: BrainPromptPhase = 'foreground'
+  // Turn-wide projection ownership survives synthetic continuation resets of promptPhase.
   wokeUp = false
   continuingQuestion = false
   questionSettled = false
@@ -761,13 +765,22 @@ export class BrainNode {
     this.resetPhase()
   }
 
+  get foregroundIdleReached(): boolean {
+    return (
+      this.promptPhase === 'foreground_idle' || this.promptPhase === 'woken'
+    )
+  }
+
+  get wokeUpSinceLastPrompt(): boolean {
+    return this.promptPhase === 'woken'
+  }
+
   /** Forget the wakeup phase: a new USER_INPUT, a transcript rewrite or (for hasActiveBackgroundWork) a runtime restart. */
   resetPhase() {
     this.retrySince = undefined
     this.retryError = undefined
     this.retryStep = -1
-    this.seenPlannerResponse = false
-    this.foregroundIdleReached = false
+    this.promptPhase = 'foreground'
     this.wokeUp = false
     this.continuingQuestion = false
     this.questionSettled = false
@@ -777,20 +790,21 @@ export class BrainNode {
 
   settleAbortedDenial(denied?: ReadonlySet<string>) {
     if (
-      !this.wokeUp &&
+      this.promptPhase !== 'woken' &&
       denied &&
       this.projector.hasDeniedOutcome(denied, this.lastStep)
     ) {
       this.projector.clearPending()
       this.abortedByDenial = true
-      this.foregroundIdleReached = true
+      this.promptPhase = 'foreground_idle'
     }
   }
 
-  markQuestionContinuation() {
+  markQuestionContinuation(syntheticPrompt = false) {
     this.continuingQuestion = true
     this.questionSettled = false
     this.wokeUp = true
+    if (syntheticPrompt) this.promptPhase = 'foreground'
     this.answeredQuestionStep = Number(this.lastStep?.step_index ?? -1)
   }
 
@@ -820,15 +834,23 @@ export class BrainNode {
     // the rows after it are still Brain's to project.
     const continuingQuestion =
       row.type === 'USER_INPUT' && this.continuingQuestion
+    const rowMessages = countRowMessages(row)
+    // shortcut: zero counts exclude user/low-priority headers; revisit if agy mixes headerless wakeups with handoffs.
+    const purePlanExecuteNotice = isPlanExecuteNotice(row) && rowMessages === 0
     if (row.type === 'USER_INPUT') {
-      if (this.continuingQuestion) this.continuingQuestion = false
-      else this.resetPhase()
+      if (this.continuingQuestion) {
+        this.continuingQuestion = false
+        this.promptPhase = 'foreground'
+      } else this.resetPhase()
     } else if (
       row.type === 'SYSTEM_MESSAGE' &&
       !isRestartNotice(row) &&
-      this.foregroundIdleReached
-    )
+      !purePlanExecuteNotice &&
+      this.promptPhase === 'foreground_idle'
+    ) {
+      this.promptPhase = 'woken'
       this.wokeUp = true
+    }
     if (isRetryWarning(row)) {
       const createdAt = Date.parse(String(row.created_at ?? ''))
       const step = Number(row.step_index)
@@ -859,16 +881,26 @@ export class BrainNode {
       this.retrySince = undefined
       this.retryError = undefined
     }
-    this.consumedMessages += countRowMessages(row)
+    this.consumedMessages += rowMessages
     const items = this.projector.project(row, continuingQuestion)
     if (row.type !== 'CHECKPOINT') this.lastStep = row
-    if (row.type === 'PLANNER_RESPONSE') this.seenPlannerResponse = true
-    if (
-      this.seenPlannerResponse &&
-      !this.projector.hasPending() &&
-      (isCompletePlannerResponse(row) || this.projector.hasBackground())
-    )
-      this.foregroundIdleReached = true
+    if (this.promptPhase !== 'woken') {
+      if (
+        this.promptPhase === 'foreground' &&
+        row.type === 'PLANNER_RESPONSE'
+      ) {
+        this.promptPhase = 'foreground_active'
+      }
+      if (purePlanExecuteNotice || this.projector.hasPending()) {
+        if (this.promptPhase === 'foreground_idle')
+          this.promptPhase = 'foreground_active'
+      } else if (
+        this.promptPhase !== 'foreground' &&
+        (isCompletePlannerResponse(row) || this.projector.hasBackground())
+      ) {
+        this.promptPhase = 'foreground_idle'
+      }
+    }
     return items
   }
 
@@ -900,6 +932,7 @@ export class BrainNode {
   isWokenWorking(): boolean {
     return (
       this.wokeUp &&
+      !this.abortedByDenial &&
       (this.projector.hasPending() ||
         (this.lastStep?.type === 'SYSTEM_MESSAGE' &&
           !isRestartNotice(this.lastStep)) ||
@@ -919,7 +952,7 @@ export class BrainNode {
       Number(this.lastStep?.step_index ?? -1) > this.answeredQuestionStep &&
       (isCompletePlannerResponse(this.lastStep) ||
         this.questionSettled ||
-        (!this.wokeUp && this.abortedByDenial))
+        (this.promptPhase !== 'woken' && this.abortedByDenial))
     )
   }
 }

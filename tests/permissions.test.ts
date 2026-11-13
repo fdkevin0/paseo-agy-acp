@@ -59,8 +59,69 @@ test('permissionKind classifies questions, mode switches, plans and tools', () =
   )
   assert.equal(kind('ask_user', 'plain_text'), 'question')
   assert.equal(kind('default_api:ask_question', 'plain_text'), 'question')
+  assert.equal(kind('Run default_api:ask_question', 'plain_text'), 'question')
   assert.equal(kind('exit_plan_mode', 'plain_text'), 'mode')
+  assert.equal(kind('enter_plan_mode', 'plain_text'), 'mode')
+  assert.equal(kind('contrib:exit_plan_mode', 'plan'), 'mode')
+  assert.equal(kind('contrib:enter_plan_mode', 'plain_text'), 'mode')
+  assert.equal(kind('Run contrib:exit_plan_mode', 'plan'), 'mode')
+  assert.equal(kind('Run default_api:exit_plan_mode', 'plan'), 'mode')
+  assert.equal(kind('Run enter_plan_mode', 'plain_text'), 'mode')
+  assert.equal(
+    permissionKind(
+      {
+        options: binary,
+        toolCall: {
+          name: 'contrib:exit_plan_mode',
+          title: 'Exit plan mode',
+          kind: 'other',
+        } as { title?: string; kind?: unknown },
+      },
+      { type: 'plan', text: '# Plan' },
+    ),
+    'mode',
+  )
+  assert.equal(
+    permissionKind(
+      {
+        options: binary,
+        toolCall: {
+          name: 'mcp__srv__other',
+          title: 'exit_plan_mode',
+        } as { title?: string; kind?: unknown },
+      },
+      { type: 'plain_text', label: 'exit_plan_mode' },
+    ),
+    'tool',
+  )
+  assert.equal(
+    permissionKind(
+      {
+        options: binary,
+        toolCall: {
+          name: 'mcp__srv__other',
+          title: 'ask_question',
+        } as { title?: string; kind?: unknown },
+      },
+      { type: 'plain_text', label: 'ask_question' },
+    ),
+    'tool',
+  )
   assert.equal(kind('x', 'plain_text', 'switch_mode'), 'mode')
+  assert.equal(
+    kind('Run mcp__srv__switch_mode', 'plain_text', 'switch_mode'),
+    'tool',
+  )
+  assert.equal(
+    kind('Run default_api:mcp__srv__switch_mode', 'plain_text', 'switch_mode'),
+    'tool',
+  )
+  assert.equal(kind('srv:switch_mode', 'plain_text', 'switch_mode'), 'tool')
+  assert.equal(kind('call_mcp_tool', 'plain_text', 'switch_mode'), 'tool')
+  assert.equal(
+    kind('Run default_api:call_mcp_tool', 'plain_text', 'switch_mode'),
+    'tool',
+  )
   assert.equal(kind('write_to_file', 'plan', 'edit'), 'plan')
   assert.equal(kind('run_command', 'plain_text', 'execute'), 'tool')
 })
