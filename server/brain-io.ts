@@ -185,28 +185,36 @@ export function extractStepUsage(
   }
 }
 
-export function countRowMessages(row: Record<string, unknown>): number {
+export function extractRowMessageSenders(
+  row: Record<string, unknown>,
+): string[] {
   if (
     row.type !== 'SYSTEM_MESSAGE' ||
     typeof row.content !== 'string' ||
     isRestartNotice(row)
   )
-    return 0
-  let count = 0
+    return []
+  const senders: string[] = []
   for (const match of row.content.matchAll(rowMessageHeaderPattern)) {
     const sender = match[1]
     const priority = match[2]
     if (sender !== 'user' && priority !== 'MESSAGE_PRIORITY_LOW') {
-      count++
+      senders.push(sender)
     }
   }
+  return senders
+}
+
+export function countRowMessages(row: Record<string, unknown>): number {
+  const senders = extractRowMessageSenders(row)
+  if (senders.length === 0) return 0
   if (
     Number(row.step_index) === 0 &&
-    /\bsender=[a-f0-9-]{36}(?=\s|$)/i.test(row.content)
+    senders.some((sender) => sessionIdPattern.test(sender))
   ) {
-    return Math.max(0, count - 1)
+    return Math.max(0, senders.length - 1)
   }
-  return count
+  return senders.length
 }
 
 type CachedMessage = {

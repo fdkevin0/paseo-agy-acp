@@ -1083,6 +1083,8 @@ async function createSession(
         }
       },
       hasChild: (nativeId: string) => subagents.hasChild(nativeId),
+      hasRunningChildren: () => subagents.hasRunningChildren(),
+      flushActiveChildren: () => subagents.flushActive(),
       isChildResumable: (nativeId: string) =>
         subagents.isChildResumable(nativeId),
       syncKilledChildren: subagents.syncKilledChildren,
@@ -1796,12 +1798,25 @@ async function promptSession(
       nextCarriedWakeup = settled.carriedWakeupUsage
       if (settled.pendingReplay) session.state.wakeup.pendingReplay = true
       if (
-        settled.stalled &&
         !turnAbort.signal.aborted &&
         !session.state.closing &&
         !session.state.failed
       ) {
-        await session.interrupt().catch(() => undefined)
+        if (settled.status === 'failed') {
+          await session.flushActiveChildren()
+        }
+        const needsFailureCleanup =
+          Boolean(settled.stalled) ||
+          (settled.status === 'failed' &&
+            (session.hasRunningChildren() ||
+              (await hasActiveBackgroundWork(
+                session.brainRoot,
+                session.state.nativeId,
+                { retryTimeoutMs: session.retryTimeoutMs },
+              ).catch(() => false))))
+        if (needsFailureCleanup) {
+          await session.interrupt().catch(() => undefined)
+        }
       }
     }
     lastStep = await reconcileFinalSnapshot(lastStep)
@@ -1811,7 +1826,7 @@ async function promptSession(
         turnAbort.signal.reason instanceof Error &&
         turnAbort.signal.reason.name === 'AbortError'
       ) {
-        // Stall failures cancel the runtime for cleanup without changing their terminal status.
+        // Stall or child failures cancel the runtime for cleanup without changing their terminal status.
         if (status !== 'failed') status = 'canceled'
       } else turnAbort.signal.throwIfAborted()
     }
