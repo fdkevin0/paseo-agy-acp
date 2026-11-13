@@ -133,6 +133,21 @@ export function stepErrorMessage(
   return fallback
 }
 
+const RETRY_EXACT_MESSAGES = new Set([
+  'The stream was interrupted. Please continue the task you were working on.',
+  'model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again',
+])
+
+const RETRY_COUNTDOWN_PREFIXES = [
+  'Your previous response ',
+  'There was a problem',
+] as const
+
+function hasPositiveRetriesRemaining(message: string): boolean {
+  const lastLine = message.trimEnd().split(/\r?\n/).at(-1) ?? ''
+  return /^Retries remaining: [1-9]\d*$/.test(lastLine)
+}
+
 // shortcut: Brain has no retry outcome; replace these observed warning forms when upstream supplies one.
 export function isRetryWarning(
   step: Record<string, unknown> | undefined,
@@ -140,19 +155,15 @@ export function isRetryWarning(
   if (
     step?.type !== 'ERROR_MESSAGE' ||
     step.status !== 'DONE' ||
-    (step.source !== undefined && step.source !== 'SYSTEM')
+    (step.source != null && step.source !== 'SYSTEM')
   )
     return false
   const message = stepErrorMessage(step).replace(/^Error: /, '')
   return (
-    message ===
-      'The stream was interrupted. Please continue the task you were working on.' ||
+    RETRY_EXACT_MESSAGES.has(message) ||
     /^API error \(attempt [1-9]\d*\): [\s\S]+$/.test(message) ||
-    /^Your previous response (?:contained an improperly formatted function call|was blocked by content safety filters):(?: [\s\S]*)?\r?\nRetries remaining: [1-9]\d*$/.test(
-      message,
-    ) ||
-    message ===
-      'model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again'
+    (RETRY_COUNTDOWN_PREFIXES.some((prefix) => message.startsWith(prefix)) &&
+      hasPositiveRetriesRemaining(message))
   )
 }
 

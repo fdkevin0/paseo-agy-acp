@@ -138,6 +138,32 @@ test('retry classification accepts only observed system warning forms and explic
       error:
         'Your previous response was blocked by content safety filters:\r\nRetries remaining: 1',
     },
+    {
+      ...warning(1),
+      source: null,
+      error:
+        'Your previous response was blocked by content safety filters\nPlease provide a response that complies with content safety guidelines.\nRetries remaining: 2',
+    },
+    {
+      ...warning(1),
+      error:
+        'Your previous response was cut off because it exceeded the output token limit\nPlease continue.\nRetries remaining: 2',
+    },
+    {
+      ...warning(1),
+      error:
+        'Your previous response encountered a generation error\nPlease try again.\nRetries remaining: 1',
+    },
+    {
+      ...warning(1),
+      error:
+        'There was a problem. \nError Message: invalid tool arguments \nRetries remaining: 2',
+    },
+    {
+      ...warning(1),
+      error:
+        'There was a problem parsing the tool call. \nError Message: unexpected EOF \nGuidance: check JSON syntax \nRetries remaining: 1',
+    },
   ]
   for (const row of positives) {
     assert.equal(isRetryWarning(row), true)
