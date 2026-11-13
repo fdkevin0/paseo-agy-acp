@@ -294,6 +294,7 @@ export class BrainTranscriptProjector {
   }
 
   hasPendingQuestion(): boolean {
+    // shortcut: JSONL has no cancel marker for an unlogged ask_question immediately followed by USER_INPUT, so replay treats it as a continuation.
     return this.pending.some((p) =>
       Boolean(p.isQuestion && !p.questionConsumed && !p.questionCompleted),
     )
