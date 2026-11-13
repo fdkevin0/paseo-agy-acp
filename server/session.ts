@@ -13,6 +13,7 @@ import {
   type NewSessionResponse,
   type ContentBlock,
   type McpServer,
+  type Usage,
 } from '@agentclientprotocol/sdk'
 import type {
   ProviderLaunch,
@@ -63,6 +64,7 @@ import {
   configState,
   addStepUsage,
   FULL_ACCESS_MODE_ID,
+  hasPositivePromptUsage,
   Timeline,
   toolDetail,
   promptContent,
@@ -1492,8 +1494,10 @@ async function promptSession(
   session.state.turnToolCallIds = []
   session.state.turnForegroundAcp = []
   session.state.deniedToolCallIds.clear()
-  session.state.wakeup.suppressEcho =
-    session.state.wakeup.pendingReplay && expectsUserEcho
+  const hadPendingReplay = session.state.wakeup.pendingReplay
+  const prevCarried = session.state.wakeup.carriedUsage
+  const initialTransport = session.transport
+  session.state.wakeup.suppressEcho = hadPendingReplay && expectsUserEcho
   session.state.wakeup.pendingReplay = false
   session.state.prompts.add(p.clientMessageId)
   session.timeline.boundary()
@@ -1526,6 +1530,59 @@ async function promptSession(
   let observation: BrainTurnObservation | undefined
   let observationTransport = session.transport
   let continuationActive = false
+  let pastWaitPrompt = false
+  let suppressedForeground = false
+  let effectiveUsage: Usage | null | undefined
+  let lastStep: StepUsage | undefined
+  let turnWokeUp = false
+  let turnWakeupUsage: StepUsage | undefined
+  let nextCarriedWakeup: StepUsage | undefined
+  let settledPendingReplay = false
+  let hasWakeupState = false
+  const settleTurnUsageAndWakeup = (isError: boolean) => {
+    const runtimeRelaunched = session.transport !== initialTransport
+    const replayStillPending =
+      !runtimeRelaunched &&
+      hadPendingReplay &&
+      (!expectsUserEcho ||
+        (pastWaitPrompt
+          ? suppressedForeground
+          : session.state.wakeup.suppressEcho))
+    if (runtimeRelaunched) {
+      session.state.wakeup.pendingReplay = false
+      session.state.wakeup.carriedUsage = undefined
+    } else {
+      session.state.wakeup.pendingReplay = Boolean(
+        settledPendingReplay ||
+        (isError &&
+          turnWokeUp &&
+          !hasWakeupState &&
+          !session.state.closing &&
+          !session.state.failed) ||
+        (replayStillPending && !effectiveUsage && !turnWokeUp),
+      )
+      session.state.wakeup.carriedUsage = effectiveUsage
+        ? nextCarriedWakeup
+        : nextCarriedWakeup
+          ? addStepUsage(prevCarried, nextCarriedWakeup)
+          : prevCarried
+    }
+    const preserveContext = session.state.turnHadContextUsage && !turnWokeUp
+    if (effectiveUsage || turnWakeupUsage) {
+      session.publishUsage(
+        promptUsage(effectiveUsage, {
+          model: configState(session.state.metadata).model,
+          contextWindowMaxTokens: session.contextWindowMaxTokens,
+          preserveContext,
+          lastStep,
+          carriedWakeup: prevCarried,
+          wakeup: turnWakeupUsage,
+        }),
+      )
+    } else if (lastStep && !preserveContext && (!isError || isCurrent())) {
+      session.publishStepContext(lastStep)
+    }
+  }
   const isCurrent = () =>
     session.state.turn === turnId &&
     session.state.turnAbort === turnAbort &&
@@ -1652,15 +1709,15 @@ async function promptSession(
     await session.drain()
     if (!isCurrent() && !turnAbort.signal.aborted)
       throw new Error('ACP runtime replaced during turn')
-    const suppressedForeground = session.state.wakeup.suppressEcho
+    suppressedForeground = session.state.wakeup.suppressEcho
+    pastWaitPrompt = true
     session.state.wakeup.suppressEcho = false
+    effectiveUsage = hasPositivePromptUsage(result.usage)
+      ? result.usage
+      : undefined
     let status: 'completed' | 'canceled' | 'failed' =
       result.stopReason === 'cancelled' ? 'canceled' : 'completed'
     let turnError: string | undefined
-    let lastStep: StepUsage | undefined
-    let turnWokeUp = false
-    let turnWakeupUsage: StepUsage | undefined
-    let nextCarriedWakeup: StepUsage | undefined
     if (status === 'completed') {
       session.state.inSettle = true
       const settled = await settleBrainTurn(
@@ -1675,6 +1732,13 @@ async function promptSession(
           onSubagents: session.rememberSubagents,
           minStepIndex,
           acpToolCallIds: session.state.turnToolCallIds,
+          onWakeupState: (wakeup) => {
+            hasWakeupState = true
+            turnWokeUp = wakeup.wokeUp
+            turnWakeupUsage = wakeup.wakeupUsage
+            nextCarriedWakeup = wakeup.carriedWakeupUsage
+            settledPendingReplay = Boolean(wakeup.pendingReplay)
+          },
           foregroundAcp: suppressedForeground
             ? []
             : [...session.state.turnForegroundAcp],
@@ -1777,8 +1841,19 @@ async function promptSession(
               )
               await session.drain()
               if (contResult.stopReason === 'cancelled') {
-                return { status: 'canceled' }
+                return {
+                  status: 'canceled',
+                  preserveCarriedWakeup: !hasPositivePromptUsage(
+                    contResult.usage,
+                  ),
+                  preservePendingReplay: !session.state.continuationEchoSeen,
+                }
               }
+            } catch (error) {
+              pendingQuestion.restoreContinuationCarry?.(
+                !session.state.continuationEchoSeen,
+              )
+              throw error
             } finally {
               continuationActive = false
               if (observation?.acceptsRows()) observation.phase = 'settling'
@@ -1796,7 +1871,7 @@ async function promptSession(
       turnWokeUp = Boolean(settled.wokeUp)
       turnWakeupUsage = settled.wakeupUsage
       nextCarriedWakeup = settled.carriedWakeupUsage
-      if (settled.pendingReplay) session.state.wakeup.pendingReplay = true
+      settledPendingReplay = Boolean(settled.pendingReplay)
       if (
         !turnAbort.signal.aborted &&
         !session.state.closing &&
@@ -1830,29 +1905,7 @@ async function promptSession(
         if (status !== 'failed') status = 'canceled'
       } else turnAbort.signal.throwIfAborted()
     }
-    const preserveContext = session.state.turnHadContextUsage && !turnWokeUp
-    if (result.usage || turnWakeupUsage) {
-      const carriedWakeup = result.usage
-        ? session.state.wakeup.carriedUsage
-        : undefined
-      session.state.wakeup.carriedUsage = result.usage
-        ? nextCarriedWakeup
-        : nextCarriedWakeup
-          ? addStepUsage(session.state.wakeup.carriedUsage, nextCarriedWakeup)
-          : session.state.wakeup.carriedUsage
-      session.publishUsage(
-        promptUsage(result.usage, {
-          model: configState(session.state.metadata).model,
-          contextWindowMaxTokens: session.contextWindowMaxTokens,
-          preserveContext,
-          lastStep,
-          carriedWakeup,
-          wakeup: turnWakeupUsage,
-        }),
-      )
-    } else if (lastStep && !preserveContext) {
-      session.publishStepContext(lastStep)
-    }
+    settleTurnUsageAndWakeup(false)
     session.finishTurnOnce(turnId, status, turnError)
   } catch (error) {
     const restartError = session.state.closing
@@ -1861,15 +1914,11 @@ async function promptSession(
           () => undefined,
           (err: unknown) => err,
         )
-    const lastStep = await reconcileFinalSnapshot().catch(
+    lastStep = await reconcileFinalSnapshot(lastStep).catch(
       () => observation?.usage.latest,
     )
-    if (
-      lastStep &&
-      (!session.state.turnHadContextUsage || observation?.wokeUp) &&
-      isCurrent()
-    )
-      session.publishStepContext(lastStep)
+    turnWokeUp ||= observation?.wokeUp === true
+    settleTurnUsageAndWakeup(true)
     const turnError = restartError ?? error
     const status =
       !restartError &&
