@@ -18,6 +18,7 @@ import type {
   ProviderUsage,
 } from '@getpaseo/plugin/server/provider'
 import {
+  classifyPlanModeTool,
   cleanToolName,
   isAskQuestionName,
   sessionIdPattern,
@@ -172,7 +173,7 @@ export function toolDetail(
   const rawName = cleanToolName(explicitRawName ?? tool.title ?? '')
   // Legacy ACP titles use `Run <native identity>` when no raw name is sent.
   const legacyName = rawName.startsWith('Run ')
-    ? rawName.slice(4).toLowerCase()
+    ? cleanToolName(rawName.slice(4)).toLowerCase()
     : ''
   const name =
     explicitRawName === undefined && Object.hasOwn(nativeToolKinds, legacyName)
@@ -257,10 +258,20 @@ export function toolDetail(
       log: output ?? '',
     }
   }
+  const planModeTool = classifyPlanModeTool(
+    explicitRawName,
+    tool.title,
+    tool.kind,
+  )
   const planText =
-    kind === 'edit' && record(input.ArtifactMetadata).RequestFeedback === true
-      ? str(input.Content ?? input.CodeContent ?? input.Replacement)
-      : undefined
+    planModeTool === 'exit_plan_mode' || planModeTool === 'switch_mode'
+      ? text(input.plan)
+        ? str(input.plan)
+        : undefined
+      : kind === 'edit' &&
+          record(input.ArtifactMetadata).RequestFeedback === true
+        ? str(input.Content ?? input.CodeContent ?? input.Replacement)
+        : undefined
   if (planText) return { type: 'plan', text: planText }
   const diff = tool.content?.find((c) => c.type === 'diff')
   const nativeWriteContent = str(input.Content ?? input.CodeContent)
@@ -406,6 +417,28 @@ export type SessionMetadata = Pick<NewSessionResponse, 'configOptions'> & {
   fullAccess?: boolean
 }
 
+const CANONICAL_EFFORTS: ReadonlyArray<{ id: string; label: string }> = [
+  { id: 'low', label: 'Low' },
+  { id: 'medium', label: 'Medium' },
+  { id: 'high', label: 'High' },
+  { id: 'xhigh', label: 'Extra' },
+  { id: 'max', label: 'Max' },
+]
+
+function parseModelEffort(
+  modelId: string,
+  sortedEffortIds: readonly string[],
+): { base: string; effort: string } | undefined {
+  const stem = modelId.endsWith('-effort') ? modelId.slice(0, -7) : modelId
+  for (const effort of sortedEffortIds) {
+    const suffix = `-${effort}`
+    if (stem.length > suffix.length && stem.endsWith(suffix)) {
+      return { base: stem.slice(0, -suffix.length), effort }
+    }
+  }
+  return undefined
+}
+
 /** Convert native catalog options to Paseo's model-specific composer controls. */
 export function configState(response: SessionMetadata): ProviderConfigState {
   const options = (response.configOptions ?? []).filter(
@@ -426,7 +459,17 @@ export function configState(response: SessionMetadata): ProviderConfigState {
         description: v.description ?? undefined,
       })) ?? []
   const thinkingOptions = choices(thinking)
+  const advertisedById = new Map(thinkingOptions.map((o) => [o.id, o]))
+  const canonicalIds = new Set(CANONICAL_EFFORTS.map((e) => e.id))
+  const knownEfforts = [
+    ...CANONICAL_EFFORTS.map((e) => advertisedById.get(e.id) ?? e),
+    ...thinkingOptions.filter((o) => !canonicalIds.has(o.id)),
+  ]
+  const sortedEffortIds = knownEfforts
+    .map((o) => o.id)
+    .sort((a, b) => b.length - a.length)
   const available = response.models?.availableModels
+  const modelId = model?.currentValue ?? response.models?.currentModelId
   const models = (
     model
       ? choices(model)
@@ -436,18 +479,35 @@ export function configState(response: SessionMetadata): ProviderConfigState {
           description: m.description,
         })) ?? [])
   ).map((m) => {
-    const fixed = /-(low|medium|high)$/.test(m.id)
-    const offered = available
-      ?.filter((a) => a.modelId.startsWith(`${m.id}-`))
-      .map((a) => a.modelId.slice(m.id.length + 1))
-    const inventoried = available?.some(
-      (a) => a.modelId === m.id || a.modelId.startsWith(`${m.id}-`),
-    )
+    const fixed = parseModelEffort(m.id, sortedEffortIds) !== undefined
+    const offered = new Set<string>()
+    let hasDirect = false
+    for (const a of available ?? []) {
+      if (a.modelId === m.id) {
+        hasDirect = true
+        continue
+      }
+      const parsed = parseModelEffort(a.modelId, sortedEffortIds)
+      if (parsed?.base === m.id) offered.add(parsed.effort)
+    }
+    const inventoried =
+      available !== undefined && (hasDirect || offered.size > 0)
     const efforts = fixed
       ? []
       : inventoried
-        ? thinkingOptions.filter((o) => offered?.includes(o.id))
+        ? knownEfforts.filter((o) => offered.has(o.id))
         : thinkingOptions
+    // Matches agy 1.5.7 acp.(*modelFamily).defaultModel: active thought_level, else 'medium', else first.
+    const defaultThinkingOptionId =
+      efforts.length > 0
+        ? m.id === modelId &&
+          thinking?.currentValue &&
+          efforts.some((o) => o.id === thinking.currentValue)
+          ? thinking.currentValue
+          : efforts.some((o) => o.id === 'medium')
+            ? 'medium'
+            : efforts[0].id
+        : undefined
     return {
       ...m,
       description:
@@ -455,11 +515,12 @@ export function configState(response: SessionMetadata): ProviderConfigState {
         available?.find((a) => a.modelId === m.id)?.description,
       contextWindowMaxTokens: contextWindowForModel(m.id),
       thinkingOptions: efforts,
+      ...(defaultThinkingOptionId ? { defaultThinkingOptionId } : {}),
     }
   })
-  const modelId = model?.currentValue ?? response.models?.currentModelId
-  const currentThinking =
-    models.find((m) => m.id === modelId)?.thinkingOptions ?? thinkingOptions
+  const currentThinking = thinking
+    ? (models.find((m) => m.id === modelId)?.thinkingOptions ?? thinkingOptions)
+    : []
   const nativeModes = choices(mode)
     .filter((m) => m.id !== FULL_ACCESS_MODE_ID)
     .map((m) => ({ ...m, ...modeVisuals[m.id] }))
@@ -559,7 +620,7 @@ export function contextUsage(update: UsageUpdate): ProviderUsage | undefined {
   }
 }
 
-/** Native model limits used when ACP does not report a context window size. */
+/** Native ACP model limits from agy 1.5.7 (observed usage_update size: 256000; 1M is TUI-only). */
 export function contextWindowForModel(modelId?: string): number {
   return modelId?.startsWith('gpt-oss') ? 131_072 : 256_000
 }
@@ -788,6 +849,27 @@ export class Timeline {
         update.sessionUpdate === 'tool_call_update' &&
         isTerminalToolStatus(oldStatus) &&
         !isTerminalToolStatus(incomingStatus)
+      const oldPlanTool =
+        old !== undefined
+          ? classifyPlanModeTool(str(record(old).name), old.title, old.kind)
+          : undefined
+      const nextPlanTool = classifyPlanModeTool(
+        str(record(update).name),
+        update.title,
+        // Permit unnamed updates; preservePlanMode below requires an existing plan tool.
+        'switch_mode',
+      )
+      const preservePlanMode =
+        update.sessionUpdate === 'tool_call_update' &&
+        (oldPlanTool === 'exit_plan_mode' || oldPlanTool === 'switch_mode') &&
+        str(record(old).name) === undefined &&
+        (nextPlanTool === 'exit_plan_mode' || nextPlanTool === 'switch_mode') &&
+        (update.kind == null ||
+          update.kind === 'other' ||
+          update.kind === 'switch_mode') &&
+        (old?.kind == null ||
+          old.kind === 'other' ||
+          old.kind === 'switch_mode')
       const tool = {
         ...old,
         // ACP v1 raw input/output null is equivalent to omission, not a clear.
@@ -795,6 +877,7 @@ export class Timeline {
           Object.entries(update).filter(([, value]) => value != null),
         ),
         ...(preserveStatus ? { status: old!.status } : {}),
+        ...(preservePlanMode ? { kind: 'switch_mode' as const } : {}),
       } as ToolCall
       setBounded(this.tools, update.toolCallId, tool, TOOL_SNAPSHOT_LIMIT)
       const base = {

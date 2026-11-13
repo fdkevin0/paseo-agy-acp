@@ -73,6 +73,7 @@ export async function hasActiveBackgroundWork(
       (info) => info.mtimeMs,
       () => Date.now(),
     )
+    node.projector.observeRows(rows)
     for (const row of rows) {
       // The restarted runtime left no woken turn running.
       if (isRestartNotice(row)) node.resetPhase()
@@ -135,6 +136,7 @@ async function settleChildren(
       try {
         const { rows, reset } = await child.reader.read(root, childId)
         if (reset) child.reset(childInbox, childSubagents)
+        child.projector.observeRows(rows)
         for (const row of rows) child.ingest(row)
       } catch (error) {
         if (isMissing(error)) {
@@ -488,7 +490,9 @@ export async function settleBrainTurn(
   error?: string
   lastStepUsage?: StepUsage
   wokeUp?: true
+  pendingReplay?: true
   wakeupUsage?: StepUsage
+  carriedWakeupUsage?: StepUsage
 }> {
   if (!sessionIdPattern.test(nativeId)) return { status: 'completed' }
   const fgReconciler = new ForegroundReconciler(
@@ -540,41 +544,66 @@ export async function settleBrainTurn(
   const continuations: {
     afterStep: number
     acpIndex: number
+    syntheticPrompt: boolean
     userStep?: number
   }[] = []
-  const beginContinuation = () => {
+  let lastStepIndex = -1
+  const dedupe = new StepDedupe()
+  let seenSyntheticPrompt = false
+  // Carry cases: before synthetic prompt -> yes; its foreground -> no; later wakeup -> yes.
+  // Each synthetic prompt clears earlier carry; finish suppresses it if any prompt lacks a USER_INPUT anchor.
+  const wakeupSteps = new Map<number, { usage: StepUsage; carried: boolean }>()
+  const clearCarriedWakeup = () => {
+    for (const entry of wakeupSteps.values()) entry.carried = false
+  }
+  const beginContinuation = (syntheticPrompt = false) => {
     const boundary = {
       afterStep: Number(node.lastStep?.step_index ?? -1),
       acpIndex: acpToolCallIds.length,
+      syntheticPrompt,
     }
     continuations.push(boundary)
-    node.markQuestionContinuation()
+    node.markQuestionContinuation(syntheticPrompt)
+    if (syntheticPrompt) {
+      seenSyntheticPrompt = true
+      clearCarriedWakeup()
+    }
     node.projector.bindToolCallIds(acpToolCallIds, boundary.acpIndex)
     fgReconciler.markPostRpcWakeup()
     stream.wokeUp = true
   }
-  let lastStepIndex = -1
-  const dedupe = new StepDedupe()
-  const wakeupSteps = new Map<number, StepUsage>()
   let inbox!: InboxState
   let subagents: SubagentRecord[] = []
   const finish = (
     status: 'completed' | 'canceled' | 'failed',
     error?: string,
-  ) => ({
-    status,
-    ...(error !== undefined ? { error } : {}),
-    lastStepUsage: stream.usage.latest,
-    ...(fgReconciler.wokeUp ? { wokeUp: true as const } : {}),
-    ...(wakeupSteps.size
-      ? {
-          wakeupUsage: [...wakeupSteps.values()].reduce<StepUsage | undefined>(
-            (sum, usage) => addStepUsage(sum, usage),
-            undefined,
-          ),
-        }
-      : {}),
-  })
+  ) => {
+    const unanchoredSynthetic = continuations.some(
+      (c) => c.syntheticPrompt && c.userStep === undefined,
+    )
+    let wakeupUsage: StepUsage | undefined
+    let carriedWakeupUsage: StepUsage | undefined
+    for (const entry of wakeupSteps.values()) {
+      wakeupUsage = addStepUsage(wakeupUsage, entry.usage)
+      if (entry.carried && !unanchoredSynthetic)
+        carriedWakeupUsage = addStepUsage(carriedWakeupUsage, entry.usage)
+    }
+    const pendingReplay =
+      seenSyntheticPrompt || unanchoredSynthetic
+        ? !unanchoredSynthetic &&
+          node.wokeUpSinceLastPrompt &&
+          fgReconciler.wokeUp
+        : fgReconciler.wokeUp
+    return {
+      status,
+      ...(error !== undefined ? { error } : {}),
+      lastStepUsage: stream.usage.latest,
+      ...(fgReconciler.wokeUp ? { wokeUp: true as const } : {}),
+      ...(pendingReplay ? { pendingReplay: true as const } : {}),
+      ...(wakeupUsage ? { wakeupUsage } : {}),
+      ...(carriedWakeupUsage ? { carriedWakeupUsage } : {}),
+    }
+  }
   const withinGrace = () => Date.now() - startedAt < transcriptGraceMs
   const stall = (timeoutMs = stallTimeoutMs) => {
     const error = `Stopped waiting for agy: transcript_full.jsonl was idle for ${Math.round(timeoutMs / 1000)}s without a final response.`
@@ -606,11 +635,6 @@ export async function settleBrainTurn(
       foldVersion++
       lastActivity = Date.now()
     }
-    const identities = node.projector.resolveToolIdentities(
-      isRpcActive?.() === true,
-    )
-    if (identities.length) foldVersion++
-    for (const item of identities) onItem(item)
     const rows = read.rows
     if (read.snapshotStepIndices) {
       dedupe.prune(read.snapshotStepIndices)
@@ -620,10 +644,17 @@ export async function settleBrainTurn(
     if (read.reset) {
       initial = true
       preamble = []
+      seenSyntheticPrompt = false
       node.reset(inbox, subagents)
       fgReconciler.reset()
       appliedHistoricalMessages = 0
     }
+    if (!initial) node.projector.observeRows(rows)
+    const identities = node.projector.resolveToolIdentities(
+      isRpcActive?.() === true,
+    )
+    if (identities.length) foldVersion++
+    for (const item of identities) onItem(item)
     const historicalDelta =
       stream.historicalMessages - appliedHistoricalMessages
     node.consumedMessages += historicalDelta
@@ -650,10 +681,11 @@ export async function settleBrainTurn(
       anchored = true
       for (const row of preamble.slice(0, start))
         node.consumedMessages += countRowMessages(row)
-      node.projector.bindToolCallIds(acpToolCallIds)
-      node.projector.resolveToolIdentities(isRpcActive?.() === true)
       slice = preamble.slice(start)
       preamble = []
+      node.projector.observeRows(slice)
+      node.projector.bindToolCallIds(acpToolCallIds)
+      node.projector.resolveToolIdentities(isRpcActive?.() === true)
     }
     for (const row of slice) {
       const stepIndex = Number(row.step_index)
@@ -665,7 +697,11 @@ export async function settleBrainTurn(
         )
         if (boundary) {
           boundary.userStep = stepIndex
-          node.markQuestionContinuation()
+          node.markQuestionContinuation(boundary.syntheticPrompt)
+          if (boundary.syntheticPrompt) {
+            seenSyntheticPrompt = true
+            clearCarriedWakeup()
+          }
           node.projector.bindToolCallIds(acpToolCallIds, boundary.acpIndex)
           fgReconciler.markPostRpcWakeup()
         } else {
@@ -678,9 +714,14 @@ export async function settleBrainTurn(
       const postRpcStep = fgReconciler.reconcile(row, items, node.wokeUp, usage)
       stream.wokeUp ||= fgReconciler.wokeUp
       if (usage) {
-        if (postRpcStep && row.status === 'DONE')
-          wakeupSteps.set(stepIndex, usage)
-        else wakeupSteps.delete(stepIndex)
+        if (postRpcStep && row.status === 'DONE') {
+          wakeupSteps.set(stepIndex, {
+            usage,
+            carried: !seenSyntheticPrompt || node.wokeUpSinceLastPrompt,
+          })
+        } else {
+          wakeupSteps.delete(stepIndex)
+        }
       }
       if (Number.isInteger(stepIndex) && stepIndex > lastStepIndex) {
         lastStepIndex = stepIndex
@@ -789,7 +830,7 @@ export async function settleBrainTurn(
                       answerText,
                     ),
                   )
-                  beginContinuation()
+                  beginContinuation(true)
                 },
               })
             : { status: 'already_handled' }
@@ -981,6 +1022,7 @@ export function watchBrain(
       if (reset) {
         node.reset(inbox, subagents)
       }
+      node.projector.observeRows(rows)
       for (const row of rows) {
         if (stopped) return
         const stepIndex = Number(row.step_index)

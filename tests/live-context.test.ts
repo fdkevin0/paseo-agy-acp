@@ -26,7 +26,12 @@ function deferred<T>() {
 }
 type Result = {
   stopReason: 'end_turn' | 'cancelled'
-  usage?: { inputTokens: number; outputTokens: number; totalTokens: number }
+  usage?: {
+    inputTokens: number
+    outputTokens: number
+    totalTokens: number
+    cachedReadTokens?: number
+  }
 }
 type Row = Record<string, unknown>
 const encode = (rows: Row[]) =>
@@ -1387,5 +1392,514 @@ test(
     assert.equal(h.session.state.turn, '')
     assert.deepEqual(h.turns(), ['canceled'])
     h.continued.resolve({ stopReason: 'cancelled' })
+  },
+)
+
+test(
+  'Orchestrator planexecute intra-turn handoffs keep exact step occupancy without false wokeUp double-billing, while woken handback and Turn 2 carriedWakeup settle cleanly',
+  { timeout: 5000 },
+  async (t) => {
+    const h = await harness(t)
+    h.session.state.metadata.configOptions = [
+      {
+        id: 'model',
+        name: 'Model',
+        type: 'select',
+        currentValue: 'gemini-pro-orchestrator',
+        options: [
+          {
+            value: 'gemini-pro-orchestrator',
+            name: 'Orchestrator (Carbon)',
+          },
+        ],
+      },
+    ]
+    const askArgs = {
+      questions: [{ question: 'Deploy target?', options: ['Staging', 'Prod'] }],
+    }
+    h.session.state.handledElicitations.push({
+      questions: normalizeAskQuestionInput(askArgs),
+      answerText: 'Staging',
+      wokeUp: false,
+    })
+
+    const held = await h.hold()
+    h.session.state.turnToolCallIds.push('acp-ask', 'acp-exit', 'acp-cmd')
+    h.session.timeline.update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'acp-ask',
+      title: 'ask_question',
+      status: 'completed',
+      rawInput: askArgs,
+      rawOutput: 'Staging',
+    })
+    h.session.timeline.update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'acp-exit',
+      title: 'Run contrib:exit_plan_mode',
+      kind: 'other',
+      status: 'completed',
+      rawInput: { plan: '## Plan\n1. Run suite' },
+      rawOutput: 'Plan approved',
+    })
+    h.session.timeline.update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'acp-cmd',
+      title: 'run_command',
+      status: 'in_progress',
+      rawInput: { CommandLine: 'npm test' },
+    })
+
+    // Foreground Planner asks a question (latching foregroundIdleReached = true) and calls contrib:exit_plan_mode
+    await h.write([
+      user(1),
+      {
+        step_index: 2,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        cache_read_tokens: 40_000,
+        input_tokens: 2_000,
+        output_tokens: 300,
+        tool_calls: [{ id: 'acp-ask', name: 'ask_question', args: askArgs }],
+      },
+      { step_index: 3, type: 'GENERIC', status: 'DONE', content: 'Staging' },
+      {
+        step_index: 4,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        cache_read_tokens: 42_000,
+        input_tokens: 3_000,
+        output_tokens: 800,
+        tool_calls: [
+          {
+            id: 'acp-exit',
+            name: 'contrib:exit_plan_mode',
+            args: { plan: '## Plan\n1. Run suite' },
+          },
+        ],
+      },
+      {
+        step_index: 5,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'Plan approved',
+      },
+    ])
+    await h.read()
+    assert.equal(h.latest().contextWindowUsedTokens, 45_800)
+    assert.equal(h.latest().contextWindowMaxTokens, 256_000)
+
+    // Intra-turn planexecute handoff to Hydrogen + KV-cache miss + RUNNING background task
+    await h.append([
+      {
+        step_index: 6,
+        type: 'SYSTEM_MESSAGE',
+        content:
+          '<SYSTEM_MESSAGE>\nPlan mode is off: this turn runs on the execution model.\n</SYSTEM_MESSAGE>',
+      },
+      {
+        step_index: 7,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        cache_read_tokens: 0,
+        input_tokens: 46_200,
+        output_tokens: 1_100,
+        content: 'Starting background suite',
+        tool_calls: [
+          {
+            id: 'acp-cmd',
+            name: 'run_command',
+            args: { CommandLine: 'npm test' },
+          },
+        ],
+      },
+      {
+        step_index: 8,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: 'Tool is running as a background task with task id: tracked',
+      },
+      {
+        step_index: 9,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        cache_read_tokens: 47_300,
+        input_tokens: 400,
+        output_tokens: 100,
+        content: 'Waiting for suite completion',
+      },
+    ])
+    await h.read()
+    assert.equal(h.latest().contextWindowUsedTokens, 47_800)
+    assert.equal(h.latest().contextWindowMaxTokens, 256_000)
+    assert.equal(held.observation.wokeUp, false)
+
+    // Foreground RPC ends with cumulative multi-model totals; turn stays open awaiting background task
+    held.done.resolve({
+      stopReason: 'end_turn',
+      usage: {
+        inputTokens: 51_600,
+        cachedReadTokens: 129_300,
+        outputTokens: 2_300,
+        totalTokens: 183_200,
+      },
+    })
+    while (!h.session.state.inSettle) {
+      await new Promise((r) => setTimeout(r, 5))
+    }
+    await h.read()
+    assert.deepEqual(h.turns(), [])
+    assert.equal(
+      held.observation.wokeUp,
+      false,
+      'intra-turn planexecute handoff after foreground ask_question must not trigger wokeUp',
+    )
+    assert.equal(
+      h.events.some(
+        (event) =>
+          event.type === 'timeline.item' &&
+          event.item.type === 'assistant_message' &&
+          (event.item.text === 'Starting background suite' ||
+            event.item.text === 'Waiting for suite completion'),
+      ),
+      false,
+      'foreground Hydrogen text must not be duplicated by Brain before wakeup',
+    )
+
+    // Post-RPC Reactive Wakeup -> [plan review due] -> contrib:enter_plan_mode -> [plan review] Planner handback
+    await h.append([
+      {
+        step_index: 10,
+        type: 'SYSTEM_MESSAGE',
+        content:
+          '[Message] sender=tracked content=Task id "tracked" finished with result:\nall green',
+      },
+      {
+        step_index: 11,
+        type: 'SYSTEM_MESSAGE',
+        content:
+          '<SYSTEM_MESSAGE>\n[plan review due] Summarize verification and return to plan mode.\n</SYSTEM_MESSAGE>',
+      },
+      {
+        step_index: 12,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        cache_read_tokens: 47_800,
+        input_tokens: 500,
+        output_tokens: 200,
+        tool_calls: [
+          {
+            id: 'woken-enter',
+            name: 'contrib:enter_plan_mode',
+            args: {},
+          },
+        ],
+      },
+      {
+        step_index: 13,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'Entered plan mode',
+      },
+      {
+        step_index: 14,
+        type: 'SYSTEM_MESSAGE',
+        content:
+          '<SYSTEM_MESSAGE>\n[plan review] Plan mode is on: this turn runs on the planning model.\n</SYSTEM_MESSAGE>',
+      },
+      {
+        step_index: 15,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        cache_read_tokens: 0,
+        input_tokens: 48_900,
+        output_tokens: 600,
+        content: 'Verification complete.',
+      },
+    ])
+    await held.running
+    assert.deepEqual(h.turns(), ['completed'])
+    assert.equal(h.latest().contextWindowUsedTokens, 49_500)
+    assert.equal(h.latest().contextWindowMaxTokens, 256_000)
+    // Foreground (51,600) + woken steps 12 & 15 only (500 + 48,900 = 49,400); zero double-counting of foreground Hydrogen!
+    assert.equal(h.latest().inputTokens, 101_000)
+    assert.equal(h.latest().cachedInputTokens, 177_100)
+    assert.equal(h.latest().outputTokens, 3_100)
+    assert.deepEqual(h.session.state.wakeup.carriedUsage, {
+      inputTokens: 49_400,
+      cachedReadTokens: 47_800,
+      outputTokens: 800,
+    })
+    assert.ok(
+      h.events.some(
+        (event) =>
+          event.type === 'timeline.item' &&
+          event.item.type === 'assistant_message' &&
+          event.item.text === 'Verification complete.',
+      ),
+    )
+
+    // Turn 2: agy includes Turn 1 woken tokens in cumulative PromptResponse.usage; carriedWakeup deducts them cleanly
+    const held2 = await h.hold()
+    await h.append([
+      user(16),
+      {
+        step_index: 17,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        cache_read_tokens: 49_500,
+        input_tokens: 1_200,
+        output_tokens: 300,
+        content: 'Next turn ready.',
+      },
+    ])
+    await h.read()
+    held2.done.resolve({
+      stopReason: 'end_turn',
+      usage: {
+        inputTokens: 49_400 + 1_200,
+        cachedReadTokens: 47_800 + 49_500,
+        outputTokens: 800 + 300,
+        totalTokens: 149_000,
+      },
+    })
+    await held2.running
+    assert.deepEqual(h.turns(), ['completed', 'completed'])
+    assert.equal(h.latest().contextWindowUsedTokens, 51_000)
+    assert.equal(h.latest().contextWindowMaxTokens, 256_000)
+    assert.equal(h.latest().inputTokens, 1_200)
+    assert.equal(h.latest().cachedInputTokens, 49_500)
+    assert.equal(h.latest().outputTokens, 300)
+  },
+)
+
+test(
+  'Orchestrator intra-turn [plan review due], woken ask_question continuation KV-cache misses, and woken elicitation decline settle cleanly',
+  { timeout: 5000 },
+  async (t) => {
+    const h = await harness(t)
+    const askArgs = {
+      questions: [{ question: 'Approve review?', options: ['Yes', 'No'] }],
+    }
+    let promptCalls = 0
+    t.mock.method(h.session.transport.rpc, 'prompt', async () => {
+      promptCalls++
+      if (promptCalls === 1) {
+        // Foreground turn with tool-less Hydrogen DONE -> intra-turn [plan review due] -> foreground [Message] while Planner has pending tools -> woken ask_question
+        await h.write([
+          user(1),
+          {
+            step_index: 2,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            input_tokens: 10_000,
+            output_tokens: 100,
+            content: 'Execution done.',
+          },
+          {
+            step_index: 3,
+            type: 'SYSTEM_MESSAGE',
+            content:
+              '<SYSTEM_MESSAGE>\n[plan review due] Return to plan mode.\n</SYSTEM_MESSAGE>',
+          },
+          {
+            step_index: 4,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            input_tokens: 10_500,
+            output_tokens: 100,
+            tool_calls: [
+              { id: 'fg-enter', name: 'contrib:enter_plan_mode', args: {} },
+            ],
+          },
+          { step_index: 5, type: 'GENERIC', status: 'DONE', content: 'ok' },
+          {
+            step_index: 6,
+            type: 'SYSTEM_MESSAGE',
+            content:
+              '<SYSTEM_MESSAGE>\n[plan review] Plan mode is on: this turn runs on the planning model.\n</SYSTEM_MESSAGE>',
+          },
+          {
+            step_index: 7,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            input_tokens: 11_000,
+            output_tokens: 200,
+            content: 'Foreground planner spawned helper.',
+            tool_calls: [
+              {
+                id: 'fg-bg',
+                name: 'run_command',
+                args: { CommandLine: 'check' },
+              },
+            ],
+          },
+          {
+            step_index: 8,
+            type: 'GENERIC',
+            status: 'RUNNING',
+            content: 'Tool is running as a background task with task id: bg1',
+          },
+          {
+            step_index: 9,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            input_tokens: 11_200,
+            output_tokens: 50,
+            content: 'Waiting on helper.',
+          },
+          // Post-RPC wakeup asks a woken ask_question
+          {
+            step_index: 10,
+            type: 'SYSTEM_MESSAGE',
+            content:
+              '[Message] sender=bg1 content=Task id "bg1" finished with result:\nready',
+          },
+          {
+            step_index: 11,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            input_tokens: 12_000,
+            output_tokens: 100,
+            tool_calls: [
+              { id: 'woken-q', name: 'ask_question', args: askArgs },
+            ],
+          },
+        ])
+        return {
+          stopReason: 'end_turn' as const,
+          usage: {
+            inputTokens: 42_700,
+            outputTokens: 450,
+            totalTokens: 43_150,
+          },
+        }
+      }
+      if (promptCalls === 2) {
+        // Synthetic continuation RPC runs Orchestrator contrib:exit_plan_mode -> Hydrogen 95k KV-cache miss and ends cleanly (no post-continuation wakeup)
+        await h.append([
+          { step_index: 12, type: 'GENERIC', status: 'DONE', content: 'Yes' },
+          user(13),
+          {
+            step_index: 14,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            input_tokens: 13_000,
+            output_tokens: 200,
+            tool_calls: [
+              {
+                id: 'cont-exit',
+                name: 'contrib:exit_plan_mode',
+                args: { plan: '# Ship' },
+              },
+            ],
+          },
+          { step_index: 15, type: 'GENERIC', status: 'DONE', content: 'off' },
+          {
+            step_index: 16,
+            type: 'SYSTEM_MESSAGE',
+            content:
+              '<SYSTEM_MESSAGE>\nPlan mode is off: this turn runs on the execution model.\n</SYSTEM_MESSAGE>',
+          },
+          {
+            step_index: 17,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            cache_read_tokens: 0,
+            input_tokens: 95_000,
+            output_tokens: 500,
+            content: 'Continuation Hydrogen finished.',
+          },
+        ])
+        return {
+          stopReason: 'end_turn' as const,
+          usage: {
+            inputTokens: 120_000,
+            outputTokens: 800,
+            totalTokens: 120_800,
+          },
+        }
+      }
+      // Turn 2: fresh Orchestrator turn reporting 120k inputTokens; must NOT subtract Turn 1's 120k continuation tokens!
+      await h.append([
+        user(18),
+        {
+          step_index: 19,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          input_tokens: 120_000,
+          output_tokens: 400,
+          content: 'Turn 2 done.',
+        },
+      ])
+      return {
+        stopReason: 'end_turn' as const,
+        usage: {
+          inputTokens: 120_000,
+          outputTokens: 400,
+          totalTokens: 120_400,
+        },
+      }
+    })
+
+    const turn1 = h.prompt('turn 1')
+    await h.wait(() =>
+      h.events.some((event) => event.type === 'session.permission'),
+    )
+    const perm = h.events.find((event) => event.type === 'session.permission')
+    assert.ok(perm?.type === 'session.permission')
+    await h.manager.handle({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: perm.request.id,
+      response: {
+        behavior: 'allow',
+        updatedInput: { answers: { 'Approve review?': 'Yes' } },
+      },
+    })
+    await turn1
+    assert.deepEqual(h.turns(), ['completed'])
+    // Turn 1 bills foreground (42,700) + woken/continuation steps 11, 14, 17 (12,000 + 13,000 + 95,000 = 120,000) = 162,700
+    assert.equal(h.latest().inputTokens, 162_700)
+    assert.equal(h.latest().contextWindowUsedTokens, 95_500)
+    // Because continuation RPC finished cleanly with no post-continuation wakeup, carriedUsage is undefined and pendingReplay is false!
+    assert.equal(h.session.state.wakeup.carriedUsage, undefined)
+    assert.equal(h.session.state.wakeup.pendingReplay, false)
+
+    // Turn 2 must report full 120,000 inputTokens (zero false deduction)
+    await h.prompt('turn 2')
+    assert.deepEqual(h.turns(), ['completed', 'completed'])
+    assert.equal(h.latest().inputTokens, 120_000)
+
+    // Woken elicitation decline cancels immediately without hanging for stallTimeoutMs
+    t.mock.method(h.session.transport.rpc, 'prompt', async () => {
+      h.session.state.handledElicitations.push({
+        questions: normalizeAskQuestionInput(askArgs),
+        answerText: null,
+        wokeUp: true,
+        declined: true,
+      })
+      await h.append([
+        user(20),
+        model(21, 1000, 'idle'),
+        {
+          step_index: 22,
+          type: 'SYSTEM_MESSAGE',
+          content:
+            '[Message] sender=system priority=MESSAGE_PRIORITY_HIGH content=wake',
+        },
+        {
+          step_index: 23,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [
+            { id: 'declined-q', name: 'ask_question', args: askArgs },
+          ],
+        },
+      ])
+      return { stopReason: 'end_turn' as const }
+    })
+    await h.prompt('turn 3')
+    assert.deepEqual(h.turns(), ['completed', 'completed', 'canceled'])
   },
 )

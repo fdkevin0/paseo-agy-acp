@@ -324,7 +324,13 @@ test('parent waits for the terminal child report, then its own response, without
         cachedReadTokens: 30,
       },
       wokeUp: true,
+      pendingReplay: true,
       wakeupUsage: {
+        inputTokens: 100,
+        outputTokens: 20,
+        cachedReadTokens: 30,
+      },
+      carriedWakeupUsage: {
         inputTokens: 100,
         outputTokens: 20,
         cachedReadTokens: 30,
@@ -376,6 +382,7 @@ test('nested child completion uses delivered reports and sending to parent never
       status: 'completed',
       lastStepUsage: undefined,
       wokeUp: true,
+      pendingReplay: true,
     })
   } finally {
     stop?.()
@@ -701,6 +708,7 @@ test('a child can report to its parent and a sibling before completing', async (
       status: 'completed',
       lastStepUsage: undefined,
       wokeUp: true,
+      pendingReplay: true,
     })
   } finally {
     await f.close()
@@ -927,6 +935,7 @@ test('batched SYSTEM_MESSAGE with multiple task completions resolves all tasks a
       status: 'completed',
       lastStepUsage: undefined,
       wokeUp: true,
+      pendingReplay: true,
     })
     const completedTools = items.filter(
       (i): i is Extract<ProviderTimelineItem, { type: 'tool_call' }> =>
@@ -991,6 +1000,7 @@ test('literal [Message] inside a subagent report body does not over-count consum
       status: 'completed',
       lastStepUsage: undefined,
       wokeUp: true,
+      pendingReplay: true,
     })
   } finally {
     abort.abort()

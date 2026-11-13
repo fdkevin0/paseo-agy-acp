@@ -8,6 +8,7 @@ import {
   ProviderEventSchema,
   type ProviderEvent,
 } from '@getpaseo/plugin/server/provider'
+import { BrainTranscriptProjector } from '../server/brain-projector.ts'
 import { alignReplayTools } from '../server/history.ts'
 import { Timeline } from '../server/mapping.ts'
 import { SessionManager } from '../server/session.ts'
@@ -1373,4 +1374,352 @@ test('alignReplayTools handles windowed ACP slices (M > N) and ambiguous window 
   )
   assert.deepEqual(ambiguousSuffix.alignedIds, ['p2'])
   assert.deepEqual([...ambiguousSuffix.verifiedAcpToolIds], ['p2'])
+})
+
+test('mixed foreground and background calls anchor at their GENERIC steps', async () => {
+  for (const backgroundFirst of [false, true]) {
+    for (const backgroundCount of [1, 2]) {
+      const foreground = { name: 'read_file', args: { Path: '/example' } }
+      const backgrounds = Array.from({ length: backgroundCount }, (_, i) => ({
+        name: 'run_command',
+        args: { CommandLine: `task-${i}`, WaitMsBeforeAsync: 500 },
+      }))
+      const calls = backgroundFirst
+        ? [...backgrounds, foreground]
+        : [foreground, ...backgrounds]
+      const updates = calls.map((tool, i) => ({
+        sessionUpdate: 'tool_call',
+        toolCallId: `call-${i}`,
+        title: tool.name,
+        status: tool.name === 'read_file' ? 'completed' : 'failed',
+        rawInput: tool.args,
+        rawOutput: tool.name === 'read_file' ? 'ok' : 'Tool failed',
+      }))
+      // Include checkpoints before the batch, between response and GENERIC,
+      // and between sibling GENERIC rows to expose premature anchors.
+      const rows = [
+        response(0, 'BEFORE'),
+        checkpoint(1),
+        {
+          step_index: 2,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: calls,
+        },
+        checkpoint(3),
+        ...calls.flatMap((tool, i) => [
+          {
+            step_index: 4 + i * 2,
+            type: 'GENERIC',
+            status:
+              tool.name === 'read_file'
+                ? 'DONE'
+                : i % 2
+                  ? 'WAITING'
+                  : 'RUNNING',
+            content:
+              tool.name === 'read_file'
+                ? 'ok'
+                : `Tool is running as a background task with task id: task-${i}`,
+          },
+          checkpoint(5 + i * 2),
+        ]),
+        response(4 + calls.length * 2, 'AFTER'),
+      ]
+      const events = await replay(rows, [
+        text('BEFORE'),
+        ...updates,
+        text('AFTER'),
+      ])
+      assert.deepEqual(labels(events), [
+        'BEFORE',
+        'compaction',
+        'compaction',
+        ...calls.flatMap(() => ['tool_call', 'compaction']),
+        'AFTER',
+      ])
+      const tools = timeline(events).flatMap(({ item }) =>
+        item.type === 'tool_call' ? [item] : [],
+      )
+      assert.deepEqual(
+        tools.map((item) => item.callId),
+        updates.map((tool) => tool.toolCallId),
+      )
+      assert.deepEqual(
+        tools.map((item) => item.status),
+        updates.map((tool) => tool.status),
+      )
+    }
+  }
+})
+
+test('no checkpoint preserves ACP terminal result', async () => {
+  const events = await replay(
+    rows.filter((r) => r.type !== 'CHECKPOINT'),
+    [
+      text('BEFORE'),
+      { ...read, status: 'failed', rawOutput: 'ACP failure' },
+      text('AFTER'),
+    ],
+  )
+  const tools = timeline(events).flatMap((e) =>
+    e.item.type === 'tool_call' ? [e.item] : [],
+  )
+  assert.equal(tools.at(-1)?.status, 'failed')
+})
+
+test('checkpoint shift preserves per-tool metadata identity', async () => {
+  const nativeRows = [
+    {
+      step_index: 0,
+      type: 'PLANNER_RESPONSE',
+      tool_calls: [
+        { name: 'read_file', args: { Path: '/a' } },
+        { name: 'read_file', args: { Path: '/b' } },
+      ],
+    },
+    checkpoint(1),
+    { step_index: 2, type: 'GENERIC', status: 'DONE', content: 'A' },
+    { step_index: 3, type: 'GENERIC', status: 'DONE', content: 'B' },
+  ]
+  const updates = ['a', 'b'].map((id) => ({
+    ...read,
+    toolCallId: id,
+    rawInput: { Path: `/${id}` },
+    rawOutput: undefined,
+  }))
+  const events = await replay(nativeRows, updates, 'replay', undefined, [
+    { stepIndex: 2, callId: 'a' },
+    { stepIndex: 3, callId: 'b' },
+  ])
+  const tools = timeline(events).flatMap((e) =>
+    e.item.type === 'tool_call' ? [e.item] : [],
+  )
+  const lastA = tools.filter((t) => t.callId === 'a').at(-1)
+  assert.ok(lastA?.detail.type === 'read' && lastA.detail.content === 'A')
+  const lastB = tools.filter((t) => t.callId === 'b').at(-1)
+  assert.ok(lastB?.detail.type === 'read' && lastB.detail.content === 'B')
+
+  // Live deferred-anonymous path across split poll batches with an intervening CHECKPOINT
+  const projector = new BrainTranscriptProjector('live')
+  projector.resolveToolIdentities(true)
+  projector.observeRows(nativeRows.slice(0, 1))
+  assert.deepEqual(projector.project(nativeRows[0]), [])
+  projector.syncMetadata(
+    {
+      messages: [],
+      readIds: new Set(),
+      unconsumedHighPriority: [],
+      consumedNonUserCount: 0,
+      stepCallIds: new Map([
+        [2, 'a'],
+        [3, 'b'],
+      ]),
+    },
+    [],
+  )
+  projector.observeRows(nativeRows.slice(1))
+  const resolved = projector.resolveToolIdentities(true)
+  assert.deepEqual(
+    resolved.map((i) => (i.type === 'tool_call' ? i.callId : i.type)),
+    ['a', 'b'],
+  )
+})
+
+test('unverified positional tool cannot recover a different ACP call result', async () => {
+  const nativeRows = [
+    {
+      step_index: 0,
+      type: 'PLANNER_RESPONSE',
+      tool_calls: [{ name: 'read_file', args: { Path: '/brain-a' } }],
+    },
+    { step_index: 1, type: 'GENERIC', status: 'DONE', content: 'A content' },
+    checkpoint(2),
+    {
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      tool_calls: [{ id: 'b', name: 'read_file', args: { Path: '/b' } }],
+    },
+  ]
+  const events = await replay(nativeRows, [
+    {
+      ...read,
+      toolCallId: 'b',
+      rawInput: { Path: '/acp' },
+      rawOutput: undefined,
+    },
+  ])
+  const tools = timeline(events).flatMap((e) =>
+    e.item.type === 'tool_call' ? [e.item] : [],
+  )
+  assert.ok(
+    !tools.some(
+      (t) =>
+        t.callId === 'b' &&
+        t.detail.type === 'read' &&
+        t.detail.content === 'A content',
+    ),
+  )
+})
+
+test('background completion recovers missing results without becoming a second history anchor', async () => {
+  for (const withCheckpoint of [false, true]) {
+    const nativeRows = [
+      {
+        step_index: 0,
+        type: 'PLANNER_RESPONSE',
+        tool_calls: [
+          { id: 'bg', name: 'run_command', args: { CommandLine: 'npm test' } },
+        ],
+      },
+      {
+        step_index: 1,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: 'Tool is running as a background task with task id: task-bg',
+      },
+      ...(withCheckpoint ? [checkpoint(2)] : []),
+      response(3, 'WAITING'),
+      {
+        step_index: 4,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content:
+          '[Message] sender=task-bg content=Task id "task-bg" finished with result:\npass\n</SYSTEM_MESSAGE>',
+      },
+    ]
+    const events = await replay(nativeRows, [
+      {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'bg',
+        title: 'run_command',
+        status: 'completed',
+        rawInput: { CommandLine: 'npm test --acp' },
+        rawOutput: null,
+      },
+      text('WAITING'),
+    ])
+    assert.deepEqual(labels(events), [
+      'tool_call',
+      ...(withCheckpoint ? ['compaction'] : []),
+      'tool_call',
+      'WAITING',
+    ])
+    const recovered = timeline(events).filter(
+      ({ item }) => item.type === 'tool_call',
+    )[1].item
+    assert.ok(
+      recovered.type === 'tool_call' && recovered.detail.type === 'shell',
+    )
+    assert.equal(recovered.detail.command, 'npm test --acp')
+    assert.equal(recovered.detail.output, 'pass')
+  }
+})
+
+test('Orchestrator contrib planexecute handoffs align across CHECKPOINT history replay and preserve plan cards', async () => {
+  const planMd = '# Plan\n- Inspect\n- Patch\n'
+  const nativeRows = [
+    {
+      step_index: 0,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      content: 'Planning',
+      tool_calls: [
+        {
+          id: 'exit-1',
+          name: 'contrib:exit_plan_mode',
+          args: { plan: planMd },
+        },
+      ],
+    },
+    {
+      step_index: 1,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: 'Plan mode is off.',
+    },
+    {
+      step_index: 2,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content:
+        '<SYSTEM_MESSAGE>\nPlan mode is off: this turn runs on the execution model.\n</SYSTEM_MESSAGE>',
+    },
+    checkpoint(3),
+    {
+      step_index: 4,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      content: 'Executing',
+      tool_calls: [
+        {
+          id: 'enter-1',
+          name: 'contrib:enter_plan_mode',
+          args: { reason: 'Ready for review' },
+        },
+      ],
+    },
+    {
+      step_index: 5,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: 'Plan mode is on.',
+    },
+    {
+      step_index: 6,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content:
+        '<SYSTEM_MESSAGE>\n[plan review] Plan mode is on: this turn runs on the planning model.\n</SYSTEM_MESSAGE>',
+    },
+    response(7, 'Reviewed'),
+  ]
+  const events = await replay(nativeRows, [
+    text('Planning'),
+    {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'exit-1',
+      title: 'Run contrib:exit_plan_mode',
+      kind: 'other',
+      status: 'completed',
+      rawInput: { plan: planMd },
+      rawOutput: null,
+    },
+    text('Executing'),
+    {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'enter-1',
+      title: 'Run contrib:enter_plan_mode',
+      kind: 'other',
+      status: 'completed',
+      rawInput: { reason: 'Ready for review' },
+      rawOutput: 'Plan mode is on.',
+    },
+    text('Reviewed'),
+  ])
+  assert.deepEqual(labels(events), [
+    'Planning',
+    'tool_call',
+    'tool_call',
+    'compaction',
+    'Executing',
+    'tool_call',
+    'Reviewed',
+  ])
+  const tools = timeline(events).filter(({ item }) => item.type === 'tool_call')
+  // exit-1 has rawOutput: null in ACP, so Brain result recovery emits a second update before compaction;
+  // both snapshots retain { type: 'plan', text: planMd }.
+  const exitItems = tools.filter(
+    ({ item }) => item.type === 'tool_call' && item.callId === 'exit-1',
+  )
+  assert.equal(exitItems.length, 2)
+  for (const { item } of exitItems) {
+    assert.ok(item.type === 'tool_call')
+    assert.deepEqual(item.detail, { type: 'plan', text: planMd })
+  }
+  const enterItem = tools.findLast(
+    ({ item }) => item.type === 'tool_call' && item.callId === 'enter-1',
+  )?.item
+  assert.ok(enterItem?.type === 'tool_call')
+  assert.equal(enterItem.detail.type, 'unknown')
 })

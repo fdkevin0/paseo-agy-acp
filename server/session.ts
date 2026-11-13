@@ -38,7 +38,6 @@ import {
   type NormalizedQuestion,
 } from './questions.ts'
 import {
-  BrainTranscriptProjector,
   hasActiveBackgroundWork,
   readInboxState,
   readSubagents,
@@ -48,11 +47,7 @@ import {
   type ForegroundAcpSegment,
 } from './brain.ts'
 import { readLatestStepUsage } from './brain-io.ts'
-import {
-  alignReplayTools,
-  mergeCompactionHistory,
-  type HistoryEntry,
-} from './history.ts'
+import { projectReplayHistory, type HistoryEntry } from './history.ts'
 import { SubagentRegistry, isSubagentMessage } from './subagents.ts'
 import { dataDirectory, removeSessionArtifacts } from './preflight.ts'
 import { connectAcp } from './transport.ts'
@@ -257,7 +252,7 @@ export class SessionManager {
         }
         session.state.turnToolCallIds = []
         session.state.turnForegroundAcp = []
-        await configureSession(session, input.config)
+        await configureSession(session, input.config, { strictThinking: false })
         await session.drain()
         if (input.persistence) await session.restoreUsage()
         session.state.loading = false
@@ -404,6 +399,7 @@ async function createSession(
       questions: NormalizedQuestion[]
       answerText: string | null
       wokeUp: boolean
+      declined?: boolean
     }>,
     suppressContinuationAcp: false,
     continuationEchoSeen: false,
@@ -857,6 +853,7 @@ async function createSession(
             formatQuestionAnswersText(pending.entry.questions, response) ||
             null,
           wokeUp: state.inSettle,
+          declined: response.behavior === 'deny',
         })
       }
       return buildElicitationResponse(
@@ -981,6 +978,7 @@ async function createSession(
       )
         return
       const prev = configState(state.metadata)
+      const prevModels = state.metadata.models
       const nativeMode = configState({
         ...state.metadata,
         fullAccess: false,
@@ -1013,7 +1011,7 @@ async function createSession(
             }),
           )),
           sessionId: state.nativeId,
-          models: next.models,
+          models: next.models ?? prevModels,
           fullAccess: skipPermissions,
         }
         await drain()
@@ -1129,79 +1127,22 @@ async function createSession(
         ])
         subagents.rememberSubagents(subagentRecords)
         // Drain ACP session/load notifications first so turnToolCallIds and acpToolSnapshots are complete;
-        // projector.project() below is purely synchronous and never triggers ACP notifications.
+        // projectReplayHistory() below is purely synchronous and never triggers ACP notifications.
         await drain()
         collectingHistory = false
-        const { alignedIds, verifiedAcpToolIds } = alignReplayTools(
+        const { entries, lastKnownStepIndex } = projectReplayHistory({
+          sessionId: id,
           rows,
-          inbox.stepCallIds,
-          subagentRecords,
-          state.turnToolCallIds,
+          inbox,
+          subagents: subagentRecords,
+          acpHistory: acpHistory.splice(0),
+          acpToolCallIds: state.turnToolCallIds,
           acpToolSnapshots,
-        )
-        const projector = new BrainTranscriptProjector(id)
-        projector.syncMetadata(inbox, subagentRecords)
-        projector.bindToolCallIds(alignedIds, 0, verifiedAcpToolIds)
-        const brainHistory: HistoryEntry[] = []
-        const hasCompletedCheckpoint = rows.some(
-          (row) =>
-            row.type === 'CHECKPOINT' &&
-            row.status === 'DONE' &&
-            Number.isInteger(row.step_index),
-        )
-        for (const row of rows) {
-          const stepIndex = Number(row.step_index)
-          if (
-            Number.isInteger(stepIndex) &&
-            stepIndex > state.lastKnownStepIndex
-          )
-            state.lastKnownStepIndex = stepIndex
-          for (const projected of projector.project(row)) {
-            let item = projected
-            if (
-              hasCompletedCheckpoint &&
-              item.type === 'tool_call' &&
-              row.type === 'GENERIC' &&
-              !acpResultProvided(item.callId)
-            ) {
-              const snapshot = acpToolSnapshots.get(item.callId)
-              if (snapshot?.rawInput != null) {
-                const detail = toolDetail({
-                  ...snapshot,
-                  rawOutput: row.content ?? row.error ?? null,
-                })
-                if (
-                  detail.type === 'sub_agent' &&
-                  item.detail.type === 'sub_agent'
-                )
-                  detail.childSessionId ??= item.detail.childSessionId
-                item = { ...item, detail }
-              }
-            }
-            const nativeToolIdentitySource =
-              row.type === 'GENERIC' ||
-              (row.type === 'PLANNER_RESPONSE' &&
-                projected.type === 'tool_call' &&
-                projected.status === 'running')
-                ? projector.nativeToolIdentitySource(projected)
-                : undefined
-            brainHistory.push({
-              item,
-              nativeToolIdentitySource,
-              ...(typeof row.created_at === 'string'
-                ? { timestamp: row.created_at }
-                : {}),
-            })
-          }
-        }
-        for (const entry of brainHistory) {
-          if (projector.isBackgroundGeneric(entry.item))
-            entry.backgroundGeneric = true
-        }
-        for (const { item, timestamp } of mergeCompactionHistory(
-          acpHistory.splice(0),
-          brainHistory,
-        )) {
+          acpResultProvided,
+        })
+        if (lastKnownStepIndex > state.lastKnownStepIndex)
+          state.lastKnownStepIndex = lastKnownStepIndex
+        for (const { item, timestamp } of entries) {
           await subagents.waitCurrentReady()
           emitItem(item, timestamp)
         }
@@ -1344,23 +1285,49 @@ async function createSession(
   }
 }
 
+type NativeConfigKey = 'model' | 'thought_level' | 'mode'
+
+function selectedConfigValue(
+  current: ReturnType<typeof configState>,
+  key: NativeConfigKey,
+): string | undefined {
+  return key === 'model'
+    ? current.model
+    : key === 'mode'
+      ? current.mode
+      : current.thinkingOption
+}
+
+function isAdvertisedConfigOption(
+  metadata: SessionMetadata,
+  current: ReturnType<typeof configState>,
+  key: NativeConfigKey,
+): boolean {
+  return (
+    Boolean(
+      metadata.configOptions?.some((o) => o.id === key || o.category === key),
+    ) &&
+    (key !== 'thought_level' || current.thinkingOptions.length > 0)
+  )
+}
+
 async function applyNativeConfigOption(
   transport: ReturnType<typeof connectAcp>,
   nativeId: string,
   metadata: NewSessionResponse & SessionMetadata,
-  key: 'model' | 'mode' | 'thought_level',
+  key: NativeConfigKey,
   value: string | undefined,
   strict = false,
-) {
-  if (!value) return
+): Promise<boolean> {
+  if (!value) return false
   const option = metadata.configOptions?.find(
     (o) => o.id === key || o.category === key,
   )
   if (!option) {
     if (strict) throw new Error(`agy does not advertise ${key}`)
-    return
+    return false
   }
-  if (option.currentValue === value) return
+  if (option.currentValue === value) return false
   const result = await transport.request(
     transport.rpc.setSessionConfigOption({
       sessionId: nativeId,
@@ -1369,11 +1336,13 @@ async function applyNativeConfigOption(
     }),
   )
   metadata.configOptions = result.configOptions
+  return true
 }
 
 async function configureSession(
   session: Session,
   changes: ProviderConfigChanges,
+  options?: { strictThinking?: boolean },
 ) {
   if (session.state.closing || session.state.failed)
     throw new Error('ACP runtime has exited; reopen the session')
@@ -1381,39 +1350,40 @@ async function configureSession(
     throw new Error('Wait for the current turn before changing configuration')
   if (changes.settings && Object.keys(changes.settings).length)
     throw new Error('Custom settings are not supported')
+  const strictThinking = options?.strictThinking ?? true
+  // Switching `model` dynamically adds or removes `thought_level` in `metadata.configOptions`
+  // via the native RPC, so `thought_level` must be re-evaluated after `model` is applied.
+  const allowMissingThinking = !strictThinking || changes.model != null
   const entries = [
     ['model', changes.model],
-    ['mode', changes.mode],
     ['thought_level', changes.thinkingOption],
+    ['mode', changes.mode],
   ] as const
+  const initial = configState(session.state.metadata)
   for (const [key, value] of entries) {
     if (value == null) continue
     if (key === 'mode' && value === FULL_ACCESS_MODE_ID) continue
-    const current = configState(session.state.metadata)
-    const selected =
-      key === 'model'
-        ? current.model
-        : key === 'mode'
-          ? current.mode
-          : current.thinkingOption
-    if (value === selected) continue
-    const advertised = session.state.metadata.configOptions?.some(
-      (o) => o.id === key || o.category === key,
-    )
-    if (!advertised) throw new Error(`agy does not advertise ${key}`)
+    if (key === 'thought_level' && allowMissingThinking) continue
+    if (value === selectedConfigValue(initial, key)) continue
+    if (!isAdvertisedConfigOption(session.state.metadata, initial, key))
+      throw new Error(`agy does not advertise ${key}`)
   }
   let mutated = false
   try {
     for (const [key, value] of entries) {
       if (value == null) continue
       const current = configState(session.state.metadata)
-      const selected =
-        key === 'model'
-          ? current.model
-          : key === 'mode'
-            ? current.mode
-            : current.thinkingOption
-      if (value === selected) continue
+      if (value === selectedConfigValue(current, key)) continue
+      if (!isAdvertisedConfigOption(session.state.metadata, current, key)) {
+        if (key === 'thought_level' && allowMissingThinking) continue
+        throw new Error(`agy does not advertise ${key}`)
+      }
+      if (
+        key === 'thought_level' &&
+        !strictThinking &&
+        !current.thinkingOptions.some((o) => o.id === value)
+      )
+        continue
       if (key === 'mode' && value === FULL_ACCESS_MODE_ID) {
         await session.relaunch(true)
         session.state.metadata.fullAccess = true
@@ -1439,7 +1409,7 @@ async function configureSession(
         session.state.metadata.fullAccess = false
         mutated = true
       }
-      await applyNativeConfigOption(
+      const applied = await applyNativeConfigOption(
         session.transport,
         session.state.nativeId,
         session.state.metadata,
@@ -1447,7 +1417,7 @@ async function configureSession(
         value,
         true,
       )
-      mutated = true
+      mutated ||= applied
     }
   } catch (error) {
     if (mutated) session.publishConfig()
@@ -1689,6 +1659,7 @@ async function promptSession(
     let lastStep: StepUsage | undefined
     let turnWokeUp = false
     let turnWakeupUsage: StepUsage | undefined
+    let nextCarriedWakeup: StepUsage | undefined
     if (status === 'completed') {
       session.state.inSettle = true
       const settled = await settleBrainTurn(
@@ -1756,6 +1727,10 @@ async function promptSession(
                 handledIndex,
                 1,
               )
+              if (pendingQuestion.wokeUp && handled.declined) {
+                await session.interrupt()
+                return { status: 'canceled' }
+              }
               return {
                 status: pendingQuestion.wokeUp ? 'answered' : 'already_handled',
                 answerText: handled.answerText ?? undefined,
@@ -1823,7 +1798,8 @@ async function promptSession(
       lastStep = settled.lastStepUsage
       turnWokeUp = Boolean(settled.wokeUp)
       turnWakeupUsage = settled.wakeupUsage
-      if (turnWokeUp) session.state.wakeup.pendingReplay = true
+      nextCarriedWakeup = settled.carriedWakeupUsage
+      if (settled.pendingReplay) session.state.wakeup.pendingReplay = true
       if (
         settled.stalled &&
         !turnAbort.signal.aborted &&
@@ -1850,8 +1826,10 @@ async function promptSession(
         ? session.state.wakeup.carriedUsage
         : undefined
       session.state.wakeup.carriedUsage = result.usage
-        ? turnWakeupUsage
-        : addStepUsage(session.state.wakeup.carriedUsage, turnWakeupUsage!)
+        ? nextCarriedWakeup
+        : nextCarriedWakeup
+          ? addStepUsage(session.state.wakeup.carriedUsage, nextCarriedWakeup)
+          : session.state.wakeup.carriedUsage
       session.publishUsage(
         promptUsage(result.usage, {
           model: configState(session.state.metadata).model,

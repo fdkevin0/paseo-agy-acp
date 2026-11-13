@@ -12,6 +12,21 @@ export function cleanToolName(name: string): string {
   return name.replace(/^default_api:/, '')
 }
 
+/** Strip agy's outer ACP `Run <name>` title wrapper, then drop `default_api:`. */
+export function unwrapToolTitle(title: string): string {
+  return cleanToolName(title.replace(/^Run\s+/i, ''))
+}
+
+/** Normalize a tool identity from an explicit raw name or an ACP `Run <name>` title. */
+function normalizeToolCandidate(
+  explicitRawName: string | undefined,
+  title: string | null | undefined,
+): string {
+  return explicitRawName !== undefined
+    ? cleanToolName(explicitRawName)
+    : unwrapToolTitle(title ?? '')
+}
+
 /** Match native lifecycle identities, including agy's legacy ACP `Run` title. */
 export function isNativeToolName(
   name: string,
@@ -22,13 +37,54 @@ export function isNativeToolName(
     | 'manage_task'
     | 'schedule',
 ): boolean {
-  const cleaned = cleanToolName(name)
-  return cleaned === expected || cleaned === `Run ${expected}`
+  return unwrapToolTitle(name) === expected
 }
 
 /** Whether a native tool name is agy's interactive question tool. */
 export function isAskQuestionName(name: string): boolean {
   return /^ask_(?:question|user)$/i.test(cleanToolName(name))
+}
+
+export type PlanModeToolName =
+  'switch_mode' | 'exit_plan_mode' | 'enter_plan_mode'
+
+/** Whether a tool name or ACP title explicitly identifies a non-native MCP tool. */
+function isForeignToolIdentity(
+  explicitRawName: string | undefined,
+  title: string | null | undefined,
+): boolean {
+  const raw = normalizeToolCandidate(explicitRawName, title)
+  if (/^mcp__|^call_mcp_tool$/i.test(raw)) return true
+  const colon = raw.indexOf(':')
+  if (colon <= 0) return false
+  const prefix = raw.slice(0, colon).toLowerCase()
+  return (
+    prefix !== 'contrib' &&
+    prefix !== 'default_api' &&
+    /^[a-z0-9_-]+:[a-z0-9_.-]+$/i.test(raw)
+  )
+}
+
+/**
+ * Classify agy's mode/plan handoff tools across raw names, `contrib:`, legacy `Run ` titles,
+ * and unnamed native `kind === 'switch_mode'` snapshots (rejecting foreign MCP identities).
+ */
+export function classifyPlanModeTool(
+  explicitRawName: string | undefined,
+  title: string | null | undefined,
+  kind?: string | null,
+): PlanModeToolName | undefined {
+  const match = normalizeToolCandidate(explicitRawName, title).match(
+    /^(?:contrib:)?(switch_mode|exit_plan_mode|enter_plan_mode)$/i,
+  )
+  if (match) return match[1].toLowerCase() as PlanModeToolName
+  if (
+    explicitRawName === undefined &&
+    kind === 'switch_mode' &&
+    !isForeignToolIdentity(explicitRawName, title)
+  )
+    return 'switch_mode'
+  return undefined
 }
 
 /** Narrow opaque protocol payloads before reading vendor fields. */

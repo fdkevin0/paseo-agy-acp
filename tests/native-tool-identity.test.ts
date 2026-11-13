@@ -26,6 +26,7 @@ const nativeForms = (name: string) => [
   name,
   `default_api:${name}`,
   `Run ${name}`,
+  `Run default_api:${name}`,
 ]
 const collisions = (name: string) => [
   `mcp__example__${name}`,
@@ -45,6 +46,22 @@ const result = (step_index: number, content = 'done') => ({
   type: 'GENERIC',
   status: 'DONE',
   content,
+})
+
+test('native lifecycle titles share case and whitespace normalization without accepting foreign identities', () => {
+  // Parser-contract cases, not evidence that agy emits these wrapper variants.
+  for (const expected of nativeNames) {
+    for (const prefix of ['run ', 'RUN ', 'Run  ', 'Run\t']) {
+      for (const name of [expected, `default_api:${expected}`])
+        assert.equal(isNativeToolName(`${prefix}${name}`, expected), true)
+      for (const name of collisions(expected))
+        assert.equal(isNativeToolName(`${prefix}${name}`, expected), false)
+      assert.equal(
+        isNativeToolName(`${prefix}${expected.toUpperCase()}`, expected),
+        false,
+      )
+    }
+  }
 })
 
 test('one native identity boundary accepts documented forms and rejects foreign collisions', () => {
@@ -190,7 +207,7 @@ test('foreign spawn cards cannot acquire ownership and foreign management does n
       error: null,
       detail: { type: 'plain_text', text: 'done' },
     })
-  assert.equal(syncs, 3)
+  assert.equal(syncs, nativeForms('manage_subagents').length)
 })
 
 test('Brain metadata and inbox agree on namespaced native spawn identity', async () => {
