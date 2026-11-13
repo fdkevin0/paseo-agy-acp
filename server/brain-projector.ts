@@ -726,7 +726,11 @@ export class BrainNode {
   private retrySince?: number
   private retryError?: string
   private retryStep = -1
-  private retryObservedAt = new Map<number, number>()
+  // Keyed by step index + error message so O_TRUNC replays keep the original deadline while in-place mutations refresh it.
+  private retryObservedAt = new Map<
+    number,
+    { error: string | undefined; observedAt: number }
+  >()
   readonly nativeId: string
   readonly sessionId: string
   private onQuestionSettled?: (
@@ -764,6 +768,7 @@ export class BrainNode {
     this.consumedMessages = 0
     this.turnStartStep = -1
     this.lastStep = undefined
+    // Intentionally retain retryObservedAt across O_TRUNC resets; only pruneRetrySteps releases deleted steps.
     this.resetPhase()
   }
 
@@ -835,6 +840,7 @@ export class BrainNode {
     observedAt?: number,
   ): ProviderTimelineItem[] {
     const now = Date.now()
+    // Clamp file mtimeMs to Date.now() so future filesystem clock skew cannot extend the 15-minute deadline.
     const clampedObservedAt =
       observedAt !== undefined && Number.isFinite(observedAt)
         ? Math.min(now, observedAt)
@@ -865,16 +871,17 @@ export class BrainNode {
       const createdAt = Date.parse(String(row.created_at ?? ''))
       const step = Number(row.step_index)
       if (Number.isInteger(step) && step > this.retryStep) {
-        let firstObserved = this.retryObservedAt.get(step)
-        if (firstObserved === undefined) {
-          firstObserved = clampedObservedAt
-          this.retryObservedAt.set(step, firstObserved)
+        const error = stepErrorMessage(row)
+        let entry = this.retryObservedAt.get(step)
+        if (!entry || entry.error !== error) {
+          entry = { error, observedAt: clampedObservedAt }
+          this.retryObservedAt.set(step, entry)
         }
         this.retrySince = Number.isFinite(createdAt)
-          ? Math.min(createdAt, firstObserved)
-          : firstObserved
+          ? Math.min(createdAt, entry.observedAt)
+          : entry.observedAt
         this.retryStep = step
-        this.retryError = stepErrorMessage(row)
+        this.retryError = error
       }
     } else if (
       row.type === 'ERROR_MESSAGE' ||

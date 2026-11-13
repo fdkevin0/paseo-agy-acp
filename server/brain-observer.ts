@@ -109,6 +109,7 @@ export class BrainTurnObservation {
   private buffered = new Map<number, Row>()
   private bufferReset = false
   private bufferSnapshot?: Set<number>
+  private bufferMtimeMs?: number
   private checkpoints = new StepDedupe()
   private drainingRead = false
   private mayPublish() {
@@ -203,6 +204,7 @@ export class BrainTurnObservation {
       this.buffered.clear()
       this.bufferReset = true
       this.bufferSnapshot = undefined
+      this.bufferMtimeMs = undefined
       this.lastStepIndex = -1
       this.historicalMessages = 0
     }
@@ -226,6 +228,12 @@ export class BrainTurnObservation {
       await this.consumer(next)
     else {
       for (const row of eligible) this.buffered.set(Number(row.step_index), row)
+      if (
+        eligible.length > 0 &&
+        read.mtimeMs !== undefined &&
+        (read.reset || this.bufferMtimeMs === undefined)
+      )
+        this.bufferMtimeMs = read.mtimeMs
       if (read.snapshotStepIndices)
         this.bufferSnapshot = new Set(read.snapshotStepIndices)
       if (this.bufferSnapshot)
@@ -279,9 +287,11 @@ export class BrainTurnObservation {
         rows,
         reset: this.bufferReset,
         snapshotStepIndices: this.bufferSnapshot,
+        mtimeMs: this.bufferMtimeMs,
       })
       this.bufferReset = false
       this.bufferSnapshot = undefined
+      this.bufferMtimeMs = undefined
     })()
       .catch((error) => {
         this.failure = error

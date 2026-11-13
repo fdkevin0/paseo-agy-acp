@@ -11,6 +11,7 @@ import {
   watchBrain,
   type BrainWatchHandle,
 } from '../server/brain.ts'
+import { BrainTurnObservation } from '../server/brain-observer.ts'
 import {
   BrainNode,
   BrainTranscriptProjector,
@@ -364,7 +365,24 @@ test('observedAt anchors timestamp-less retry warnings, clamps future mtimeMs, s
   rewriteNode.pruneRetrySteps(new Set()) // empty set is a no-op
   rewriteNode.reset(inbox, [])
   rewriteNode.ingest({ step_index: 1, type: 'USER_INPUT' })
+  rewriteNode.ingest(warning(2, 1))
+  assert.match(
+    rewriteNode.failure()!,
+    /attempt 1.*No retry recovery was observed/,
+  )
+
+  // In-place mutation at the same step_index (e.g. attempt 1 -> attempt 2) refreshes the deadline.
+  rewriteNode.reset(inbox, [])
+  rewriteNode.ingest({ step_index: 1, type: 'USER_INPUT' })
   rewriteNode.ingest(warning(2, 2))
+  assert.equal(
+    rewriteNode.failure(),
+    undefined,
+    'in-place warning mutation at the same step_index refreshes retryObservedAt',
+  )
+  t.mock.timers.tick(RETRY_IDLE_TIMEOUT_MS - 1)
+  assert.equal(rewriteNode.failure(), undefined)
+  t.mock.timers.tick(1)
   assert.match(
     rewriteNode.failure()!,
     /attempt 2.*No retry recovery was observed/,
@@ -489,20 +507,205 @@ test('initial transcript reads anchor timestamp-less retry warnings to file mtim
       undefined,
       undefined,
       undefined,
-      70,
+      200,
     )
     await handle.ready
     assert.equal(handle.isRunning(), true)
-    await delay(35)
+    await delay(40)
     await writeTranscript(liveChildId, childRows)
-    await delay(55)
-    assert.equal(
-      handle.isRunning(),
-      false,
-      'O_TRUNC rewrite at 35ms must not extend the 70ms retry deadline',
-    )
+    const deadline = Date.now() + 2000
+    while (handle.isRunning() && Date.now() < deadline) await delay(10)
+    assert.equal(handle.isRunning(), false)
     assert.ok(
       liveEvents.some((e) => e.type === 'session.turn' && e.state === 'failed'),
+    )
+  } finally {
+    handle?.()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('BrainTurnObservation pre-attach buffering preserves mtimeMs across multi-turn preamble reads', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'brain-retry-obs-'))
+  const sessionId = '44444444-4444-4444-8444-444444444444'
+  const filePath = join(
+    root,
+    sessionId,
+    '.system_generated/logs/transcript_full.jsonl',
+  )
+  const writeRows = async (rows: readonly Record<string, unknown>[]) => {
+    await mkdir(join(root, sessionId, '.system_generated/logs'), {
+      recursive: true,
+    })
+    await writeFile(
+      filePath,
+      rows.map((r) => JSON.stringify(r)).join('\n') + '\n',
+    )
+  }
+
+  let observation: BrainTurnObservation | undefined
+  try {
+    // Turn 0 already on disk when Turn 1 observation starts.
+    await writeRows([
+      { step_index: 0, type: 'USER_INPUT', content: 'turn 0' },
+      quiet(1),
+    ])
+    observation = new BrainTurnObservation(
+      root,
+      sessionId,
+      'p',
+      1,
+      {
+        isCurrent: () => true,
+        onUsage: () => {},
+        onItem: () => {},
+      },
+      10,
+    )
+    await observation.poll()
+
+    // Turn 1 arrives and is buffered BEFORE settleBrainTurn calls attach().
+    await writeRows([
+      { step_index: 0, type: 'USER_INPUT', content: 'turn 0' },
+      quiet(1),
+      { step_index: 2, type: 'USER_INPUT', content: 'turn 1' },
+      warning(3, 1),
+    ])
+    const expiredDate = new Date(Date.now() - 20 * 60_000)
+    await utimes(filePath, expiredDate, expiredDate)
+    await observation.poll()
+
+    const settled = await settleBrainTurn(root, sessionId, 'p', () => {}, {
+      minStepIndex: 1,
+      pollIntervalMs: 5,
+      observation,
+    })
+    assert.equal(settled.status, 'failed')
+    assert.equal(settled.stalled, true)
+    assert.match(settled.error ?? '', /attempt 1/)
+  } finally {
+    await observation?.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('settleChildren handles ENOENT -> appeared and torn initial reads without prematurely latching initialReadDone', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'brain-retry-torn-'))
+  const parentId = '55555555-5555-4555-8555-555555555555'
+  const childId = '66666666-6666-4666-8666-666666666666'
+  const tornChildId = '77777777-7777-4777-8777-777777777777'
+  let handle: BrainWatchHandle | undefined
+
+  const transcriptPath = (sessionId: string) =>
+    join(root, sessionId, '.system_generated/logs/transcript_full.jsonl')
+  const writeTranscript = async (
+    sessionId: string,
+    rows: readonly Record<string, unknown>[],
+  ) => {
+    const dir = join(root, sessionId, '.system_generated/logs')
+    await mkdir(dir, { recursive: true })
+    await writeFile(
+      transcriptPath(sessionId),
+      rows.map((r) => JSON.stringify(r)).join('\n') + '\n',
+    )
+  }
+
+  try {
+    // 1. settleChildren: child starts as ENOENT, then appears with warning + O_TRUNC rewrite.
+    await writeTranscript(parentId, [
+      { step_index: 0, type: 'USER_INPUT', content: 'start' },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ id: 'invoke', name: 'invoke_subagent', args: {} }],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: JSON.stringify({ conversationId: childId }),
+      },
+      quiet(3),
+    ])
+    const subDir = join(root, parentId, '.system_generated/subagents')
+    await mkdir(subDir, { recursive: true })
+    await writeFile(
+      join(subDir, `${childId}.json`),
+      JSON.stringify({
+        conversationId: childId,
+        state: 'SUBAGENT_STATE_ALIVE',
+        spawnStepIndex: 2,
+        spawnCallId: 'invoke',
+      }),
+    )
+
+    const settlePromise = settleBrainTurn(root, parentId, 'p', () => {}, {
+      minStepIndex: -1,
+      pollIntervalMs: 10,
+      retryTimeoutMs: 120,
+    })
+
+    await delay(25)
+    const childRows = [
+      {
+        step_index: 0,
+        type: 'SYSTEM_MESSAGE',
+        content: `<SYSTEM_MESSAGE>\n[Message] sender=${parentId} priority=MESSAGE_PRIORITY_HIGH content=work\n</SYSTEM_MESSAGE>`,
+      },
+      warning(1, 1),
+    ]
+    await writeTranscript(childId, childRows)
+    await delay(40)
+    await writeTranscript(childId, childRows)
+
+    const settled = await settlePromise
+    assert.equal(settled.status, 'failed')
+    assert.equal(settled.stalled, true)
+    assert.match(settled.error ?? '', new RegExp(`Subagent ${childId} failed`))
+
+    // 2. watchBrain: torn initial read (no trailing newline -> rows: []) must not latch initialReadDone.
+    await mkdir(join(root, tornChildId, '.system_generated/logs'), {
+      recursive: true,
+    })
+    const line0 = JSON.stringify({
+      step_index: 0,
+      type: 'SYSTEM_MESSAGE',
+      content: `<SYSTEM_MESSAGE>\n[Message] sender=${parentId} priority=MESSAGE_PRIORITY_HIGH content=work\n</SYSTEM_MESSAGE>`,
+    })
+    await writeFile(transcriptPath(tornChildId), line0.slice(0, 20))
+    const expiredDate = new Date(Date.now() - 20 * 60_000)
+    await utimes(transcriptPath(tornChildId), expiredDate, expiredDate)
+
+    const events: ProviderEvent[] = []
+    handle = watchBrain(
+      root,
+      tornChildId,
+      'torn-child',
+      (e) => events.push(e),
+      10,
+    )
+    await handle.ready
+    assert.equal(
+      handle.isRunning(),
+      true,
+      'torn initial read with rows: [] must not latch initialReadDone',
+    )
+
+    await writeTranscript(tornChildId, childRows)
+    await utimes(transcriptPath(tornChildId), expiredDate, expiredDate)
+    const deadline = Date.now() + 2000
+    while (handle.isRunning() && Date.now() < deadline) await delay(10)
+    assert.equal(handle.isRunning(), false)
+    assert.ok(
+      events.some(
+        (e) =>
+          e.type === 'session.turn' &&
+          e.state === 'failed' &&
+          /attempt 1.*No retry recovery was observed/s.test(
+            e.error?.message ?? '',
+          ),
+      ),
     )
   } finally {
     handle?.()

@@ -135,7 +135,7 @@ async function settleChildren(
         const { rows, reset, snapshotStepIndices, mtimeMs } =
           await child.reader.read(root, childId)
         const observedAt = child.initialReadDone ? undefined : mtimeMs
-        child.initialReadDone = true
+        if (rows.length > 0) child.initialReadDone = true
         if (snapshotStepIndices) child.pruneRetrySteps(snapshotStepIndices)
         if (reset) child.reset(childInbox, childSubagents)
         child.projector.observeRows(rows)
@@ -592,8 +592,6 @@ export async function settleBrainTurn(
     }
     const rows = read.rows
     const observedAt = node.initialReadDone ? undefined : read.mtimeMs
-    if (read.mtimeMs !== undefined || rows.length > 0)
-      node.initialReadDone = true
     if (read.snapshotStepIndices) {
       dedupe.prune(read.snapshotStepIndices)
       node.pruneRetrySteps(read.snapshotStepIndices)
@@ -646,6 +644,7 @@ export async function settleBrainTurn(
       node.projector.bindToolCallIds(acpToolCallIds)
       node.projector.resolveToolIdentities(isRpcActive?.() === true)
     }
+    if (slice.length > 0) node.initialReadDone = true
     for (const row of slice) {
       const stepIndex = Number(row.step_index)
       if (row.type === 'USER_INPUT') {
@@ -978,7 +977,7 @@ export function watchBrain(
       const { rows, reset, snapshotStepIndices, mtimeMs } =
         await node.reader.read(root, nativeId)
       const observedAt = node.initialReadDone ? undefined : mtimeMs
-      node.initialReadDone = true
+      if (rows.length > 0) node.initialReadDone = true
       if (snapshotStepIndices) {
         dedupe.prune(snapshotStepIndices)
         node.pruneRetrySteps(snapshotStepIndices)
