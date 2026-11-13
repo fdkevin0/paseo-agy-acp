@@ -178,7 +178,11 @@ export class BrainTranscriptProjector {
     this.verifiedAcpToolIds = verifiedAcpToolIds
   }
 
-  /** Pre-scan transcript rows so tool slots know their checkpoint-shifted GENERIC step indexes before projection. */
+  /**
+   * Pre-scan transcript rows so tool slots know their checkpoint-shifted GENERIC step indexes before projection.
+   * Invariant: every row passed here must also be passed to `project()` (in order, exactly once), because
+   * `slotIndex` in `project()` indexes into `observedSlots`; skipping either side desyncs slot lookups.
+   */
   observeRows(
     rows: readonly Record<string, unknown>[],
   ): readonly ObservedToolSlot[] {
