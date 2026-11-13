@@ -789,7 +789,7 @@ export class BrainNode {
 
   settleAbortedDenial(denied?: ReadonlySet<string>) {
     if (
-      !this.wokeUp &&
+      this.promptPhase !== 'woken' &&
       denied &&
       this.projector.hasDeniedOutcome(denied, this.lastStep)
     ) {
@@ -833,6 +833,8 @@ export class BrainNode {
     // the rows after it are still Brain's to project.
     const continuingQuestion =
       row.type === 'USER_INPUT' && this.continuingQuestion
+    const rowMessages = countRowMessages(row)
+    const purePlanExecuteNotice = isPlanExecuteNotice(row) && rowMessages === 0
     if (row.type === 'USER_INPUT') {
       if (this.continuingQuestion) {
         this.continuingQuestion = false
@@ -841,7 +843,7 @@ export class BrainNode {
     } else if (
       row.type === 'SYSTEM_MESSAGE' &&
       !isRestartNotice(row) &&
-      !isPlanExecuteNotice(row) &&
+      !purePlanExecuteNotice &&
       this.promptPhase === 'foreground_idle'
     ) {
       this.promptPhase = 'woken'
@@ -877,7 +879,7 @@ export class BrainNode {
       this.retrySince = undefined
       this.retryError = undefined
     }
-    this.consumedMessages += countRowMessages(row)
+    this.consumedMessages += rowMessages
     const items = this.projector.project(row, continuingQuestion)
     if (row.type !== 'CHECKPOINT') this.lastStep = row
     if (this.promptPhase !== 'woken') {
@@ -887,7 +889,7 @@ export class BrainNode {
       ) {
         this.promptPhase = 'foreground_active'
       }
-      if (isPlanExecuteNotice(row) || this.projector.hasPending()) {
+      if (purePlanExecuteNotice || this.projector.hasPending()) {
         if (this.promptPhase === 'foreground_idle')
           this.promptPhase = 'foreground_active'
       } else if (
@@ -928,6 +930,7 @@ export class BrainNode {
   isWokenWorking(): boolean {
     return (
       this.wokeUp &&
+      !this.abortedByDenial &&
       (this.projector.hasPending() ||
         (this.lastStep?.type === 'SYSTEM_MESSAGE' &&
           !isRestartNotice(this.lastStep)) ||
@@ -947,7 +950,7 @@ export class BrainNode {
       Number(this.lastStep?.step_index ?? -1) > this.answeredQuestionStep &&
       (isCompletePlannerResponse(this.lastStep) ||
         this.questionSettled ||
-        (!this.wokeUp && this.abortedByDenial))
+        (this.promptPhase !== 'woken' && this.abortedByDenial))
     )
   }
 }

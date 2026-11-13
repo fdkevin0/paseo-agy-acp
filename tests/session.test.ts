@@ -1589,6 +1589,41 @@ new AgentSideConnection((client) => ({
       assert.equal(cfg.config.thinkingOption, undefined)
       assert.equal(cfg.config.mode, 'default')
 
+      // 5b. session.open on a model with restricted efforts (e.g. gemini-4-carbon without xhigh)
+      // ignores an unsupported best-effort thinkingOption ('xhigh') without failing session.open.
+      await provider.send({
+        type: 'session.open',
+        requestId: 'open-carbon-xhigh',
+        sessionId: 's-carbon',
+        history: 'skip',
+        config: {
+          cwd: home,
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: true,
+          model: 'gemini-4-carbon',
+          thinkingOption: 'xhigh',
+        },
+      })
+      await wait(
+        (e) => e.type === 'session.ready' && e.sessionId === 's-carbon',
+      )
+      const carbonCfg = events.findLast(
+        (e) => e.type === 'session.config' && e.sessionId === 's-carbon',
+      )
+      assert.ok(carbonCfg?.type === 'session.config')
+      assert.equal(carbonCfg.config.model, 'gemini-4-carbon')
+      assert.equal(carbonCfg.config.thinkingOption, 'medium')
+      await provider.send({
+        type: 'session.close',
+        requestId: 'close-carbon',
+        sessionId: 's-carbon',
+      })
+      await wait(
+        (e) => e.type === 'session.closed' && e.sessionId === 's-carbon',
+      )
+
       // 6. Standalone { mode: 'full-access', thinkingOption: 'high' } without model rejects before relaunching
       const spawnsBefore = (await readFile(logPath, 'utf8'))
         .trim()

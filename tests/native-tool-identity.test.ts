@@ -26,6 +26,7 @@ const nativeForms = (name: string) => [
   name,
   `default_api:${name}`,
   `Run ${name}`,
+  `Run default_api:${name}`,
 ]
 const collisions = (name: string) => [
   `mcp__example__${name}`,
@@ -190,7 +191,7 @@ test('foreign spawn cards cannot acquire ownership and foreign management does n
       error: null,
       detail: { type: 'plain_text', text: 'done' },
     })
-  assert.equal(syncs, 3)
+  assert.equal(syncs, nativeForms('manage_subagents').length)
 })
 
 test('Brain metadata and inbox agree on namespaced native spawn identity', async () => {

@@ -987,6 +987,11 @@ test('exit_plan_mode renders as a Markdown plan card across ACP variants and par
       kind: 'other' as const,
       rawInput: { plan: md },
     },
+    {
+      title: 'Run default_api:exit_plan_mode',
+      kind: 'other' as const,
+      rawInput: { plan: md },
+    },
   ]) {
     assert.deepEqual(toolDetail(tool as Parameters<typeof toolDetail>[0]), {
       type: 'plan',
@@ -1017,8 +1022,11 @@ test('exit_plan_mode renders as a Markdown plan card across ACP variants and par
   )
   for (const foreignTitle of [
     'Run mcp__srv__switch_mode',
+    'Run default_api:mcp__srv__switch_mode',
     'srv:switch_mode',
+    'Run default_api:srv:switch_mode',
     'Run call_mcp_tool',
+    'Run default_api:call_mcp_tool',
   ]) {
     assert.equal(
       toolDetail({

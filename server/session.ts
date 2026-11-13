@@ -1346,6 +1346,12 @@ async function configureSession(
         if (key === 'thought_level' && allowMissingThinking) continue
         throw new Error(`agy does not advertise ${key}`)
       }
+      if (
+        key === 'thought_level' &&
+        !strictThinking &&
+        !current.thinkingOptions.some((o) => o.id === value)
+      )
+        continue
       if (key === 'mode' && value === FULL_ACCESS_MODE_ID) {
         await session.relaunch(true)
         session.state.metadata.fullAccess = true

@@ -276,3 +276,43 @@ test('confirmed model or correlated tool progress releases retry state; unrelate
     'a new turn cannot inherit an earlier turn retry deadline',
   )
 })
+
+test('synthetic continuation denial settles cleanly even when turn wokeUp latch is true, and mixed planexecute/wakeup SYSTEM_MESSAGE enters woken', () => {
+  const node = new BrainNode(id)
+  node.ingest({ step_index: 1, type: 'USER_INPUT' })
+  node.ingest(quiet(2))
+  assert.equal(node.promptPhase, 'foreground_idle')
+  // A SYSTEM_MESSAGE with both a planexecute prefix and a real [Message] header still enters woken.
+  node.ingest({
+    step_index: 3,
+    type: 'SYSTEM_MESSAGE',
+    content:
+      '<SYSTEM_MESSAGE>\nPlan mode is off: this turn runs on Gemini 4 Hydrogen (High).\n[Message] sender=22222222-2222-4222-8222-222222222222 priority=MESSAGE_PRIORITY_HIGH content=report\n</SYSTEM_MESSAGE>',
+  })
+  assert.equal(node.promptPhase, 'woken')
+  assert.equal(node.wokeUp, true)
+
+  // Woken question triggers a synthetic continuation prompt (wokeUp stays true, promptPhase resets to foreground).
+  node.markQuestionContinuation(true)
+  node.ingest({ step_index: 4, type: 'USER_INPUT', content: 'Proceed' })
+  assert.equal(node.wokeUp, true)
+  assert.equal(node.promptPhase, 'foreground')
+  node.projector.bindToolCallIds(['call-denied'])
+  node.ingest({
+    step_index: 5,
+    type: 'PLANNER_RESPONSE',
+    status: 'DONE',
+    tool_calls: [{ id: 'call-denied', name: 'run_command', args: {} }],
+  })
+  assert.equal(node.promptPhase, 'foreground_active')
+  node.settleAbortedDenial(new Set(['call-denied']))
+  assert.equal(node.promptPhase, 'foreground_idle')
+  assert.equal(node.isWokenWorking(), false)
+  assert.equal(
+    node.isSettled({
+      ...inbox,
+      consumedNonUserCount: 1,
+    }),
+    true,
+  )
+})

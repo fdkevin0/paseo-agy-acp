@@ -173,7 +173,7 @@ export function toolDetail(
   const rawName = cleanToolName(explicitRawName ?? tool.title ?? '')
   // Legacy ACP titles use `Run <native identity>` when no raw name is sent.
   const legacyName = rawName.startsWith('Run ')
-    ? rawName.slice(4).toLowerCase()
+    ? cleanToolName(rawName.slice(4)).toLowerCase()
     : ''
   const name =
     explicitRawName === undefined && Object.hasOwn(nativeToolKinds, legacyName)

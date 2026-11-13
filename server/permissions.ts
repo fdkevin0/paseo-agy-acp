@@ -9,6 +9,7 @@ import {
   isAskQuestionName,
   record,
   str,
+  unwrapToolTitle,
 } from './common.ts'
 
 /** Validate the permission fields consumed by the bridge before creating pending work. */
@@ -78,9 +79,10 @@ export function permissionKind(
   detail: ProviderToolCallDetail,
 ): 'question' | 'mode' | 'plan' | 'tool' {
   const explicitRawName = str(record(request.toolCall).name)
-  const identity = cleanToolName(
-    explicitRawName ?? request.toolCall.title ?? '',
-  )
+  const identity =
+    explicitRawName !== undefined
+      ? cleanToolName(explicitRawName)
+      : unwrapToolTitle(request.toolCall.title ?? '')
   if (isChooserRequest(request.options) || isAskQuestionName(identity))
     return 'question'
   if (
