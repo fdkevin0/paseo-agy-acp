@@ -721,10 +721,12 @@ export class BrainNode {
   abortedByDenial = false
   /** Last step seen when a question was answered; agy's reply must come after it. */
   answeredQuestionStep = -1
+  initialReadDone = false
   lastStep?: Record<string, unknown>
   private retrySince?: number
   private retryError?: string
   private retryStep = -1
+  private retryObservedAt = new Map<number, number>()
   readonly nativeId: string
   readonly sessionId: string
   private onQuestionSettled?: (
@@ -773,6 +775,12 @@ export class BrainNode {
 
   get wokeUpSinceLastPrompt(): boolean {
     return this.promptPhase === 'woken'
+  }
+
+  pruneRetrySteps(stepIndices: ReadonlySet<number>) {
+    if (stepIndices.size === 0) return
+    for (const step of this.retryObservedAt.keys())
+      if (!stepIndices.has(step)) this.retryObservedAt.delete(step)
   }
 
   /** Forget the wakeup phase: a new USER_INPUT, a transcript rewrite or (for hasActiveBackgroundWork) a runtime restart. */
@@ -824,8 +832,13 @@ export class BrainNode {
   /** Fold one transcript row into wakeup phase, message accounting, projection and the last step. */
   ingest(
     row: Record<string, unknown>,
-    observedAt = Date.now(),
+    observedAt?: number,
   ): ProviderTimelineItem[] {
+    const now = Date.now()
+    const clampedObservedAt =
+      observedAt !== undefined && Number.isFinite(observedAt)
+        ? Math.min(now, observedAt)
+        : now
     this.questionSettled = false
     this.abortedByDenial = false
     if (row.type === 'USER_INPUT' || isRestartNotice(row))
@@ -852,9 +865,14 @@ export class BrainNode {
       const createdAt = Date.parse(String(row.created_at ?? ''))
       const step = Number(row.step_index)
       if (Number.isInteger(step) && step > this.retryStep) {
+        let firstObserved = this.retryObservedAt.get(step)
+        if (firstObserved === undefined) {
+          firstObserved = clampedObservedAt
+          this.retryObservedAt.set(step, firstObserved)
+        }
         this.retrySince = Number.isFinite(createdAt)
-          ? Math.min(createdAt, observedAt)
-          : observedAt
+          ? Math.min(createdAt, firstObserved)
+          : firstObserved
         this.retryStep = step
         this.retryError = stepErrorMessage(row)
       }

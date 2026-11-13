@@ -507,6 +507,7 @@ export class TranscriptReader {
     reset: boolean
     /** Complete replacement identities, separate from immediately deliverable records. */
     snapshotStepIndices?: ReadonlySet<number>
+    mtimeMs?: number
   }> {
     const previous = {
       identity: this.identity,
@@ -581,7 +582,11 @@ export class TranscriptReader {
             !(await this.matches(file, this.head, 0).catch(() => false))
           if (racedRewrite) {
             this.clearCursor()
-            return { rows: [], reset: true }
+            return {
+              rows: [],
+              reset: true,
+              mtimeMs: latestStat?.mtimeMs ?? stat.mtimeMs,
+            }
           }
         }
         throw error
@@ -597,7 +602,7 @@ export class TranscriptReader {
           ? this.snapshotStepIndices
           : undefined
       if (snapshotStepIndices) this.snapshotStepIndices = undefined
-      return { rows, reset, snapshotStepIndices }
+      return { rows, reset, snapshotStepIndices, mtimeMs: stat.mtimeMs }
     } finally {
       await file.close()
     }
