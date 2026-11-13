@@ -648,30 +648,6 @@ export function addStepUsage(
 }
 
 /** Combine ACP turn token counters with per-step context occupancy from transcript_full.jsonl when available. */
-function validCarriedWakeup(
-  raw: Record<string, unknown>,
-  carriedWakeup?: StepUsage,
-): StepUsage | undefined {
-  return carriedWakeup &&
-    nonnegative(raw.inputTokens) &&
-    raw.inputTokens >= carriedWakeup.inputTokens &&
-    nonnegative(raw.outputTokens) &&
-    raw.outputTokens >= carriedWakeup.outputTokens
-    ? carriedWakeup
-    : undefined
-}
-
-export function netPromptInputTokens(
-  usage?: Usage | null,
-  carriedWakeup?: StepUsage,
-): number | undefined {
-  if (!usage) return undefined
-  const raw = record(usage)
-  if (!nonnegative(raw.inputTokens)) return undefined
-  const carried = validCarriedWakeup(raw, carriedWakeup)
-  return Math.max(0, raw.inputTokens - (carried?.inputTokens ?? 0))
-}
-
 export function promptUsage(
   usage?: Usage | null,
   options?: {
@@ -685,7 +661,14 @@ export function promptUsage(
 ): ProviderUsage {
   if (!usage && !options?.lastStep && !options?.wakeup) return {}
   const raw = record(usage)
-  const carried = validCarriedWakeup(raw, options?.carriedWakeup)
+  const carried =
+    options?.carriedWakeup &&
+    nonnegative(raw.inputTokens) &&
+    raw.inputTokens >= options.carriedWakeup.inputTokens &&
+    nonnegative(raw.outputTokens) &&
+    raw.outputTokens >= options.carriedWakeup.outputTokens
+      ? options.carriedWakeup
+      : undefined
   const field = (
     rawVal: unknown,
     sub: number | undefined,

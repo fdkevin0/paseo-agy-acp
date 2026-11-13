@@ -892,18 +892,24 @@ export class BrainNode {
         if (this.promptPhase === 'foreground_idle')
           this.promptPhase = 'foreground_active'
       } else if (this.promptPhase !== 'foreground') {
-        // Foreground idle is not sticky: synchronous tool loops and inline-answered ask_question
-        // GENERIC(DONE) rows return to 'foreground_active' until an idle response or background handoff.
+        // Foreground idle is not sticky for active continuations: synchronous tool loops and
+        // inline-answered ask_question GENERIC(DONE) rows resume 'foreground_active', whereas
+        // orphan GENERIC(DONE) or CANCELED/INTERRUPTED rows must not block a subsequent wakeup.
         if (row.type === 'PLANNER_RESPONSE') {
           this.promptPhase = isCompletePlannerResponse(row)
             ? 'foreground_idle'
             : 'foreground_active'
         } else if (row.type === 'GENERIC') {
-          this.promptPhase =
-            runningStepStatuses.has(String(row.status)) &&
-            this.projector.hasBackground()
-              ? 'foreground_idle'
-              : 'foreground_active'
+          if (runningStepStatuses.has(String(row.status))) {
+            if (this.projector.hasBackground())
+              this.promptPhase = 'foreground_idle'
+          } else if (
+            items.length > 0 &&
+            row.status !== 'CANCELED' &&
+            row.status !== 'INTERRUPTED'
+          ) {
+            this.promptPhase = 'foreground_active'
+          }
         }
       }
     }

@@ -67,7 +67,6 @@ import {
   toolDetail,
   promptContent,
   contextUsage,
-  netPromptInputTokens,
   promptUsage,
   type SessionMetadata,
   type StepUsage,
@@ -1677,10 +1676,6 @@ async function promptSession(
           foregroundAcp: suppressedForeground
             ? []
             : [...session.state.turnForegroundAcp],
-          foregroundInputTokens: netPromptInputTokens(
-            result.usage,
-            session.state.wakeup.carriedUsage,
-          ),
           deniedToolCallIds: session.state.deniedToolCallIds,
           emitForeground: suppressedForeground,
           shouldEmitPreWakeupTool: (item) =>

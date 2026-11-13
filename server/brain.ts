@@ -285,34 +285,27 @@ type ForegroundReconcilePhase =
  */
 class ForegroundReconciler {
   private readonly foregroundAcp: readonly ForegroundAcpSegment[]
-  private readonly foregroundInputTokens: number | undefined
   private readonly emitForeground: boolean
   private phase: ForegroundReconcilePhase = 'foreground'
   private cursor: ForegroundCursor = { index: 0, offset: 0 }
-  private consumedInputTokens = 0
   private sawRetrySinceMatch = false
-  private sawCheckpointOrRetry = false
 
   constructor(
     foregroundAcp: readonly ForegroundAcpSegment[],
-    foregroundInputTokens: number | undefined,
     emitForeground: boolean,
   ) {
     this.foregroundAcp = foregroundAcp
-    this.foregroundInputTokens = foregroundInputTokens
     this.emitForeground = emitForeground
   }
 
-  get wokeUp(): boolean {
+  get postRpc(): boolean {
     return this.phase === 'post_rpc_wakeup'
   }
 
   reset(): void {
     this.phase = 'foreground'
     this.cursor = { index: 0, offset: 0 }
-    this.consumedInputTokens = 0
     this.sawRetrySinceMatch = false
-    this.sawCheckpointOrRetry = false
   }
 
   markPostRpcWakeup(): void {
@@ -320,12 +313,7 @@ class ForegroundReconciler {
   }
 
   observeRowMeta(row: Record<string, unknown>): void {
-    if (isRetryWarning(row)) {
-      this.sawRetrySinceMatch = true
-      this.sawCheckpointOrRetry = true
-    } else if (row.type === 'CHECKPOINT') {
-      this.sawCheckpointOrRetry = true
-    }
+    if (isRetryWarning(row)) this.sawRetrySinceMatch = true
   }
 
   /** Advance reconciliation state for one ingested row and return whether it belongs to post-RPC wakeup. */
@@ -333,21 +321,16 @@ class ForegroundReconciler {
     row: Record<string, unknown>,
     items: readonly ProviderTimelineItem[],
     nodeWokeUp: boolean,
-    usage: StepUsage | undefined,
   ): boolean {
     if (this.phase === 'post_rpc_wakeup') return true
     if (!nodeWokeUp) {
       this.phase = 'foreground'
       this.advanceForegroundMatchables(items)
-      this.recordDoneUsage(row, usage)
       return false
     }
     this.phase = 'reconciling_in_rpc'
     if (row.type !== 'PLANNER_RESPONSE') return false
-    if (this.isPlannerRowCoveredByAcp(items, usage)) {
-      this.recordDoneUsage(row, usage)
-      return false
-    }
+    if (this.isPlannerRowCoveredByAcp(items)) return false
     this.phase = 'post_rpc_wakeup'
     return true
   }
@@ -370,36 +353,13 @@ class ForegroundReconciler {
     }
   }
 
-  private recordDoneUsage(
-    row: Record<string, unknown>,
-    usage: StepUsage | undefined,
-  ): void {
-    if (usage && row.status === 'DONE')
-      this.consumedInputTokens += usage.inputTokens
-  }
-
-  private canCoverByInputTokens(usage: StepUsage | undefined): boolean {
-    // Checkpoints and retry warnings can inflate or reset step token counters relative to
-    // PromptResponse.usage, so disable token-budget coverage for silent steps once either appears.
-    return (
-      !this.sawCheckpointOrRetry &&
-      this.foregroundInputTokens !== undefined &&
-      usage !== undefined &&
-      this.consumedInputTokens + usage.inputTokens <= this.foregroundInputTokens
-    )
-  }
-
   private isPlannerRowCoveredByAcp(
     items: readonly ProviderTimelineItem[],
-    usage: StepUsage | undefined,
   ): boolean {
-    if (this.emitForeground) return this.canCoverByInputTokens(usage)
+    if (this.emitForeground) return false
     const matchable = items.filter(isMatchableForegroundItem)
     if (matchable.length === 0) {
-      return (
-        this.cursor.index < this.foregroundAcp.length ||
-        this.canCoverByInputTokens(usage)
-      )
+      return this.cursor.index < this.foregroundAcp.length
     }
     let next: ForegroundCursor | undefined = this.cursor
     for (let i = 0; i < matchable.length && next; i++) {
@@ -429,7 +389,6 @@ export async function settleBrainTurn(
     pollIntervalMs = 200,
     acpToolCallIds = [],
     foregroundAcp = [],
-    foregroundInputTokens,
     deniedToolCallIds,
     shouldEmitPreWakeupTool,
     emitForeground = false,
@@ -456,8 +415,6 @@ export async function settleBrainTurn(
     acpToolCallIds?: readonly string[]
     /** Ordered ACP output observed before session/prompt returned, used to detect in-RPC inbox continuations. */
     foregroundAcp?: readonly ForegroundAcpSegment[]
-    /** Net foreground input tokens reported by session/prompt result.usage (excluding prior carriedWakeup). */
-    foregroundInputTokens?: number
     deniedToolCallIds?: ReadonlySet<string>
     shouldEmitPreWakeupTool?: (
       item: Extract<ProviderTimelineItem, { type: 'tool_call' }>,
@@ -495,11 +452,7 @@ export async function settleBrainTurn(
   carriedWakeupUsage?: StepUsage
 }> {
   if (!sessionIdPattern.test(nativeId)) return { status: 'completed' }
-  const fgReconciler = new ForegroundReconciler(
-    foregroundAcp,
-    foregroundInputTokens,
-    emitForeground,
-  )
+  const fgReconciler = new ForegroundReconciler(foregroundAcp, emitForeground)
   const settledQuestions = new Map<
     string,
     { questions: readonly NormalizedQuestion[]; wokeUp: boolean }
@@ -511,7 +464,7 @@ export async function settleBrainTurn(
     sessionId,
     (questions, _wokeUp, key) => {
       if (!deliveredQuestions.has(key))
-        settledQuestions.set(key, { questions, wokeUp: fgReconciler.wokeUp })
+        settledQuestions.set(key, { questions, wokeUp: fgReconciler.postRpc })
     },
     observation?.reader,
   )
@@ -525,7 +478,7 @@ export async function settleBrainTurn(
       minStepIndex,
       {
         isCurrent: () => !signal?.aborted,
-        onUsage: (usage) => onUsage?.(usage, fgReconciler.wokeUp),
+        onUsage: (usage) => onUsage?.(usage, fgReconciler.postRpc),
         onItem,
       },
       pollIntervalMs,
@@ -592,13 +545,13 @@ export async function settleBrainTurn(
       seenSyntheticPrompt || unanchoredSynthetic
         ? !unanchoredSynthetic &&
           node.wokeUpSinceLastPrompt &&
-          fgReconciler.wokeUp
-        : fgReconciler.wokeUp
+          fgReconciler.postRpc
+        : fgReconciler.postRpc
     return {
       status,
       ...(error !== undefined ? { error } : {}),
       lastStepUsage: stream.usage.latest,
-      ...(fgReconciler.wokeUp ? { wokeUp: true as const } : {}),
+      ...(fgReconciler.postRpc ? { wokeUp: true as const } : {}),
       ...(pendingReplay ? { pendingReplay: true as const } : {}),
       ...(wakeupUsage ? { wakeupUsage } : {}),
       ...(carriedWakeupUsage ? { carriedWakeupUsage } : {}),
@@ -711,8 +664,8 @@ export async function settleBrainTurn(
       fgReconciler.observeRowMeta(row)
       const items = node.ingest(row)
       const usage = extractStepUsage(row)
-      const postRpcStep = fgReconciler.reconcile(row, items, node.wokeUp, usage)
-      stream.wokeUp ||= fgReconciler.wokeUp
+      const postRpcStep = fgReconciler.reconcile(row, items, node.wokeUp)
+      stream.wokeUp ||= fgReconciler.postRpc
       if (usage) {
         if (postRpcStep && row.status === 'DONE') {
           wakeupSteps.set(stepIndex, {
@@ -737,6 +690,8 @@ export async function settleBrainTurn(
             postRpcStep ||
             emitForeground ||
             item.type === 'error' ||
+            // SYSTEM_MESSAGE produces no ACP segment; emit unstreamed task-completion cards once
+            // via node.wokeUp while fgReconciler checks whether the next reply was streamed.
             (row.type === 'SYSTEM_MESSAGE' && node.wokeUp)
           ) {
             onItem(item, timestamp)
@@ -821,7 +776,7 @@ export async function settleBrainTurn(
           : onQuestion
             ? await onQuestion({
                 ...question,
-                wokeUp: fgReconciler.wokeUp,
+                wokeUp: fgReconciler.postRpc,
                 beginContinuation: (answerText) => {
                   beganContinuation = true
                   onItem(
@@ -863,7 +818,7 @@ export async function settleBrainTurn(
         }
         // Answered through elicitation/create: only surface the card where its tool call is shown.
         if (
-          fgReconciler.wokeUp ||
+          fgReconciler.postRpc ||
           emitForeground ||
           (completed.type === 'tool_call' &&
             shouldEmitPreWakeupTool?.(completed) !== false)
