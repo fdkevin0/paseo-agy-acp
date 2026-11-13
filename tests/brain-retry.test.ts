@@ -17,6 +17,7 @@ import {
   BrainTranscriptProjector,
 } from '../server/brain-projector.ts'
 import {
+  StepDedupe,
   isRetryWarning,
   RETRY_IDLE_TIMEOUT_MS,
   type InboxState,
@@ -130,6 +131,51 @@ test('retry classification accepts only observed system warning forms and explic
       error:
         'The stream was interrupted. Please continue the task you were working on.',
     },
+    {
+      step_index: 1,
+      source: 'SYSTEM',
+      type: 'ERROR_MESSAGE',
+      status: 'DONE',
+      content: null,
+      error:
+        'Your previous response contained an improperly formatted function call: Tool name must not be empty.\nRetries remaining: 3',
+    },
+    {
+      ...warning(1),
+      error:
+        'Your previous response contained an improperly formatted function call: invalid JSON arguments\nRetries remaining: 2',
+    },
+    {
+      ...warning(1),
+      error:
+        'Your previous response was blocked by content safety filters:\r\nRetries remaining: 1',
+    },
+    {
+      ...warning(1),
+      source: null,
+      error:
+        'Your previous response was blocked by content safety filters\nPlease provide a response that complies with content safety guidelines.\nRetries remaining: 2',
+    },
+    {
+      ...warning(1),
+      error:
+        'Your previous response was cut off because it exceeded the output token limit\nPlease continue.\nRetries remaining: 2',
+    },
+    {
+      ...warning(1),
+      error:
+        'Your previous response encountered a generation error\nPlease try again.\nRetries remaining: 1',
+    },
+    {
+      ...warning(1),
+      error:
+        'There was a problem. \nError Message: invalid tool arguments \nRetries remaining: 2',
+    },
+    {
+      ...warning(1),
+      error:
+        'There was a problem parsing the tool call. \nError Message: unexpected EOF \nGuidance: check JSON syntax \nRetries remaining: 1',
+    },
   ]
   for (const row of positives) {
     assert.equal(isRetryWarning(row), true)
@@ -154,6 +200,21 @@ test('retry classification accepts only observed system warning forms and explic
       error: 'model output error: generic::unavailable: please try again',
     },
     { ...warning(1), error: 'request failed: connection reset' },
+    {
+      ...warning(1),
+      error:
+        'Your previous response contained an improperly formatted function call: invalid JSON\nRetries remaining: 0',
+    },
+    {
+      ...warning(1),
+      error:
+        'Your previous response contained an improperly formatted function call: invalid JSON\nRetries remaining: 2 extra',
+    },
+    {
+      ...warning(1),
+      error:
+        'Quoted: Your previous response was blocked by content safety filters:\nRetries remaining: 2',
+    },
   ]
   for (const row of negatives) {
     assert.equal(isRetryWarning(row), false)
@@ -711,4 +772,30 @@ test('settleChildren handles ENOENT -> appeared and torn initial reads without p
     handle?.()
     await rm(root, { recursive: true, force: true })
   }
+})
+
+test('StepDedupe.fresh re-delivers steps when error or source mutates in place', () => {
+  const dedupe = new StepDedupe()
+  const base = {
+    step_index: 4,
+    source: 'SYSTEM',
+    type: 'ERROR_MESSAGE',
+    status: 'DONE',
+    content: null,
+    error:
+      'Your previous response contained an improperly formatted function call: Tool name must not be empty.\nRetries remaining: 3',
+  }
+  assert.equal(dedupe.fresh(base), true)
+  assert.equal(dedupe.fresh({ ...base }), false)
+  assert.equal(
+    dedupe.fresh({ ...base, error: 'Fatal terminal error' }),
+    true,
+    'mutating row.error on O_TRUNC with content: null must re-deliver the step',
+  )
+  assert.equal(dedupe.fresh({ ...base, error: 'Fatal terminal error' }), false)
+  assert.equal(
+    dedupe.fresh({ ...base, source: 'MODEL', error: 'Fatal terminal error' }),
+    true,
+    'mutating row.source must re-deliver the step',
+  )
 })
