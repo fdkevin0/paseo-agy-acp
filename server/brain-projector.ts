@@ -806,10 +806,16 @@ export class BrainNode {
   abortedByDenial = false
   /** Last step seen when a question was answered; agy's reply must come after it. */
   answeredQuestionStep = -1
+  initialReadDone = false
   lastStep?: Record<string, unknown>
   private retrySince?: number
   private retryError?: string
   private retryStep = -1
+  // Keyed by step index + error message so O_TRUNC replays keep the original deadline while in-place mutations refresh it.
+  private retryObservedAt = new Map<
+    number,
+    { error: string | undefined; observedAt: number }
+  >()
   private allowInitialSpawnPrompt: boolean
   readonly nativeId: string
   readonly sessionId: string
@@ -847,6 +853,7 @@ export class BrainNode {
     this.consumedMessages = 0
     this.turnStartStep = -1
     this.lastStep = undefined
+    // Intentionally retain retryObservedAt across O_TRUNC resets; only pruneRetrySteps releases deleted steps.
     this.resetPhase()
   }
 
@@ -858,6 +865,12 @@ export class BrainNode {
 
   get wokeUpSinceLastPrompt(): boolean {
     return this.promptPhase === 'woken'
+  }
+
+  pruneRetrySteps(stepIndices: ReadonlySet<number>) {
+    if (stepIndices.size === 0) return
+    for (const step of this.retryObservedAt.keys())
+      if (!stepIndices.has(step)) this.retryObservedAt.delete(step)
   }
 
   /** Forget the wakeup phase: a new USER_INPUT, a transcript rewrite or (for hasActiveBackgroundWork) a runtime restart. */
@@ -918,8 +931,14 @@ export class BrainNode {
   /** Fold one transcript row into wakeup phase, message accounting, projection and the last step. */
   ingest(
     row: Record<string, unknown>,
-    observedAt = Date.now(),
+    observedAt?: number,
   ): ProviderTimelineItem[] {
+    const now = Date.now()
+    // Clamp file mtimeMs to Date.now() so future filesystem clock skew cannot extend the 15-minute deadline.
+    const clampedObservedAt =
+      observedAt !== undefined && Number.isFinite(observedAt)
+        ? Math.min(now, observedAt)
+        : now
     this.questionSettled = false
     this.abortedByDenial = false
     const continuingQuestion = this.isQuestionContinuationInput(row)
@@ -948,11 +967,17 @@ export class BrainNode {
       const createdAt = Date.parse(String(row.created_at ?? ''))
       const step = Number(row.step_index)
       if (Number.isInteger(step) && step > this.retryStep) {
+        const error = stepErrorMessage(row)
+        let entry = this.retryObservedAt.get(step)
+        if (!entry || entry.error !== error) {
+          entry = { error, observedAt: clampedObservedAt }
+          this.retryObservedAt.set(step, entry)
+        }
         this.retrySince = Number.isFinite(createdAt)
-          ? Math.min(createdAt, observedAt)
-          : observedAt
+          ? Math.min(createdAt, entry.observedAt)
+          : entry.observedAt
         this.retryStep = step
-        this.retryError = stepErrorMessage(row)
+        this.retryError = error
       }
     } else if (
       row.type === 'ERROR_MESSAGE' ||
