@@ -983,7 +983,7 @@ export function watchBrain(
       for (const row of rows) {
         if (stopped) return
         const stepIndex = Number(row.step_index)
-        // A rewrite re-delivers earlier steps; StepDedupe.fresh hashes type/status/content/thinking/tool_calls.
+        // A rewrite re-delivers earlier steps; StepDedupe.fresh hashes type/source/status/content/thinking/tool_calls/error.
         const replayed =
           !dedupe.fresh(row) ||
           (resume !== undefined && stepIndex <= resume.afterStep)
