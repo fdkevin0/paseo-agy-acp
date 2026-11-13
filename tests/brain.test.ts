@@ -6108,3 +6108,54 @@ test('initial spawn prompt quoting task results or batched with a followup messa
   // Root countRowMessages(row, false) counts step-0 UUID wakeup without subtracting 1.
   assert.equal(countRowMessages(message(0, child, 'root wakeup'), false), 1)
 })
+
+test('same-turn second parent wakeup preserves the child terminal failure', async () => {
+  const f = await fixture()
+  let handle: BrainWatchHandle | undefined
+  try {
+    await f.put(parent, [
+      { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
+      done(1),
+      { step_index: 2, type: 'USER_INPUT', content: 'turn 2' },
+      ...report(child, 'first wake', 3),
+      ...report(child, 'second wake', 6),
+    ])
+    await f.deliver(child, parent, 'init', true, 'init', {
+      conversationId: parent,
+      stepIndex: 0,
+      name: 'invoke_subagent',
+      callId: 'spawn',
+    })
+    for (const [id, stepIndex] of [
+      ['first', 4],
+      ['second', 7],
+    ] as const)
+      await f.deliver(child, parent, id, true, id, {
+        conversationId: parent,
+        stepIndex,
+        name: 'send_message',
+        callId: id,
+      })
+    await f.put(child, [
+      message(0, parent, 'init'),
+      done(1),
+      message(2, parent, 'first'),
+      { step_index: 3, type: 'ERROR_MESSAGE', content: 'same-turn fatal' },
+      message(4, parent, 'second'),
+    ])
+    const events: ProviderEvent[] = []
+    handle = watchBrain(f.root, child, 'child', (e) => events.push(e), 50)
+    await handle.ready
+    assert.ok(
+      events.some(
+        (e) =>
+          e.type === 'session.turn' &&
+          e.state === 'failed' &&
+          e.error?.message === 'same-turn fatal',
+      ),
+    )
+  } finally {
+    handle?.()
+    await f.close()
+  }
+})

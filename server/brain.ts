@@ -1146,6 +1146,11 @@ export function watchBrain(
         isNativeToolName(m.tool?.name ?? '', 'invoke_subagent'),
       )
       const parentId = init?.tool?.conversationId
+      const {
+        messages: parentWakeupMsgs,
+        tagged,
+        allTagged,
+      } = selectParentWakeups(inbox, parentId)
       node.projector.observeRows(rows)
       for (const row of rows) {
         if (stopped) return
@@ -1156,10 +1161,10 @@ export function watchBrain(
           (resume !== undefined && stepIndex <= resume.afterStep)
         if (Number.isInteger(stepIndex) && stepIndex > lastStepIndex)
           lastStepIndex = stepIndex
-        // If the child's prior turn ended in ERROR_MESSAGE or retry timeout and a new parent
-        // wakeup SYSTEM_MESSAGE arrives before or across poll boundaries, advance turnFloor past the failed step.
-        // Exclude grandchild reports and task notifications so they never erase a child's failure.
+        // Tagged wakeups use the canonical parent-turn boundary below; a second send in
+        // the same turn must never move the floor past that turn's terminal error.
         if (
+          !allTagged &&
           node.failure(retryTimeoutMs) !== undefined &&
           row.type === 'SYSTEM_MESSAGE' &&
           !isRestartNotice(row) &&
@@ -1210,11 +1215,6 @@ export function watchBrain(
         }
       }
       childUsage.observe({ rows, reset, snapshotStepIndices })
-      const {
-        messages: parentWakeupMsgs,
-        tagged,
-        allTagged,
-      } = selectParentWakeups(inbox, parentId)
       const wakeupSteps = parentId ? node.wakeupStepsFrom(parentId) : []
       let awaitingCrossTurnEntry = false
       if (
