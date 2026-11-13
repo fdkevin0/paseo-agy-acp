@@ -2481,7 +2481,13 @@ test(
         },
         { step_index: 4, type: 'USER_INPUT', content: 'Proceed?: Yes' },
       ])
-      await delay(150)
+      for (let i = 0; i < 100 && session.state.lastKnownStepIndex < 4; i++) {
+        await delay(20)
+      }
+      assert.ok(
+        session.state.lastKnownStepIndex >= 4,
+        'continuation USER_INPUT step 4 must be consumed before cancel',
+      )
       await session.transport.rpc.cancel({
         sessionId: session.state.nativeId,
       })
