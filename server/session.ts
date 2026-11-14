@@ -496,6 +496,7 @@ async function createSession(
     getNativeId: () => state.nativeId,
     isParentTurnActive: () => state.turnRunning,
     isLoading: () => state.loading,
+    isSuppressingReplay: () => state.loading && !state.replay,
     isUnavailable: () => state.closing || state.failed,
     retryTimeoutMs: options.retryTimeoutMs,
   })
@@ -611,19 +612,24 @@ async function createSession(
   function emitItem(item: ProviderTimelineItem, timestamp?: string) {
     if (state.silenced) return
     timeline.track(item)
-    publishItem(item, timestamp)
+    subagents.linkSubsession(id, state.nativeId, item)
+    emit({
+      type: 'timeline.item',
+      sessionId: id,
+      item,
+      ...(timestamp ? { timestamp } : {}),
+    })
   }
   /** Link child sessions and publish an item the timeline already tracks. */
   function publishItem(item: ProviderTimelineItem, timestamp?: string) {
-    if (state.silenced) return
+    if (state.silenced || (state.loading && !state.replay)) return
     subagents.linkSubsession(id, state.nativeId, item)
-    if (state.replay)
-      emit({
-        type: 'timeline.item',
-        sessionId: id,
-        item,
-        ...(timestamp ? { timestamp } : {}),
-      })
+    emit({
+      type: 'timeline.item',
+      sessionId: id,
+      item,
+      ...(timestamp ? { timestamp } : {}),
+    })
   }
   async function update(notification: SessionNotification) {
     if (state.closing || state.failed) return
@@ -752,7 +758,8 @@ async function createSession(
           delete item.detail.childSessionId
           await subagents.refreshSubagents()
           // Do not restore a native ID that a later terminalization could publish.
-          if (state.closing || state.failed) return
+          if (state.closing || state.failed || (state.loading && !state.replay))
+            return
           if (nativeId !== undefined) item.detail.childSessionId = nativeId
         }
         if (
@@ -1164,67 +1171,14 @@ async function createSession(
         if (restoreMode && !state.closing && !state.failed) publishConfig()
       }
     }
-    async function doRelaunch(
-      skipPermissions: boolean,
-      force = false,
-    ): Promise<void> {
+    async function replaceRuntime(opts: {
+      skipPermissions: boolean
+      sendCancel: boolean
+      backgroundReload: boolean
+    }): Promise<void> {
       if (state.closing) return
       if (state.failed) throw runtimeExitedError()
-      if (
-        !force &&
-        (state.skipPermissions === skipPermissions || !canReloadSession())
-      )
-        return
-      const prev = configState(state.metadata)
-      const prevModels = state.metadata.models
-      const nativeMode = configState({
-        ...state.metadata,
-        fullAccess: false,
-      }).mode
-      state.observation?.stop()
-      state.loading = true
-      state.replay = false
-      const obsolete = currentTransport
-      retiring.add(obsolete)
-      let handedToReload = false
-      try {
-        await cancelAllSubagentsBounded(150)
-        await obsolete.close()
-        if (state.closing) return
-        if (currentTransport !== obsolete)
-          throw new Error('ACP runtime superseded during relaunch')
-        if (state.failed) throw runtimeExitedError()
-        if (!canReloadSession())
-          throw new Error(
-            'agy cannot reload after interruption; reopen the session',
-          )
-        const next = startRuntime(skipPermissions)
-        currentTransport = next
-        handedToReload = true
-        await reloadIntoRuntime(
-          next,
-          skipPermissions,
-          force,
-          prev,
-          prevModels,
-          nativeMode,
-        )
-      } catch (error) {
-        if (!handedToReload && !state.closing) {
-          onExit(error instanceof Error ? error : new Error(String(error)))
-        }
-        throw error
-      } finally {
-        if (!handedToReload) {
-          state.loading = false
-          state.replay = true
-        }
-      }
-    }
-    async function retireAndRecover(sendCancel: boolean): Promise<void> {
-      if (state.closing) return
-      if (state.failed) throw runtimeExitedError()
-      const skipPermissions = Boolean(state.metadata.fullAccess)
+      const { skipPermissions, sendCancel, backgroundReload } = opts
       const prev = configState(state.metadata)
       const prevModels = state.metadata.models
       const nativeMode = configState({
@@ -1250,14 +1204,16 @@ async function createSession(
         try {
           await obsolete.close()
         } catch (error) {
-          if (!state.closing) {
+          if (state.closing) return
+          if (currentTransport === obsolete) {
             onExit(error instanceof Error ? error : new Error(String(error)))
-            throw error
           }
-          return
+          throw error
         }
         clearWakeupAndTurnState()
         if (state.closing) return
+        if (currentTransport !== obsolete)
+          throw new Error('ACP runtime superseded during relaunch')
         if (state.failed) throw runtimeExitedError()
         if (!canReloadSession()) {
           const error = new Error(
@@ -1269,31 +1225,54 @@ async function createSession(
         const next = startRuntime(skipPermissions)
         currentTransport = next
         handedToReload = true
-        void runControl(() =>
-          reloadIntoRuntime(
+        if (backgroundReload) {
+          void runControl(() =>
+            reloadIntoRuntime(
+              next,
+              skipPermissions,
+              true,
+              prev,
+              prevModels,
+              nativeMode,
+            ),
+          ).catch(() => undefined)
+        } else {
+          await reloadIntoRuntime(
             next,
             skipPermissions,
-            true,
+            false,
             prev,
             prevModels,
             nativeMode,
-          ),
-        ).catch(() => undefined)
+          )
+        }
+      } catch (error) {
+        if (
+          !handedToReload &&
+          !state.closing &&
+          currentTransport === obsolete
+        ) {
+          onExit(error instanceof Error ? error : new Error(String(error)))
+        }
+        throw error
       } finally {
-        if (!handedToReload) {
+        if (!handedToReload && currentTransport === obsolete) {
           state.loading = false
           state.replay = true
         }
       }
     }
-    function runRetireAndRecover(sendCancel: boolean): Promise<void> {
-      if (state.interrupting) return state.interrupting
-      const task = (async () => {
-        await retireAndRecover(sendCancel)
-      })()
-      state.interrupting = task
-      return task.finally(() => {
-        if (state.interrupting === task) state.interrupting = null
+    async function relaunchForPermissions(
+      skipPermissions: boolean,
+    ): Promise<void> {
+      if (state.closing) return
+      if (state.failed) throw runtimeExitedError()
+      if (state.skipPermissions === skipPermissions || !canReloadSession())
+        return
+      await replaceRuntime({
+        skipPermissions,
+        sendCancel: false,
+        backgroundReload: false,
       })
     }
     return {
@@ -1480,7 +1459,11 @@ async function createSession(
           if (state.closing) return
           if (state.failed) throw runtimeExitedError()
           if (needsRelaunch) {
-            await retireAndRecover(true)
+            await replaceRuntime({
+              skipPermissions: Boolean(state.metadata.fullAccess),
+              sendCancel: true,
+              backgroundReload: true,
+            })
             return
           }
           if (state.loading || controlActive > 0) return
@@ -1501,7 +1484,11 @@ async function createSession(
           } catch {
             if (state.closing) return
             if (state.failed) throw runtimeExitedError()
-            await retireAndRecover(false)
+            await replaceRuntime({
+              skipPermissions: Boolean(state.metadata.fullAccess),
+              sendCancel: false,
+              backgroundReload: true,
+            })
           }
         })()
         try {
@@ -1510,12 +1497,7 @@ async function createSession(
           state.interrupting = null
         }
       },
-      runRetireAndRecover,
-      relaunchDirect: (skipPermissions: boolean) =>
-        doRelaunch(skipPermissions, false),
-      relaunch(skipPermissions: boolean, force = false): Promise<void> {
-        return runControl(() => doRelaunch(skipPermissions, force))
-      },
+      relaunchForPermissions,
       close(): Promise<void> {
         if (closing) return closing
         state.closing = true
@@ -1661,7 +1643,7 @@ async function configureSession(
       )
         continue
       if (key === 'mode' && value === FULL_ACCESS_MODE_ID) {
-        await session.relaunchDirect(true)
+        await session.relaunchForPermissions(true)
         if (session.state.closing) throw new Error('Session is closing')
         if (session.state.failed)
           throw sessionRuntimeExitedError(session.state.failureError)
@@ -1684,7 +1666,7 @@ async function configureSession(
         continue
       }
       if (key === 'mode') {
-        await session.relaunchDirect(false)
+        await session.relaunchForPermissions(false)
         if (session.state.closing) throw new Error('Session is closing')
         if (session.state.failed)
           throw sessionRuntimeExitedError(session.state.failureError)
@@ -1871,12 +1853,20 @@ async function promptSession(
   const stopObservation = () => observation?.stop()
   turnAbort.signal.addEventListener('abort', stopObservation, { once: true })
   const waitPrompt = async (
-    operation: ReturnType<typeof session.transport.rpc.prompt>,
+    sendPrompt: () => ReturnType<typeof session.transport.rpc.prompt>,
   ) => {
+    turnAbort.signal.throwIfAborted()
     const transport = session.transport
-    const outcome = operation.then(
-      (value) => ({ ok: true as const, value }),
-      (error) => ({ ok: false as const, error }),
+    let settledOutcome:
+      | {
+          ok: true
+          value: Awaited<ReturnType<typeof session.transport.rpc.prompt>>
+        }
+      | { ok: false; error: unknown }
+      | null = null
+    const outcome = sendPrompt().then(
+      (value) => (settledOutcome = { ok: true as const, value }),
+      (error) => (settledOutcome = { ok: false as const, error }),
     )
     const promptEntry = {
       transport,
@@ -1895,7 +1885,7 @@ async function promptSession(
         if (session.state.closing) throw turnAbort.signal.reason
         await session.state.interrupting
         if (session.state.closing) throw turnAbort.signal.reason
-        result = await Promise.race([outcome, Promise.resolve(null)])
+        result = settledOutcome
         if (!result) {
           if (session.state.failed)
             throw (
@@ -1906,21 +1896,7 @@ async function promptSession(
             turnAbort.signal.throwIfAborted()
             throw new Error('ACP runtime closed during prompt')
           }
-          // Cancel is a notification. Bound direct-abort convergence with a 500 ms window instead of blocking on shutdown.
-          try {
-            result = await transport.request(outcome, {
-              timeoutMs: 500,
-              fatalOnTimeout: false,
-            })
-          } catch (error) {
-            if (
-              !session.state.closing &&
-              !session.state.failed &&
-              session.transport === transport
-            )
-              await session.runRetireAndRecover(false)
-            throw error
-          }
+          result = await outcome
         }
       }
       if (!result.ok) throw result.error
@@ -2019,7 +1995,7 @@ async function promptSession(
     )
     session.state.observation = observation
     observation.start()
-    const result = await waitPrompt(
+    const result = await waitPrompt(() =>
       session.transport.rpc.prompt({
         sessionId: session.state.nativeId,
         prompt: blocks,
@@ -2153,7 +2129,7 @@ async function promptSession(
               observation.wokeUp = true
             }
             try {
-              const contResult = await waitPrompt(
+              const contResult = await waitPrompt(() =>
                 session.transport.rpc.prompt({
                   sessionId: session.state.nativeId,
                   prompt: [{ type: 'text', text: answerText }],

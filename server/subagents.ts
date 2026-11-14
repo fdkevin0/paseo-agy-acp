@@ -22,6 +22,7 @@ export interface SubagentRegistryOptions {
   getNativeId: () => string
   isParentTurnActive: () => boolean
   isLoading: () => boolean
+  isSuppressingReplay?: () => boolean
   isUnavailable: () => boolean
   retryTimeoutMs?: number
 }
@@ -256,7 +257,12 @@ export class SubagentRegistry {
     parentNativeId: string,
     item: ProviderTimelineItem,
   ): void {
-    if (this.cancelingAll) return
+    if (this.cancelingAll || this.opts.isSuppressingReplay?.()) {
+      if (item.type === 'tool_call' && item.detail.type === 'sub_agent') {
+        delete item.detail.childSessionId
+      }
+      return
+    }
     if (item.type === 'tool_call' && item.detail.type === 'sub_agent') {
       const nativeId = item.detail.childSessionId
       delete item.detail.childSessionId
