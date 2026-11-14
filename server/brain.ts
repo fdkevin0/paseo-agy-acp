@@ -51,16 +51,38 @@ export {
   type SubagentRecord,
 }
 
+function filterInbox(
+  inbox: InboxState,
+  ignoredMessageIds?: ReadonlySet<string>,
+): InboxState {
+  if (!ignoredMessageIds?.size) return inbox
+  return {
+    ...inbox,
+    unconsumedHighPriority: inbox.unconsumedHighPriority.filter(
+      (message) => !ignoredMessageIds.has(message.id),
+    ),
+  }
+}
+
 /** Determine whether the session has running background tasks or active subagents. Standing IsDaemon schedules are excluded by default so foreground interrupts do not kill them, and included when checking whether an idle runtime can stop. */
 export async function hasActiveBackgroundWork(
   root: string,
   nativeId: string,
-  options: { includeDaemons?: boolean; retryTimeoutMs?: number } = {},
+  options: {
+    includeDaemons?: boolean
+    retryTimeoutMs?: number
+    /** Ignore transcript work and daemons at or before this parent step from a killed/restarted ACP process. */
+    afterStepIndex?: number
+    /** Ignore orphaned unread wakeup messages present before the current ACP runtime started. */
+    ignoredMessageIds?: ReadonlySet<string>
+  } = {},
   visiting = new Set<string>(),
   isChild = false,
 ): Promise<boolean> {
   if (!sessionIdPattern.test(nativeId) || visiting.has(nativeId)) return false
   visiting.add(nativeId)
+  const afterStepIndex = isChild ? undefined : options.afterStepIndex
+  const ignoredMessageIds = isChild ? undefined : options.ignoredMessageIds
   try {
     const node = new BrainNode(nativeId, nativeId, {
       allowInitialSpawnPrompt: isChild,
@@ -74,13 +96,28 @@ export async function hasActiveBackgroundWork(
       }),
     ])
     if (isChild && rows.length === 0) return true
-    node.projector.observeRows(rows)
+    const effectiveInbox = filterInbox(inbox, ignoredMessageIds)
+    node.projector.observeRows(rows, afterStepIndex)
+    const restartAt =
+      afterStepIndex !== undefined && afterStepIndex >= 0
+        ? afterStepIndex
+        : undefined
+    let crossedRestart = restartAt === undefined
     for (const row of rows) {
+      if (
+        !crossedRestart &&
+        Number.isInteger(row.step_index) &&
+        Number(row.step_index) > restartAt!
+      ) {
+        crossedRestart = true
+        node.applyRestartBoundary(restartAt!)
+      }
       // The restarted runtime left no woken turn running.
       if (isRestartNotice(row)) node.resetPhase()
       node.ingest(row, mtimeMs)
     }
-    if (inbox.unconsumedHighPriority.length > 0) return true
+    if (!crossedRestart) node.applyRestartBoundary(restartAt!)
+    if (effectiveInbox.unconsumedHighPriority.length > 0) return true
     if (
       node.projector.hasBackground() ||
       (options.includeDaemons && node.projector.hasDaemons())
@@ -91,9 +128,10 @@ export async function hasActiveBackgroundWork(
       if (node.retryPending()) return true
       if (
         isChild
-          ? node.hasUnprocessedMessages(inbox) || !node.isSettled(inbox)
+          ? node.hasUnprocessedMessages(effectiveInbox) ||
+            !node.isSettled(effectiveInbox)
           : (node.foregroundIdleReached &&
-              node.hasUnprocessedMessages(inbox)) ||
+              node.hasUnprocessedMessages(effectiveInbox)) ||
             node.isWokenWorking()
       )
         return true
@@ -410,6 +448,7 @@ export async function settleBrainTurn(
     onUsage,
     onWakeupState,
     isRpcActive,
+    ignoredMessageIds,
   }: {
     observation?: BrainTurnObservation
     onUsage?: (usage: StepUsage, wokeUp: boolean) => void
@@ -420,6 +459,7 @@ export async function settleBrainTurn(
       pendingReplay?: boolean
     }) => void
     isRpcActive?: () => boolean
+    ignoredMessageIds?: ReadonlySet<string>
     onSubagents?: (subagents: readonly SubagentRecord[]) => void
     signal?: AbortSignal
     minStepIndex?: number
@@ -620,7 +660,7 @@ export async function settleBrainTurn(
     if (!stream.acceptsRows() || signal?.aborted) return
     const metadata = await node.pollMetadata(root)
     if (!stream.acceptsRows() || signal?.aborted) return
-    inbox = metadata.inbox
+    inbox = filterInbox(metadata.inbox, ignoredMessageIds)
     subagents = metadata.subagents
     onSubagents?.(subagents)
     const nextFingerprint = `${inbox.messages.length}:${inbox.readIds.size}:${subagents
@@ -913,7 +953,14 @@ export async function settleBrainTurn(
         }
       if (childStatus.settled && node.isSettled(inbox)) {
         if (activeChildIds.length > 0) {
-          if (node.hasUnprocessedMessages(await readInboxState(root, nativeId)))
+          if (
+            node.hasUnprocessedMessages(
+              filterInbox(
+                await readInboxState(root, nativeId),
+                ignoredMessageIds,
+              ),
+            )
+          )
             continue
         }
         if (checkedVersion !== foldVersion) continue

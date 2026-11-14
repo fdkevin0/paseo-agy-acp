@@ -2,9 +2,11 @@ import { AgentSideConnection, ndJsonStream } from '@agentclientprotocol/sdk'
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Readable, Writable } from 'node:stream'
+import { setTimeout as delay } from 'node:timers/promises'
 
 const nativeId = '33333333-3333-4333-8333-333333333333'
 const home = process.env.HOME!
+const loadDelayMs = Number(process.env.AGY_LOAD_DELAY_MS ?? '40')
 const fullAccess = process.argv.includes('--dangerously-skip-permissions')
 const log = (event: string, data: object = {}) =>
   appendFileSync(
@@ -37,8 +39,15 @@ const rows = (value: object[], append = true) => {
 }
 log('start', { fullAccess })
 process.stdin.on('end', () => {
-  log('exit')
-  process.exit(0)
+  log('stdin-ended')
+  // Keep a real retiring process available while another provider request arrives.
+  setTimeout(
+    () => {
+      log('exit')
+      process.exit(0)
+    },
+    Number(process.env.AGY_EXIT_DELAY_MS ?? '0'),
+  )
 })
 new AgentSideConnection(
   (client) => {
@@ -77,11 +86,35 @@ new AgentSideConnection(
           sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: 'HISTORY_REPLAY' },
         })
-        await new Promise((resolve) => setTimeout(resolve, 40))
+        await delay(loadDelayMs)
+        if (process.env.AGY_LOAD_WAKEUP) {
+          const messages = join(directory, '../messages')
+          mkdirSync(messages, { recursive: true })
+          writeFileSync(
+            join(messages, 'fresh.json'),
+            JSON.stringify({ id: 'fresh', sender: 'task-new' }),
+          )
+          writeFileSync(
+            join(messages, 'read.json'),
+            JSON.stringify({ fresh: true }),
+          )
+          rows([
+            {
+              step_index: 4,
+              type: 'SYSTEM_MESSAGE',
+              content: '[Message] sender=task-new content=fresh wakeup',
+            },
+            { step_index: 5, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+          ])
+        }
+        log('loaded')
         commands()
         return { configOptions }
       },
       async setSessionConfigOption(params) {
+        log('configure', { configId: params.configId, value: params.value })
+        // Integration coverage needs a real cross-process RPC window.
+        await delay(Number(process.env.AGY_CONFIG_DELAY_MS ?? '0'))
         if (typeof params.value !== 'string')
           throw new Error('Expected select option')
         configOptions.find(

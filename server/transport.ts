@@ -17,22 +17,28 @@ import type { ProviderLaunch } from '@getpaseo/plugin/server/provider'
 
 const execFileAsync = promisify(execFile)
 
-async function listProcesses(): Promise<number[][]> {
-  const options = { encoding: 'utf8' as const, timeout: 1000 }
+async function listProcesses(signal: AbortSignal): Promise<number[][]> {
+  const options = { encoding: 'utf8' as const, timeout: 1000, signal }
   // procps/BSD accept -A; BusyBox lists every process by default and rejects -A.
   const { stdout } = await execFileAsync(
     'ps',
     ['-A', '-o', 'pid=,ppid=,pgid='],
     options,
-  ).catch(() => execFileAsync('ps', ['-o', 'pid,ppid,pgid'], options))
+  ).catch(() => {
+    signal.throwIfAborted()
+    return execFileAsync('ps', ['-o', 'pid,ppid,pgid'], options)
+  })
   return stdout
     .split('\n')
     .map((line) => line.trim().split(/\s+/).map(Number))
     .filter((row) => row.length === 3 && row.every(Number.isInteger))
 }
 
-async function ownedProcessGroups(pid: number): Promise<Set<number>> {
-  const processes = await listProcesses()
+async function ownedProcessGroups(
+  pid: number,
+  signal: AbortSignal,
+): Promise<Set<number>> {
+  const processes = await listProcesses(signal)
   const owned = new Set([pid])
   let previousSize = 0
   while (previousSize !== owned.size) {
@@ -56,8 +62,8 @@ function killGroup(group: number) {
 }
 
 const SHUTDOWN_GRACE_MS = 500
-const SIGKILL_TIMEOUT_MS = 2000
-const TERMINATION_DEADLINE_MS = 2500
+const SIGKILL_TIMEOUT_MS = 1000
+const TERMINATION_DEADLINE_MS = 1400
 const ACP_REQUEST_TIMEOUT_MS = 30_000
 const STDERR_DRAIN_MS = 50
 
@@ -233,18 +239,20 @@ export function connectAcp(
     if (closing) return closing
     stopping = true
     closing = (async () => {
+      const discovery = new AbortController()
       const groups = new Set<number>()
       // Best effort: without a usable `ps`, still stop agy's own process group.
       const collectGroups = async () => {
         if (process.platform === 'win32' || !child.pid) return
         groups.add(child.pid)
-        const owned = await ownedProcessGroups(child.pid).catch(
-          () => new Set<number>(),
-        )
+        discovery.signal.throwIfAborted()
+        const owned = await ownedProcessGroups(
+          child.pid,
+          discovery.signal,
+        ).catch(() => new Set<number>())
+        discovery.signal.throwIfAborted()
         for (const group of owned) groups.add(group)
       }
-      await collectGroups()
-      child.stdin.end()
       const stop = async () => {
         if (process.platform === 'win32') await terminateProcess(child)
         else {
@@ -256,21 +264,27 @@ export function connectAcp(
         void stop().catch(() => undefined)
       }, SHUTDOWN_GRACE_MS)
       const force = setTimeout(() => child.kill('SIGKILL'), SIGKILL_TIMEOUT_MS)
-      let deadline: NodeJS.Timeout | undefined
+      let deadlineTimer: NodeJS.Timeout | undefined
+      const deadline = new Promise<never>((_, reject) => {
+        deadlineTimer = setTimeout(
+          () => reject(new Error('agy did not exit after termination')),
+          TERMINATION_DEADLINE_MS,
+        )
+      })
       try {
         await Promise.race([
-          exited,
-          new Promise<never>((_, reject) => {
-            deadline = setTimeout(
-              () => reject(new Error('agy did not exit after termination')),
-              TERMINATION_DEADLINE_MS,
-            )
-          }),
+          (async () => {
+            await collectGroups()
+            child.stdin.end()
+            await exited
+          })(),
+          deadline,
         ])
       } finally {
+        discovery.abort()
         clearTimeout(timer)
         clearTimeout(force)
-        clearTimeout(deadline)
+        clearTimeout(deadlineTimer)
         child.stdin.destroy()
         child.stdout.destroy()
         child.stderr.destroy()

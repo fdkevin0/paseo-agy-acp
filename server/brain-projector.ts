@@ -201,11 +201,21 @@ export class BrainTranscriptProjector {
    */
   observeRows(
     rows: readonly Record<string, unknown>[],
+    afterStepIndex?: number,
   ): readonly ObservedToolSlot[] {
+    const restartAt =
+      afterStepIndex !== undefined && afterStepIndex >= 0
+        ? afterStepIndex
+        : undefined
+    let crossedRestart = restartAt === undefined
     for (const raw of rows) {
       const row = record(raw)
       if (!Number.isInteger(row.step_index)) continue
       const stepIndex = Number(row.step_index)
+      if (!crossedRestart && stepIndex > restartAt!) {
+        crossedRestart = true
+        this.observedPending = []
+      }
       switch (row.type) {
         case 'USER_INPUT':
           this.observedPending = []
@@ -288,6 +298,16 @@ export class BrainTranscriptProjector {
 
   clearPending() {
     this.pending = []
+  }
+
+  /** Forget transient calls, background tasks, daemons and wakeup subagents owned by an exited runtime. */
+  resetRestartState() {
+    this.pending = []
+    this.retired = []
+    this.background.clear()
+    this.daemons.clear()
+    this.touchedSubagents.clear()
+    this.lastErrorCallId = undefined
   }
 
   hasBackground(): boolean {
@@ -577,11 +597,7 @@ export class BrainTranscriptProjector {
         this.lastErrorCallId = undefined
         if (isRestartNotice(row)) {
           // Stopped calls never log a result; child transcripts have no USER_INPUT to reset them.
-          this.pending = []
-          this.retired = []
-          this.background.clear()
-          this.daemons.clear()
-          this.touchedSubagents.clear()
+          this.resetRestartState()
           return []
         }
         const taskResults = [...text.matchAll(systemTaskResultPattern)]
@@ -886,6 +902,15 @@ export class BrainNode {
     this.answeredQuestionStep = -1
   }
 
+  /** Advance the turn boundary past steps owned by an exited ACP process. */
+  applyRestartBoundary(stepIndex: number) {
+    this.turnStartStep = stepIndex
+    this.resetPhase()
+    this.promptPhase = 'foreground_idle'
+    this.projector.resetRestartState()
+    this.lastStep = undefined
+  }
+
   settleAbortedDenial(denied?: ReadonlySet<string>) {
     if (
       this.promptPhase !== 'woken' &&
@@ -1071,6 +1096,8 @@ export class BrainNode {
       (this.projector.hasPending() ||
         (this.lastStep?.type === 'SYSTEM_MESSAGE' &&
           !isRestartNotice(this.lastStep)) ||
+        (this.lastStep?.type === 'PLANNER_RESPONSE' &&
+          runningStepStatuses.has(String(this.lastStep.status))) ||
         (this.lastStep?.type === 'GENERIC' &&
           this.lastStep.status !== 'CANCELED' &&
           this.lastStep.status !== 'INTERRUPTED'))

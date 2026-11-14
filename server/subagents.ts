@@ -30,6 +30,7 @@ export interface SubagentRegistryOptions {
 export class SubagentRegistry {
   private children = new Map<string, BrainWatchHandle>()
   private childParents = new Map<string, string>()
+  private runtimeEpoch = 0
   private killedChildren = new Set<string>()
   private resuming = new Set<string>()
   private opts: SubagentRegistryOptions
@@ -69,7 +70,20 @@ export class SubagentRegistry {
   }
 
   cancelAll(): Promise<void>[] {
-    return [...this.children.values()].map((child) => child.cancel())
+    this.runtimeEpoch++
+    return [
+      (async () => {
+        const canceled = new Set<BrainWatchHandle>()
+        for (;;) {
+          const children = [...this.children.values()].filter(
+            (child) => !canceled.has(child),
+          )
+          if (children.length === 0) return
+          for (const child of children) canceled.add(child)
+          await Promise.all(children.map((child) => child.cancel()))
+        }
+      })(),
+    ]
   }
 
   async waitCurrentReady(): Promise<void> {
@@ -171,10 +185,12 @@ export class SubagentRegistry {
   ) {
     if (this.resuming.has(childId)) return
     this.resuming.add(childId)
+    const runtimeEpoch = this.runtimeEpoch
     void existing.cancel().then(() => {
       this.resuming.delete(childId)
       if (
         this.opts.isUnavailable() ||
+        this.runtimeEpoch !== runtimeEpoch ||
         this.killedChildren.has(childId) ||
         this.children.get(childId) !== existing
       )
