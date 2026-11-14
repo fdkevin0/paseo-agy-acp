@@ -2174,10 +2174,11 @@ test('post-waitPrompt settle failure still publishes positive result.usage and c
     outputTokens: 4,
     cachedReadTokens: 0,
   }
+  t.mock.method(h.session, 'syncKilledChildren', async () => {
+    throw new Error('Post-prompt settle aborted')
+  })
   t.mock.method(h.session.transport.rpc, 'prompt', async () => {
     await h.write([{ step_index: 0, type: 'USER_INPUT', content: 'turn 1' }])
-    // Force observation/settle to fail after waitPrompt returns positive usage.
-    h.session.state.turnAbort?.abort(new Error('Post-prompt settle aborted'))
     return {
       stopReason: 'end_turn' as const,
       usage: { inputTokens: 120, outputTokens: 12, totalTokens: 132 },

@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { spawn } from 'node:child_process'
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -99,12 +107,15 @@ test(
   { skip: process.platform === 'win32' },
   async () => {
     const home = await mkdtemp(join(tmpdir(), 'agy-transport-nops-'))
-    const path = process.env.PATH
     const transport = connectAcp(
       {
         command: process.execPath,
         args: [fileURLToPath(new URL('./transport-acp.ts', import.meta.url))],
-        env: { HOME: home, PATH: path ?? '', AGY_SHUTDOWN: 'stubborn' },
+        env: {
+          HOME: home,
+          PATH: join(home, 'no-such-bin'),
+          AGY_SHUTDOWN: 'stubborn',
+        },
       },
       home,
       {},
@@ -116,29 +127,25 @@ test(
       },
       () => {},
     )
-    let commandPid: number | undefined
     try {
       await transport.rpc.initialize({
         protocolVersion: 1,
         clientCapabilities: {},
       })
       await transport.rpc.newSession({ cwd: home, mcpServers: [] })
-      commandPid = Number(await readFile(join(home, 'command.pid'), 'utf8'))
-      // Simulate slim images without procps: `ps` cannot be found.
-      process.env.PATH = join(home, 'no-such-bin')
-      await transport.close()
-      process.env.PATH = path
-      await transport.exited
-    } finally {
-      process.env.PATH = path
-      await transport.close()
-      if (commandPid) {
+      const commandPid = Number(
+        await readFile(join(home, 'command.pid'), 'utf8'),
+      )
+      try {
+        await transport.close()
+        await transport.exited
+      } finally {
         try {
           process.kill(-commandPid, 'SIGKILL')
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
-        }
+        } catch {}
       }
+    } finally {
+      await transport.close()
       await rm(home, { recursive: true, force: true })
     }
   },
@@ -222,3 +229,63 @@ test('transport surfaces stderr on immediate startup failure and notifies onExit
     await rm(home, { recursive: true, force: true })
   }
 })
+
+test(
+  'transport shutdown aborts hanging ps and still meets termination budget',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-transport-hangps-'))
+    const binDir = join(home, 'bin')
+    await mkdir(binDir, { recursive: true })
+    const psPath = join(binDir, 'ps')
+    const invokedPath = join(home, 'ps-invoked')
+    await writeFile(
+      psPath,
+      `#!${process.execPath}\nprocess.on('SIGTERM', () => {})\nrequire('node:fs').writeFileSync(${JSON.stringify(invokedPath)}, String(process.pid))\nsetInterval(() => {}, 60_000)\n`,
+    )
+    await chmod(psPath, 0o755)
+    const transport = connectAcp(
+      {
+        command: process.execPath,
+        args: [fileURLToPath(new URL('./transport-acp.ts', import.meta.url))],
+        env: { HOME: home, PATH: binDir, AGY_SHUTDOWN: 'stubborn' },
+      },
+      home,
+      {},
+      {
+        sessionUpdate: async () => {},
+        requestPermission: async () => ({
+          outcome: { outcome: 'cancelled' },
+        }),
+      },
+      () => {},
+    )
+    try {
+      await transport.rpc.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {},
+      })
+      await transport.rpc.newSession({ cwd: home, mcpServers: [] })
+      const commandPid = Number(
+        await readFile(join(home, 'command.pid'), 'utf8'),
+      )
+      try {
+        await transport.close()
+        await transport.exited
+        const psPid = Number(await readFile(invokedPath, 'utf8'))
+        assert.ok(Number.isInteger(psPid) && psPid > 0)
+        assert.throws(() => process.kill(psPid, 0), { code: 'ESRCH' })
+      } finally {
+        try {
+          process.kill(Number(await readFile(invokedPath, 'utf8')), 'SIGKILL')
+        } catch {}
+        try {
+          process.kill(-commandPid, 'SIGKILL')
+        } catch {}
+      }
+    } finally {
+      await transport.close()
+      await rm(home, { recursive: true, force: true })
+    }
+  },
+)

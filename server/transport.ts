@@ -17,22 +17,70 @@ import type { ProviderLaunch } from '@getpaseo/plugin/server/provider'
 
 const execFileAsync = promisify(execFile)
 
-async function listProcesses(): Promise<number[][]> {
-  const options = { encoding: 'utf8' as const, timeout: 1000 }
-  // procps/BSD accept -A; BusyBox lists every process by default and rejects -A.
-  const { stdout } = await execFileAsync(
-    'ps',
-    ['-A', '-o', 'pid=,ppid=,pgid='],
-    options,
-  ).catch(() => execFileAsync('ps', ['-o', 'pid,ppid,pgid'], options))
-  return stdout
-    .split('\n')
-    .map((line) => line.trim().split(/\s+/).map(Number))
-    .filter((row) => row.length === 3 && row.every(Number.isInteger))
+function shouldRetryBusyboxPs(error: unknown, signal: AbortSignal): boolean {
+  if (signal.aborted) return false
+  const e = error as NodeJS.ErrnoException & { killed?: boolean }
+  return (
+    e?.code !== 'ENOENT' &&
+    !e?.killed &&
+    e?.code !== 'ETIMEDOUT' &&
+    e?.name !== 'AbortError'
+  )
 }
 
-async function ownedProcessGroups(pid: number): Promise<Set<number>> {
-  const processes = await listProcesses()
+async function listProcesses(
+  signal: AbortSignal,
+  env: NodeJS.ProcessEnv,
+): Promise<number[][]> {
+  const attempt = new AbortController()
+  const onAbort = () => attempt.abort()
+  if (signal.aborted) attempt.abort()
+  else signal.addEventListener('abort', onAbort, { once: true })
+  const options = {
+    encoding: 'utf8' as const,
+    timeout: PS_TIMEOUT_MS,
+    killSignal: 'SIGKILL' as const,
+    signal: attempt.signal,
+    env,
+  }
+  let raceTimer: NodeJS.Timeout | undefined
+  try {
+    // procps/BSD accept -A; BusyBox lists every process by default and rejects -A.
+    const psRun = execFileAsync(
+      'ps',
+      ['-A', '-o', 'pid=,ppid=,pgid='],
+      options,
+    ).catch((error) => {
+      if (!shouldRetryBusyboxPs(error, attempt.signal)) throw error
+      return execFileAsync('ps', ['-o', 'pid,ppid,pgid'], options)
+    })
+    const { stdout } = await Promise.race([
+      psRun,
+      new Promise<never>((_, reject) => {
+        raceTimer = setTimeout(() => {
+          attempt.abort()
+          const error = new Error('ps timed out')
+          error.name = 'AbortError'
+          reject(error)
+        }, PS_TIMEOUT_MS)
+      }),
+    ])
+    return stdout
+      .split('\n')
+      .map((line) => line.trim().split(/\s+/).map(Number))
+      .filter((row) => row.length === 3 && row.every(Number.isInteger))
+  } finally {
+    clearTimeout(raceTimer)
+    signal.removeEventListener('abort', onAbort)
+  }
+}
+
+async function ownedProcessGroups(
+  pid: number,
+  signal: AbortSignal,
+  env: NodeJS.ProcessEnv,
+): Promise<Set<number>> {
+  const processes = await listProcesses(signal, env)
   const owned = new Set([pid])
   let previousSize = 0
   while (previousSize !== owned.size) {
@@ -55,9 +103,10 @@ function killGroup(group: number) {
   }
 }
 
-const SHUTDOWN_GRACE_MS = 500
-const SIGKILL_TIMEOUT_MS = 2000
-const TERMINATION_DEADLINE_MS = 2500
+const PS_TIMEOUT_MS = 200
+const SHUTDOWN_GRACE_MS = 300
+const SIGKILL_TIMEOUT_MS = 650
+const TERMINATION_DEADLINE_MS = 1100
 const ACP_REQUEST_TIMEOUT_MS = 30_000
 const STDERR_DRAIN_MS = 50
 
@@ -78,9 +127,17 @@ export function connectAcp(
 ) {
   const cmdName = launch?.command ?? 'agy'
   const requestTimeoutMs = options?.requestTimeoutMs ?? ACP_REQUEST_TIMEOUT_MS
+  const resolvedEnv: NodeJS.ProcessEnv = {
+    ...(launch?.env ?? process.env),
+    ...env,
+  }
+  const psEnv: NodeJS.ProcessEnv =
+    resolvedEnv.PATH !== undefined
+      ? resolvedEnv
+      : { ...process.env, ...resolvedEnv }
   const child = spawnProcess(cmdName, launch?.args ?? ['acp'], {
     cwd,
-    env: { ...(launch?.env ?? process.env), ...env },
+    env: resolvedEnv,
     stdio: 'pipe',
     detached: process.platform !== 'win32',
   })
@@ -234,17 +291,31 @@ export function connectAcp(
     stopping = true
     closing = (async () => {
       const groups = new Set<number>()
+      if (process.platform !== 'win32' && child.pid) groups.add(child.pid)
+      const discovery = new AbortController()
+      let collecting: Promise<void> | undefined
+      let psBroken = false
       // Best effort: without a usable `ps`, still stop agy's own process group.
-      const collectGroups = async () => {
-        if (process.platform === 'win32' || !child.pid) return
-        groups.add(child.pid)
-        const owned = await ownedProcessGroups(child.pid).catch(
-          () => new Set<number>(),
+      const collectGroups = () => {
+        if (
+          psBroken ||
+          process.platform === 'win32' ||
+          !child.pid ||
+          discovery.signal.aborted
         )
-        for (const group of owned) groups.add(group)
+          return Promise.resolve()
+        collecting ??= ownedProcessGroups(child.pid, discovery.signal, psEnv)
+          .then((owned) => {
+            for (const group of owned) groups.add(group)
+          })
+          .catch(() => {
+            psBroken = true
+          })
+          .finally(() => {
+            collecting = undefined
+          })
+        return collecting
       }
-      await collectGroups()
-      child.stdin.end()
       const stop = async () => {
         if (process.platform === 'win32') await terminateProcess(child)
         else {
@@ -252,14 +323,30 @@ export function connectAcp(
           for (const group of groups) killGroup(group)
         }
       }
-      const timer = setTimeout(() => {
-        void stop().catch(() => undefined)
-      }, SHUTDOWN_GRACE_MS)
-      const force = setTimeout(() => child.kill('SIGKILL'), SIGKILL_TIMEOUT_MS)
+      let timer: NodeJS.Timeout | undefined
+      let force: NodeJS.Timeout | undefined
       let deadline: NodeJS.Timeout | undefined
       try {
         await Promise.race([
-          exited,
+          (async () => {
+            await Promise.race([collectGroups(), exited])
+            if (!exitInfo) {
+              child.stdin.end()
+              timer = setTimeout(() => {
+                void stop().catch(() => undefined)
+              }, SHUTDOWN_GRACE_MS)
+              force = setTimeout(
+                () => child.kill('SIGKILL'),
+                SIGKILL_TIMEOUT_MS,
+              )
+              await exited
+            } else if (collecting) {
+              await Promise.race([
+                collecting,
+                delay(50, undefined, { ref: false }),
+              ])
+            }
+          })(),
           new Promise<never>((_, reject) => {
             deadline = setTimeout(
               () => reject(new Error('agy did not exit after termination')),
@@ -268,6 +355,7 @@ export function connectAcp(
           }),
         ])
       } finally {
+        discovery.abort()
         clearTimeout(timer)
         clearTimeout(force)
         clearTimeout(deadline)

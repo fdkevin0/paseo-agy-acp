@@ -765,13 +765,16 @@ export function activeChildIdsForTurn(
   subagents: readonly SubagentRecord[],
   projector: BrainTranscriptProjector,
   minStepIndex: number,
+  ignoredSubagentIds?: ReadonlySet<string>,
 ): string[] {
   const touched = projector.touchedSubagentIds()
   const ids = new Set<string>()
   for (const sub of subagents) {
     if (
       sub.state === SUBAGENT_ALIVE &&
-      (sub.spawnStepIndex > minStepIndex || touched.has(sub.conversationId))
+      ((sub.spawnStepIndex > minStepIndex &&
+        !ignoredSubagentIds?.has(sub.conversationId)) ||
+        touched.has(sub.conversationId))
     ) {
       ids.add(sub.conversationId)
     }
@@ -873,7 +876,7 @@ export class BrainNode {
       if (!stepIndices.has(step)) this.retryObservedAt.delete(step)
   }
 
-  /** Forget the wakeup phase: a new USER_INPUT, a transcript rewrite or (for hasActiveBackgroundWork) a runtime restart. */
+  /** Forget the wakeup phase on a new USER_INPUT or transcript rewrite. */
   resetPhase() {
     this.retrySince = undefined
     this.retryError = undefined
@@ -1074,6 +1077,16 @@ export class BrainNode {
         (this.lastStep?.type === 'GENERIC' &&
           this.lastStep.status !== 'CANCELED' &&
           this.lastStep.status !== 'INTERRUPTED'))
+    )
+  }
+
+  isWokenActive(): boolean {
+    return (
+      this.isWokenWorking() ||
+      (this.wokeUp &&
+        !this.abortedByDenial &&
+        this.lastStep?.type === 'PLANNER_RESPONSE' &&
+        runningStepStatuses.has(String(this.lastStep.status)))
     )
   }
 

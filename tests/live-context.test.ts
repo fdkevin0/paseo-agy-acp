@@ -653,8 +653,14 @@ test(
       held = await h.hold()
     await h.write([user(1), model(2, 10)])
     await h.read()
-    h.session.state.turnAbort!.abort()
-    held.done.resolve({ stopReason: 'cancelled' })
+    t.mock.method(h.session.transport.rpc, 'cancel', async () => {
+      held.done.resolve({ stopReason: 'cancelled' })
+    })
+    await h.manager.handle({
+      type: 'session.interrupt',
+      requestId: 'int',
+      sessionId: 's',
+    })
     await held.running
     const count = h.events.length
     await h.append([model(3, 100), checkpoint(4)])
@@ -932,7 +938,14 @@ test(
     await entered.promise
     const oldTransport = h.session.transport,
       nativeId = h.session.state.nativeId
-    await h.session.relaunch(h.session.state.skipPermissions, true)
+    t.mock.method(oldTransport.rpc, 'cancel', async () => {
+      throw new Error('unresponsive')
+    })
+    await h.manager.handle({
+      type: 'session.interrupt',
+      requestId: 'int',
+      sessionId: 's',
+    })
     assert.equal(h.session.state.nativeId, nativeId)
     assert.notEqual(h.session.transport, oldTransport)
     const count = h.events.filter(
@@ -950,9 +963,11 @@ test(
       ).length,
       count,
     )
-    held.done.reject(new Error('old transport closed'))
     await held.running
-    assert.deepEqual(h.turns(), ['failed'])
+    await h.session.waitForRuntimeReady(new AbortController().signal)
+    assert.deepEqual(h.turns(), ['canceled'])
+    assert.equal(h.latest().contextWindowUsedTokens, 101)
+    assert.equal(h.compactions().length, 1)
     assert.equal(held.observation.phase, 'disposed')
   },
 )
@@ -1373,18 +1388,16 @@ test(
     await h.answer()
     await h.entered.promise
     const oldTransport = h.session.transport
-    const request = oldTransport.request.bind(oldTransport)
-    t.mock.method(
-      oldTransport,
-      'request',
-      async (...args: Parameters<typeof request>) => {
-        if (args[1]?.fatalOnTimeout === false)
-          throw new Error('synthetic convergence timeout')
-        return request(...args)
-      },
-    )
-    h.session.state.turnAbort!.abort()
+    t.mock.method(oldTransport.rpc, 'cancel', async () => {
+      throw new Error('synthetic convergence timeout')
+    })
+    await h.manager.handle({
+      type: 'session.interrupt',
+      requestId: 'int',
+      sessionId: 's',
+    })
     await h.running
+    await h.session.waitForRuntimeReady(new AbortController().signal)
     assert.notEqual(h.session.transport, oldTransport)
     assert.equal(h.session.state.suppressContinuationAcp, false)
     assert.equal(h.session.state.inSettle, false)

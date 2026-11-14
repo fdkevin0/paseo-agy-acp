@@ -22,6 +22,7 @@ export interface SubagentRegistryOptions {
   getNativeId: () => string
   isParentTurnActive: () => boolean
   isLoading: () => boolean
+  isSuppressingReplay?: () => boolean
   isUnavailable: () => boolean
   retryTimeoutMs?: number
 }
@@ -31,7 +32,9 @@ export class SubagentRegistry {
   private children = new Map<string, BrainWatchHandle>()
   private childParents = new Map<string, string>()
   private killedChildren = new Set<string>()
-  private resuming = new Set<string>()
+  private resuming = new Map<string, Promise<void>>()
+  private cancelingAll = false
+  private generation = 0
   private opts: SubagentRegistryOptions
 
   constructor(opts: SubagentRegistryOptions) {
@@ -59,17 +62,47 @@ export class SubagentRegistry {
   }
 
   hasRunningChildren(): boolean {
-    return [...this.children.values()].some((child) => child.isRunning())
+    return (
+      this.resuming.size > 0 ||
+      [...this.children.values()].some((child) => child.isRunning())
+    )
   }
 
   cancelRunning(): Promise<void>[] {
-    return [...this.children.values()]
-      .filter((child) => child.isRunning())
-      .map((child) => child.cancel())
+    this.generation++
+    const tasks = [...this.resuming.values()]
+    for (const child of this.children.values()) {
+      if (child.isRunning()) tasks.push(child.cancel())
+    }
+    return tasks
   }
 
-  cancelAll(): Promise<void>[] {
-    return [...this.children.values()].map((child) => child.cancel())
+  async cancelAll(): Promise<void> {
+    this.cancelingAll = true
+    const seen = new Set<BrainWatchHandle>()
+    try {
+      while (true) {
+        this.generation++
+        const batch: Promise<void>[] = [...this.resuming.values()]
+        for (const child of this.children.values()) {
+          if (!seen.has(child)) {
+            seen.add(child)
+            batch.push(child.cancel())
+          }
+        }
+        if (batch.length === 0) break
+        await Promise.all(batch)
+      }
+    } finally {
+      this.cancelingAll = false
+    }
+  }
+
+  /** Synchronously stop every active child watcher when bounded drain expires. */
+  forceStopAll(): void {
+    this.generation++
+    this.resuming.clear()
+    for (const child of this.children.values()) child.forceCancel()
   }
 
   async waitCurrentReady(): Promise<void> {
@@ -169,18 +202,25 @@ export class SubagentRegistry {
     childId: string,
     existing: BrainWatchHandle,
   ) {
-    if (this.resuming.has(childId)) return
-    this.resuming.add(childId)
-    void existing.cancel().then(() => {
-      this.resuming.delete(childId)
-      if (
-        this.opts.isUnavailable() ||
-        this.killedChildren.has(childId) ||
-        this.children.get(childId) !== existing
-      )
-        return
-      this.watchChild(nativeId, childId, existing.resumePoint())
-    })
+    if (this.cancelingAll || this.resuming.has(childId)) return
+    const generation = this.generation
+    const task = existing
+      .cancel()
+      .then(() => {
+        if (
+          this.cancelingAll ||
+          this.generation !== generation ||
+          this.opts.isUnavailable() ||
+          this.killedChildren.has(childId) ||
+          this.children.get(childId) !== existing
+        )
+          return
+        this.watchChild(nativeId, childId, existing.resumePoint())
+      })
+      .finally(() => {
+        if (this.resuming.get(childId) === task) this.resuming.delete(childId)
+      })
+    this.resuming.set(childId, task)
   }
 
   canLinkChild = (
@@ -217,6 +257,12 @@ export class SubagentRegistry {
     parentNativeId: string,
     item: ProviderTimelineItem,
   ): void {
+    if (this.cancelingAll || this.opts.isSuppressingReplay?.()) {
+      if (item.type === 'tool_call' && item.detail.type === 'sub_agent') {
+        delete item.detail.childSessionId
+      }
+      return
+    }
     if (item.type === 'tool_call' && item.detail.type === 'sub_agent') {
       const nativeId = item.detail.childSessionId
       delete item.detail.childSessionId
@@ -258,6 +304,8 @@ export class SubagentRegistry {
   }
 
   closeAll(): void {
+    this.generation++
+    this.resuming.clear()
     for (const [childId, stop] of this.children) {
       stop()
       this.opts.emit({ type: 'session.closed', sessionId: childId })

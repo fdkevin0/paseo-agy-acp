@@ -51,11 +51,111 @@ export {
   type SubagentRecord,
 }
 
+export type RuntimeEpoch = {
+  afterStepIndex: number
+  ignoredMessageIds: ReadonlySet<string>
+  ignoredSubagentIds: ReadonlySet<string>
+  consumedDeficit: number
+}
+
+export function adjustInboxForEpoch(
+  inbox: InboxState,
+  epoch?: RuntimeEpoch,
+): InboxState {
+  if (!epoch) return inbox
+  const unconsumedHighPriority =
+    epoch.ignoredMessageIds.size > 0
+      ? inbox.unconsumedHighPriority.filter(
+          (m) => !epoch.ignoredMessageIds.has(m.id),
+        )
+      : inbox.unconsumedHighPriority
+  let ignoredNowRead = 0
+  for (const id of epoch.ignoredMessageIds)
+    if (inbox.readIds.has(id)) ignoredNowRead++
+  const consumedNonUserCount =
+    epoch.consumedDeficit > 0 || ignoredNowRead > 0
+      ? Math.max(
+          0,
+          inbox.consumedNonUserCount - epoch.consumedDeficit - ignoredNowRead,
+        )
+      : inbox.consumedNonUserCount
+  if (
+    unconsumedHighPriority === inbox.unconsumedHighPriority &&
+    consumedNonUserCount === inbox.consumedNonUserCount
+  )
+    return inbox
+  return {
+    ...inbox,
+    unconsumedHighPriority,
+    consumedNonUserCount,
+  }
+}
+
+/** Snapshot pre-restart Brain artifacts so a restarted/reopened runtime only tracks work created after this boundary. */
+export function computeRuntimeEpoch(
+  rows: readonly Record<string, unknown>[],
+  inbox: InboxState,
+  subagents: readonly SubagentRecord[],
+  minAfterStep = -1,
+): RuntimeEpoch | undefined {
+  let afterStepIndex = minAfterStep
+  let loggedMessages = 0
+  for (const row of rows) {
+    const step = Number(row.step_index)
+    if (Number.isInteger(step) && step > afterStepIndex) afterStepIndex = step
+    loggedMessages += countRowMessages(row, false)
+  }
+  const ignoredMessageIds = new Set(
+    inbox.unconsumedHighPriority.map((m) => m.id),
+  )
+  const ignoredSubagentIds = new Set(
+    subagents
+      .filter((s) => s.state === 'SUBAGENT_STATE_ALIVE')
+      .map((s) => s.conversationId),
+  )
+  const consumedDeficit = Math.max(
+    0,
+    inbox.consumedNonUserCount - loggedMessages,
+  )
+  if (
+    afterStepIndex < 0 &&
+    ignoredMessageIds.size === 0 &&
+    ignoredSubagentIds.size === 0 &&
+    consumedDeficit === 0
+  )
+    return undefined
+  return {
+    afterStepIndex,
+    ignoredMessageIds,
+    ignoredSubagentIds,
+    consumedDeficit,
+  }
+}
+
+/** Read and snapshot pre-restart Brain artifacts for a restarted or reopened runtime. */
+export async function captureRuntimeEpoch(
+  root: string,
+  nativeId: string,
+): Promise<RuntimeEpoch | undefined> {
+  if (!sessionIdPattern.test(nativeId)) return undefined
+  const [rows, inbox, subagents, tailStep] = await Promise.all([
+    readTranscriptRows(root, nativeId),
+    readInboxState(root, nativeId),
+    readSubagents(root, nativeId),
+    readLastStepIndex(root, nativeId).catch(() => -1),
+  ])
+  return computeRuntimeEpoch(rows, inbox, subagents, tailStep)
+}
+
 /** Determine whether the session has running background tasks or active subagents. Standing IsDaemon schedules are excluded by default so foreground interrupts do not kill them, and included when checking whether an idle runtime can stop. */
 export async function hasActiveBackgroundWork(
   root: string,
   nativeId: string,
-  options: { includeDaemons?: boolean; retryTimeoutMs?: number } = {},
+  options: {
+    includeDaemons?: boolean
+    retryTimeoutMs?: number
+    runtimeEpoch?: RuntimeEpoch
+  } = {},
   visiting = new Set<string>(),
   isChild = false,
 ): Promise<boolean> {
@@ -65,17 +165,37 @@ export async function hasActiveBackgroundWork(
     const node = new BrainNode(nativeId, nativeId, {
       allowInitialSpawnPrompt: isChild,
     })
-    const [{ inbox, subagents }, { rows, mtimeMs }] = await Promise.all([
-      node.pollMetadata(root),
-      node.reader.read(root, nativeId).catch((error) => {
-        if (isMissing(error))
-          return { rows: [], reset: false, mtimeMs: undefined }
-        throw error
-      }),
-    ])
+    const [{ inbox: rawInbox, subagents }, { rows, mtimeMs }] =
+      await Promise.all([
+        node.pollMetadata(root),
+        node.reader.read(root, nativeId).catch((error) => {
+          if (isMissing(error))
+            return { rows: [], reset: false, mtimeMs: undefined }
+          throw error
+        }),
+      ])
+    const inbox = isChild
+      ? rawInbox
+      : adjustInboxForEpoch(rawInbox, options.runtimeEpoch)
     if (isChild && rows.length === 0) return true
-    node.projector.observeRows(rows)
-    for (const row of rows) {
+    const restartAfterStep = isChild
+      ? undefined
+      : options.runtimeEpoch?.afterStepIndex
+    let eligibleRows = rows
+    if (restartAfterStep !== undefined && restartAfterStep >= 0) {
+      for (const row of rows) {
+        const stepIndex = Number(row.step_index)
+        if (Number.isInteger(stepIndex) && stepIndex <= restartAfterStep)
+          node.consumedMessages += countRowMessages(row, false)
+      }
+      node.turnStartStep = restartAfterStep
+      node.promptPhase = 'foreground_idle'
+      eligibleRows = rows.filter(
+        (row) => Number(row.step_index) > restartAfterStep,
+      )
+    }
+    node.projector.observeRows(eligibleRows)
+    for (const row of eligibleRows) {
       // The restarted runtime left no woken turn running.
       if (isRestartNotice(row)) node.resetPhase()
       node.ingest(row, mtimeMs)
@@ -94,7 +214,7 @@ export async function hasActiveBackgroundWork(
           ? node.hasUnprocessedMessages(inbox) || !node.isSettled(inbox)
           : (node.foregroundIdleReached &&
               node.hasUnprocessedMessages(inbox)) ||
-            node.isWokenWorking()
+            node.isWokenActive()
       )
         return true
     }
@@ -102,9 +222,21 @@ export async function hasActiveBackgroundWork(
       subagents,
       node.projector,
       isChild ? -1 : node.turnStartStep,
+      isChild ? undefined : options.runtimeEpoch?.ignoredSubagentIds,
     )
+    const childOptions = options.runtimeEpoch
+      ? { ...options, runtimeEpoch: undefined }
+      : options
     for (const childId of activeChildIds) {
-      if (await hasActiveBackgroundWork(root, childId, options, visiting, true))
+      if (
+        await hasActiveBackgroundWork(
+          root,
+          childId,
+          childOptions,
+          visiting,
+          true,
+        )
+      )
         return true
     }
     return false
@@ -410,6 +542,7 @@ export async function settleBrainTurn(
     onUsage,
     onWakeupState,
     isRpcActive,
+    runtimeEpoch,
   }: {
     observation?: BrainTurnObservation
     onUsage?: (usage: StepUsage, wokeUp: boolean) => void
@@ -420,6 +553,7 @@ export async function settleBrainTurn(
       pendingReplay?: boolean
     }) => void
     isRpcActive?: () => boolean
+    runtimeEpoch?: RuntimeEpoch
     onSubagents?: (subagents: readonly SubagentRecord[]) => void
     signal?: AbortSignal
     minStepIndex?: number
@@ -464,6 +598,10 @@ export async function settleBrainTurn(
   carriedWakeupUsage?: StepUsage
 }> {
   if (!sessionIdPattern.test(nativeId)) return { status: 'completed' }
+  const effectiveMinStepIndex = Math.max(
+    minStepIndex,
+    runtimeEpoch?.afterStepIndex ?? -1,
+  )
   const fgReconciler = new ForegroundReconciler(foregroundAcp, emitForeground)
   const settledQuestions = new Map<
     string,
@@ -486,7 +624,7 @@ export async function settleBrainTurn(
       root,
       nativeId,
       sessionId,
-      minStepIndex,
+      effectiveMinStepIndex,
       {
         isCurrent: () => !signal?.aborted,
         onUsage: (usage) => onUsage?.(usage, fgReconciler.postRpc),
@@ -620,10 +758,10 @@ export async function settleBrainTurn(
     if (!stream.acceptsRows() || signal?.aborted) return
     const metadata = await node.pollMetadata(root)
     if (!stream.acceptsRows() || signal?.aborted) return
-    inbox = metadata.inbox
+    inbox = adjustInboxForEpoch(metadata.inbox, runtimeEpoch)
     subagents = metadata.subagents
     onSubagents?.(subagents)
-    const nextFingerprint = `${inbox.messages.length}:${inbox.readIds.size}:${subagents
+    const nextFingerprint = `${metadata.inbox.messages.length}:${metadata.inbox.readIds.size}:${subagents
       .map((s) => `${s.conversationId}=${s.state}`)
       .join(',')}`
     if (nextFingerprint !== fingerprint) {
@@ -669,7 +807,7 @@ export async function settleBrainTurn(
       for (let i = 0; i < preamble.length; i++) {
         if (
           preamble[i].type === 'USER_INPUT' &&
-          Number(preamble[i].step_index) > minStepIndex
+          Number(preamble[i].step_index) > effectiveMinStepIndex
         ) {
           start = i
           break
@@ -895,7 +1033,8 @@ export async function settleBrainTurn(
       const activeChildIds = activeChildIdsForTurn(
         subagents,
         node.projector,
-        minStepIndex,
+        effectiveMinStepIndex,
+        runtimeEpoch?.ignoredSubagentIds,
       )
       const childStatus = await settleChildren(
         root,
@@ -913,8 +1052,11 @@ export async function settleBrainTurn(
         }
       if (childStatus.settled && node.isSettled(inbox)) {
         if (activeChildIds.length > 0) {
-          if (node.hasUnprocessedMessages(await readInboxState(root, nativeId)))
-            continue
+          const latestInbox = adjustInboxForEpoch(
+            await readInboxState(root, nativeId),
+            runtimeEpoch,
+          )
+          if (node.hasUnprocessedMessages(latestInbox)) continue
         }
         if (checkedVersion !== foldVersion) continue
         return finish('completed')
@@ -942,6 +1084,8 @@ export async function settleBrainTurn(
 export type BrainWatchHandle = (() => void) & {
   /** Drain rows written so far, then end the active child turn as canceled. */
   cancel: () => Promise<void>
+  /** Immediately mark the child turn canceled and stop polling without awaiting drain. */
+  forceCancel: () => void
   isRunning: () => boolean
   /** Stopped or canceled: no further rows are read. */
   isStopped: () => boolean
@@ -1175,6 +1319,12 @@ export function watchBrain(
           stopped = true
         })()
         return cancelling
+      },
+      forceCancel() {
+        if (stopped) return
+        clearInterval(timer)
+        finishTurn('canceled')
+        stopped = true
       },
     },
   )
