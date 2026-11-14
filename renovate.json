@@ -7,7 +7,7 @@
   "schedule": ["before 9am on monday"],
   "minimumReleaseAge": "3 days",
   "constraints": {
-    "node": "24",
+    "node": "26",
     "npm": "11"
   },
   "lockFileMaintenance": {
