@@ -32,6 +32,7 @@ export class SubagentRegistry {
   private childParents = new Map<string, string>()
   private killedChildren = new Set<string>()
   private resuming = new Map<string, Promise<void>>()
+  private cancelingAll = false
   private generation = 0
   private opts: SubagentRegistryOptions
 
@@ -76,19 +77,31 @@ export class SubagentRegistry {
   }
 
   async cancelAll(): Promise<void> {
-    this.generation++
+    this.cancelingAll = true
     const seen = new Set<BrainWatchHandle>()
-    while (true) {
-      const batch: Promise<void>[] = [...this.resuming.values()]
-      for (const child of this.children.values()) {
-        if (!seen.has(child)) {
-          seen.add(child)
-          batch.push(child.cancel())
+    try {
+      while (true) {
+        this.generation++
+        const batch: Promise<void>[] = [...this.resuming.values()]
+        for (const child of this.children.values()) {
+          if (!seen.has(child)) {
+            seen.add(child)
+            batch.push(child.cancel())
+          }
         }
+        if (batch.length === 0) break
+        await Promise.all(batch)
       }
-      if (batch.length === 0) break
-      await Promise.all(batch)
+    } finally {
+      this.cancelingAll = false
     }
+  }
+
+  /** Synchronously stop every active child watcher when bounded drain expires. */
+  forceStopAll(): void {
+    this.generation++
+    this.resuming.clear()
+    for (const child of this.children.values()) child.forceCancel()
   }
 
   async waitCurrentReady(): Promise<void> {
@@ -188,12 +201,13 @@ export class SubagentRegistry {
     childId: string,
     existing: BrainWatchHandle,
   ) {
-    if (this.resuming.has(childId)) return
+    if (this.cancelingAll || this.resuming.has(childId)) return
     const generation = this.generation
     const task = existing
       .cancel()
       .then(() => {
         if (
+          this.cancelingAll ||
           this.generation !== generation ||
           this.opts.isUnavailable() ||
           this.killedChildren.has(childId) ||
@@ -242,6 +256,7 @@ export class SubagentRegistry {
     parentNativeId: string,
     item: ProviderTimelineItem,
   ): void {
+    if (this.cancelingAll) return
     if (item.type === 'tool_call' && item.detail.type === 'sub_agent') {
       const nativeId = item.detail.childSessionId
       delete item.detail.childSessionId

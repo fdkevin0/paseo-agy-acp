@@ -54,6 +54,7 @@ export {
 export type RuntimeEpoch = {
   afterStepIndex: number
   ignoredMessageIds: ReadonlySet<string>
+  ignoredSubagentIds: ReadonlySet<string>
   consumedDeficit: number
 }
 
@@ -68,9 +69,15 @@ export function adjustInboxForEpoch(
           (m) => !epoch.ignoredMessageIds.has(m.id),
         )
       : inbox.unconsumedHighPriority
+  let ignoredNowRead = 0
+  for (const id of epoch.ignoredMessageIds)
+    if (inbox.readIds.has(id)) ignoredNowRead++
   const consumedNonUserCount =
-    epoch.consumedDeficit > 0
-      ? Math.max(0, inbox.consumedNonUserCount - epoch.consumedDeficit)
+    epoch.consumedDeficit > 0 || ignoredNowRead > 0
+      ? Math.max(
+          0,
+          inbox.consumedNonUserCount - epoch.consumedDeficit - ignoredNowRead,
+        )
       : inbox.consumedNonUserCount
   if (
     unconsumedHighPriority === inbox.unconsumedHighPriority &&
@@ -85,16 +92,13 @@ export function adjustInboxForEpoch(
 }
 
 /** Snapshot pre-restart Brain artifacts so a restarted/reopened runtime only tracks work created after this boundary. */
-export async function captureRuntimeEpoch(
-  root: string,
-  nativeId: string,
-): Promise<RuntimeEpoch | undefined> {
-  if (!sessionIdPattern.test(nativeId)) return undefined
-  const [rows, inbox] = await Promise.all([
-    readTranscriptRows(root, nativeId),
-    readInboxState(root, nativeId),
-  ])
-  let afterStepIndex = -1
+export function computeRuntimeEpoch(
+  rows: readonly Record<string, unknown>[],
+  inbox: InboxState,
+  subagents: readonly SubagentRecord[],
+  minAfterStep = -1,
+): RuntimeEpoch | undefined {
+  let afterStepIndex = minAfterStep
   let loggedMessages = 0
   for (const row of rows) {
     const step = Number(row.step_index)
@@ -104,6 +108,11 @@ export async function captureRuntimeEpoch(
   const ignoredMessageIds = new Set(
     inbox.unconsumedHighPriority.map((m) => m.id),
   )
+  const ignoredSubagentIds = new Set(
+    subagents
+      .filter((s) => s.state === 'SUBAGENT_STATE_ALIVE')
+      .map((s) => s.conversationId),
+  )
   const consumedDeficit = Math.max(
     0,
     inbox.consumedNonUserCount - loggedMessages,
@@ -111,10 +120,31 @@ export async function captureRuntimeEpoch(
   if (
     afterStepIndex < 0 &&
     ignoredMessageIds.size === 0 &&
+    ignoredSubagentIds.size === 0 &&
     consumedDeficit === 0
   )
     return undefined
-  return { afterStepIndex, ignoredMessageIds, consumedDeficit }
+  return {
+    afterStepIndex,
+    ignoredMessageIds,
+    ignoredSubagentIds,
+    consumedDeficit,
+  }
+}
+
+/** Read and snapshot pre-restart Brain artifacts for a restarted or reopened runtime. */
+export async function captureRuntimeEpoch(
+  root: string,
+  nativeId: string,
+): Promise<RuntimeEpoch | undefined> {
+  if (!sessionIdPattern.test(nativeId)) return undefined
+  const [rows, inbox, subagents, tailStep] = await Promise.all([
+    readTranscriptRows(root, nativeId),
+    readInboxState(root, nativeId),
+    readSubagents(root, nativeId),
+    readLastStepIndex(root, nativeId).catch(() => -1),
+  ])
+  return computeRuntimeEpoch(rows, inbox, subagents, tailStep)
 }
 
 /** Determine whether the session has running background tasks or active subagents. Standing IsDaemon schedules are excluded by default so foreground interrupts do not kill them, and included when checking whether an idle runtime can stop. */
@@ -151,23 +181,25 @@ export async function hasActiveBackgroundWork(
     const restartAfterStep = isChild
       ? undefined
       : options.runtimeEpoch?.afterStepIndex
-    node.projector.observeRows(rows, restartAfterStep)
-    let boundaryApplied = restartAfterStep === undefined || restartAfterStep < 0
-    for (const row of rows) {
-      const stepIndex = Number(row.step_index)
-      if (
-        !boundaryApplied &&
-        Number.isInteger(stepIndex) &&
-        stepIndex > restartAfterStep!
-      ) {
-        node.applyRestartBoundary(restartAfterStep!)
-        boundaryApplied = true
+    let eligibleRows = rows
+    if (restartAfterStep !== undefined && restartAfterStep >= 0) {
+      for (const row of rows) {
+        const stepIndex = Number(row.step_index)
+        if (Number.isInteger(stepIndex) && stepIndex <= restartAfterStep)
+          node.consumedMessages += countRowMessages(row, false)
       }
+      node.turnStartStep = restartAfterStep
+      node.promptPhase = 'foreground_idle'
+      eligibleRows = rows.filter(
+        (row) => Number(row.step_index) > restartAfterStep,
+      )
+    }
+    node.projector.observeRows(eligibleRows)
+    for (const row of eligibleRows) {
       // The restarted runtime left no woken turn running.
       if (isRestartNotice(row)) node.resetPhase()
       node.ingest(row, mtimeMs)
     }
-    if (!boundaryApplied) node.applyRestartBoundary(restartAfterStep!)
     if (inbox.unconsumedHighPriority.length > 0) return true
     if (
       node.projector.hasBackground() ||
@@ -190,6 +222,7 @@ export async function hasActiveBackgroundWork(
       subagents,
       node.projector,
       isChild ? -1 : node.turnStartStep,
+      isChild ? undefined : options.runtimeEpoch?.ignoredSubagentIds,
     )
     const childOptions = options.runtimeEpoch
       ? { ...options, runtimeEpoch: undefined }
@@ -1001,6 +1034,7 @@ export async function settleBrainTurn(
         subagents,
         node.projector,
         effectiveMinStepIndex,
+        runtimeEpoch?.ignoredSubagentIds,
       )
       const childStatus = await settleChildren(
         root,
@@ -1050,6 +1084,8 @@ export async function settleBrainTurn(
 export type BrainWatchHandle = (() => void) & {
   /** Drain rows written so far, then end the active child turn as canceled. */
   cancel: () => Promise<void>
+  /** Immediately mark the child turn canceled and stop polling without awaiting drain. */
+  forceCancel: () => void
   isRunning: () => boolean
   /** Stopped or canceled: no further rows are read. */
   isStopped: () => boolean
@@ -1283,6 +1319,12 @@ export function watchBrain(
           stopped = true
         })()
         return cancelling
+      },
+      forceCancel() {
+        if (stopped) return
+        clearInterval(timer)
+        finishTurn('canceled')
+        stopped = true
       },
     },
   )

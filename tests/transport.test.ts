@@ -241,7 +241,7 @@ test(
     const invokedPath = join(home, 'ps-invoked')
     await writeFile(
       psPath,
-      `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(invokedPath)}, '1')\nsetInterval(() => {}, 60_000)\n`,
+      `#!${process.execPath}\nprocess.on('SIGTERM', () => {})\nrequire('node:fs').writeFileSync(${JSON.stringify(invokedPath)}, String(process.pid))\nsetInterval(() => {}, 60_000)\n`,
     )
     await chmod(psPath, 0o755)
     const transport = connectAcp(
@@ -270,15 +270,15 @@ test(
         await readFile(join(home, 'command.pid'), 'utf8'),
       )
       try {
-        const started = Date.now()
         await transport.close()
         await transport.exited
-        assert.ok(
-          Date.now() - started < 1800,
-          'expected close() with hanging ps to finish under 1800ms',
-        )
-        assert.equal(await readFile(invokedPath, 'utf8'), '1')
+        const psPid = Number(await readFile(invokedPath, 'utf8'))
+        assert.ok(Number.isInteger(psPid) && psPid > 0)
+        assert.throws(() => process.kill(psPid, 0), { code: 'ESRCH' })
       } finally {
+        try {
+          process.kill(Number(await readFile(invokedPath, 'utf8')), 'SIGKILL')
+        } catch {}
         try {
           process.kill(-commandPid, 'SIGKILL')
         } catch {}

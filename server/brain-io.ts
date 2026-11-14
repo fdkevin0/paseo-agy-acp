@@ -641,7 +641,11 @@ export async function readTranscriptRows(
 ): Promise<Record<string, unknown>[]> {
   if (!sessionIdPattern.test(nativeId)) return []
   try {
-    return (await new TranscriptReader().read(root, nativeId)).rows
+    const reader = new TranscriptReader()
+    const first = await reader.read(root, nativeId)
+    if (first.reset && first.rows.length === 0)
+      return (await reader.read(root, nativeId)).rows
+    return first.rows
   } catch (error) {
     if (isMissing(error)) return []
     throw error

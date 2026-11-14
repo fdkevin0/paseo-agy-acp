@@ -4,7 +4,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  watch,
+  renameSync,
   writeFileSync,
 } from 'node:fs'
 import { join } from 'node:path'
@@ -14,21 +14,25 @@ const nativeId = '33333333-3333-4333-8333-333333333333'
 const home = process.env.HOME!
 const fullAccess = process.argv.includes('--dangerously-skip-permissions')
 const resumeCap = process.env.AGY_RESUME_CAP === '1'
+const noReload = process.env.AGY_NO_RELOAD === '1'
+const failReload = process.env.AGY_FAIL_RELOAD === '1'
 const gateDir = process.env.AGY_RELOAD_GATE
 const awaitReloadGate = async (kind: 'load' | 'resume') => {
   if (!gateDir) return
   mkdirSync(gateDir, { recursive: true })
-  writeFileSync(join(gateDir, 'entered'), kind)
+  const tmp = join(gateDir, 'entered.tmp')
+  writeFileSync(tmp, kind)
+  renameSync(tmp, join(gateDir, 'entered'))
   if (existsSync(join(gateDir, 'release'))) return
   await new Promise<void>((resolve) => {
-    const watcher = watch(gateDir, () => {
+    const poll = setInterval(() => {
       if (existsSync(join(gateDir, 'release'))) {
-        watcher.close()
+        clearInterval(poll)
         resolve()
       }
-    })
+    }, 10)
     if (existsSync(join(gateDir, 'release'))) {
-      watcher.close()
+      clearInterval(poll)
       resolve()
     }
   })
@@ -100,10 +104,12 @@ new AgentSideConnection(
       async initialize() {
         return {
           protocolVersion: 1,
-          agentCapabilities: {
-            loadSession: true,
-            ...(resumeCap ? { sessionCapabilities: { resume: {} } } : {}),
-          },
+          agentCapabilities: noReload
+            ? { loadSession: false }
+            : {
+                loadSession: true,
+                ...(resumeCap ? { sessionCapabilities: { resume: {} } } : {}),
+              },
         }
       },
       async authenticate() {
@@ -117,6 +123,7 @@ new AgentSideConnection(
       async loadSession(params) {
         log('load', { params, nativeId: params.sessionId })
         await awaitReloadGate('load')
+        if (failReload) throw new Error('Simulated reload failure')
         await update({
           sessionUpdate: 'user_message_chunk',
           content: { type: 'text', text: 'old prompt' },
@@ -132,6 +139,7 @@ new AgentSideConnection(
       async resumeSession(params) {
         log('resume', { params, nativeId: params.sessionId })
         await awaitReloadGate('resume')
+        if (failReload) throw new Error('Simulated reload failure')
         commands()
         return { configOptions }
       },
@@ -286,11 +294,12 @@ new AgentSideConnection(
           )
         } else if (text === 'stall') {
           probeLatePermissionOnCancel = true
+          const step = nextStepIndex(4)
           rows(
             [
-              { step_index: 2, type: 'USER_INPUT', content: text },
+              { step_index: step, type: 'USER_INPUT', content: text },
               {
-                step_index: 3,
+                step_index: step + 1,
                 type: 'PLANNER_RESPONSE',
                 status: 'RUNNING',
               },
@@ -313,6 +322,29 @@ new AgentSideConnection(
               subagentDescriptor: { typeName: 'research', role: 'Researcher' },
               spawnStepIndex: 1,
               state: 'SUBAGENT_STATE_ALIVE',
+            }),
+          )
+          const childMsgDir = join(
+            home,
+            '.gemini/antigravity-cli/brain',
+            staleChild,
+            '.system_generated/messages',
+          )
+          mkdirSync(childMsgDir, { recursive: true })
+          writeFileSync(
+            join(childMsgDir, 'init.json'),
+            JSON.stringify({
+              id: 'init',
+              sender: nativeId,
+              recipient: staleChild,
+              sourceMetadata: {
+                tool: {
+                  conversationId: nativeId,
+                  name: 'invoke_subagent',
+                  stepIndex: 1,
+                  toolCall: { id: 'inv-stale' },
+                },
+              },
             }),
           )
           const childLogs = join(
@@ -408,7 +440,7 @@ new AgentSideConnection(
                 step_index: 4,
                 type: 'GENERIC',
                 status: 'DONE',
-                content: `Launched subagent ${staleChild}`,
+                content: `Launched subagent conversationId=${staleChild}`,
               },
               {
                 step_index: 5,
@@ -423,6 +455,55 @@ new AgentSideConnection(
             sessionUpdate: 'agent_message_chunk',
             content: { type: 'text', text: 'WAITING_STALE' },
           })
+        } else if (text === 'enter-plan-bg') {
+          configOptions.find((option) => option.id === 'mode')!.currentValue =
+            'plan'
+          await update({
+            sessionUpdate: 'config_option_update',
+            configOptions,
+          })
+          rows(
+            [
+              { step_index: 0, type: 'USER_INPUT', content: text },
+              {
+                step_index: 1,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                tool_calls: [
+                  {
+                    id: 'bg-plan',
+                    name: 'run_command',
+                    args: { CommandLine: 'bg plan work' },
+                  },
+                ],
+              },
+              {
+                step_index: 2,
+                type: 'GENERIC',
+                status: 'RUNNING',
+                content: `Tool is running as a background task with task id: ${nativeId}/task-plan\n`,
+              },
+              {
+                step_index: 3,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                content: 'ENTERED_PLAN_BG',
+              },
+            ],
+            false,
+          )
+          await update({
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'ENTERED_PLAN_BG' },
+          })
+        } else if (text === 'ignore-cancel') {
+          const step = nextStepIndex(4)
+          rows([{ step_index: step, type: 'USER_INPUT', content: text }])
+          await update({
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'IGNORE_CANCEL' },
+          })
+          await new Promise<void>(() => {})
         } else if (text === 'hang') {
           const step = nextStepIndex(4)
           rows([{ step_index: step, type: 'USER_INPUT', content: text }])

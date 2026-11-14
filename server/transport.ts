@@ -32,25 +32,47 @@ async function listProcesses(
   signal: AbortSignal,
   env: NodeJS.ProcessEnv,
 ): Promise<number[][]> {
+  const attempt = new AbortController()
+  const onAbort = () => attempt.abort()
+  if (signal.aborted) attempt.abort()
+  else signal.addEventListener('abort', onAbort, { once: true })
   const options = {
     encoding: 'utf8' as const,
     timeout: PS_TIMEOUT_MS,
-    signal,
+    killSignal: 'SIGKILL' as const,
+    signal: attempt.signal,
     env,
   }
-  // procps/BSD accept -A; BusyBox lists every process by default and rejects -A.
-  const { stdout } = await execFileAsync(
-    'ps',
-    ['-A', '-o', 'pid=,ppid=,pgid='],
-    options,
-  ).catch((error) => {
-    if (!shouldRetryBusyboxPs(error, signal)) throw error
-    return execFileAsync('ps', ['-o', 'pid,ppid,pgid'], options)
-  })
-  return stdout
-    .split('\n')
-    .map((line) => line.trim().split(/\s+/).map(Number))
-    .filter((row) => row.length === 3 && row.every(Number.isInteger))
+  let raceTimer: NodeJS.Timeout | undefined
+  try {
+    // procps/BSD accept -A; BusyBox lists every process by default and rejects -A.
+    const psRun = execFileAsync(
+      'ps',
+      ['-A', '-o', 'pid=,ppid=,pgid='],
+      options,
+    ).catch((error) => {
+      if (!shouldRetryBusyboxPs(error, attempt.signal)) throw error
+      return execFileAsync('ps', ['-o', 'pid,ppid,pgid'], options)
+    })
+    const { stdout } = await Promise.race([
+      psRun,
+      new Promise<never>((_, reject) => {
+        raceTimer = setTimeout(() => {
+          attempt.abort()
+          const error = new Error('ps timed out')
+          error.name = 'AbortError'
+          reject(error)
+        }, PS_TIMEOUT_MS)
+      }),
+    ])
+    return stdout
+      .split('\n')
+      .map((line) => line.trim().split(/\s+/).map(Number))
+      .filter((row) => row.length === 3 && row.every(Number.isInteger))
+  } finally {
+    clearTimeout(raceTimer)
+    signal.removeEventListener('abort', onAbort)
+  }
 }
 
 async function ownedProcessGroups(
@@ -81,10 +103,10 @@ function killGroup(group: number) {
   }
 }
 
-const PS_TIMEOUT_MS = 250
-const SHUTDOWN_GRACE_MS = 500
-const SIGKILL_TIMEOUT_MS = 900
-const TERMINATION_DEADLINE_MS = 1300
+const PS_TIMEOUT_MS = 200
+const SHUTDOWN_GRACE_MS = 300
+const SIGKILL_TIMEOUT_MS = 650
+const TERMINATION_DEADLINE_MS = 1100
 const ACP_REQUEST_TIMEOUT_MS = 30_000
 const STDERR_DRAIN_MS = 50
 
@@ -272,9 +294,11 @@ export function connectAcp(
       if (process.platform !== 'win32' && child.pid) groups.add(child.pid)
       const discovery = new AbortController()
       let collecting: Promise<void> | undefined
+      let psBroken = false
       // Best effort: without a usable `ps`, still stop agy's own process group.
       const collectGroups = () => {
         if (
+          psBroken ||
           process.platform === 'win32' ||
           !child.pid ||
           discovery.signal.aborted
@@ -284,7 +308,9 @@ export function connectAcp(
           .then((owned) => {
             for (const group of owned) groups.add(group)
           })
-          .catch(() => undefined)
+          .catch(() => {
+            psBroken = true
+          })
           .finally(() => {
             collecting = undefined
           })
@@ -314,6 +340,11 @@ export function connectAcp(
                 SIGKILL_TIMEOUT_MS,
               )
               await exited
+            } else if (collecting) {
+              await Promise.race([
+                collecting,
+                delay(50, undefined, { ref: false }),
+              ])
             }
           })(),
           new Promise<never>((_, reject) => {
