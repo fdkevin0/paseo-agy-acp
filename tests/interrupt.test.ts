@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -13,14 +13,18 @@ import { createProvider } from '../server/provider.ts'
 import { collectProviderEvents } from './helpers.ts'
 
 /** Connect a provider to interrupt-acp.ts and record its events. */
-async function connect(home: string, timeoutMs = 2000) {
+async function connect(
+  home: string,
+  timeoutMs = 2000,
+  extraEnv: Record<string, string> = {},
+) {
   const provider = await createProvider().connect({
     versions: [1],
     capabilities: PROVIDER_CAPABILITIES,
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./interrupt-acp.ts', import.meta.url))],
-      env: { HOME: home, PATH: process.env.PATH ?? '' },
+      env: { HOME: home, PATH: process.env.PATH ?? '', ...extraEnv },
     },
   })
   const { events, wait } = collectProviderEvents(provider)
@@ -305,6 +309,377 @@ test('interrupt without active background work uses native session/cancel fast p
       log.some((row) => row.event === 'load'),
       false,
     )
+  } finally {
+    await provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('interrupt completes before slow loadSession, avoids relaunch loops without restart notice, and keeps can_stop_runtime accurate', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-interrupt-slow-load-'))
+  const { provider, events, until, log } = await connect(home, 4000, {
+    AGY_LOAD_DELAY_MS: '2200',
+  })
+  const prompt = (clientMessageId: string, text: string) =>
+    provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId,
+        delivery: 'auto',
+        input: { type: 'message', content: [{ type: 'text', text }] },
+      },
+    })
+  try {
+    await provider.send({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'skip',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    await until((event) => event.type === 'session.ready')
+    await prompt('p-bg', 'background')
+    await until(
+      (event) =>
+        event.type === 'timeline.item' &&
+        event.item.type === 'assistant_message' &&
+        event.item.text === 'WAITING',
+    )
+
+    const interruptStartedAt = Date.now()
+    await provider.send({
+      type: 'session.interrupt',
+      requestId: 'interrupt-1',
+      sessionId: 's',
+    })
+    await until(
+      (event) =>
+        event.type === 'request.completed' && event.requestId === 'interrupt-1',
+    )
+    await until(
+      (event) => event.type === 'session.turn' && event.state === 'canceled',
+    )
+    assert.ok(
+      Date.now() - interruptStartedAt < 1500,
+      'interrupt must finish Phase 1 shutdown well under Paseo 2s budget despite 2.2s loadSession',
+    )
+
+    // Admit follow-up prompt immediately while background loadSession is still running.
+    await prompt('p-next', 'next')
+    const started = await until(
+      (event) =>
+        event.type === 'session.turn' &&
+        event.state === 'started' &&
+        events.some(
+          (p) =>
+            p.type === 'session.prompt_result' &&
+            p.clientMessageId === 'p-next' &&
+            p.result.type === 'turn' &&
+            p.result.turnId === event.turnId,
+        ),
+    )
+    assert.ok(started.type === 'session.turn')
+    await until(
+      (event) =>
+        event.type === 'session.turn' &&
+        event.turnId === started.turnId &&
+        event.state === 'completed',
+    )
+    assert.ok(
+      events.some(
+        (event) =>
+          event.type === 'timeline.item' &&
+          event.item.type === 'assistant_message' &&
+          event.item.text === 'NEW_REPLY',
+      ),
+    )
+
+    // Transcript still contains pre-relaunch GENERIC(RUNNING) without a restart notice; idle runtime must be stoppable.
+    await provider.send({
+      type: 'session.can_stop_runtime',
+      requestId: 'can-stop',
+      sessionId: 's',
+    })
+    const canStopEvent = await until(
+      (event) =>
+        event.type === 'session.can_stop_runtime' &&
+        event.requestId === 'can-stop',
+    )
+    assert.ok(canStopEvent.type === 'session.can_stop_runtime')
+    assert.equal(
+      canStopEvent.canStop,
+      true,
+      'pre-relaunch RUNNING row without restart notice must not block can_stop_runtime',
+    )
+
+    // A second interrupt must take the fast cancel path rather than entering a relaunch loop.
+    const secondInterruptAt = Date.now()
+    await provider.send({
+      type: 'session.interrupt',
+      requestId: 'interrupt-2',
+      sessionId: 's',
+    })
+    await until(
+      (event) =>
+        event.type === 'request.completed' && event.requestId === 'interrupt-2',
+    )
+    assert.ok(Date.now() - secondInterruptAt < 1000)
+
+    const entries = await log()
+    assert.equal(entries.filter((row) => row.event === 'start').length, 2)
+    assert.equal(entries.filter((row) => row.event === 'load').length, 1)
+    assert.equal(entries.filter((row) => row.event === 'cancel').length, 2)
+  } finally {
+    await provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('interrupting a queued prompt while background reload is in progress cancels it without killing replacement runtime', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-interrupt-queued-'))
+  const { provider, events, until, log } = await connect(home, 3000, {
+    AGY_LOAD_DELAY_MS: '800',
+  })
+  const prompt = (clientMessageId: string, text: string) =>
+    provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId,
+        delivery: 'auto',
+        input: { type: 'message', content: [{ type: 'text', text }] },
+      },
+    })
+  try {
+    await provider.send({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'skip',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    await until((event) => event.type === 'session.ready')
+    await prompt('p-bg', 'background')
+    await until(
+      (event) =>
+        event.type === 'timeline.item' &&
+        event.item.type === 'assistant_message' &&
+        event.item.text === 'WAITING',
+    )
+
+    await provider.send({
+      type: 'session.interrupt',
+      requestId: 'interrupt-1',
+      sessionId: 's',
+    })
+    await until(
+      (event) =>
+        event.type === 'request.completed' && event.requestId === 'interrupt-1',
+    )
+    await until(
+      (event) => event.type === 'session.turn' && event.state === 'canceled',
+    )
+
+    await prompt('p-queued', 'should-not-run')
+    const queuedTurn = await until(
+      (event) =>
+        event.type === 'session.turn' &&
+        event.state === 'started' &&
+        events.some(
+          (p) =>
+            p.type === 'session.prompt_result' &&
+            p.clientMessageId === 'p-queued' &&
+            p.result.type === 'turn' &&
+            p.result.turnId === event.turnId,
+        ),
+    )
+    assert.ok(queuedTurn.type === 'session.turn')
+
+    const cancelQueuedAt = Date.now()
+    await provider.send({
+      type: 'session.interrupt',
+      requestId: 'interrupt-2',
+      sessionId: 's',
+    })
+    await until(
+      (event) =>
+        event.type === 'request.completed' && event.requestId === 'interrupt-2',
+    )
+    await until(
+      (event) =>
+        event.type === 'session.turn' &&
+        event.turnId === queuedTurn.turnId &&
+        event.state === 'canceled',
+    )
+    assert.ok(Date.now() - cancelQueuedAt < 500)
+
+    await prompt('p-after', 'next')
+    const afterTurn = await until(
+      (event) =>
+        event.type === 'session.turn' &&
+        event.state === 'started' &&
+        events.some(
+          (p) =>
+            p.type === 'session.prompt_result' &&
+            p.clientMessageId === 'p-after' &&
+            p.result.type === 'turn' &&
+            p.result.turnId === event.turnId,
+        ),
+    )
+    assert.ok(afterTurn.type === 'session.turn')
+    await until(
+      (event) =>
+        event.type === 'session.turn' &&
+        event.turnId === afterTurn.turnId &&
+        event.state === 'completed',
+    )
+
+    const entries = await log()
+    assert.equal(entries.filter((row) => row.event === 'start').length, 2)
+    assert.deepEqual(
+      entries.filter((row) => row.event === 'prompt').map((row) => row.text),
+      ['background', 'next'],
+    )
+  } finally {
+    await provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('reopened persisted session fences pre-restart RUNNING work and orphaned unread inbox messages', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-interrupt-reopen-'))
+  const { provider, until, log } = await connect(home, 3000)
+  try {
+    await provider.send({
+      type: 'session.open',
+      requestId: 'open-1',
+      sessionId: 's1',
+      history: 'skip',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    const opened = await until(
+      (event) => event.type === 'session.opened' && event.sessionId === 's1',
+    )
+    assert.ok(
+      opened.type === 'session.opened' &&
+        opened.persistence?.data &&
+        typeof opened.persistence.data === 'object' &&
+        !Array.isArray(opened.persistence.data),
+    )
+    await until(
+      (event) => event.type === 'session.ready' && event.sessionId === 's1',
+    )
+    await provider.send({
+      type: 'session.prompt',
+      sessionId: 's1',
+      prompt: {
+        clientMessageId: 'p-bg',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'background' }],
+        },
+      },
+    })
+    await until(
+      (event) =>
+        event.type === 'timeline.item' &&
+        event.item.type === 'assistant_message' &&
+        event.item.text === 'WAITING',
+    )
+
+    const nativeId = String(opened.persistence.data.sessionId)
+    const messagesDir = join(
+      home,
+      '.gemini/antigravity-cli/brain',
+      nativeId,
+      '.system_generated/messages',
+    )
+    await mkdir(messagesDir, { recursive: true })
+    await writeFile(
+      join(messagesDir, 'dead-unread.json'),
+      JSON.stringify({
+        id: 'dead-unread',
+        sender: '22222222-2222-4222-8222-222222222222',
+        priority: 'MESSAGE_PRIORITY_HIGH',
+        content: 'orphaned from previous runtime',
+      }),
+    )
+
+    await provider.send({
+      type: 'session.close',
+      requestId: 'close-1',
+      sessionId: 's1',
+    })
+    await until(
+      (event) => event.type === 'session.closed' && event.sessionId === 's1',
+    )
+
+    await provider.send({
+      type: 'session.open',
+      requestId: 'open-2',
+      sessionId: 's2',
+      history: 'skip',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+      persistence: opened.persistence,
+    })
+    await until(
+      (event) => event.type === 'session.ready' && event.sessionId === 's2',
+    )
+
+    await provider.send({
+      type: 'session.can_stop_runtime',
+      requestId: 'can-stop-reopen',
+      sessionId: 's2',
+    })
+    const canStopEvent = await until(
+      (event) =>
+        event.type === 'session.can_stop_runtime' &&
+        event.requestId === 'can-stop-reopen',
+    )
+    assert.ok(canStopEvent.type === 'session.can_stop_runtime')
+    assert.equal(canStopEvent.canStop, true)
+
+    await provider.send({
+      type: 'session.interrupt',
+      requestId: 'interrupt-reopen',
+      sessionId: 's2',
+    })
+    await until(
+      (event) =>
+        event.type === 'request.completed' &&
+        event.requestId === 'interrupt-reopen',
+    )
+
+    const entries = await log()
+    assert.equal(entries.filter((row) => row.event === 'start').length, 2)
+    assert.equal(entries.filter((row) => row.event === 'load').length, 1)
+    assert.equal(entries.filter((row) => row.event === 'cancel').length, 1)
   } finally {
     await provider.close()
     await rm(home, { recursive: true, force: true })

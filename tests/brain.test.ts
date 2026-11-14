@@ -4575,3 +4575,158 @@ test('initial spawn prompt quoting task results or batched with a followup messa
   // Root countRowMessages(row, false) counts step-0 UUID wakeup without subtracting 1.
   assert.equal(countRowMessages(message(0, child, 'root wakeup'), false), 1)
 })
+
+test('hasActiveBackgroundWork and settleBrainTurn fence pre-restart processes, daemons, descendants and unread inbox messages past afterStepIndex', async () => {
+  const f = await fixture()
+  try {
+    const turn1 = [
+      { step_index: 1, type: 'USER_INPUT', content: 'turn 1' },
+      {
+        step_index: 2,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          { id: 'invoke-old', name: 'invoke_subagent', args: {} },
+          {
+            id: 'bg-old',
+            name: 'run_command',
+            args: { CommandLine: 'sleep 100' },
+          },
+          {
+            id: 'sched-old-call',
+            name: 'schedule',
+            args: { CronExpression: '* * * * *', IsDaemon: true },
+          },
+        ],
+      },
+      {
+        step_index: 3,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: JSON.stringify({ conversationId: child }),
+      },
+      {
+        step_index: 4,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: 'Tool is running as a background task with task id: task-old',
+      },
+      {
+        step_index: 5,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: 'Tool is running as a background task with task id: sched-old',
+      },
+      done(6, 'waiting'),
+    ]
+    await f.put(parent, turn1)
+    await f.subagent(parent, child, 'SUBAGENT_STATE_ALIVE', 3, 'invoke-old')
+    await f.put(child, [
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'RUNNING',
+        thinking: 'pre-restart child',
+      },
+    ])
+    await f.deliver(parent, child, 'orphaned unread', false, 'msg-old')
+
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), true)
+    const epoch = {
+      afterStepIndex: 6,
+      ignoredMessageIds: new Set(['msg-old']),
+    }
+    assert.equal(
+      await hasActiveBackgroundWork(f.root, parent, {
+        ...epoch,
+        includeDaemons: true,
+      }),
+      false,
+    )
+
+    // Unignored unread messages arriving after epoch capture remain active.
+    await f.deliver(parent, grandchild, 'fresh wakeup', false, 'msg-new')
+    assert.equal(await hasActiveBackgroundWork(f.root, parent, epoch), true)
+    await rm(join(f.root, parent, '.system_generated/messages/msg-new.json'))
+
+    // Post-restart turn on parent: child's own transcript step 1 (<= parent's 6) must NOT be suppressed.
+    await f.put(parent, [
+      ...turn1,
+      { step_index: 7, type: 'USER_INPUT', content: 'turn 2' },
+      {
+        step_index: 8,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          { id: 'invoke-new', name: 'invoke_subagent', args: {} },
+          {
+            id: 'sched-new-call',
+            name: 'schedule',
+            args: { CronExpression: '*/5 * * * *', IsDaemon: true },
+          },
+        ],
+      },
+      {
+        step_index: 9,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: JSON.stringify({ conversationId: grandchild }),
+      },
+      {
+        step_index: 10,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: 'Tool is running as a background task with task id: sched-new',
+      },
+      done(11, 'turn 2 done'),
+    ])
+    await f.subagent(
+      parent,
+      grandchild,
+      'SUBAGENT_STATE_ALIVE',
+      9,
+      'invoke-new',
+    )
+    await f.put(grandchild, [
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'RUNNING',
+        thinking: 'post-restart child',
+      },
+    ])
+    assert.equal(await hasActiveBackgroundWork(f.root, parent, epoch), true)
+
+    await f.subagent(
+      parent,
+      grandchild,
+      'SUBAGENT_STATE_KILLED',
+      9,
+      'invoke-new',
+    )
+    assert.equal(await hasActiveBackgroundWork(f.root, parent, epoch), false)
+    assert.equal(
+      await hasActiveBackgroundWork(f.root, parent, {
+        ...epoch,
+        includeDaemons: true,
+      }),
+      true,
+    )
+
+    // Subsequent prompt settlement ignores orphaned pre-restart unread msg-old rather than stalling.
+    await f.put(parent, [
+      ...turn1,
+      { step_index: 7, type: 'USER_INPUT', content: 'turn 2' },
+      done(8, 'settled cleanly'),
+    ])
+    const settled = await settleBrainTurn(f.root, parent, 'p', () => {}, {
+      minStepIndex: 6,
+      ignoredMessageIds: epoch.ignoredMessageIds,
+      pollIntervalMs: 10,
+      stallTimeoutMs: 100,
+    })
+    assert.equal(settled.status, 'completed')
+  } finally {
+    await f.close()
+  }
+})

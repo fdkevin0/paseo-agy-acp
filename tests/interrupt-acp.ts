@@ -5,6 +5,7 @@ import { Readable, Writable } from 'node:stream'
 
 const nativeId = '33333333-3333-4333-8333-333333333333'
 const home = process.env.HOME!
+const loadDelayMs = Number(process.env.AGY_LOAD_DELAY_MS ?? '40')
 const fullAccess = process.argv.includes('--dangerously-skip-permissions')
 const log = (event: string, data: object = {}) =>
   appendFileSync(
@@ -77,7 +78,7 @@ new AgentSideConnection(
           sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: 'HISTORY_REPLAY' },
         })
-        await new Promise((resolve) => setTimeout(resolve, 40))
+        await new Promise((resolve) => setTimeout(resolve, loadDelayMs))
         commands()
         return { configOptions }
       },
