@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { spawn } from 'node:child_process'
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, stat, writeFile, chmod } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -222,3 +222,61 @@ test('transport surfaces stderr on immediate startup failure and notifies onExit
     await rm(home, { recursive: true, force: true })
   }
 })
+
+test(
+  'shutdown deadlines include a slow process-group snapshot',
+  {
+    skip: process.platform === 'win32',
+  },
+  async () => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-slow-ps-'))
+    const path = process.env.PATH
+    const transport = connectAcp(
+      {
+        command: process.execPath,
+        args: [fileURLToPath(new URL('./transport-acp.ts', import.meta.url))],
+        env: { HOME: home, PATH: path ?? '', AGY_SHUTDOWN: 'stubborn' },
+      },
+      home,
+      {},
+      {
+        sessionUpdate: async () => {},
+        requestPermission: async () => ({ outcome: { outcome: 'cancelled' } }),
+      },
+      () => {},
+    )
+    try {
+      await transport.rpc.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {},
+      })
+      // A separate ps process must consume real shutdown time; fake JS timers cannot advance it.
+      await writeFile(
+        join(home, 'ps'),
+        `#!${process.execPath}
+import { execFile } from 'node:child_process'
+setTimeout(() => execFile('/bin/ps', process.argv.slice(2), (error, stdout) => {
+  process.stdout.write(stdout)
+  process.exit(error ? 1 : 0)
+}), 800)
+`,
+      )
+      await chmod(join(home, 'ps'), 0o755)
+      process.env.PATH = home
+      const startedAt = Date.now()
+      // The transport may reject at its hard deadline, but discovery must not defer that deadline.
+      await transport.close().catch((error: Error) => {
+        assert.equal(error.message, 'agy did not exit after termination')
+      })
+      assert.ok(
+        Date.now() - startedAt < 1600,
+        'process discovery must not extend the 1.4s shutdown deadline',
+      )
+      await transport.exited
+    } finally {
+      process.env.PATH = path
+      await transport.close().catch(() => undefined)
+      await rm(home, { recursive: true, force: true })
+    }
+  },
+)

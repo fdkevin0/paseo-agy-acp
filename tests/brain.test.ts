@@ -1487,6 +1487,7 @@ test('a settled ALIVE child does not suspend the parent stall timeout', async ()
         minStepIndex: -1,
         pollIntervalMs: 5,
         stallTimeoutMs: 50,
+        wokenStallTimeoutMs: 50,
       }),
     )
     assert.equal(result.status, 'failed')
@@ -4727,6 +4728,101 @@ test('hasActiveBackgroundWork and settleBrainTurn fence pre-restart processes, d
     })
     assert.equal(settled.status, 'completed')
   } finally {
+    await f.close()
+  }
+})
+
+test('the first post-epoch wakeup is active without another USER_INPUT', async () => {
+  const f = await fixture()
+  try {
+    const rows = [
+      { step_index: 1, type: 'USER_INPUT', content: 'old turn' },
+      done(2),
+      message(3, child, 'fresh wakeup'),
+      { step_index: 4, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+    ]
+    await f.put(parent, rows)
+    assert.equal(
+      await hasActiveBackgroundWork(f.root, parent, { afterStepIndex: 2 }),
+      true,
+    )
+    await appendFile(f.path(parent), encode([done(5)]))
+    assert.equal(
+      await hasActiveBackgroundWork(f.root, parent, { afterStepIndex: 2 }),
+      false,
+    )
+  } finally {
+    await f.close()
+  }
+})
+
+test('runtime retirement invalidates child resumptions already queued for a drained watcher', async () => {
+  const f = await fixture()
+  let loading = false
+  const registry = new SubagentRegistry({
+    sessionId: 'p',
+    cwd: f.root,
+    brainRoot: f.root,
+    capabilities: ['session.subsession'],
+    emit() {},
+    getNativeId: () => parent,
+    isParentTurnActive: () => true,
+    isLoading: () => loading,
+    isUnavailable: () => false,
+  })
+  const link = (name: string) =>
+    registry.linkSubsession('p', parent, {
+      type: 'tool_call',
+      id: name,
+      callId: name,
+      name,
+      status: 'completed',
+      error: null,
+      detail: { type: 'sub_agent', childSessionId: child, log: '' },
+    })
+  try {
+    await f.put(child, [
+      { step_index: 1, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+    ])
+    link('invoke_subagent')
+    await registry.waitCurrentReady()
+    await Promise.all(registry.cancelAll())
+    await appendFile(f.path(child), encode([message(2, parent, 'new work')]))
+    link('send_message')
+    loading = true
+    await Promise.all(registry.cancelAll())
+    loading = false
+    await registry.waitCurrentReady()
+    assert.equal(registry.hasRunningChildren(), false)
+    // A later runtime can resume it, but cancellation must also drain newly discovered descendants.
+    link('send_message')
+    await waitUntil(() => registry.hasRunningChildren())
+    await f.put(grandchild, [
+      { step_index: 1, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+    ])
+    await appendFile(
+      f.path(child),
+      encode([
+        {
+          step_index: 3,
+          type: 'PLANNER_RESPONSE',
+          tool_calls: [{ id: 'nested', name: 'invoke_subagent', args: {} }],
+        },
+        {
+          step_index: 4,
+          type: 'GENERIC',
+          status: 'DONE',
+          content: JSON.stringify({ conversationId: grandchild }),
+        },
+      ]),
+    )
+    loading = true
+    await Promise.all(registry.cancelAll())
+    loading = false
+    await registry.waitCurrentReady()
+    assert.equal(registry.hasRunningChildren(), false)
+  } finally {
+    registry.closeAll()
     await f.close()
   }
 })

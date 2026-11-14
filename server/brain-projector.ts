@@ -906,6 +906,7 @@ export class BrainNode {
   applyRestartBoundary(stepIndex: number) {
     this.turnStartStep = stepIndex
     this.resetPhase()
+    this.promptPhase = 'foreground_idle'
     this.projector.resetRestartState()
     this.lastStep = undefined
   }
@@ -1095,6 +1096,8 @@ export class BrainNode {
       (this.projector.hasPending() ||
         (this.lastStep?.type === 'SYSTEM_MESSAGE' &&
           !isRestartNotice(this.lastStep)) ||
+        (this.lastStep?.type === 'PLANNER_RESPONSE' &&
+          runningStepStatuses.has(String(this.lastStep.status))) ||
         (this.lastStep?.type === 'GENERIC' &&
           this.lastStep.status !== 'CANCELED' &&
           this.lastStep.status !== 'INTERRUPTED'))

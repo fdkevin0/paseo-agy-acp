@@ -185,6 +185,7 @@ export class SessionManager {
           if (!canResume && !session.initialized.agentCapabilities?.loadSession)
             throw new Error('agy does not support session/load')
           session.state.nativeId = data.sessionId as string
+          await session.captureRuntimeEpoch()
           session.state.metadata = {
             ...(await session.transport.request(
               canResume
@@ -250,11 +251,10 @@ export class SessionManager {
               session.state.nativeId,
             ).catch(() => -1)
           }
-          await session.captureRuntimeEpoch()
         }
         session.state.turnToolCallIds = []
         session.state.turnForegroundAcp = []
-        await configureSession(session, input.config, { strictThinking: false })
+        await session.configure(input.config, { strictThinking: false })
         await session.drain()
         if (input.persistence) await session.restoreUsage()
         session.state.loading = false
@@ -341,9 +341,10 @@ export class SessionManager {
         await session.interrupt()
       return
     }
-    if (input.type === 'session.configure')
-      await configureSession(session, input.changes)
-    else if (input.type === 'session.interrupt') {
+    if (input.type === 'session.configure') {
+      if (!session.state.ready) throw new Error('Session is not ready')
+      await session.configure(input.changes)
+    } else if (input.type === 'session.interrupt') {
       await session.interrupt()
     } else if (input.type === 'session.can_stop_runtime') {
       emit({
@@ -429,6 +430,7 @@ async function createSession(
     observation: null as BrainTurnObservation | null,
     turnFinished: false,
     interrupting: null as Promise<void> | null,
+    configuring: null as Promise<void> | null,
     failed: false,
     metadata: { sessionId: '' } as NewSessionResponse & SessionMetadata,
     prompts: new Set<string>(),
@@ -461,6 +463,7 @@ async function createSession(
   let relaunching = Promise.resolve()
   let runtimeEpochStep = -1
   const ignoredMessageIds = new Set<string>()
+  let configurationAbort = new AbortController()
   const nativeWindowSizes = new Map<string | undefined, number>()
   let usage: ProviderUsage = {}
   let deferredUsage = false
@@ -1011,11 +1014,9 @@ async function createSession(
       state.replay = false
       retiring.add(currentTransport)
       try {
-        if (!currentTransport.closed) {
-          await currentTransport.close()
-          if (state.closing) return
-          await captureRuntimeEpoch()
-        }
+        await currentTransport.close()
+        if (state.closing) return
+        await captureRuntimeEpoch()
         if (state.closing) return
         if (state.failed)
           throw new Error('ACP runtime has exited; reopen the session')
@@ -1118,16 +1119,12 @@ async function createSession(
         }
         await obsolete.close()
         if (state.closing) return
-        await captureRuntimeEpoch()
-        if (state.closing) return
         if (!currentInitialized.agentCapabilities?.loadSession)
           throw new Error(
             'agy cannot reload after interruption; reopen the session',
           )
         launchedReplacement = true
         void relaunch(state.skipPermissions, true).catch(() => undefined)
-        // Advance one microtask so the replacement runtime is spawned while loadSession completes in the background.
-        await Promise.resolve()
       } catch (error) {
         if (!launchedReplacement) {
           state.loading = false
@@ -1247,22 +1244,57 @@ async function createSession(
       ignoredMessageIds: ignoredMessageIds as ReadonlySet<string>,
       isRetiredTransport: (transport: ReturnType<typeof connectAcp>) =>
         retiring.has(transport),
-      async waitForReady(signal?: AbortSignal): Promise<void> {
+      configure(
+        changes: ProviderConfigChanges,
+        options?: { strictThinking?: boolean },
+      ): Promise<void> {
+        if (state.turn)
+          return Promise.reject(
+            new Error(
+              'Wait for the current turn before changing configuration',
+            ),
+          )
+        const signal = configurationAbort.signal
+        const run = (state.configuring ?? Promise.resolve())
+          .catch(() => undefined)
+          .then(() => configureSession(this, changes, options, signal))
+          .finally(() => {
+            if (state.configuring === run) state.configuring = null
+          })
+        state.configuring = run
+        return run
+      },
+      async waitForReady(
+        signal?: AbortSignal,
+        includeConfiguration = true,
+      ): Promise<void> {
         signal?.throwIfAborted()
-        if (!signal) {
-          await relaunching
-          return
-        }
         let onAbort!: () => void
         const aborted = new Promise<never>((_, reject) => {
-          onAbort = () => reject(signal.reason)
+          onAbort = () => reject(signal?.reason)
         })
-        signal.addEventListener('abort', onAbort, { once: true })
+        signal?.addEventListener('abort', onAbort, { once: true })
         try {
-          if (signal.aborted) signal.throwIfAborted()
-          await Promise.race([relaunching, aborted])
+          for (;;) {
+            const interruption = state.interrupting
+            const replacement = relaunching
+            const configuration = includeConfiguration
+              ? state.configuring
+              : null
+            await Promise.race([
+              Promise.all([interruption, replacement, configuration]),
+              aborted,
+            ])
+            signal?.throwIfAborted()
+            if (
+              interruption === state.interrupting &&
+              replacement === relaunching &&
+              (!includeConfiguration || configuration === state.configuring)
+            )
+              return
+          }
         } finally {
-          signal.removeEventListener('abort', onAbort)
+          signal?.removeEventListener('abort', onAbort)
         }
       },
       async canStop(): Promise<boolean> {
@@ -1272,6 +1304,7 @@ async function createSession(
           state.loading ||
           state.turn ||
           state.interrupting ||
+          state.configuring ||
           permissions.size > 0 ||
           subagents.hasRunningChildren()
         )
@@ -1290,12 +1323,15 @@ async function createSession(
         await notificationLane
       },
       async interrupt(): Promise<void> {
-        if (state.interrupting) return state.interrupting
         if (state.closing) return
         if (state.failed)
           throw new Error('ACP runtime has exited; reopen the session')
+        const hadConfiguration = state.configuring !== null
+        configurationAbort.abort()
+        configurationAbort = new AbortController()
         state.turnAbort?.abort()
         cancelPermissions()
+        if (state.interrupting) return state.interrupting
         // Children stay registered when canceled so they are neither reopened nor left unclosed.
         const canceling = subagents.cancelRunning()
         // Native session/cancel leaves background tasks alive; stop their owner when background work is active.
@@ -1307,6 +1343,7 @@ async function createSession(
           if (state.loading) return
           const needsRelaunch =
             canceling.length > 0 ||
+            hadConfiguration ||
             (await hasActiveBackgroundWork(brainRoot, state.nativeId, {
               retryTimeoutMs: options.retryTimeoutMs,
               afterStepIndex: runtimeEpochStep,
@@ -1351,6 +1388,7 @@ async function createSession(
         closingObservation?.stop()
         const closingTurnId = state.turn
         state.turnAbort?.abort()
+        configurationAbort.abort()
         resolveCommands()
         closing = (async () => {
           cancelPermissions()
@@ -1378,6 +1416,7 @@ async function createSession(
             () => false,
           )
           await relaunching
+          await state.configuring?.catch(() => undefined)
           if (!currentTransport.closed)
             stopped =
               (await currentTransport.close().then(
@@ -1455,17 +1494,14 @@ async function applyNativeConfigOption(
 async function configureSession(
   session: Session,
   changes: ProviderConfigChanges,
-  options?: { strictThinking?: boolean },
-) {
+  options: { strictThinking?: boolean } | undefined,
+  signal: AbortSignal,
+): Promise<void> {
   if (session.state.closing || session.state.failed)
     throw new Error('ACP runtime has exited; reopen the session')
-  if (session.state.turn)
-    throw new Error('Wait for the current turn before changing configuration')
-  await session.waitForReady()
+  await session.waitForReady(signal, false)
   if (session.state.closing || session.state.failed)
     throw new Error('ACP runtime has exited; reopen the session')
-  if (session.state.turn)
-    throw new Error('Wait for the current turn before changing configuration')
   if (changes.settings && Object.keys(changes.settings).length)
     throw new Error('Custom settings are not supported')
   const strictThinking = options?.strictThinking ?? true
@@ -1489,6 +1525,7 @@ async function configureSession(
   let mutated = false
   try {
     for (const [key, value] of entries) {
+      signal.throwIfAborted()
       if (value == null) continue
       const current = configState(session.state.metadata)
       if (value === selectedConfigValue(current, key)) continue
@@ -1504,6 +1541,7 @@ async function configureSession(
         continue
       if (key === 'mode' && value === FULL_ACCESS_MODE_ID) {
         await session.relaunch(true)
+        signal.throwIfAborted()
         session.state.metadata.fullAccess = true
         mutated = true
         const nativeModes = configState({
@@ -1524,6 +1562,7 @@ async function configureSession(
       }
       if (key === 'mode') {
         await session.relaunch(false)
+        signal.throwIfAborted()
         session.state.metadata.fullAccess = false
         mutated = true
       }
@@ -1535,6 +1574,7 @@ async function configureSession(
         value,
         true,
       )
+      signal.throwIfAborted()
       mutated ||= applied
     }
   } catch (error) {
@@ -1576,7 +1616,8 @@ async function promptSession(
   if (session.state.prompts.has(p.clientMessageId)) return
   if (p.clearPendingPermissions) session.cancelPermissions()
   if (session.state.closing) throw new Error('Session is closing')
-  if (session.state.opening) throw new Error('Session is not ready')
+  if (session.state.opening || !session.state.ready)
+    throw new Error('Session is not ready')
   if (session.state.turn) throw new Error('Session already has an active turn')
   if (session.state.failed)
     throw new Error('ACP runtime has exited; reopen the session')

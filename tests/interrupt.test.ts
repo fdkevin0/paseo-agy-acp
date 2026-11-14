@@ -10,7 +10,7 @@ import {
   type ProviderEvent,
 } from '@getpaseo/plugin/server/provider'
 import { createProvider } from '../server/provider.ts'
-import { collectProviderEvents } from './helpers.ts'
+import { collectProviderEvents, writeBrainTranscript } from './helpers.ts'
 
 /** Connect a provider to interrupt-acp.ts and record its events. */
 async function connect(
@@ -36,7 +36,14 @@ async function connect(
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line))
-  return { provider, events, until, log }
+  const untilLog = async (event: string) => {
+    const deadline = Date.now() + timeoutMs
+    while (!(await log()).some((row) => row.event === event)) {
+      assert.ok(Date.now() < deadline, `Timed out waiting for ${event}`)
+      await delay(10)
+    }
+  }
+  return { provider, events, until, log, untilLog }
 }
 
 for (const mode of ['plan', 'full-access']) {
@@ -680,6 +687,356 @@ test('reopened persisted session fences pre-restart RUNNING work and orphaned un
     assert.equal(entries.filter((row) => row.event === 'start').length, 2)
     assert.equal(entries.filter((row) => row.event === 'load').length, 1)
     assert.equal(entries.filter((row) => row.event === 'cancel').length, 1)
+  } finally {
+    await provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+for (const operation of ['prompt', 'configure']) {
+  test(`${operation} arriving during idle-runtime retirement waits for its replacement`, async () => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-retiring-ready-'))
+    const { provider, until, log, untilLog } = await connect(home, 3000, {
+      AGY_EXIT_DELAY_MS: '300',
+    })
+    try {
+      await provider.send({
+        type: 'session.open',
+        requestId: 'open',
+        sessionId: 's',
+        history: 'skip',
+        config: {
+          cwd: home,
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: true,
+        },
+      })
+      await until((event) => event.type === 'session.ready')
+      // An idle runtime with unread background work still needs retirement.
+      const messages = join(
+        home,
+        '.gemini/antigravity-cli/brain',
+        '33333333-3333-4333-8333-333333333333',
+        '.system_generated/messages',
+      )
+      await mkdir(messages, { recursive: true })
+      await writeFile(
+        join(messages, 'unread.json'),
+        JSON.stringify({ id: 'unread', sender: 'task-old' }),
+      )
+      await provider.send({
+        type: 'session.interrupt',
+        requestId: 'interrupt',
+        sessionId: 's',
+      })
+      await untilLog('stdin-ended')
+      if (operation === 'configure') {
+        await provider.send({
+          type: 'session.configure',
+          requestId: 'configure',
+          sessionId: 's',
+          changes: { model: 'large' },
+        })
+        await until(
+          (event) =>
+            event.type === 'request.completed' &&
+            event.requestId === 'configure',
+        )
+      }
+      await provider.send({
+        type: 'session.prompt',
+        sessionId: 's',
+        prompt: {
+          clientMessageId: 'next',
+          delivery: 'auto',
+          input: { type: 'message', content: [{ type: 'text', text: 'next' }] },
+        },
+      })
+      await until(
+        (event) => event.type === 'session.turn' && event.state === 'completed',
+      )
+      const entries = await log()
+      const loaded = entries.find((row) => row.event === 'loaded')
+      const prompted = entries.find((row) => row.event === 'prompt')
+      assert.ok(loaded)
+      assert.equal(prompted.pid, loaded.pid)
+      assert.equal(
+        prompted.config.model,
+        operation === 'configure' ? 'large' : 'small',
+      )
+    } finally {
+      await provider.close()
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+}
+
+test('a prompt waits for an in-flight configuration transaction', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-config-prompt-'))
+  const { provider, until, log, untilLog } = await connect(home, 3000, {
+    AGY_CONFIG_DELAY_MS: '200',
+  })
+  try {
+    await provider.send({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'skip',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    await until((event) => event.type === 'session.ready')
+    await provider.send({
+      type: 'session.configure',
+      requestId: 'configure',
+      sessionId: 's',
+      changes: { model: 'large', thinkingOption: 'high' },
+    })
+    await untilLog('configure')
+    await provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'next',
+        delivery: 'auto',
+        input: { type: 'message', content: [{ type: 'text', text: 'next' }] },
+      },
+    })
+    await until(
+      (event) => event.type === 'session.turn' && event.state === 'completed',
+    )
+    const prompted = (await log()).find((row) => row.event === 'prompt')
+    assert.equal(prompted.config.model, 'large')
+    assert.equal(prompted.config.thought_level, 'high')
+  } finally {
+    await provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('restoration fences history before load, not wakeups created by the new runtime', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-load-wakeup-'))
+  const { provider, until } = await connect(home, 3000, {
+    AGY_LOAD_WAKEUP: '1',
+  })
+  const nativeId = '33333333-3333-4333-8333-333333333333'
+  try {
+    await writeBrainTranscript(
+      join(home, '.gemini/antigravity-cli/brain'),
+      nativeId,
+      [
+        {
+          step_index: 3,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: 'old turn',
+        },
+      ],
+    )
+    await provider.send({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'skip',
+      persistence: { version: 1, data: { sessionId: nativeId } },
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    await until((event) => event.type === 'session.ready')
+    await provider.send({
+      type: 'session.can_stop_runtime',
+      requestId: 'can-stop',
+      sessionId: 's',
+    })
+    const result = await until(
+      (event) => event.type === 'session.can_stop_runtime',
+    )
+    assert.ok(result.type === 'session.can_stop_runtime')
+    assert.equal(
+      result.canStop,
+      false,
+      'a newly woken model must keep its runtime alive',
+    )
+  } finally {
+    await provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+for (const operation of ['prompt', 'configure']) {
+  test(`a repeated interrupt cancels a ${operation} queued during retirement`, async () => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-retiring-cancel-'))
+    const { provider, until, untilLog, log } = await connect(home, 3000, {
+      AGY_EXIT_DELAY_MS: '300',
+    })
+    try {
+      await provider.send({
+        type: 'session.open',
+        requestId: 'open',
+        sessionId: 's',
+        history: 'skip',
+        config: {
+          cwd: home,
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: true,
+        },
+      })
+      await until((event) => event.type === 'session.ready')
+      const messages = join(
+        home,
+        '.gemini/antigravity-cli/brain',
+        '33333333-3333-4333-8333-333333333333',
+        '.system_generated/messages',
+      )
+      await mkdir(messages, { recursive: true })
+      await writeFile(
+        join(messages, 'old.json'),
+        JSON.stringify({ id: 'old', sender: 'task-old' }),
+      )
+      await provider.send({
+        type: 'session.interrupt',
+        requestId: 'interrupt-1',
+        sessionId: 's',
+      })
+      await untilLog('stdin-ended')
+      if (operation === 'configure') {
+        await provider.send({
+          type: 'session.configure',
+          requestId: 'queued-config',
+          sessionId: 's',
+          changes: { model: 'large' },
+        })
+      } else {
+        await provider.send({
+          type: 'session.prompt',
+          sessionId: 's',
+          prompt: {
+            clientMessageId: 'queued',
+            delivery: 'auto',
+            input: {
+              type: 'message',
+              content: [{ type: 'text', text: 'must-not-run' }],
+            },
+          },
+        })
+        await until(
+          (event) => event.type === 'session.turn' && event.state === 'started',
+        )
+      }
+      await provider.send({
+        type: 'session.interrupt',
+        requestId: 'interrupt-2',
+        sessionId: 's',
+      })
+      await until((event) =>
+        operation === 'configure'
+          ? event.type === 'request.failed' &&
+            event.requestId === 'queued-config'
+          : event.type === 'session.turn' && event.state === 'canceled',
+      )
+      await until(
+        (event) =>
+          event.type === 'request.completed' &&
+          event.requestId === 'interrupt-2',
+      )
+      await provider.send({
+        type: 'session.prompt',
+        sessionId: 's',
+        prompt: {
+          clientMessageId: 'after',
+          delivery: 'auto',
+          input: { type: 'message', content: [{ type: 'text', text: 'next' }] },
+        },
+      })
+      await until(
+        (event) => event.type === 'session.turn' && event.state === 'completed',
+      )
+      const entries = await log()
+      assert.deepEqual(
+        entries.filter((row) => row.event === 'prompt').map((row) => row.text),
+        ['next'],
+      )
+      assert.equal(
+        entries.some((row) => row.event === 'configure'),
+        false,
+      )
+      assert.equal(entries.filter((row) => row.event === 'start').length, 2)
+    } finally {
+      await provider.close()
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+}
+
+test('initial session configuration does not admit prompts or external configuration before ready', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-opening-config-'))
+  const { provider, until, untilLog, log } = await connect(home, 3000, {
+    AGY_CONFIG_DELAY_MS: '200',
+  })
+  try {
+    await provider.send({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'skip',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+        model: 'large',
+      },
+    })
+    await until((event) => event.type === 'session.opened')
+    await untilLog('configure')
+    await provider.send({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'too-early',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'must-not-run' }],
+        },
+      },
+    })
+    const result = await until(
+      (event) => event.type === 'session.prompt_result',
+    )
+    assert.ok(result.type === 'session.prompt_result')
+    assert.equal(result.result.type, 'failed')
+    await provider.send({
+      type: 'session.configure',
+      requestId: 'too-early-config',
+      sessionId: 's',
+      changes: { model: 'small' },
+    })
+    await until(
+      (event) =>
+        event.type === 'request.failed' &&
+        event.requestId === 'too-early-config',
+    )
+    await until((event) => event.type === 'session.ready')
+    assert.equal(
+      (await log()).some((row) => row.event === 'prompt'),
+      false,
+    )
   } finally {
     await provider.close()
     await rm(home, { recursive: true, force: true })
