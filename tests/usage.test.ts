@@ -99,6 +99,56 @@ test('email discovery uses recent logs, the latest match and bounded tails', asy
   }
 })
 
+test('keychain logins without a token file remain discoverable', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-keychain-'))
+  const dir = join(home, '.gemini/antigravity-cli')
+  const fixture = join(home, 'quota.json')
+  const scope = {
+    kind: 'session' as const,
+    provider: 'agy',
+    env: { HOME: home },
+  }
+  const usage = new AgyUsageSource()
+  try {
+    await mkdir(dir, { recursive: true })
+    await writeFile(
+      join(dir, 'cli.log'),
+      'applyAuthResult: email=keychain@example.test\n',
+    )
+    await writeFile(fixture, envelope(groups))
+    // agy >=1.5 authenticates from the OS keychain and writes no token file, so a
+    // login line in the retained cli.log is the only discovery evidence available.
+    const [account] = await usage.discover(scope)
+    assert.ok(account)
+    assert.equal(account.key, hashAccountKey(dir))
+    assert.equal(account.label, 'keychain@example.test')
+    usage.remember(
+      {
+        command: process.execPath,
+        args: [
+          fileURLToPath(new URL('./mock-usage.ts', import.meta.url)),
+          'acp',
+        ],
+        env: {
+          HOME: home,
+          AGY_USAGE_FIXTURE: fixture,
+          AGY_USAGE_ARGS: join(home, 'args.json'),
+        },
+      },
+      {},
+      home,
+    )
+    const report = await usage.fetch(account.input)
+    assert.equal(report.status, 'available')
+
+    // Without a token file, a remembered launch or a login line there is nothing to show.
+    await rm(join(dir, 'cli.log'))
+    assert.deepEqual(await new AgyUsageSource().discover(scope), [])
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('usage discovers account scopes and maps windows, tier and failures through the CLI', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agy-usage-'))
   const home = join(root, 'home')
@@ -279,10 +329,9 @@ test('usage discovers account scopes and maps windows, tier and failures through
       'available',
     )
     await rm(join(dir, 'antigravity-oauth-token'))
-    await assert.rejects(
-      usage.fetch(account.input),
-      /login store no longer exists/,
-    )
+    // The CLI stays authoritative: removing the legacy token file must not hide an
+    // account that still answers, because keychain logins never write that file.
+    assert.equal((await usage.fetch(account.input)).status, 'available')
     // A known launch can use an OS-backed login store instead of the token file.
     const fresh = new AgyUsageSource()
     fresh.remember(launch, {}, home)

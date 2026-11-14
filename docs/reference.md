@@ -168,7 +168,7 @@ Usage Source `agy` supplies the Composer context popover and `paseo usage ls --j
 
 Global discovery considers observed account directories (bounded to 100 entries) and the default data directory. Session discovery serves provider IDs `agy` and `antigravity`, resolving the directory using the session environment and a matching remembered launch. Paseo's usage scope has no launch command; if several custom launches match the same environment, the latest observation wins.
 
-Account keys are SHA-256 hashes of data directories. A non-empty `antigravity-oauth-token` file or a remembered launch makes a directory discoverable, except that directories where a previously observed OAuth token file was removed (`hadLogin && !hasToken`) are skipped during discovery until signed in again. Labels use the latest login match across `cli.log` (always retained) plus up to ten most recent `log/cli-*.log` and `log/acp-server-*.log` files, reading at most 64 KiB from the tail of each file. Missing logs fall back to `Antigravity`. Token contents are not read or copied into usage inputs.
+Account keys are SHA-256 hashes of data directories. A non-empty `antigravity-oauth-token` file, a login line in the retained logs, or a remembered launch makes a directory discoverable. agy 1.5 and later keeps credentials in the OS keychain and writes no token file, so the login line and the remembered launch are the signals that survive there; a directory with none of them is skipped. Labels use the latest login match across `cli.log` (always retained) plus up to ten most recent `log/cli-*.log` and `log/acp-server-*.log` files, reading at most 64 KiB from the tail of each file. Missing logs fall back to `Antigravity`. Token contents are not read or copied into usage inputs.
 
 Successful catalog discovery and session opening remember `_meta.antigravity.tier.name` as `planLabel`. The label is absent until observed and can be stale after an account change.
 
@@ -198,5 +198,5 @@ Windows are included in the default summary. Usage above 90% has a danger tone; 
 | Valid quota buckets                                 | `available`, with windows and the observed plan label when known. |
 | No buckets                                          | `unavailable` with `no_quota`.                                    |
 | Command, authentication, timeout or parsing failure | `error` with a diagnostic.                                        |
-| Previously observed login file disappears           | Raise a login-store error.                                        |
-| Remembered launch has never exposed a token file    | Let the CLI try its OS-backed login store.                        |
+| No token file, login line or remembered launch      | Omit the account from discovery.                                  |
+| Login store removed but the CLI still answers       | Report the CLI result; the token file is not authoritative.       |

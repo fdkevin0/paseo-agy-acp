@@ -140,7 +140,8 @@ export async function readLoggedEmail(
   }
 }
 
-async function hasLogin(dataDir: string): Promise<boolean> {
+/** agy >=1.5 keeps credentials in the OS keychain; the token file is the legacy store. */
+async function hasTokenFile(dataDir: string): Promise<boolean> {
   return stat(join(dataDir, 'antigravity-oauth-token')).then(
     (s) => s.isFile() && s.size > 0,
     () => false,
@@ -190,7 +191,6 @@ export class AgyUsageSource {
       launch?: ProviderLaunch
       env: Record<string, string>
       cwd?: string
-      hadLogin: boolean
     }
   >()
 
@@ -200,7 +200,6 @@ export class AgyUsageSource {
     cwd?: string,
   ): string {
     const dir = dataDirectory(launch, env, cwd)
-    const hadLogin = this.launches.get(dir)?.hadLogin ?? false
     setBounded(
       this.launches,
       dir,
@@ -208,7 +207,6 @@ export class AgyUsageSource {
         launch,
         env: { ...launch?.env, ...env },
         cwd,
-        hadLogin,
       },
       ACCOUNT_CACHE_LIMIT,
     )
@@ -238,16 +236,16 @@ export class AgyUsageSource {
     const accounts: UsageAccount[] = []
     for (const dir of new Set(dirs)) {
       let known = this.launches.get(dir)
-      const loggedIn = await hasLogin(dir)
-      if (!loggedIn && (!known || known.hadLogin)) continue
+      const email = await readLoggedEmail(dir)
+      const loggedIn = (await hasTokenFile(dir)) || email !== undefined
+      if (!loggedIn && !known) continue
       if (!known) {
         this.remember(undefined, scope.kind === 'session' ? scope.env : {})
         known = this.launches.get(dir)
       }
-      if (known && loggedIn) known.hadLogin = true
       accounts.push({
         key: hashAccountKey(dir),
-        label: (await readLoggedEmail(dir)) ?? 'Antigravity',
+        label: email ?? 'Antigravity',
         harness: 'Antigravity',
         input: {
           dataDir: dir,
@@ -262,12 +260,8 @@ export class AgyUsageSource {
     const known = this.launches.get(dataDir)
     const cmd = known?.launch?.command ?? 'agy'
     const rawArgs = known?.launch?.args ?? []
-    const loggedIn = await hasLogin(dataDir)
-    if (!loggedIn && (!known || known.hadLogin))
-      throw new Error(
-        'Antigravity login store no longer exists; run agy to sign in again',
-      )
-    if (known && loggedIn) known.hadLogin = true
+    // The CLI is the only reliable auth oracle: keychain logins leave no token file,
+    // and a failed read surfaces as an error report instead of a disappearing account.
     try {
       let cwd = known?.cwd
       if (
