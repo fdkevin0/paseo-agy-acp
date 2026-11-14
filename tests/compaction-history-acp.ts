@@ -1,5 +1,5 @@
 import { AgentSideConnection, ndJsonStream } from '@agentclientprotocol/sdk'
-import { readFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Readable, Writable } from 'node:stream'
 
@@ -30,7 +30,26 @@ new AgentSideConnection(
         await client.sessionUpdate({ sessionId, update })
       return {}
     },
-    async prompt() {
+    async prompt(params) {
+      const text = params.prompt
+        .flatMap((block) => (block.type === 'text' ? [block.text] : []))
+        .join('')
+      if (text === 'stage-and-cancel') {
+        const dir = join(
+          process.env.HOME!,
+          '.gemini/antigravity-cli/brain',
+          params.sessionId,
+          '.system_generated/logs',
+        )
+        await mkdir(dir, { recursive: true })
+        const staged = await readFile(
+          join(process.env.HOME!, 'stage-transcript.jsonl'),
+          'utf8',
+        )
+        await writeFile(join(dir, 'transcript_full.jsonl'), staged)
+        return { stopReason: 'cancelled' as const }
+      }
+      if (text === 'cancel-only') return { stopReason: 'cancelled' as const }
       return { stopReason: 'end_turn' as const }
     },
     async cancel() {},

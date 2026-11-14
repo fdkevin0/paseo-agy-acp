@@ -136,6 +136,24 @@ export class SubagentRegistry {
     else await this.syncKilledChildren(subagents)
   }
 
+  /** Strip raw childSessionId across async ownership refresh; return false if session became unavailable. */
+  async prepareMessageItem(item: ProviderTimelineItem): Promise<boolean> {
+    if (
+      item.type === 'tool_call' &&
+      item.detail.type === 'sub_agent' &&
+      isSubagentMessage(item.name)
+    ) {
+      // Terminalization may run while ownership is being read.
+      const nativeId = item.detail.childSessionId
+      delete item.detail.childSessionId
+      await this.refreshSubagents()
+      // Do not restore a native ID that a later terminalization could publish.
+      if (this.opts.isUnavailable()) return false
+      if (nativeId !== undefined) item.detail.childSessionId = nativeId
+    }
+    return true
+  }
+
   private watchChild(
     nativeId: string,
     childId: string,

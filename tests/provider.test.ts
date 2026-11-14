@@ -1767,15 +1767,11 @@ test('an elicitation sent during a native background wakeup reuses the pending c
     const card = await q.nextQuestion()
     assert.equal(card.kind, 'question')
     // Wait until elicitation/create has arrived while Brain's QuestionCard is still open.
-    const deadline = Date.now() + 2000
-    while (!(await readFile(q.log, 'utf8')).includes('elicit\n')) {
-      assert.ok(
-        Date.now() < deadline,
-        'Timed out waiting for woken elicitation',
-      )
-      await new Promise((r) => setTimeout(r, 10))
-    }
-    await new Promise((r) => setTimeout(r, 20))
+    await q.h.wait(
+      (e) =>
+        e.type === 'session.commands' &&
+        e.commands.some((c) => c.name === 'elicit-dispatched'),
+    )
     assert.equal(q.questionCards(), 1)
     await q.answer(card.id, { 'Question 1': '(Recommended) Option 1' })
     await q.turn('completed')

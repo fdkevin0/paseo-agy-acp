@@ -147,7 +147,10 @@ test(
 test('transport surfaces stderr on immediate startup failure and notifies onExit on request timeout', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-transport-errors-'))
   try {
-    let crashError: Error | undefined
+    let resolveExit!: (err: Error) => void
+    const exited = new Promise<Error>((resolve) => {
+      resolveExit = resolve
+    })
     const crashing = connectAcp(
       {
         command: process.execPath,
@@ -165,15 +168,12 @@ test('transport surfaces stderr on immediate startup failure and notifies onExit
           outcome: { outcome: 'cancelled' },
         }),
       },
-      (err) => {
-        crashError = err
-      },
+      resolveExit,
     )
     await assert.rejects(
       crashing.rpc.initialize({ protocolVersion: 1, clientCapabilities: {} }),
     )
-    await delay(80)
-    assert.ok(crashError, 'expected onExit error from startup crash')
+    const crashError = await exited
     assert.match(crashError.message, /code 2/)
     assert.match(crashError.message, /OAuth token expired/)
     await crashing.close()

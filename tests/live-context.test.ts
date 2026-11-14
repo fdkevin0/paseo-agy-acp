@@ -86,7 +86,7 @@ async function harness(t: TestContext) {
     async (...args: Parameters<typeof start>) =>
       (session = await start(...args)),
   )
-  await manager.open({
+  await manager.handle({
     type: 'session.open',
     requestId: 'open',
     sessionId: 's',
@@ -423,34 +423,55 @@ test(
   },
 )
 
+async function runFinalPrefixPassTest(
+  t: TestContext,
+  settle: (done: ReturnType<typeof deferred<Result>>) => void,
+) {
+  const h = await harness(t),
+    held = await h.hold()
+  h.session.publishUsage({ inputTokens: 1000, outputTokens: 100 })
+  const local = deferred<void>()
+  const cancelEntered = deferred<void>()
+  t.mock.method(h.session.transport.rpc, 'cancel', async () => {
+    cancelEntered.resolve()
+    await local.promise
+  })
+  const interrupting = h.manager.handle({
+    type: 'session.interrupt',
+    requestId: 'interrupt',
+    sessionId: 's',
+  })
+  await cancelEntered.promise
+  await h.write([user(1), model(2, 70207), checkpoint(3)], '{"step_index":4')
+  settle(held.done)
+  assert.deepEqual(h.turns(), [])
+  local.resolve()
+  await Promise.all([held.running, interrupting])
+  assert.equal(h.latest().contextWindowUsedTokens, 70208)
+  assert.equal(h.latest().inputTokens, 1000)
+  assert.equal(h.compactions().length, 1)
+  assert.equal(h.session.state.lastKnownStepIndex, 3)
+  assert.deepEqual(h.turns(), ['canceled'])
+  assert.equal(held.observation.phase, 'disposed')
+}
+
 test(
-  'cancel/throw final pass waits for observable local work and preserves complete prefix before a partial tail',
+  'cancel final pass waits for observable local work and preserves complete prefix before a partial tail',
   { timeout: 5000 },
   async (t) => {
-    for (const throws of [false, true]) {
-      const h = await harness(t),
-        held = await h.hold()
-      h.session.publishUsage({ inputTokens: 1000, outputTokens: 100 })
-      const local = deferred<void>()
-      h.session.state.interrupting = local.promise
-      h.session.state.turnAbort!.abort()
-      await h.write(
-        [user(1), model(2, 70207), checkpoint(3)],
-        '{"step_index":4',
-      )
-      if (throws) held.done.reject(new Error('native failure'))
-      else held.done.resolve({ stopReason: 'cancelled' })
-      assert.deepEqual(h.turns(), [])
-      local.resolve()
-      await held.running
-      h.session.state.interrupting = null
-      assert.equal(h.latest().contextWindowUsedTokens, 70208)
-      assert.equal(h.latest().inputTokens, 1000)
-      assert.equal(h.compactions().length, 1)
-      assert.equal(h.session.state.lastKnownStepIndex, 3)
-      assert.deepEqual(h.turns(), ['canceled'])
-      assert.equal(held.observation.phase, 'disposed')
-    }
+    await runFinalPrefixPassTest(t, (done) =>
+      done.resolve({ stopReason: 'cancelled' }),
+    )
+  },
+)
+
+test(
+  'throw final pass waits for observable local work and preserves complete prefix before a partial tail',
+  { timeout: 5000 },
+  async (t) => {
+    await runFinalPrefixPassTest(t, (done) =>
+      done.reject(new Error('native failure')),
+    )
   },
 )
 
@@ -653,8 +674,14 @@ test(
       held = await h.hold()
     await h.write([user(1), model(2, 10)])
     await h.read()
-    h.session.state.turnAbort!.abort()
-    held.done.resolve({ stopReason: 'cancelled' })
+    t.mock.method(h.session.transport.rpc, 'cancel', async () => {
+      held.done.resolve({ stopReason: 'cancelled' })
+    })
+    await h.manager.handle({
+      type: 'session.interrupt',
+      requestId: 'interrupt',
+      sessionId: 's',
+    })
     await held.running
     const count = h.events.length
     await h.append([model(3, 100), checkpoint(4)])
@@ -681,7 +708,7 @@ test(
       sessionId: 's',
       requestId: 'close',
     })
-    await h.manager.open({
+    await h.manager.handle({
       type: 'session.open',
       sessionId: 'restored',
       requestId: 'restore',
@@ -977,55 +1004,94 @@ test(
   },
 )
 
-for (const cached of [false, true])
-  for (const throws of [false, true])
-    test(
-      `final drain prefers complete no-LF EOF snapshot (prior observed usage=${cached}, throw=${throws})`,
-      { timeout: 5000 },
-      async (t) => {
-        const h = await harness(t),
-          held = await h.hold()
-        h.session.publishUsage({ inputTokens: 1000, outputTokens: 100 })
-        await h.write(
-          cached
-            ? [user(1), model(2, 10), checkpoint(3)]
-            : [user(1), checkpoint(3)],
-        )
-        await h.read()
-        assert.equal(h.compactions().length, 1)
-        await appendFile(
-          h.path,
-          JSON.stringify({
-            step_index: 4,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            input_tokens: 70,
-            output_tokens: 3,
-            content: 'newest',
-          }),
-        )
-        await h.read()
-        const streamingIndex = held.observation.lastStepIndex
-        assert.equal(
-          streamingIndex,
-          3,
-          'no-LF EOF is not a delivered streaming row',
-        )
-        h.session.state.turnAbort!.abort()
-        if (throws) held.done.reject(new Error('native cancellation'))
-        else held.done.resolve({ stopReason: 'cancelled' })
-        await held.running
-        assert.equal(h.latest().contextWindowUsedTokens, 73)
-        assert.equal(h.session.state.lastKnownStepIndex, 4)
-        assert.equal(
-          h.latest().inputTokens,
-          1000,
-          'context observation does not add a bill',
-        )
-        assert.equal(h.compactions().length, 1)
-        assert.deepEqual(h.turns(), ['canceled'])
-      },
+async function runNoLfEofSnapshotTest(
+  t: TestContext,
+  initialRows: Row[],
+  settle: (done: ReturnType<typeof deferred<Result>>) => void,
+) {
+  const h = await harness(t),
+    held = await h.hold()
+  h.session.publishUsage({ inputTokens: 1000, outputTokens: 100 })
+  await h.write(initialRows)
+  await h.read()
+  assert.equal(h.compactions().length, 1)
+  await appendFile(
+    h.path,
+    JSON.stringify({
+      step_index: 4,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      input_tokens: 70,
+      output_tokens: 3,
+      content: 'newest',
+    }),
+  )
+  await h.read()
+  const streamingIndex = held.observation.lastStepIndex
+  assert.equal(streamingIndex, 3, 'no-LF EOF is not a delivered streaming row')
+  t.mock.method(h.session.transport.rpc, 'cancel', async () => {
+    settle(held.done)
+  })
+  await h.manager.handle({
+    type: 'session.interrupt',
+    requestId: 'interrupt',
+    sessionId: 's',
+  })
+  await held.running
+  assert.equal(h.latest().contextWindowUsedTokens, 73)
+  assert.equal(h.session.state.lastKnownStepIndex, 4)
+  assert.equal(
+    h.latest().inputTokens,
+    1000,
+    'context observation does not add a bill',
+  )
+  assert.equal(h.compactions().length, 1)
+  assert.deepEqual(h.turns(), ['canceled'])
+}
+
+test(
+  'final drain prefers complete no-LF EOF snapshot (prior observed usage=false, throw=false)',
+  { timeout: 5000 },
+  async (t) => {
+    await runNoLfEofSnapshotTest(t, [user(1), checkpoint(3)], (done) =>
+      done.resolve({ stopReason: 'cancelled' }),
     )
+  },
+)
+
+test(
+  'final drain prefers complete no-LF EOF snapshot (prior observed usage=false, throw=true)',
+  { timeout: 5000 },
+  async (t) => {
+    await runNoLfEofSnapshotTest(t, [user(1), checkpoint(3)], (done) =>
+      done.reject(new Error('native cancellation')),
+    )
+  },
+)
+
+test(
+  'final drain prefers complete no-LF EOF snapshot (prior observed usage=true, throw=false)',
+  { timeout: 5000 },
+  async (t) => {
+    await runNoLfEofSnapshotTest(
+      t,
+      [user(1), model(2, 10), checkpoint(3)],
+      (done) => done.resolve({ stopReason: 'cancelled' }),
+    )
+  },
+)
+
+test(
+  'final drain prefers complete no-LF EOF snapshot (prior observed usage=true, throw=true)',
+  { timeout: 5000 },
+  async (t) => {
+    await runNoLfEofSnapshotTest(
+      t,
+      [user(1), model(2, 10), checkpoint(3)],
+      (done) => done.reject(new Error('native cancellation')),
+    )
+  },
+)
 
 test(
   'normal completion reconciles a newer complete no-LF snapshot without projecting its row',
@@ -1140,13 +1206,21 @@ test(
     const h = await harness(t),
       held = await h.hold(),
       local = deferred<void>()
-    h.session.state.interrupting = local.promise
+    t.mock.method(h.session.transport.rpc, 'cancel', async () => {
+      await local.promise
+    })
+    const interrupting = h.manager.handle({
+      type: 'session.interrupt',
+      requestId: 'interrupt',
+      sessionId: 's',
+    })
     await h.manager.close()
     await held.running
     assert.deepEqual(h.turns(), ['canceled'])
     const count = h.events.length
     local.resolve()
     held.done.resolve({ stopReason: 'cancelled' })
+    await interrupting.catch(() => undefined)
     await held.observation.poll()
     assert.equal(h.events.length, count)
   },
@@ -1278,49 +1352,80 @@ async function pendingBrainQuestion(t: TestContext) {
   return { ...h, running, entered, continued, answer, calls: () => calls }
 }
 
-for (const mode of ['failure', 'cancel', 'close'] as const)
-  test(
-    `an unresolved reader I/O fault preserves ${mode} question termination`,
-    { timeout: 5000 },
-    async (t) => {
-      const h = await pendingBrainQuestion(t),
-        obs = h.session.state.observation!
-      let reads = 0
-      t.mock.method(obs.reader, 'read', async () => {
-        throw Object.assign(new Error(`unavailable reader ${++reads}`), {
-          code: 'EBUSY',
-        })
-      })
-      await assert.rejects(obs.poll(), /unavailable reader 1/)
-      await assert.rejects(obs.poll(), /unavailable reader 2/)
-      assert.match(String(obs.error), /unavailable reader 2/)
-      if (mode === 'failure') await h.answer()
-      else if (mode === 'close') await h.manager.close()
-      else {
-        h.session.state.turnAbort!.abort()
-        h.session.cancelPermissions()
-      }
-      await h.running
-      assert.deepEqual(h.turns(), [mode === 'failure' ? 'failed' : 'canceled'])
-      assert.equal(
-        h.calls(),
-        1,
-        'no continuation RPC starts while the reader is still failing',
-      )
-      if (mode === 'failure') {
-        const terminal = h.events.findLast(
-          (event) => event.type === 'session.turn' && event.state === 'failed',
-        )
-        assert.ok(
-          terminal?.type === 'session.turn' && terminal.state === 'failed',
-        )
-        assert.match(terminal.error?.message ?? '', /unavailable reader/)
-      }
-      const count = h.events.length
-      await obs.poll()
-      assert.equal(h.events.length, count)
-    },
+async function setupReaderFaultQuestion(t: TestContext) {
+  const h = await pendingBrainQuestion(t),
+    obs = h.session.state.observation!
+  let reads = 0
+  t.mock.method(obs.reader, 'read', async () => {
+    throw Object.assign(new Error(`unavailable reader ${++reads}`), {
+      code: 'EBUSY',
+    })
+  })
+  await assert.rejects(obs.poll(), /unavailable reader 1/)
+  await assert.rejects(obs.poll(), /unavailable reader 2/)
+  assert.match(String(obs.error), /unavailable reader 2/)
+  return { h, obs }
+}
+
+async function assertReaderFaultPreservedTermination(
+  h: Awaited<ReturnType<typeof pendingBrainQuestion>>,
+  obs: NonNullable<
+    Awaited<
+      ReturnType<typeof pendingBrainQuestion>
+    >['session']['state']['observation']
+  >,
+  expectedTurn: 'failed' | 'canceled',
+) {
+  await h.running
+  assert.deepEqual(h.turns(), [expectedTurn])
+  assert.equal(
+    h.calls(),
+    1,
+    'no continuation RPC starts while the reader is still failing',
   )
+  const count = h.events.length
+  await obs.poll()
+  assert.equal(h.events.length, count)
+}
+
+test(
+  'an unresolved reader I/O fault preserves failure question termination',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, obs } = await setupReaderFaultQuestion(t)
+    await h.answer()
+    await assertReaderFaultPreservedTermination(h, obs, 'failed')
+    const terminal = h.events.findLast(
+      (event) => event.type === 'session.turn' && event.state === 'failed',
+    )
+    assert.ok(terminal?.type === 'session.turn' && terminal.state === 'failed')
+    assert.match(terminal.error?.message ?? '', /unavailable reader/)
+  },
+)
+
+test(
+  'an unresolved reader I/O fault preserves cancel question termination',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, obs } = await setupReaderFaultQuestion(t)
+    await h.manager.handle({
+      type: 'session.interrupt',
+      requestId: 'interrupt',
+      sessionId: 's',
+    })
+    await assertReaderFaultPreservedTermination(h, obs, 'canceled')
+  },
+)
+
+test(
+  'an unresolved reader I/O fault preserves close question termination',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, obs } = await setupReaderFaultQuestion(t)
+    await h.manager.close()
+    await assertReaderFaultPreservedTermination(h, obs, 'canceled')
+  },
+)
 
 test(
   'reader recovery cannot erase an actual Brain terminal failure',
@@ -1374,24 +1479,34 @@ test(
     await h.entered.promise
     const oldTransport = h.session.transport
     const request = oldTransport.request.bind(oldTransport)
+    t.mock.method(oldTransport.rpc, 'cancel', async () => {})
+    const handlers = [
+      request,
+      async () => {
+        throw new Error('synthetic convergence timeout')
+      },
+    ]
     t.mock.method(
       oldTransport,
       'request',
-      async (...args: Parameters<typeof request>) => {
-        if (args[1]?.fatalOnTimeout === false)
-          throw new Error('synthetic convergence timeout')
-        return request(...args)
-      },
+      (...args: Parameters<typeof request>) => handlers.shift()!(...args),
     )
-    h.session.state.turnAbort!.abort()
+    await h.manager.handle({
+      type: 'session.interrupt',
+      requestId: 'interrupt',
+      sessionId: 's',
+    })
     await h.running
     assert.notEqual(h.session.transport, oldTransport)
     assert.equal(h.session.state.suppressContinuationAcp, false)
     assert.equal(h.session.state.inSettle, false)
-    assert.equal(h.session.state.turnAbort, null)
-    assert.equal(h.session.state.turn, '')
     assert.deepEqual(h.turns(), ['canceled'])
     h.continued.resolve({ stopReason: 'cancelled' })
+    t.mock.method(h.session.transport.rpc, 'prompt', async () => ({
+      stopReason: 'cancelled' as const,
+    }))
+    await h.prompt('after-relaunch')
+    assert.deepEqual(h.turns(), ['canceled', 'canceled'])
   },
 )
 
@@ -1535,6 +1650,16 @@ test(
     assert.equal(held.observation.wokeUp, false)
 
     // Foreground RPC ends with cumulative multi-model totals; turn stays open awaiting background task
+    const settlingStarted = deferred<void>()
+    const attach = held.observation.attach.bind(held.observation)
+    t.mock.method(
+      held.observation,
+      'attach',
+      async (...args: Parameters<typeof attach>) => {
+        await attach(...args)
+        settlingStarted.resolve()
+      },
+    )
     held.done.resolve({
       stopReason: 'end_turn',
       usage: {
@@ -1544,9 +1669,7 @@ test(
         totalTokens: 183_200,
       },
     })
-    while (!h.session.state.inSettle) {
-      await new Promise((r) => setTimeout(r, 5))
-    }
+    await settlingStarted.promise
     await h.read()
     assert.deepEqual(h.turns(), [])
     assert.equal(

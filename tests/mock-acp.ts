@@ -5,6 +5,8 @@ import { join } from 'node:path'
 import { WritableStream } from 'node:stream/web'
 import { Readable, Writable } from 'node:stream'
 let nativeId = ''
+if (process.env.AGY_TEST_PID_FILE)
+  writeFileSync(process.env.AGY_TEST_PID_FILE, String(process.pid))
 function log(method: string) {
   if (process.env.AGY_TEST_LOG)
     appendFileSync(process.env.AGY_TEST_LOG, method + '\n')
@@ -180,9 +182,16 @@ new AgentSideConnection((client) => {
           ),
           'utf8',
         )
-          .trim()
           .split('\n')
-          .map((line) => JSON.parse(line))
+          .flatMap((line) => {
+            const trimmed = line.trim()
+            if (!trimmed) return []
+            try {
+              return [JSON.parse(trimmed)]
+            } catch {
+              return []
+            }
+          })
         for (const row of rows) {
           if (
             (row.type === 'USER_INPUT' || row.type === 'PLANNER_RESPONSE') &&
@@ -379,6 +388,97 @@ new AgentSideConnection((client) => {
         }
       }
 
+      if (text === 'cancel-only') {
+        return { stopReason: 'cancelled' as const }
+      }
+      if (text === 'seed-woken-carry') {
+        const dir = join(
+          process.env.HOME!,
+          '.gemini/antigravity-cli/brain',
+          sessionId,
+          '.system_generated/logs',
+        )
+        mkdirSync(dir, { recursive: true })
+        const step = ++wokenStepBase * 10
+        appendFileSync(
+          join(dir, 'transcript_full.jsonl'),
+          [
+            { step_index: step, type: 'USER_INPUT', content: text },
+            {
+              step_index: step + 1,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'Foreground',
+              input_tokens: 100,
+              output_tokens: 10,
+            },
+            {
+              step_index: step + 2,
+              type: 'SYSTEM_MESSAGE',
+              content:
+                '<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-10T18:59:59+08:00 sender=bg-1 priority=MESSAGE_PRIORITY_HIGH content=ready\n</SYSTEM_MESSAGE>',
+            },
+            {
+              step_index: step + 3,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'Woken done',
+              input_tokens: 40,
+              output_tokens: 4,
+            },
+          ]
+            .map((row) => JSON.stringify(row) + '\n')
+            .join(''),
+        )
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
+        }
+      }
+      if (text === 'corrupt-transcript-positive-usage') {
+        const dir = join(
+          process.env.HOME!,
+          '.gemini/antigravity-cli/brain',
+          sessionId,
+          '.system_generated/logs',
+        )
+        mkdirSync(dir, { recursive: true })
+        appendFileSync(join(dir, 'transcript_full.jsonl'), '{corrupt\n')
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 120, outputTokens: 12, totalTokens: 132 },
+        }
+      }
+      if (text === 'clean-positive-usage') {
+        const dir = join(
+          process.env.HOME!,
+          '.gemini/antigravity-cli/brain',
+          sessionId,
+          '.system_generated/logs',
+        )
+        mkdirSync(dir, { recursive: true })
+        const step = ++wokenStepBase * 10
+        appendFileSync(
+          join(dir, 'transcript_full.jsonl'),
+          [
+            { step_index: step, type: 'USER_INPUT', content: text },
+            {
+              step_index: step + 1,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'Clean done',
+              input_tokens: 50,
+              output_tokens: 5,
+            },
+          ]
+            .map((row) => JSON.stringify(row) + '\n')
+            .join(''),
+        )
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 50, outputTokens: 5, totalTokens: 55 },
+        }
+      }
       if (text === 'message-refresh-boundary') {
         await client.sessionUpdate({
           sessionId,
@@ -1217,7 +1317,7 @@ new AgentSideConnection((client) => {
         setTimeout(() => {
           void (async () => {
             // Send elicitation/create after Brain's onQuestion has already popped the card.
-            const response = await elicit({
+            const pendingResponse = elicit({
               message: 'The agent has a question.',
               requestedSchema: {
                 type: 'object',
@@ -1233,6 +1333,16 @@ new AgentSideConnection((client) => {
                 },
               },
             })
+            await client.sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate: 'available_commands_update',
+                availableCommands: [
+                  { name: 'elicit-dispatched', description: 'sync' },
+                ],
+              },
+            })
+            const response = await pendingResponse
             appendFileSync(
               file,
               [

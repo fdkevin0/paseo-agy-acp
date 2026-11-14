@@ -49,7 +49,7 @@ import {
 } from './brain.ts'
 import { readLatestStepUsage } from './brain-io.ts'
 import { projectReplayHistory, type HistoryEntry } from './history.ts'
-import { SubagentRegistry, isSubagentMessage } from './subagents.ts'
+import { SubagentRegistry } from './subagents.ts'
 import { dataDirectory, removeSessionArtifacts } from './preflight.ts'
 import { connectAcp } from './transport.ts'
 import {
@@ -155,7 +155,7 @@ export class SessionManager {
     return createSession(id, cwd, config, this.options, this.transports)
   }
 
-  async open(input: Open) {
+  private async open(input: Open) {
     const { emit, capabilities } = this.options
     if (this.sessions.has(input.sessionId) || this.opening.has(input.sessionId))
       throw new Error('Session already open')
@@ -527,8 +527,14 @@ async function createSession(
     turnId: string,
     status: 'completed' | 'canceled' | 'failed',
     error?: string,
+    cleared = false,
   ) {
-    if (state.turn !== turnId || state.turnFinished || state.silenced) return
+    if (
+      (!cleared && state.turn !== turnId) ||
+      state.turnFinished ||
+      state.silenced
+    )
+      return
     state.turnFinished = true
     terminalize(status, error)
     emit({
@@ -673,19 +679,7 @@ async function createSession(
       // Timeline.update already tracks the ACP item.
       const item = timeline.update(u, state.deniedToolCallIds)
       if (item) {
-        if (
-          item.type === 'tool_call' &&
-          item.detail.type === 'sub_agent' &&
-          isSubagentMessage(item.name)
-        ) {
-          // Terminalization may run while ownership is being read.
-          const nativeId = item.detail.childSessionId
-          delete item.detail.childSessionId
-          await subagents.refreshSubagents()
-          // Do not restore a native ID that a later terminalization could publish.
-          if (state.closing || state.failed) return
-          if (nativeId !== undefined) item.detail.childSessionId = nativeId
-        }
+        if (!(await subagents.prepareMessageItem(item))) return
         if (
           state.loading &&
           state.persisted &&
@@ -1074,7 +1068,6 @@ async function createSession(
       publishConfig,
       publishUsage,
       flushDeferredUsage,
-      terminalize,
       finishTurnOnce,
       emitItem,
       resetWakeup() {
@@ -1536,6 +1529,8 @@ async function promptSession(
   let turnWakeupUsage: StepUsage | undefined
   let nextCarriedWakeup: StepUsage | undefined
   let settledPendingReplay = false
+  let pendingFinish:
+    { status: 'completed' | 'canceled' | 'failed'; error?: string } | undefined
   let hasWakeupState = false
   const settleTurnUsageAndWakeup = (isError: boolean) => {
     const runtimeRelaunched = session.transport !== initialTransport
@@ -1891,7 +1886,7 @@ async function promptSession(
       } else turnAbort.signal.throwIfAborted()
     }
     settleTurnUsageAndWakeup(false)
-    session.finishTurnOnce(turnId, status, turnError)
+    pendingFinish = { status, error: turnError }
   } catch (error) {
     const restartError = session.state.closing
       ? undefined
@@ -1913,14 +1908,15 @@ async function promptSession(
         ? 'canceled'
         : 'failed'
     const message = formatErrorMessage(turnError)
-    session.finishTurnOnce(turnId, status, message)
+    pendingFinish = { status, error: message }
   } finally {
     turnAbort.signal.removeEventListener('abort', stopObservation)
     await observation?.dispose()
-    if (
-      session.state.turn === turnId &&
-      session.state.turnAbort === turnAbort
-    ) {
+    const isCurrentTurn =
+      session.state.turn === turnId && session.state.turnAbort === turnAbort
+    const canEmitTurn =
+      isCurrentTurn && !session.state.turnFinished && !session.state.silenced
+    if (isCurrentTurn) {
       session.state.observation = null
       session.state.wakeup.suppressEcho = false
       session.state.inSettle = false
@@ -1931,6 +1927,14 @@ async function promptSession(
       session.state.turn = ''
       session.timeline.boundary()
       session.cancelPermissions()
+    }
+    if (canEmitTurn && pendingFinish) {
+      session.finishTurnOnce(
+        turnId,
+        pendingFinish.status,
+        pendingFinish.error,
+        true,
+      )
     }
   }
 }
