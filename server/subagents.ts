@@ -31,7 +31,8 @@ export class SubagentRegistry {
   private children = new Map<string, BrainWatchHandle>()
   private childParents = new Map<string, string>()
   private killedChildren = new Set<string>()
-  private resuming = new Set<string>()
+  private resuming = new Map<string, Promise<void>>()
+  private generation = 0
   private opts: SubagentRegistryOptions
 
   constructor(opts: SubagentRegistryOptions) {
@@ -59,17 +60,35 @@ export class SubagentRegistry {
   }
 
   hasRunningChildren(): boolean {
-    return [...this.children.values()].some((child) => child.isRunning())
+    return (
+      this.resuming.size > 0 ||
+      [...this.children.values()].some((child) => child.isRunning())
+    )
   }
 
   cancelRunning(): Promise<void>[] {
-    return [...this.children.values()]
-      .filter((child) => child.isRunning())
-      .map((child) => child.cancel())
+    this.generation++
+    const tasks = [...this.resuming.values()]
+    for (const child of this.children.values()) {
+      if (child.isRunning()) tasks.push(child.cancel())
+    }
+    return tasks
   }
 
-  cancelAll(): Promise<void>[] {
-    return [...this.children.values()].map((child) => child.cancel())
+  async cancelAll(): Promise<void> {
+    this.generation++
+    const seen = new Set<BrainWatchHandle>()
+    while (true) {
+      const batch: Promise<void>[] = [...this.resuming.values()]
+      for (const child of this.children.values()) {
+        if (!seen.has(child)) {
+          seen.add(child)
+          batch.push(child.cancel())
+        }
+      }
+      if (batch.length === 0) break
+      await Promise.all(batch)
+    }
   }
 
   async waitCurrentReady(): Promise<void> {
@@ -170,17 +189,23 @@ export class SubagentRegistry {
     existing: BrainWatchHandle,
   ) {
     if (this.resuming.has(childId)) return
-    this.resuming.add(childId)
-    void existing.cancel().then(() => {
-      this.resuming.delete(childId)
-      if (
-        this.opts.isUnavailable() ||
-        this.killedChildren.has(childId) ||
-        this.children.get(childId) !== existing
-      )
-        return
-      this.watchChild(nativeId, childId, existing.resumePoint())
-    })
+    const generation = this.generation
+    const task = existing
+      .cancel()
+      .then(() => {
+        if (
+          this.generation !== generation ||
+          this.opts.isUnavailable() ||
+          this.killedChildren.has(childId) ||
+          this.children.get(childId) !== existing
+        )
+          return
+        this.watchChild(nativeId, childId, existing.resumePoint())
+      })
+      .finally(() => {
+        if (this.resuming.get(childId) === task) this.resuming.delete(childId)
+      })
+    this.resuming.set(childId, task)
   }
 
   canLinkChild = (
@@ -258,6 +283,8 @@ export class SubagentRegistry {
   }
 
   closeAll(): void {
+    this.generation++
+    this.resuming.clear()
     for (const [childId, stop] of this.children) {
       stop()
       this.opts.emit({ type: 'session.closed', sessionId: childId })

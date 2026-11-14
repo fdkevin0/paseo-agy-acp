@@ -201,11 +201,18 @@ export class BrainTranscriptProjector {
    */
   observeRows(
     rows: readonly Record<string, unknown>[],
+    restartAfterStepIndex?: number,
   ): readonly ObservedToolSlot[] {
+    let clearedAtBoundary =
+      restartAfterStepIndex === undefined || restartAfterStepIndex < 0
     for (const raw of rows) {
       const row = record(raw)
       if (!Number.isInteger(row.step_index)) continue
       const stepIndex = Number(row.step_index)
+      if (!clearedAtBoundary && stepIndex > restartAfterStepIndex!) {
+        this.observedPending = []
+        clearedAtBoundary = true
+      }
       switch (row.type) {
         case 'USER_INPUT':
           this.observedPending = []
@@ -248,6 +255,7 @@ export class BrainTranscriptProjector {
           break
       }
     }
+    if (!clearedAtBoundary) this.observedPending = []
     return this.observedSlots
   }
 
@@ -288,6 +296,16 @@ export class BrainTranscriptProjector {
 
   clearPending() {
     this.pending = []
+  }
+
+  resetRestartState() {
+    this.pending = []
+    this.retired = []
+    this.lastErrorCallId = undefined
+    this.background.clear()
+    this.daemons.clear()
+    this.touchedSubagents.clear()
+    this.observedPending = []
   }
 
   hasBackground(): boolean {
@@ -886,6 +904,14 @@ export class BrainNode {
     this.answeredQuestionStep = -1
   }
 
+  applyRestartBoundary(stepIndex: number) {
+    this.projector.resetRestartState()
+    if (stepIndex > this.turnStartStep) this.turnStartStep = stepIndex
+    this.lastStep = undefined
+    this.resetPhase()
+    this.promptPhase = 'foreground_idle'
+  }
+
   settleAbortedDenial(denied?: ReadonlySet<string>) {
     if (
       this.promptPhase !== 'woken' &&
@@ -1074,6 +1100,16 @@ export class BrainNode {
         (this.lastStep?.type === 'GENERIC' &&
           this.lastStep.status !== 'CANCELED' &&
           this.lastStep.status !== 'INTERRUPTED'))
+    )
+  }
+
+  isWokenActive(): boolean {
+    return (
+      this.isWokenWorking() ||
+      (this.wokeUp &&
+        !this.abortedByDenial &&
+        this.lastStep?.type === 'PLANNER_RESPONSE' &&
+        runningStepStatuses.has(String(this.lastStep.status)))
     )
   }
 
