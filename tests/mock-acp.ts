@@ -1,10 +1,19 @@
 import { AgentSideConnection, ndJsonStream } from '@agentclientprotocol/sdk'
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs'
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs'
 import { join } from 'node:path'
 import { WritableStream } from 'node:stream/web'
 import { Readable, Writable } from 'node:stream'
 let nativeId = ''
+let initialSessionId = ''
+let hasRegisteredSession = false
+const openSessions = new Set<string>()
 function log(method: string) {
   if (process.env.AGY_TEST_LOG)
     appendFileSync(process.env.AGY_TEST_LOG, method + '\n')
@@ -149,6 +158,9 @@ new AgentSideConnection((client) => {
     async newSession(params) {
       const previousId = nativeId || randomUUID()
       nativeId = randomUUID()
+      if (!initialSessionId) initialSessionId = nativeId
+      hasRegisteredSession = true
+      openSessions.add(nativeId)
       const append = (
         params._meta?.antigravity as { systemPrompt?: { append?: string } }
       )?.systemPrompt?.append
@@ -159,11 +171,15 @@ new AgentSideConnection((client) => {
     },
     async closeSession({ sessionId }) {
       log('close')
+      openSessions.delete(sessionId)
       if (process.env.AGY_TEST_STALE_EVENTS) await staleEvents(sessionId)
       if (process.env.AGY_TEST_CLOSE_ERROR) throw new Error('close failed')
       return {}
     },
     async loadSession({ sessionId, _meta }) {
+      if (!initialSessionId) initialSessionId = sessionId
+      hasRegisteredSession = true
+      openSessions.add(sessionId)
       const append = (
         _meta?.antigravity as { systemPrompt?: { append?: string } }
       )?.systemPrompt?.append
@@ -171,18 +187,19 @@ new AgentSideConnection((client) => {
       else if (process.env.AGY_TEST_LOG_LOAD) log('load')
       sendCommands(sessionId)
       if (process.env.AGY_TEST_CHECKPOINT_HISTORY) {
-        const rows = readFileSync(
-          join(
-            process.env.HOME!,
-            '.gemini/antigravity-cli/brain',
-            sessionId,
-            '.system_generated/logs/transcript_full.jsonl',
-          ),
-          'utf8',
+        const transcriptPath = join(
+          process.env.HOME!,
+          '.gemini/antigravity-cli/brain',
+          sessionId,
+          '.system_generated/logs/transcript_full.jsonl',
         )
-          .trim()
-          .split('\n')
-          .map((line) => JSON.parse(line))
+        const rows = existsSync(transcriptPath)
+          ? readFileSync(transcriptPath, 'utf8')
+              .trim()
+              .split('\n')
+              .filter(Boolean)
+              .map((line) => JSON.parse(line))
+          : []
         for (const row of rows) {
           if (
             (row.type === 'USER_INPUT' || row.type === 'PLANNER_RESPONSE') &&
@@ -244,6 +261,9 @@ new AgentSideConnection((client) => {
       }
     },
     async resumeSession({ sessionId, _meta }) {
+      if (!initialSessionId) initialSessionId = sessionId
+      hasRegisteredSession = true
+      openSessions.add(sessionId)
       const append = (
         _meta?.antigravity as { systemPrompt?: { append?: string } }
       )?.systemPrompt?.append
@@ -263,7 +283,17 @@ new AgentSideConnection((client) => {
         ],
       }
     },
-    async setSessionConfigOption({ configId, value }) {
+    async setSessionConfigOption({ sessionId, configId, value }) {
+      if (hasRegisteredSession && !openSessions.has(sessionId)) {
+        throw new Error(`Session not found: ${sessionId}`)
+      }
+      if (
+        process.env.AGY_TEST_FAIL_CONFIG_ON_REVERT &&
+        initialSessionId &&
+        sessionId !== initialSessionId
+      ) {
+        throw new Error('simulated config failure')
+      }
       log(`configure:${configId}=${value}`)
       return {
         configOptions: configOptions.map((o) =>
@@ -277,6 +307,9 @@ new AgentSideConnection((client) => {
       cancels.get(sessionId)?.()
     },
     async prompt({ sessionId, prompt }) {
+      if (hasRegisteredSession && !openSessions.has(sessionId)) {
+        throw new Error(`Session not found: ${sessionId}`)
+      }
       const text = prompt.map((c) => (c.type === 'text' ? c.text : '')).join('')
       if (process.env.AGY_TEST_LOG_ELICITATION_CAP) log(`prompt:${text}`)
       if (

@@ -46,10 +46,12 @@ import {
   readLastStepIndex,
   settleBrainTurn,
   type ForegroundAcpSegment,
+  type SubagentRecord,
 } from './brain.ts'
 import { readLatestStepUsage } from './brain-io.ts'
 import {
   captureTurnFileCheckpoint,
+  clearCheckpointToolOwners,
   extractToolEditTargets,
   readSessionCheckpoints,
   recordJournalToolEdit,
@@ -61,6 +63,7 @@ import {
   attachReplayRevertTokens,
   extractUserStepRows,
   makeRevertToken,
+  removeForkedConversation,
   revertSession,
   type RevertScope,
 } from './revert.ts'
@@ -376,16 +379,23 @@ export class SessionManager {
         throw new Error('Session is still opening')
       if (session.state.turn || session.state.interrupting)
         throw new Error('Cannot revert while a turn is active')
-      const result = await session.revert(scope, input.token)
-      if (scope !== 'files' && result.newNativeId) {
-        emit({
-          type: 'session.persistence',
-          sessionId: session.id,
-          persistence: {
-            version: 1,
-            data: { sessionId: result.newNativeId },
-          },
-        })
+      if (session.state.reverting)
+        throw new Error('Session revert is already in progress')
+      session.state.reverting = true
+      try {
+        const result = await session.revert(scope, input.token)
+        if (scope !== 'files' && result.newNativeId) {
+          emit({
+            type: 'session.persistence',
+            sessionId: session.id,
+            persistence: {
+              version: 1,
+              data: { sessionId: result.newNativeId },
+            },
+          })
+        }
+      } finally {
+        session.state.reverting = false
       }
     } else if (input.type === 'session.interrupt') {
       await session.interrupt()
@@ -485,6 +495,7 @@ async function createSession(
     loading: true,
     ready: false,
     replay: true,
+    reverting: false,
     turn: '',
     turnAbort: null as AbortController | null,
     observation: null as BrainTurnObservation | null,
@@ -523,6 +534,7 @@ async function createSession(
   const nativeWindowSizes = new Map<string | undefined, number>()
   let usage: ProviderUsage = {}
   let deferredUsage = false
+  let revertLoadedUsage: ProviderUsage | undefined
   let commandsReceived = false
   let emittedCommands: string | undefined
   let commandWaiter: (() => void) | null = null
@@ -660,7 +672,9 @@ async function createSession(
         u.size,
         100,
       )
-      if (!state.loading || state.replay) {
+      if (state.reverting && state.loading && !state.replay) {
+        revertLoadedUsage = { ...revertLoadedUsage, ...next }
+      } else if (!state.loading || state.replay) {
         if (state.turn) state.turnHadContextUsage = true
         publishUsage(next)
       } else if (!state.ready) {
@@ -1267,35 +1281,194 @@ async function createSession(
         await subagents.syncKilledChildren(subagentRecords)
       },
       async revert(scope: RevertScope, token: unknown) {
-        const checkpoints = await readSessionCheckpoints(
-          appDataDir,
-          state.nativeId,
-        )
+        let freshSessionResponse: NewSessionResponse | undefined
+        const previousNativeId = state.nativeId
+        const previousMetadata = {
+          ...state.metadata,
+          ...(state.metadata.configOptions
+            ? { configOptions: [...state.metadata.configOptions] }
+            : {}),
+        }
         const result = await revertSession({
           appDataDir,
           nativeId: state.nativeId,
           scope,
           token,
-          checkpoints,
           createFreshSession: async () => {
             const fresh = await currentTransport.request(
               currentTransport.rpc.newSession(sessionParams(cwd, config)),
             )
+            freshSessionResponse = fresh
             return fresh.sessionId
           },
         })
         if (scope !== 'files' && result.newNativeId) {
-          state.nativeId = result.newNativeId
-          state.persisted = true
-          state.lastKnownStepIndex =
-            result.cutoffStepIndex !== undefined && result.cutoffStepIndex > 0
-              ? result.cutoffStepIndex - 1
-              : -1
-          const nextRows = await readTranscriptRows(
-            brainRoot,
-            state.nativeId,
-          ).catch(() => [] as Record<string, unknown>[])
-          state.userTurnCount = extractUserStepRows(nextRows).length
+          const forkedNativeId = result.newNativeId
+          let registeredOnTransport = Boolean(freshSessionResponse)
+          try {
+            if (state.closing || state.failed) {
+              throw new Error('Session is closed')
+            }
+            const prev = configState(previousMetadata)
+            const prevModels = previousMetadata.models
+            const prevFullAccess = Boolean(previousMetadata.fullAccess)
+            const nativeMode = configState({
+              ...previousMetadata,
+              fullAccess: false,
+            }).mode
+            const params = sessionParams(cwd, config)
+            const canResume = Boolean(
+              currentInitialized.agentCapabilities?.sessionCapabilities?.resume,
+            )
+            if (
+              !freshSessionResponse &&
+              !canResume &&
+              !currentInitialized.agentCapabilities?.loadSession
+            ) {
+              throw new Error('agy does not support session/load')
+            }
+
+            let configChanged = false
+            state.loading = true
+            state.replay = false
+            state.nativeId = forkedNativeId
+            revertLoadedUsage = undefined
+            let fallbackUsage: ProviderUsage | undefined
+            try {
+              const loaded =
+                freshSessionResponse ??
+                (await currentTransport.request(
+                  canResume
+                    ? currentTransport.rpc.resumeSession({
+                        ...params,
+                        sessionId: forkedNativeId,
+                      })
+                    : currentTransport.rpc.loadSession({
+                        ...params,
+                        sessionId: forkedNativeId,
+                      }),
+                ))
+              registeredOnTransport = true
+              state.metadata = {
+                ...loaded,
+                sessionId: forkedNativeId,
+                models: currentTransport.models ?? prevModels,
+                fullAccess: prevFullAccess,
+              }
+              await drain()
+              if (state.closing || state.failed) {
+                throw new Error('Session is closed')
+              }
+              for (const [k, v] of [
+                ['model', prev.model],
+                ['thought_level', prev.thinkingOption],
+                ['mode', nativeMode],
+              ] as const) {
+                const applied = await applyNativeConfigOption(
+                  currentTransport,
+                  state.nativeId,
+                  state.metadata,
+                  k,
+                  v,
+                )
+                configChanged ||= applied
+              }
+              await drain()
+              fallbackUsage = revertLoadedUsage
+            } finally {
+              state.loading = false
+              state.replay = true
+              revertLoadedUsage = undefined
+            }
+
+            if (configChanged) publishConfig()
+            if (
+              previousNativeId &&
+              previousNativeId !== state.nativeId &&
+              sessionIdPattern.test(previousNativeId)
+            ) {
+              await currentTransport
+                .request(
+                  currentTransport.rpc.closeSession({
+                    sessionId: previousNativeId,
+                  }),
+                  { timeoutMs: 1500, fatalOnTimeout: false },
+                )
+                .catch(() => undefined)
+            }
+
+            state.persisted = true
+            state.lastKnownStepIndex =
+              result.cutoffStepIndex !== undefined && result.cutoffStepIndex > 0
+                ? result.cutoffStepIndex - 1
+                : -1
+            state.wakeup = {
+              pendingReplay: false,
+              suppressEcho: false,
+              carriedUsage: undefined,
+            }
+            state.turnToolCallIds = []
+            state.turnForegroundAcp = []
+            state.deniedToolCallIds.clear()
+            timeline.boundary()
+
+            const [nextRows, nextSubagents, latestUsage] = await Promise.all([
+              readTranscriptRows(brainRoot, state.nativeId).catch(
+                () => [] as Record<string, unknown>[],
+              ),
+              readSubagents(brainRoot, state.nativeId).catch(
+                () => [] as SubagentRecord[],
+              ),
+              readLatestStepUsage(brainRoot, state.nativeId).catch(
+                () => undefined,
+              ),
+            ])
+            state.userTurnCount = extractUserStepRows(nextRows).length
+            await subagents.reconcileAfterRevert(
+              previousNativeId,
+              state.nativeId,
+              nextSubagents,
+            )
+            if (latestUsage?.lastStepUsage) {
+              this.publishStepContext(latestUsage.lastStepUsage)
+            } else if (
+              nextRows.length === 0 &&
+              usage.contextWindowUsedTokens !== undefined
+            ) {
+              publishUsage({
+                contextWindowUsedTokens: 0,
+                ...(this.contextWindowMaxTokens !== undefined
+                  ? { contextWindowMaxTokens: this.contextWindowMaxTokens }
+                  : {}),
+              })
+            } else if (fallbackUsage) {
+              publishUsage(fallbackUsage)
+            }
+          } catch (error) {
+            state.nativeId = previousNativeId
+            state.metadata = previousMetadata
+            if (
+              forkedNativeId !== previousNativeId &&
+              sessionIdPattern.test(forkedNativeId)
+            ) {
+              if (registeredOnTransport && !state.closing && !state.failed) {
+                await currentTransport
+                  .request(
+                    currentTransport.rpc.closeSession({
+                      sessionId: forkedNativeId,
+                    }),
+                    { timeoutMs: 1500, fatalOnTimeout: false },
+                  )
+                  .catch(() => undefined)
+              }
+              await removeForkedConversation(appDataDir, forkedNativeId).catch(
+                () => undefined,
+              )
+            }
+            throw error
+          } finally {
+            revertLoadedUsage = undefined
+          }
         }
         return result
       },
@@ -1304,6 +1477,7 @@ async function createSession(
           state.closing ||
           state.opening ||
           state.loading ||
+          state.reverting ||
           state.turn ||
           state.interrupting ||
           permissions.size > 0 ||
@@ -1493,6 +1667,8 @@ async function configureSession(
 ) {
   if (session.state.closing || session.state.failed)
     throw new Error('ACP runtime has exited; reopen the session')
+  if (session.state.reverting)
+    throw new Error('Wait for revert to finish before changing configuration')
   if (session.state.turn)
     throw new Error('Wait for the current turn before changing configuration')
   if (changes.settings && Object.keys(changes.settings).length)
@@ -1607,6 +1783,7 @@ async function promptSession(
   if (session.state.closing) throw new Error('Session is closing')
   if (session.state.opening || session.state.loading)
     throw new Error('Session is not ready')
+  if (session.state.reverting) throw new Error('Session is reverting')
   if (session.state.turn) throw new Error('Session already has an active turn')
   if (session.state.failed)
     throw new Error('ACP runtime has exited; reopen the session')
@@ -1679,6 +1856,9 @@ async function promptSession(
       session.state.turn === turnId &&
       session.state.turnAbort === turnAbort
     ) {
+      if (session.state.activeCheckpoint) {
+        clearCheckpointToolOwners(session.state.activeCheckpoint.id)
+      }
       session.state.activeCheckpoint = undefined
       session.state.pendingJournalEdits.length = 0
       session.state.turnAbort = null
@@ -1796,6 +1976,9 @@ async function promptSession(
       session.state.turn === turnId &&
       session.state.turnAbort === turnAbort
     ) {
+      if (session.state.activeCheckpoint) {
+        clearCheckpointToolOwners(session.state.activeCheckpoint.id)
+      }
       session.state.activeCheckpoint = undefined
       session.state.observation = null
       session.state.wakeup.suppressEcho = false

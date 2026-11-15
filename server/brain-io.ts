@@ -10,6 +10,7 @@ import { createHash } from 'node:crypto'
 import { join, sep } from 'node:path'
 import {
   isAskQuestionName,
+  isMissingError,
   isNativeToolName,
   nonnegative,
   record,
@@ -80,10 +81,7 @@ class BrainEscapeError extends Error {
   }
 }
 
-export function isMissing(error: unknown): boolean {
-  const code = (error as NodeJS.ErrnoException | undefined)?.code
-  return code === 'ENOENT' || code === 'ENOTDIR'
-}
+export const isMissing = isMissingError
 
 function isUnloggedStep(row: Record<string, unknown>): boolean {
   return typeof row.status === 'string' && unloggedStepStatuses.has(row.status)

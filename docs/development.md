@@ -37,12 +37,16 @@ Paseo compiles the TypeScript plugin; no separate build output is required. Git/
 | `server/common.ts`                                                        | Shared primitives (`record`, `cleanToolName`, `setBounded`, `formatErrorMessage`, env). |
 | `server/provider.ts`                                                      | Provider contract, capability negotiation, bounded catalog cache and pending tracking.  |
 | `server/session.ts`                                                       | Session manager, notifications, prompts, woken question continuations and lifecycle.    |
+| `server/history.ts`                                                       | Merge ACP replay snapshots with Brain transcripts into ordered history entries.         |
+| `server/checkpoints.ts`                                                   | Per-turn workspace snapshots using isolated shadow Git trees or non-Git journals.       |
+| `server/revert.ts`                                                        | Revert token handling, SQLite/Brain conversation forking and workspace rollback.        |
 | `server/subagents.ts`                                                     | Subagent ownership cache, multi-level subsession linking and child Brain watchers.      |
 | `server/questions.ts`                                                     | Normalize `elicitation/create` schemas and `ask_question` calls into `QuestionCard`s.   |
 | `server/permissions.ts`                                                   | Classify permission requests, MCP `toolPolicy` preapprovals and option selection.       |
 | `server/transport.ts`                                                     | ACP stdio process, `elicitation/create` interception, metadata capture and shutdown.    |
 | `server/mapping.ts`                                                       | Timeline state machine, configuration, attachment and context/token usage mapping.      |
 | `server/brain-io.ts`                                                      | Realpath-contained Brain file readers, `O_TRUNC` cursor detection and inbox/subagents.  |
+| `server/brain-observer.ts`                                                | Live turn transcript observation, step dedupe and usage snapshot reconciliation.        |
 | `server/brain-projector.ts`                                               | Pure state machine projecting Brain transcript steps and inbox messages into cards.     |
 | `server/brain.ts`                                                         | Turn-settlement polling loop (`settleBrainTurn`) and child transcript watcher.          |
 | `server/preflight.ts`                                                     | Version checks, cache identity, data directory resolution and symlink-safe cleanup.     |

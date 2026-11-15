@@ -17,7 +17,13 @@ import {
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 import { z } from 'zod'
-import { record, sessionIdPattern, str } from './common.ts'
+import {
+  assertSafeNativeId,
+  isMissingError,
+  record,
+  sessionIdPattern,
+  str,
+} from './common.ts'
 
 const execFileAsync = promisify(execFile)
 const GIT_TIMEOUT_MS = 5000
@@ -41,6 +47,7 @@ export const TurnFileCheckpointSchema = z.discriminatedUnion('kind', [
     kind: z.literal('git'),
     repoRoot: z.string(),
     treeHash: z.string(),
+    unbornDirs: z.array(z.string()).optional(),
     createdAt: z.string(),
   }),
   z.object({
@@ -63,6 +70,11 @@ const SessionCheckpointsFileSchema = z.object({
 const sessionWriteLanes = new Map<string, Promise<void>>()
 const checkpointFirstTools = new Map<string, Map<string, string>>()
 
+/** Release per-checkpoint tool ownership tracking once a turn ends or checkpoints are removed. */
+export function clearCheckpointToolOwners(checkpointId: string): void {
+  checkpointFirstTools.delete(checkpointId)
+}
+
 function queueSessionOp<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const prev = sessionWriteLanes.get(key) ?? Promise.resolve()
   const next = prev.catch(() => undefined).then(fn)
@@ -77,15 +89,15 @@ function queueSessionOp<T>(key: string, fn: () => Promise<T>): Promise<T> {
   return next
 }
 
-function isMissingError(error: unknown): boolean {
-  const code = (error as NodeJS.ErrnoException | undefined)?.code
-  return code === 'ENOENT' || code === 'ENOTDIR'
-}
-
-function assertSafeNativeId(nativeId: string) {
-  if (!sessionIdPattern.test(nativeId)) {
-    throw new Error(`Invalid session ID: ${nativeId}`)
-  }
+async function removeExistingEntry(
+  targetPath: string,
+  statInfo: Awaited<ReturnType<typeof lstat>> | null,
+): Promise<void> {
+  if (!statInfo) return
+  await rm(targetPath, {
+    recursive: statInfo.isDirectory() && !statInfo.isSymbolicLink(),
+    force: true,
+  })
 }
 
 function checkpointsRoot(appDataDir: string): string {
@@ -289,11 +301,25 @@ async function ensureShadowGitRepo(
   return shadowDir
 }
 
+function parseUnbornGitPaths(error: unknown): string[] {
+  const errRecord = record(error)
+  const stderr =
+    str(errRecord.stderr) ?? (error instanceof Error ? error.message : '')
+  const paths: string[] = []
+  for (const match of stderr.matchAll(
+    /error:\s+'([^']+?)\/?'\s+does not have a commit checked out/g,
+  )) {
+    const cleaned = match[1].replace(/\/+$/, '')
+    if (cleaned) paths.push(cleaned)
+  }
+  return paths
+}
+
 async function captureGitTree(
   repoRoot: string,
   shadowDir: string,
   realGitDir: string,
-): Promise<string> {
+): Promise<{ treeHash: string; unbornDirs: string[] }> {
   const tempIndex = join(shadowDir, `tmp-index-${randomUUID()}`)
   const env = {
     ...process.env,
@@ -301,15 +327,55 @@ async function captureGitTree(
     GIT_WORK_TREE: repoRoot,
     GIT_INDEX_FILE: tempIndex,
   }
+  const excluded: string[] = []
+  const excludedSet = new Set<string>()
+  let captured = false
+  let lastError: unknown
   try {
-    // Seed tempIndex with a copy of the real git index so `git add -A` skips clean tracked files via stat cache.
-    await copyFile(join(realGitDir, 'index'), tempIndex).catch(() => undefined)
-    await execFileAsync('git', ['add', '-A'], {
-      cwd: repoRoot,
-      env,
-      encoding: 'utf8',
-      timeout: GIT_TIMEOUT_MS,
-    })
+    for (let attempt = 0; attempt < 128; attempt++) {
+      // Seed tempIndex with a copy of the real git index so `git add -A` skips clean tracked files via stat cache.
+      await copyFile(join(realGitDir, 'index'), tempIndex).catch(
+        () => undefined,
+      )
+      const addArgs =
+        excluded.length > 0
+          ? [
+              'add',
+              '-A',
+              '--',
+              '.',
+              ...excluded.map((dir) => `:(top,exclude,literal)${dir}`),
+            ]
+          : ['add', '-A', '--', '.']
+      try {
+        await execFileAsync('git', addArgs, {
+          cwd: repoRoot,
+          env,
+          encoding: 'utf8',
+          timeout: GIT_TIMEOUT_MS,
+        })
+        captured = true
+        break
+      } catch (error) {
+        lastError = error
+        await rm(tempIndex, { force: true }).catch(() => undefined)
+        const discovered = parseUnbornGitPaths(error).filter(
+          (rel) => !excludedSet.has(rel),
+        )
+        if (discovered.length === 0) throw error
+        for (const rel of discovered) {
+          excludedSet.add(rel)
+          excluded.push(rel)
+        }
+      }
+    }
+    if (!captured) {
+      throw lastError instanceof Error
+        ? lastError
+        : new Error(
+            'Exceeded maximum unborn nested repository exclusions while capturing git tree',
+          )
+    }
     const { stdout } = await execFileAsync('git', ['write-tree'], {
       cwd: repoRoot,
       env,
@@ -320,7 +386,7 @@ async function captureGitTree(
     if (!/^[a-f0-9]{40,64}$/i.test(treeHash)) {
       throw new Error(`Invalid git tree hash: ${treeHash}`)
     }
-    return treeHash
+    return { treeHash, unbornDirs: excluded }
   } finally {
     await rm(tempIndex, { force: true }).catch(() => undefined)
   }
@@ -362,9 +428,9 @@ function parseNullDiffTree(buf: Buffer): DiffEntry[] {
 
 async function restoreGitTree(
   appDataDir: string,
-  repoRoot: string,
-  targetTreeHash: string,
+  checkpoint: Extract<TurnFileCheckpoint, { kind: 'git' }>,
 ): Promise<void> {
+  const { repoRoot, treeHash: targetTreeHash } = checkpoint
   const resolvedRoot = await realpath(repoRoot)
   const git = await resolveGitRepo(resolvedRoot)
   if (!git) {
@@ -376,12 +442,22 @@ async function restoreGitTree(
     git.gitDir,
     git.commonDir,
   )
-  const currentTreeHash = await captureGitTree(
-    resolvedRoot,
-    shadowDir,
-    git.gitDir,
-  )
-  if (currentTreeHash === targetTreeHash) return
+  const current = await captureGitTree(resolvedRoot, shadowDir, git.gitDir)
+  const baselineUnborn = new Set(checkpoint.unbornDirs ?? [])
+  for (const unbornDir of current.unbornDirs) {
+    if (baselineUnborn.has(unbornDir)) continue
+    const absPath = resolveContainedPath(resolvedRoot, unbornDir)
+    if (!absPath) continue
+    if (!(await assertNoSymlinkEscape(resolvedRoot, dirname(absPath)))) {
+      throw new Error(
+        `Refusing to remove directory across symlink: ${unbornDir}`,
+      )
+    }
+    const existing = await lstat(absPath).catch(() => null)
+    await removeExistingEntry(absPath, existing)
+    await pruneEmptyParents(dirname(absPath), resolvedRoot)
+  }
+  if (current.treeHash === targetTreeHash) return
   const { stdout } = await execFileAsync(
     'git',
     [
@@ -391,7 +467,7 @@ async function restoreGitTree(
       '-z',
       '--no-renames',
       targetTreeHash,
-      currentTreeHash,
+      current.treeHash,
     ],
     {
       cwd: resolvedRoot,
@@ -400,17 +476,26 @@ async function restoreGitTree(
       timeout: GIT_TIMEOUT_MS,
     },
   )
-  for (const entry of parseNullDiffTree(stdout)) {
-    if (entry.modeOld === '160000' || entry.modeNew === '160000') continue
+  const diffEntries = parseNullDiffTree(stdout).filter(
+    (entry) => entry.modeOld !== '160000' && entry.modeNew !== '160000',
+  )
+  // Remove added paths before restoring target entries so file/directory swaps cannot collide across phases.
+  for (const entry of diffEntries) {
+    if (entry.status !== 'A') continue
     const absPath = resolveContainedPath(resolvedRoot, entry.path)
     if (!absPath) continue
-    if (entry.status === 'A') {
-      const existing = await lstat(absPath).catch(() => null)
-      if (!existing) continue
-      await rm(absPath, { recursive: false, force: true })
-      await pruneEmptyParents(dirname(absPath), resolvedRoot)
-      continue
+    if (!(await assertNoSymlinkEscape(resolvedRoot, dirname(absPath)))) {
+      throw new Error(`Refusing to remove entry across symlink: ${entry.path}`)
     }
+    const existing = await lstat(absPath).catch(() => null)
+    if (!existing) continue
+    await removeExistingEntry(absPath, existing)
+    await pruneEmptyParents(dirname(absPath), resolvedRoot)
+  }
+  for (const entry of diffEntries) {
+    if (entry.status === 'A') continue
+    const absPath = resolveContainedPath(resolvedRoot, entry.path)
+    if (!absPath) continue
     const { stdout: blob } = await execFileAsync(
       'git',
       [`--git-dir=${shadowDir}`, 'cat-file', 'blob', entry.hashOld],
@@ -427,32 +512,94 @@ async function restoreGitTree(
     }
     await mkdir(parent, { recursive: true })
     const currentStat = await lstat(absPath).catch(() => null)
-    if (currentStat?.isSymbolicLink() || currentStat?.isDirectory()) {
-      await rm(absPath, { recursive: currentStat.isDirectory(), force: true })
-    }
     if (entry.modeOld === '120000') {
+      await removeExistingEntry(absPath, currentStat)
       await symlink(blob.toString('utf8'), absPath)
       continue
+    }
+    if (currentStat?.isSymbolicLink() || currentStat?.isDirectory()) {
+      await removeExistingEntry(absPath, currentStat)
     }
     await writeFile(absPath, blob)
     await chmod(absPath, entry.modeOld === '100755' ? 0o755 : 0o644)
   }
 }
 
+const inFlightBlobs = new Map<string, number>()
+
+function pinBlob(hash: string): void {
+  inFlightBlobs.set(hash, (inFlightBlobs.get(hash) ?? 0) + 1)
+}
+
+function unpinBlob(hash: string): void {
+  const count = inFlightBlobs.get(hash) ?? 0
+  if (count <= 1) inFlightBlobs.delete(hash)
+  else inFlightBlobs.set(hash, count - 1)
+}
+
 async function storeBlob(appDataDir: string, content: Buffer): Promise<string> {
   const hash = createHash('sha256').update(content).digest('hex')
+  pinBlob(hash)
   const dir = blobsDir(appDataDir)
   const blobPath = join(dir, hash)
   try {
     await lstat(blobPath)
   } catch (error) {
-    if (!isMissingError(error)) throw error
-    await mkdir(dir, { recursive: true })
-    const tmpPath = `${blobPath}.tmp-${randomUUID()}`
-    await writeFile(tmpPath, content)
-    await rename(tmpPath, blobPath)
+    try {
+      if (!isMissingError(error)) throw error
+      await mkdir(dir, { recursive: true })
+      const tmpPath = `${blobPath}.tmp-${randomUUID()}`
+      await writeFile(tmpPath, content)
+      await rename(tmpPath, blobPath)
+    } catch (writeError) {
+      unpinBlob(hash)
+      throw writeError
+    }
   }
   return hash
+}
+
+const JOURNAL_MAX_FILE_BYTES = 32 * 1024 * 1024
+
+function collectReferencedBlobHashes(
+  checkpoints: readonly TurnFileCheckpoint[],
+): Set<string> {
+  const hashes = new Set<string>()
+  for (const cp of checkpoints) {
+    if (cp.kind !== 'journal') continue
+    for (const snap of Object.values(cp.edits)) {
+      if (snap.existed) hashes.add(snap.blobSha256)
+    }
+  }
+  return hashes
+}
+
+async function pruneUnreferencedBlobs(
+  appDataDir: string,
+  candidates: readonly TurnFileCheckpoint[],
+): Promise<void> {
+  const candidateHashes = collectReferencedBlobHashes(candidates)
+  if (candidateHashes.size === 0) return
+  const sessionsDir = join(checkpointsRoot(appDataDir), 'sessions')
+  const entries = await readdir(sessionsDir).catch((error: unknown) => {
+    if (isMissingError(error)) return [] as string[]
+    throw error
+  })
+  const referenced = new Set<string>()
+  for (const name of entries) {
+    if (!name.endsWith('.json')) continue
+    const nativeId = name.slice(0, -5)
+    if (!sessionIdPattern.test(nativeId)) continue
+    const cps = await readSessionCheckpoints(appDataDir, nativeId).catch(
+      () => [] as TurnFileCheckpoint[],
+    )
+    for (const hash of collectReferencedBlobHashes(cps)) referenced.add(hash)
+  }
+  const dir = blobsDir(appDataDir)
+  for (const hash of candidateHashes) {
+    if (referenced.has(hash) || (inFlightBlobs.get(hash) ?? 0) > 0) continue
+    await rm(join(dir, hash), { force: true }).catch(() => undefined)
+  }
 }
 
 /** Capture a pre-turn workspace checkpoint before dispatching `session/prompt`. */
@@ -467,31 +614,25 @@ export async function captureTurnFileCheckpoint(
   const git = await resolveGitRepo(cwd)
   let checkpoint: TurnFileCheckpoint
   if (git) {
-    try {
-      const shadowDir = await ensureShadowGitRepo(
-        appDataDir,
-        git.repoRoot,
-        git.gitDir,
-        git.commonDir,
-      )
-      const treeHash = await captureGitTree(git.repoRoot, shadowDir, git.gitDir)
-      checkpoint = {
-        id: randomUUID(),
-        afterStepIndex,
-        kind: 'git',
-        repoRoot: git.repoRoot,
-        treeHash,
-        createdAt,
-      }
-    } catch {
-      checkpoint = {
-        id: randomUUID(),
-        afterStepIndex,
-        kind: 'journal',
-        cwd: await realpath(cwd).catch(() => resolve(cwd)),
-        edits: {},
-        createdAt,
-      }
+    const shadowDir = await ensureShadowGitRepo(
+      appDataDir,
+      git.repoRoot,
+      git.gitDir,
+      git.commonDir,
+    )
+    const { treeHash, unbornDirs } = await captureGitTree(
+      git.repoRoot,
+      shadowDir,
+      git.gitDir,
+    )
+    checkpoint = {
+      id: randomUUID(),
+      afterStepIndex,
+      kind: 'git',
+      repoRoot: git.repoRoot,
+      treeHash,
+      ...(unbornDirs.length > 0 ? { unbornDirs } : {}),
+      createdAt,
     }
   } else {
     checkpoint = {
@@ -528,56 +669,94 @@ export async function recordJournalToolEdit(
   const absPath = await resolveSafeJournalTarget(cwd, filePath)
   if (!absPath) return
 
+  const currentStat = await lstat(absPath).catch((error: unknown) =>
+    isMissingError(error) ? null : undefined,
+  )
+  const observedMode =
+    currentStat && !currentStat.isSymbolicLink() && currentStat.isFile()
+      ? currentStat.mode & 0o777
+      : undefined
+
   let snapshot: JournalFileSnapshot | undefined
+  let pinnedHash: string | undefined
   if (options?.toolCompleted && options.oldText !== undefined) {
     if (options.oldText === null) snapshot = { existed: false }
     else {
-      const blobSha256 = await storeBlob(
+      pinnedHash = await storeBlob(
         appDataDir,
         Buffer.from(options.oldText, 'utf8'),
       )
-      snapshot = { existed: true, blobSha256 }
+      snapshot = {
+        existed: true,
+        blobSha256: pinnedHash,
+        ...(observedMode !== undefined ? { mode: observedMode } : {}),
+      }
     }
-  } else {
+  } else if (currentStat === null) {
+    snapshot = { existed: false }
+  } else if (
+    currentStat &&
+    !currentStat.isSymbolicLink() &&
+    currentStat.isFile() &&
+    currentStat.size <= JOURNAL_MAX_FILE_BYTES
+  ) {
     try {
-      const info = await lstat(absPath)
-      if (info.isSymbolicLink() || !info.isFile()) return
       const data = await readFile(absPath)
-      const blobSha256 = await storeBlob(appDataDir, data)
-      snapshot = { existed: true, blobSha256, mode: info.mode & 0o777 }
+      pinnedHash = await storeBlob(appDataDir, data)
+      snapshot = {
+        existed: true,
+        blobSha256: pinnedHash,
+        mode: currentStat.mode & 0o777,
+      }
     } catch (error) {
       if (!isMissingError(error)) return
       snapshot = { existed: false }
     }
+  } else {
+    return
   }
 
-  if (!snapshot) return
-  const finalSnapshot = snapshot
-  await queueSessionOp(nativeId, async () => {
-    const existing = await readSessionCheckpoints(appDataDir, nativeId)
-    const target = existing.find((cp) => cp.id === checkpointId)
-    if (!target || target.kind !== 'journal') return
-    let toolOwners = checkpointFirstTools.get(checkpointId)
-    if (!toolOwners) {
-      toolOwners = new Map<string, string>()
-      checkpointFirstTools.set(checkpointId, toolOwners)
-    }
-    const alreadyRecorded = Object.hasOwn(target.edits, absPath)
-    if (alreadyRecorded) {
-      // Allow the same first tool call to refine an racy pre-edit lstat once its diff oldText completes.
-      const owner = toolOwners.get(absPath)
-      const canRefine =
-        Boolean(options?.toolCompleted) &&
-        options?.oldText !== undefined &&
-        Boolean(options?.toolCallId) &&
-        owner === options?.toolCallId
-      if (!canRefine) return
-    } else if (options?.toolCallId) {
-      toolOwners.set(absPath, options.toolCallId)
-    }
-    target.edits[absPath] = finalSnapshot
-    await writeSessionCheckpoints(appDataDir, nativeId, existing)
-  })
+  const baseSnapshot = snapshot
+  try {
+    await queueSessionOp(nativeId, async () => {
+      const existing = await readSessionCheckpoints(appDataDir, nativeId)
+      const target = existing.find((cp) => cp.id === checkpointId)
+      if (!target || target.kind !== 'journal') return
+      let toolOwners = checkpointFirstTools.get(checkpointId)
+      if (!toolOwners) {
+        toolOwners = new Map<string, string>()
+        checkpointFirstTools.set(checkpointId, toolOwners)
+      }
+      const alreadyRecorded = Object.hasOwn(target.edits, absPath)
+      const previous = target.edits[absPath]
+      if (alreadyRecorded) {
+        // Allow the same first tool call to refine a pre-edit lstat once its diff oldText completes.
+        const owner = toolOwners.get(absPath)
+        const canRefine =
+          Boolean(options?.toolCompleted) &&
+          options?.oldText !== undefined &&
+          Boolean(options?.toolCallId) &&
+          owner === options?.toolCallId
+        if (!canRefine) return
+      } else if (options?.toolCallId) {
+        toolOwners.set(absPath, options.toolCallId)
+      }
+      const preservedMode = previous?.existed ? previous.mode : undefined
+      target.edits[absPath] = baseSnapshot.existed
+        ? {
+            ...baseSnapshot,
+            ...(preservedMode !== undefined
+              ? { mode: preservedMode }
+              : baseSnapshot.mode !== undefined
+                ? { mode: baseSnapshot.mode }
+                : {}),
+          }
+        : baseSnapshot
+      await writeSessionCheckpoints(appDataDir, nativeId, existing)
+    })
+  } finally {
+    if (pinnedHash) unpinBlob(pinnedHash)
+  }
 }
 
 /** Restore the workspace to the state recorded by `checkpointId`. */
@@ -595,13 +774,32 @@ export async function restoreSessionFileCheckpoint(
     }
     const target = checkpoints[idx]
     if (target.kind === 'git') {
-      await restoreGitTree(appDataDir, target.repoRoot, target.treeHash)
+      await restoreGitTree(appDataDir, target)
       return
     }
+    const earliestPostGitIdx = checkpoints.findIndex(
+      (cp, i) => i > idx && cp.kind === 'git',
+    )
+    if (
+      earliestPostGitIdx >= 0 &&
+      checkpoints.slice(earliestPostGitIdx + 1).some((cp) => cp.kind !== 'git')
+    ) {
+      throw new Error(
+        'Cannot restore files across interleaved non-git and git turns',
+      )
+    }
+    if (earliestPostGitIdx >= 0) {
+      const firstGit = checkpoints[earliestPostGitIdx]
+      if (firstGit.kind === 'git') {
+        await restoreGitTree(appDataDir, firstGit)
+      }
+    }
+    const postGitEnd =
+      earliestPostGitIdx >= 0 ? earliestPostGitIdx : checkpoints.length
     const resolvedRoot = await realpath(target.cwd).catch(() =>
       resolve(target.cwd),
     )
-    for (let i = checkpoints.length - 1; i >= idx; i--) {
+    for (let i = postGitEnd - 1; i >= idx; i--) {
       const cp = checkpoints[i]
       if (cp.kind !== 'journal') continue
       for (const [absPath, snap] of Object.entries(cp.edits)) {
@@ -610,14 +808,22 @@ export async function restoreSessionFileCheckpoint(
         if (!(await assertNoSymlinkEscape(resolvedRoot, dirname(contained)))) {
           throw new Error(`Refusing to restore file across symlink: ${absPath}`)
         }
+        const existingStat = await lstat(contained).catch(() => null)
         if (!snap.existed) {
-          await rm(contained, { force: true })
+          await removeExistingEntry(contained, existingStat)
           await pruneEmptyParents(dirname(contained), resolvedRoot)
           continue
         }
         const blobPath = join(blobsDir(appDataDir), snap.blobSha256)
         const data = await readFile(blobPath)
         await mkdir(dirname(contained), { recursive: true })
+        if (!(await assertNoSymlinkEscape(resolvedRoot, dirname(contained)))) {
+          throw new Error(`Refusing to restore file across symlink: ${absPath}`)
+        }
+        const leafStat = await lstat(contained).catch(() => null)
+        if (leafStat?.isSymbolicLink() || leafStat?.isDirectory()) {
+          await removeExistingEntry(contained, leafStat)
+        }
         await writeFile(contained, data)
         if (snap.mode !== undefined) await chmod(contained, snap.mode)
       }
@@ -634,36 +840,50 @@ export async function forkSessionCheckpoints(
 ): Promise<void> {
   if (
     !sessionIdPattern.test(oldNativeId) ||
-    !sessionIdPattern.test(newNativeId)
+    !sessionIdPattern.test(newNativeId) ||
+    oldNativeId === newNativeId
   ) {
     return
   }
-  const existing = await queueSessionOp(oldNativeId, () =>
-    readSessionCheckpoints(appDataDir, oldNativeId),
-  )
-  const retained = existing.filter((cp) => cp.afterStepIndex < cutoffStepIndex)
-  if (!retained.length) return
-  await queueSessionOp(newNativeId, () =>
-    writeSessionCheckpoints(appDataDir, newNativeId, retained),
-  )
+  await queueSessionOp(oldNativeId, async () => {
+    const existing = await readSessionCheckpoints(appDataDir, oldNativeId)
+    for (const cp of existing) {
+      if (cp.afterStepIndex >= cutoffStepIndex) clearCheckpointToolOwners(cp.id)
+    }
+    const retained = existing.filter(
+      (cp) => cp.afterStepIndex < cutoffStepIndex,
+    )
+    if (!retained.length) return
+    await queueSessionOp(newNativeId, () =>
+      writeSessionCheckpoints(appDataDir, newNativeId, retained),
+    )
+  })
 }
 
-/** Remove the persisted checkpoint manifest for a disposable or closed session. */
+/** Remove the persisted checkpoint manifest and unreferenced blobs for a disposable or closed session. */
 export async function removeSessionCheckpoints(
   appDataDir: string,
   nativeId: string,
 ): Promise<void> {
   if (!sessionIdPattern.test(nativeId)) return
-  const filePath = sessionCheckpointsPath(appDataDir, nativeId)
-  const info = await lstat(filePath).catch((error: unknown) => {
-    if (isMissingError(error)) return null
-    throw error
+  await queueSessionOp(nativeId, async () => {
+    const filePath = sessionCheckpointsPath(appDataDir, nativeId)
+    const info = await lstat(filePath).catch((error: unknown) => {
+      if (isMissingError(error)) return null
+      throw error
+    })
+    if (!info) return
+    if (info.isSymbolicLink()) {
+      throw new Error(`Refusing to remove symlink: ${filePath}`)
+    }
+    const removedCheckpoints = await readSessionCheckpoints(
+      appDataDir,
+      nativeId,
+    ).catch(() => [] as TurnFileCheckpoint[])
+    for (const cp of removedCheckpoints) clearCheckpointToolOwners(cp.id)
+    await rm(filePath, { force: true })
+    await pruneUnreferencedBlobs(appDataDir, removedCheckpoints)
   })
-  if (!info) return
-  if (info.isSymbolicLink()) {
-    throw new Error(`Refusing to remove symlink: ${filePath}`)
-  }
-  await rm(filePath, { force: true })
 }
 
 /** Find the checkpoint captured immediately before `userStepIndex` (bounded by `prevUserStepIndex`). */

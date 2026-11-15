@@ -141,12 +141,17 @@ export class SubagentRegistry {
     childId: string,
     resume?: ReturnType<BrainWatchHandle['resumePoint']>,
   ) {
+    let handle: BrainWatchHandle | undefined
     const child = watchBrain(
       this.opts.brainRoot,
       nativeId,
       childId,
       (event) => {
-        if (this.opts.isUnavailable()) return
+        if (
+          this.opts.isUnavailable() ||
+          (handle !== undefined && this.children.get(childId) !== handle)
+        )
+          return
         if (event.type === 'timeline.item')
           this.linkSubsession(childId, nativeId, event.item)
         this.opts.emit(event)
@@ -154,9 +159,17 @@ export class SubagentRegistry {
       1000,
       this.opts.isParentTurnActive,
       resume,
-      (subagents) => this.rememberSubagents(subagents, nativeId),
+      (subagents) => {
+        if (
+          this.opts.isUnavailable() ||
+          (handle !== undefined && this.children.get(childId) !== handle)
+        )
+          return
+        this.rememberSubagents(subagents, nativeId)
+      },
       this.opts.retryTimeoutMs,
     )
+    handle = child
     this.children.set(childId, child)
     void child.ready.then(() => {
       if (this.killedChildren.has(childId)) return child.cancel()
@@ -263,5 +276,59 @@ export class SubagentRegistry {
       this.opts.emit({ type: 'session.closed', sessionId: childId })
     }
     this.children.clear()
+  }
+
+  /** Reconcile child ownership and close watchers pruned by a conversation revert. */
+  async reconcileAfterRevert(
+    previousRootNativeId: string,
+    newRootNativeId: string,
+    retainedSubagents: readonly SubagentRecord[],
+  ): Promise<void> {
+    const retainedRootIds = new Set(
+      retainedSubagents.map((sub) => sub.conversationId),
+    )
+    for (const [childNativeId, parentNativeId] of this.childParents) {
+      if (parentNativeId !== previousRootNativeId) continue
+      if (retainedRootIds.has(childNativeId)) {
+        this.childParents.set(childNativeId, newRootNativeId)
+      } else {
+        this.childParents.delete(childNativeId)
+      }
+    }
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const [childNativeId, parentNativeId] of this.childParents) {
+        if (
+          parentNativeId !== newRootNativeId &&
+          !this.childParents.has(parentNativeId)
+        ) {
+          this.childParents.delete(childNativeId)
+          changed = true
+        }
+      }
+    }
+    const prefix = `${this.opts.sessionId}:child:`
+    const pruned: Array<[string, BrainWatchHandle]> = []
+    for (const [childId, child] of this.children) {
+      const nativeChildId = childId.startsWith(prefix)
+        ? childId.slice(prefix.length)
+        : childId
+      if (!this.childParents.has(nativeChildId)) {
+        pruned.push([childId, child])
+      }
+    }
+    for (const [childId, child] of pruned) {
+      await child.cancel().catch(() => undefined)
+      child()
+      if (this.children.get(childId) !== child) continue
+      this.children.delete(childId)
+      this.killedChildren.delete(childId)
+      this.resuming.delete(childId)
+      if (!this.opts.isUnavailable()) {
+        this.opts.emit({ type: 'session.closed', sessionId: childId })
+      }
+    }
+    this.rememberSubagents(retainedSubagents, newRootNativeId)
   }
 }

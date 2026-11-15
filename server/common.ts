@@ -7,6 +7,22 @@ export const PACKAGE_VERSION = '0.1.1'
 export const sessionIdPattern =
   /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i
 
+/** Whether a filesystem error indicates a missing file or non-directory path component. */
+export function isMissingError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code
+  return code === 'ENOENT' || code === 'ENOTDIR'
+}
+
+/** Validate that a native conversation ID is a bare UUID before building artifact paths. */
+export function assertSafeNativeId(
+  nativeId: string,
+  label = 'session ID',
+): void {
+  if (!sessionIdPattern.test(nativeId)) {
+    throw new Error(`Invalid ${label}: ${nativeId}`)
+  }
+}
+
 /** Drop agy's `default_api:` namespace from native tool names. */
 export function cleanToolName(name: string): string {
   return name.replace(/^default_api:/, '')
