@@ -14,7 +14,7 @@ Linux has been smoke-tested; other operating systems have not been verified. See
 
 ## Capabilities and data flow
 
-Supports text, images, attachment context, appended system prompts, native commands, permission decisions, persistent sessions, session revert (conversation fork and workspace file rollback), rich tool cards and child conversation timelines. Prompt content, tool results and configured MCP services are handled by the local agy process, which communicates with its configured model service. The plugin reads local Brain transcripts and structured `.system_generated` state to populate timelines; events go to connected Paseo clients.
+Supports text, images, attachment context, appended system prompts, native commands, permission decisions, persistent sessions, session revert (conversation fork and Git workspace file rollback), rich tool cards and child conversation timelines. Prompt content, tool results and configured MCP services are handled by the local agy process, which communicates with its configured model service. The plugin reads local Brain transcripts and structured `.system_generated` state to populate timelines; events go to connected Paseo clients.
 
 The Composer context popover shows context occupancy and subscription quota. Usage Source `agy`, also available through `paseo usage ls --json`, reports Gemini and Claude/GPT 5-hour and weekly quotas, reset times and the subscription tier when known. It calls agy's `/usage` command without starting a model turn. Account labels come from local login logs; token contents are not read by the plugin or exposed in usage reports.
 

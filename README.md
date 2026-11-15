@@ -83,7 +83,7 @@ Existing agents keep their original provider; they are not migrated. Remove the 
 | Configuration | Native models, modes (`default`, `accept-edits`, `plan`) plus **Full Access**, per-model thinking choices and appended system prompts.    |
 | Permissions   | Native approval options with tool arguments, details, MCP `toolPolicy` preapprovals, or unattended auto-approval in **Full Access** mode. |
 | Timeline      | Streaming responses, reasoning, plans and rich tool cards.                                                                                |
-| Revert        | Conversation fork and workspace file rollback (`conversation`, `files`, `both`).                                                          |
+| Revert        | Conversation fork and Git workspace file rollback (`conversation`, `files`, `both`).                                                      |
 | Context       | Token counters, context occupancy and reported USD costs.                                                                                 |
 | Subscription  | Gemini and Claude/GPT 5-hour and weekly quota windows.                                                                                    |
 | Subagents     | Native multi-level child links and read-only Brain transcript cards.                                                                      |

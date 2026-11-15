@@ -38,8 +38,9 @@ Paseo compiles the TypeScript plugin; no separate build output is required. Git/
 | `server/provider.ts`                                                      | Provider contract, capability negotiation, bounded catalog cache and pending tracking.  |
 | `server/session.ts`                                                       | Session manager, notifications, prompts, woken question continuations and lifecycle.    |
 | `server/history.ts`                                                       | Merge ACP replay snapshots with Brain transcripts into ordered history entries.         |
-| `server/checkpoints.ts`                                                   | Per-turn workspace snapshots using isolated shadow Git trees or non-Git journals.       |
-| `server/revert.ts`                                                        | Revert token handling, SQLite/Brain conversation forking and workspace rollback.        |
+| `server/checkpoints.ts`                                                   | Per-turn Git workspace snapshots using isolated shadow Git trees.                       |
+| `server/agy-fork.ts`                                                      | Native agy v1.5.9 SQLite, Protobuf metadata, Brain directory and summary forking.       |
+| `server/revert.ts`                                                        | Revert token resolution, conversation fork orchestration and Git file rollback.         |
 | `server/subagents.ts`                                                     | Subagent ownership cache, multi-level subsession linking and child Brain watchers.      |
 | `server/questions.ts`                                                     | Normalize `elicitation/create` schemas and `ask_question` calls into `QuestionCard`s.   |
 | `server/permissions.ts`                                                   | Classify permission requests, MCP `toolPolicy` preapprovals and option selection.       |

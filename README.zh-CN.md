@@ -83,7 +83,7 @@ paseo usage ls --json
 | 配置     | 原生模型、模式（`default`、`accept-edits`、`plan`）与 **Full Access** 全权限模式、按模型区分的思考等级选项及附加系统提示词。 |
 | 权限审批 | 原生审批选项（展示工具参数与详情卡片）、MCP `toolPolicy` 预批准，或 **Full Access** 模式下的免确认自动放行。                 |
 | 时间线   | 流式回复、推理过程、执行计划与丰富工具卡片。                                                                                 |
-| 会话回退 | 对话分叉回退与工作区文件快照恢复（`conversation`、`files`、`both`）。                                                        |
+| 会话回退 | 对话分叉回退与 Git 工作区文件快照恢复（`conversation`、`files`、`both`）。                                                   |
 | 上下文   | Token 计数、上下文窗口占用及已报告的美元费用。                                                                               |
 | 订阅配额 | Gemini 与 Claude/GPT 模型组的 5 小时及每周配额窗口。                                                                         |
 | 子 Agent | 原生多层级子会话链接与只读 Brain 日志时间线卡片。                                                                            |

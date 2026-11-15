@@ -448,14 +448,14 @@ new AgentSideConnection((client) => {
         })
         return { stopReason: 'end_turn' }
       }
-      if (text === 'revert-journal-edit') {
+      if (text === 'revert-file-edit') {
         const targetDir = process.env.AGY_TEST_REVERT_DIR
         if (!targetDir) throw new Error('AGY_TEST_REVERT_DIR required')
         const existingPath = join(targetDir, 'existing.txt')
         const perm = await client.requestPermission({
           sessionId,
           toolCall: {
-            toolCallId: 'journal-perm-edit',
+            toolCallId: 'file-perm-edit',
             title: 'replace_file_content',
             rawInput: { TargetFile: existingPath },
           },
@@ -472,7 +472,7 @@ new AgentSideConnection((client) => {
           sessionId,
           update: {
             sessionUpdate: 'tool_call',
-            toolCallId: 'journal-create',
+            toolCallId: 'file-create',
             title: 'write_to_file',
             kind: 'edit',
             status: 'in_progress',
@@ -484,7 +484,7 @@ new AgentSideConnection((client) => {
           sessionId,
           update: {
             sessionUpdate: 'tool_call_update',
-            toolCallId: 'journal-create',
+            toolCallId: 'file-create',
             status: 'completed',
             content: [
               {
@@ -492,26 +492,6 @@ new AgentSideConnection((client) => {
                 path: createdPath,
                 oldText: null,
                 newText: 'created',
-              },
-            ],
-          },
-        })
-        const oldTextOnlyPath = join(targetDir, 'oldtext-only.txt')
-        writeFileSync(oldTextOnlyPath, 'to-diff')
-        await client.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: 'tool_call_update',
-            toolCallId: 'journal-diff-only',
-            title: 'replace_file_content',
-            kind: 'edit',
-            status: 'completed',
-            content: [
-              {
-                type: 'diff',
-                path: oldTextOnlyPath,
-                oldText: 'from-diff',
-                newText: 'to-diff',
               },
             ],
           },

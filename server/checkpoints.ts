@@ -1,4 +1,4 @@
-/** Per-turn file checkpoints using isolated shadow Git trees or non-Git pre-edit journals. */
+/** Per-turn workspace file checkpoints using isolated shadow Git trees. */
 import { execFile } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import {
@@ -31,36 +31,15 @@ const execFileAsync = promisify(execFile)
 const GIT_TIMEOUT_MS = 5000
 const GIT_DIFF_MAX_BUFFER = 32 * 1024 * 1024
 
-const JournalFileSnapshotSchema = z.discriminatedUnion('existed', [
-  z.object({ existed: z.literal(false) }),
-  z.object({
-    existed: z.literal(true),
-    blobSha256: z.string().regex(/^[a-f0-9]{64}$/),
-    mode: z.number().int().optional(),
-  }),
-])
-
-type JournalFileSnapshot = z.infer<typeof JournalFileSnapshotSchema>
-
-const TurnFileCheckpointSchema = z.discriminatedUnion('kind', [
-  z.object({
-    id: z.string(),
-    afterStepIndex: z.number().int().min(-1),
-    kind: z.literal('git'),
-    repoRoot: z.string(),
-    treeHash: z.string(),
-    unbornDirs: z.array(z.string()).optional(),
-    createdAt: z.string(),
-  }),
-  z.object({
-    id: z.string(),
-    afterStepIndex: z.number().int().min(-1),
-    kind: z.literal('journal'),
-    cwd: z.string(),
-    edits: z.record(z.string(), JournalFileSnapshotSchema),
-    createdAt: z.string(),
-  }),
-])
+const TurnFileCheckpointSchema = z.object({
+  id: z.string(),
+  afterStepIndex: z.number().int().min(-1),
+  kind: z.literal('git'),
+  repoRoot: z.string(),
+  treeHash: z.string().regex(/^[a-f0-9]{40,64}$/i),
+  unbornDirs: z.array(z.string()).optional(),
+  createdAt: z.string(),
+})
 
 export type TurnFileCheckpoint = z.infer<typeof TurnFileCheckpointSchema>
 
@@ -70,12 +49,6 @@ const SessionCheckpointsFileSchema = z.object({
 })
 
 const sessionWriteLanes = new Map<string, Promise<void>>()
-const checkpointFirstTools = new Map<string, Map<string, string>>()
-
-/** Release per-checkpoint tool ownership tracking once a turn ends or checkpoints are removed. */
-export function clearCheckpointToolOwners(checkpointId: string): void {
-  checkpointFirstTools.delete(checkpointId)
-}
 
 function queueSessionOp<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const prev = sessionWriteLanes.get(key) ?? Promise.resolve()
@@ -111,10 +84,6 @@ function sessionCheckpointsPath(appDataDir: string, nativeId: string): string {
   return join(checkpointsRoot(appDataDir), 'sessions', `${nativeId}.json`)
 }
 
-function blobsDir(appDataDir: string): string {
-  return join(checkpointsRoot(appDataDir), 'blobs')
-}
-
 function shadowGitDirForRepo(appDataDir: string, repoRoot: string): string {
   const hash = createHash('sha256').update(repoRoot).digest('hex').slice(0, 16)
   return join(checkpointsRoot(appDataDir), 'git', `${hash}.git`)
@@ -128,27 +97,6 @@ function resolveContainedPath(root: string, relOrAbs: string): string | null {
   if (candidate === resolvedRoot) return null
   if (!candidate.startsWith(resolvedRoot + sep)) return null
   return candidate
-}
-
-async function resolveSafeJournalTarget(
-  cwd: string,
-  filePath: string,
-): Promise<string | null> {
-  const rawRoot = resolve(cwd)
-  const realRoot = await realpath(rawRoot).catch(() => rawRoot)
-  const candidate = isAbsolute(filePath)
-    ? resolve(filePath)
-    : resolve(rawRoot, filePath)
-  let rel: string | null = null
-  if (candidate.startsWith(rawRoot + sep)) {
-    rel = relative(rawRoot, candidate)
-  } else if (candidate.startsWith(realRoot + sep)) {
-    rel = relative(realRoot, candidate)
-  }
-  if (!rel) return null
-  const absPath = join(realRoot, rel)
-  if (!(await assertNoSymlinkEscape(realRoot, absPath))) return null
-  return absPath
 }
 
 async function assertNoSymlinkEscape(
@@ -244,10 +192,7 @@ async function resolveGitRepo(
       execFileAsync(
         'git',
         ['-C', repoRoot, 'rev-parse', '--absolute-git-dir'],
-        {
-          encoding: 'utf8',
-          timeout: 2000,
-        },
+        { encoding: 'utf8', timeout: 2000 },
       ),
       execFileAsync('git', ['-C', repoRoot, 'rev-parse', '--git-common-dir'], {
         encoding: 'utf8',
@@ -264,6 +209,11 @@ async function resolveGitRepo(
   } catch {
     return null
   }
+}
+
+/** Whether `cwd` is inside a Git working tree eligible for shadow Git file checkpoints. */
+export async function isGitWorkspace(cwd: string): Promise<boolean> {
+  return Boolean(await resolveGitRepo(cwd))
 }
 
 async function ensureShadowGitRepo(
@@ -435,7 +385,7 @@ function parseNullDiffTree(buf: Buffer): DiffEntry[] {
 
 async function validateGitCheckpoint(
   appDataDir: string,
-  checkpoint: Extract<TurnFileCheckpoint, { kind: 'git' }>,
+  checkpoint: TurnFileCheckpoint,
 ): Promise<{
   resolvedRoot: string
   git: { repoRoot: string; gitDir: string; commonDir: string }
@@ -463,7 +413,7 @@ async function validateGitCheckpoint(
 
 async function restoreGitTree(
   appDataDir: string,
-  checkpoint: Extract<TurnFileCheckpoint, { kind: 'git' }>,
+  checkpoint: TurnFileCheckpoint,
 ): Promise<void> {
   const { treeHash: targetTreeHash } = checkpoint
   const { resolvedRoot, git, shadowDir } = await validateGitCheckpoint(
@@ -551,133 +501,49 @@ async function restoreGitTree(
   }
 }
 
-const inFlightBlobs = new Map<string, number>()
-
-function pinBlob(hash: string): void {
-  inFlightBlobs.set(hash, (inFlightBlobs.get(hash) ?? 0) + 1)
-}
-
-function unpinBlob(hash: string): void {
-  const count = inFlightBlobs.get(hash) ?? 0
-  if (count <= 1) inFlightBlobs.delete(hash)
-  else inFlightBlobs.set(hash, count - 1)
-}
-
-async function storeBlob(appDataDir: string, content: Buffer): Promise<string> {
-  const hash = createHash('sha256').update(content).digest('hex')
-  pinBlob(hash)
-  const dir = blobsDir(appDataDir)
-  const blobPath = join(dir, hash)
-  try {
-    await lstat(blobPath)
-  } catch (error) {
-    try {
-      if (!isMissingError(error)) throw error
-      await mkdir(dir, { recursive: true })
-      const tmpPath = `${blobPath}.tmp-${randomUUID()}`
-      await writeFile(tmpPath, content)
-      await rename(tmpPath, blobPath)
-    } catch (writeError) {
-      unpinBlob(hash)
-      throw writeError
-    }
-  }
-  return hash
-}
-
-const JOURNAL_MAX_FILE_BYTES = 32 * 1024 * 1024
-
-function collectReferencedBlobHashes(
-  checkpoints: readonly TurnFileCheckpoint[],
-): Set<string> {
-  const hashes = new Set<string>()
-  for (const cp of checkpoints) {
-    if (cp.kind !== 'journal') continue
-    for (const snap of Object.values(cp.edits)) {
-      if (snap.existed) hashes.add(snap.blobSha256)
-    }
-  }
-  return hashes
-}
-
-async function pruneUnreferencedBlobHashes(
+async function loadTargetCheckpoint(
   appDataDir: string,
-  candidateHashes: ReadonlySet<string>,
-): Promise<void> {
-  if (candidateHashes.size === 0) return
-  const sessionsDir = join(checkpointsRoot(appDataDir), 'sessions')
-  const entries = await readdir(sessionsDir).catch((error: unknown) => {
-    if (isMissingError(error)) return [] as string[]
-    throw error
-  })
-  const referenced = new Set<string>()
-  for (const name of entries) {
-    if (!name.endsWith('.json')) continue
-    const nativeId = name.slice(0, -5)
-    if (!sessionIdPattern.test(nativeId)) continue
-    const cps = await readSessionCheckpoints(appDataDir, nativeId).catch(
-      () => [] as TurnFileCheckpoint[],
-    )
-    for (const hash of collectReferencedBlobHashes(cps)) referenced.add(hash)
+  nativeId: string,
+  checkpointId: string,
+): Promise<TurnFileCheckpoint> {
+  const checkpoints = await readSessionCheckpoints(appDataDir, nativeId)
+  const checkpoint = checkpoints.find((cp) => cp.id === checkpointId)
+  if (!checkpoint) {
+    throw new Error('No file checkpoint recorded for this message')
   }
-  const dir = blobsDir(appDataDir)
-  for (const hash of candidateHashes) {
-    if (referenced.has(hash) || (inFlightBlobs.get(hash) ?? 0) > 0) continue
-    await rm(join(dir, hash), { force: true }).catch(() => undefined)
-  }
+  return checkpoint
 }
 
-async function pruneUnreferencedBlobs(
-  appDataDir: string,
-  candidates: readonly TurnFileCheckpoint[],
-): Promise<void> {
-  await pruneUnreferencedBlobHashes(
-    appDataDir,
-    collectReferencedBlobHashes(candidates),
-  )
-}
-
-/** Capture a pre-turn workspace checkpoint before dispatching `session/prompt`. */
+/** Capture a pre-turn Git workspace checkpoint before dispatching `session/prompt`, or return `undefined` outside Git. */
 export async function captureTurnFileCheckpoint(
   appDataDir: string,
   nativeId: string,
   cwd: string,
   afterStepIndex: number,
-): Promise<TurnFileCheckpoint> {
+): Promise<TurnFileCheckpoint | undefined> {
   assertSafeNativeId(nativeId)
-  const createdAt = new Date().toISOString()
   const git = await resolveGitRepo(cwd)
-  let checkpoint: TurnFileCheckpoint
-  if (git) {
-    const shadowDir = await ensureShadowGitRepo(
-      appDataDir,
-      git.repoRoot,
-      git.gitDir,
-      git.commonDir,
-    )
-    const { treeHash, unbornDirs } = await captureGitTree(
-      git.repoRoot,
-      shadowDir,
-      git.gitDir,
-    )
-    checkpoint = {
-      id: randomUUID(),
-      afterStepIndex,
-      kind: 'git',
-      repoRoot: git.repoRoot,
-      treeHash,
-      ...(unbornDirs.length > 0 ? { unbornDirs } : {}),
-      createdAt,
-    }
-  } else {
-    checkpoint = {
-      id: randomUUID(),
-      afterStepIndex,
-      kind: 'journal',
-      cwd: await realpath(cwd).catch(() => resolve(cwd)),
-      edits: {},
-      createdAt,
-    }
+  if (!git) return undefined
+  const createdAt = new Date().toISOString()
+  const shadowDir = await ensureShadowGitRepo(
+    appDataDir,
+    git.repoRoot,
+    git.gitDir,
+    git.commonDir,
+  )
+  const { treeHash, unbornDirs } = await captureGitTree(
+    git.repoRoot,
+    shadowDir,
+    git.gitDir,
+  )
+  const checkpoint: TurnFileCheckpoint = {
+    id: randomUUID(),
+    afterStepIndex,
+    kind: 'git',
+    repoRoot: git.repoRoot,
+    treeHash,
+    ...(unbornDirs.length > 0 ? { unbornDirs } : {}),
+    createdAt,
   }
   await queueSessionOp(nativeId, async () => {
     const existing = await readSessionCheckpoints(appDataDir, nativeId)
@@ -687,240 +553,29 @@ export async function captureTurnFileCheckpoint(
   return checkpoint
 }
 
-/** Record pre-edit state of a file touched during a non-Git turn checkpoint. */
-export async function recordJournalToolEdit(
-  appDataDir: string,
-  nativeId: string,
-  checkpointId: string,
-  cwd: string,
-  filePath: string,
-  options?: {
-    oldText?: string | null
-    toolCompleted?: boolean
-    toolCallId?: string
-  },
-): Promise<void> {
-  if (!sessionIdPattern.test(nativeId)) return
-  const absPath = await resolveSafeJournalTarget(cwd, filePath)
-  if (!absPath) return
-
-  const currentStat = await lstat(absPath).catch((error: unknown) =>
-    isMissingError(error) ? null : undefined,
-  )
-  const observedMode =
-    currentStat && !currentStat.isSymbolicLink() && currentStat.isFile()
-      ? currentStat.mode & 0o777
-      : undefined
-
-  let snapshot: JournalFileSnapshot | undefined
-  let pinnedHash: string | undefined
-  if (options?.toolCompleted && options.oldText !== undefined) {
-    if (options.oldText === null) snapshot = { existed: false }
-    else {
-      pinnedHash = await storeBlob(
-        appDataDir,
-        Buffer.from(options.oldText, 'utf8'),
-      )
-      snapshot = {
-        existed: true,
-        blobSha256: pinnedHash,
-        ...(observedMode !== undefined ? { mode: observedMode } : {}),
-      }
-    }
-  } else if (currentStat === null) {
-    snapshot = { existed: false }
-  } else if (
-    currentStat &&
-    !currentStat.isSymbolicLink() &&
-    currentStat.isFile() &&
-    currentStat.size <= JOURNAL_MAX_FILE_BYTES
-  ) {
-    try {
-      const data = await readFile(absPath)
-      pinnedHash = await storeBlob(appDataDir, data)
-      snapshot = {
-        existed: true,
-        blobSha256: pinnedHash,
-        mode: currentStat.mode & 0o777,
-      }
-    } catch (error) {
-      if (!isMissingError(error)) return
-      snapshot = { existed: false }
-    }
-  } else {
-    return
-  }
-
-  const baseSnapshot = snapshot
-  let saved = false
-  let replacedHash: string | undefined
-  try {
-    await queueSessionOp(nativeId, async () => {
-      const existing = await readSessionCheckpoints(appDataDir, nativeId)
-      const target = existing.find((cp) => cp.id === checkpointId)
-      if (!target || target.kind !== 'journal') return
-      let toolOwners = checkpointFirstTools.get(checkpointId)
-      if (!toolOwners) {
-        toolOwners = new Map<string, string>()
-        checkpointFirstTools.set(checkpointId, toolOwners)
-      }
-      const alreadyRecorded = Object.hasOwn(target.edits, absPath)
-      const previous = target.edits[absPath]
-      if (alreadyRecorded) {
-        // Allow the same first tool call to refine a pre-edit lstat once its diff oldText completes.
-        const owner = toolOwners.get(absPath)
-        const canRefine =
-          Boolean(options?.toolCompleted) &&
-          options?.oldText !== undefined &&
-          Boolean(options?.toolCallId) &&
-          owner === options?.toolCallId
-        if (!canRefine) return
-      } else if (options?.toolCallId) {
-        toolOwners.set(absPath, options.toolCallId)
-      }
-      const preservedMode = previous?.existed ? previous.mode : undefined
-      const nextSnapshot = baseSnapshot.existed
-        ? {
-            ...baseSnapshot,
-            ...(preservedMode !== undefined
-              ? { mode: preservedMode }
-              : baseSnapshot.mode !== undefined
-                ? { mode: baseSnapshot.mode }
-                : {}),
-          }
-        : baseSnapshot
-      target.edits[absPath] = nextSnapshot
-      await writeSessionCheckpoints(appDataDir, nativeId, existing)
-      saved = true
-      if (
-        previous?.existed &&
-        (!nextSnapshot.existed ||
-          previous.blobSha256 !== nextSnapshot.blobSha256)
-      ) {
-        replacedHash = previous.blobSha256
-      }
-    })
-  } finally {
-    if (pinnedHash) unpinBlob(pinnedHash)
-    const toPrune = new Set<string>()
-    if (!saved && pinnedHash) toPrune.add(pinnedHash)
-    if (replacedHash) toPrune.add(replacedHash)
-    if (toPrune.size > 0) {
-      await pruneUnreferencedBlobHashes(appDataDir, toPrune).catch(
-        () => undefined,
-      )
-    }
-  }
-}
-
-async function withCheckpointPlan(
-  appDataDir: string,
-  nativeId: string,
-  checkpointId: string,
-  handlers: {
-    onGit: (cp: Extract<TurnFileCheckpoint, { kind: 'git' }>) => Promise<void>
-    onJournalEntry: (
-      resolvedRoot: string,
-      absPath: string,
-      snap: JournalFileSnapshot,
-    ) => Promise<void>
-  },
-): Promise<void> {
-  assertSafeNativeId(nativeId)
-  await queueSessionOp(nativeId, async () => {
-    const checkpoints = await readSessionCheckpoints(appDataDir, nativeId)
-    const idx = checkpoints.findIndex((cp) => cp.id === checkpointId)
-    if (idx < 0) {
-      throw new Error('No file checkpoint recorded for this message')
-    }
-    const target = checkpoints[idx]
-    if (target.kind === 'git') {
-      await handlers.onGit(target)
-      return
-    }
-    const earliestPostGitIdx = checkpoints.findIndex(
-      (cp, i) => i > idx && cp.kind === 'git',
-    )
-    if (
-      earliestPostGitIdx >= 0 &&
-      checkpoints.slice(earliestPostGitIdx + 1).some((cp) => cp.kind !== 'git')
-    ) {
-      throw new Error(
-        'Cannot restore files across interleaved non-git and git turns',
-      )
-    }
-    if (earliestPostGitIdx >= 0) {
-      const firstGit = checkpoints[earliestPostGitIdx]
-      if (firstGit.kind === 'git') await handlers.onGit(firstGit)
-    }
-    const postGitEnd =
-      earliestPostGitIdx >= 0 ? earliestPostGitIdx : checkpoints.length
-    const resolvedRoot = await realpath(target.cwd).catch(() =>
-      resolve(target.cwd),
-    )
-    for (let i = postGitEnd - 1; i >= idx; i--) {
-      const cp = checkpoints[i]
-      if (cp.kind !== 'journal') continue
-      for (const [absPath, snap] of Object.entries(cp.edits)) {
-        await handlers.onJournalEntry(resolvedRoot, absPath, snap)
-      }
-    }
-  })
-}
-
-/** Verify that `checkpointId` exists and its backing Git tree or journal blobs can be restored without mutating workspace files. */
+/** Verify that `checkpointId` exists and its backing Git tree can be restored without mutating workspace files. */
 export async function validateSessionFileCheckpoint(
   appDataDir: string,
   nativeId: string,
   checkpointId: string,
 ): Promise<void> {
-  await withCheckpointPlan(appDataDir, nativeId, checkpointId, {
-    onGit: async (cp) => {
-      await validateGitCheckpoint(appDataDir, cp)
-    },
-    onJournalEntry: async (resolvedRoot, absPath, snap) => {
-      if (!resolveContainedPath(resolvedRoot, absPath) || !snap.existed) return
-      await lstat(join(blobsDir(appDataDir), snap.blobSha256))
-    },
+  assertSafeNativeId(nativeId)
+  await queueSessionOp(nativeId, async () => {
+    const cp = await loadTargetCheckpoint(appDataDir, nativeId, checkpointId)
+    await validateGitCheckpoint(appDataDir, cp)
   })
 }
 
-/** Restore the workspace to the state recorded by `checkpointId`. */
+/** Restore the workspace to the Git snapshot recorded by `checkpointId`. */
 export async function restoreSessionFileCheckpoint(
   appDataDir: string,
   nativeId: string,
   checkpointId: string,
 ): Promise<void> {
-  await withCheckpointPlan(appDataDir, nativeId, checkpointId, {
-    onGit: (cp) => restoreGitTree(appDataDir, cp),
-    onJournalEntry: async (resolvedRoot, absPath, snap) => {
-      const contained = resolveContainedPath(resolvedRoot, absPath)
-      if (!contained) return
-      if (!(await assertNoSymlinkEscape(resolvedRoot, dirname(contained)))) {
-        throw new Error(`Refusing to restore file across symlink: ${absPath}`)
-      }
-      const existingStat = await lstat(contained).catch(() => null)
-      if (!snap.existed) {
-        await removeExistingEntry(contained, existingStat)
-        await pruneEmptyParents(dirname(contained), resolvedRoot)
-        return
-      }
-      const blobPath = join(blobsDir(appDataDir), snap.blobSha256)
-      const data = await readFile(blobPath)
-      await mkdir(dirname(contained), { recursive: true })
-      if (!(await assertNoSymlinkEscape(resolvedRoot, dirname(contained)))) {
-        throw new Error(`Refusing to restore file across symlink: ${absPath}`)
-      }
-      const leafStat = await lstat(contained).catch(() => null)
-      const fallbackMode =
-        !leafStat?.isSymbolicLink() && leafStat?.isFile()
-          ? leafStat.mode & 0o777
-          : undefined
-      await removeExistingEntry(contained, leafStat)
-      await writeFile(contained, data)
-      const finalMode = snap.mode ?? fallbackMode
-      if (finalMode !== undefined) await chmod(contained, finalMode)
-    },
+  assertSafeNativeId(nativeId)
+  await queueSessionOp(nativeId, async () => {
+    const cp = await loadTargetCheckpoint(appDataDir, nativeId, checkpointId)
+    await restoreGitTree(appDataDir, cp)
   })
 }
 
@@ -940,9 +595,6 @@ export async function forkSessionCheckpoints(
   }
   await queueSessionOp(oldNativeId, async () => {
     const existing = await readSessionCheckpoints(appDataDir, oldNativeId)
-    for (const cp of existing) {
-      if (cp.afterStepIndex >= cutoffStepIndex) clearCheckpointToolOwners(cp.id)
-    }
     const retained = existing.filter(
       (cp) => cp.afterStepIndex < cutoffStepIndex,
     )
@@ -953,7 +605,7 @@ export async function forkSessionCheckpoints(
   })
 }
 
-/** Remove the persisted checkpoint manifest and unreferenced blobs for a disposable or closed session. */
+/** Remove the persisted checkpoint manifest for a disposable or closed session. */
 export async function removeSessionCheckpoints(
   appDataDir: string,
   nativeId: string,
@@ -969,13 +621,7 @@ export async function removeSessionCheckpoints(
     if (info.isSymbolicLink()) {
       throw new Error(`Refusing to remove symlink: ${filePath}`)
     }
-    const removedCheckpoints = await readSessionCheckpoints(
-      appDataDir,
-      nativeId,
-    ).catch(() => [] as TurnFileCheckpoint[])
-    for (const cp of removedCheckpoints) clearCheckpointToolOwners(cp.id)
     await rm(filePath, { force: true })
-    await pruneUnreferencedBlobs(appDataDir, removedCheckpoints)
   })
 }
 
@@ -995,59 +641,4 @@ export function findCheckpointForUserStep(
     }
   }
   return match
-}
-
-/** Extract candidate edited file paths and pre-edit text from an ACP tool update. */
-export function extractToolEditTargets(tool: Record<string, unknown>): Array<{
-  filePath: string
-  oldText?: string | null
-}> {
-  const results: Array<{ filePath: string; oldText?: string | null }> = []
-  const seen = new Set<string>()
-  const add = (filePath: string | undefined, oldText?: string | null) => {
-    if (!filePath || seen.has(filePath)) return
-    seen.add(filePath)
-    results.push({
-      filePath,
-      ...(oldText !== undefined ? { oldText } : {}),
-    })
-  }
-  const content = Array.isArray(tool.content) ? tool.content : []
-  for (const block of content) {
-    const c = record(block)
-    if (c.type === 'diff' && typeof c.path === 'string' && c.path) {
-      const oldText =
-        typeof c.oldText === 'string'
-          ? c.oldText
-          : c.oldText === null
-            ? null
-            : undefined
-      add(c.path, oldText)
-    }
-  }
-  const input = record(tool.rawInput)
-  const inputPath =
-    str(input.TargetFile) ??
-    str(input.file_path) ??
-    str(input.filePath) ??
-    str(input.AbsolutePath) ??
-    str(input.Path) ??
-    str(input.path)
-  const kind = str(tool.kind)
-  const title = str(tool.title) ?? ''
-  const isEditLike =
-    kind === 'edit' ||
-    kind === 'delete' ||
-    /(?:write_file|write_to_file|create_file|fs\/write_text_file|write_text_file|edit_file|replace_file_content|multi_replace_file_content|delete_directory)/i.test(
-      title,
-    )
-  if (isEditLike && inputPath) add(inputPath)
-  const locations = Array.isArray(tool.locations) ? tool.locations : []
-  if (isEditLike) {
-    for (const loc of locations) {
-      const path = str(record(loc).path)
-      if (path) add(path)
-    }
-  }
-  return results
 }

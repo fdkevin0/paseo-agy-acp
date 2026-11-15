@@ -51,10 +51,7 @@ import {
 import { readLatestStepUsage } from './brain-io.ts'
 import {
   captureTurnFileCheckpoint,
-  clearCheckpointToolOwners,
-  extractToolEditTargets,
   readSessionCheckpoints,
-  recordJournalToolEdit,
   restoreSessionFileCheckpoint,
 } from './checkpoints.ts'
 import { projectReplayHistory, type HistoryEntry } from './history.ts'
@@ -487,9 +484,6 @@ async function createSession(
     turnForegroundAcp: [] as ForegroundAcpSegment[],
     deniedToolCallIds: new Set<string>(),
     lastKnownStepIndex: -1,
-    activeCheckpoint: undefined as
-      { id: string; kind: 'git' | 'journal' } | undefined,
-    pendingJournalEdits: [] as Promise<void>[],
     userTurnCount: 0,
     wakeup: {
       pendingReplay: false,
@@ -539,7 +533,7 @@ async function createSession(
   const nativeWindowSizes = new Map<string | undefined, number>()
   let usage: ProviderUsage = {}
   let deferredUsage = false
-  let revertLoadedUsage: ProviderUsage | undefined
+  let silentReload: { loadedUsage?: ProviderUsage } | null = null
   let commandsReceived = false
   let emittedCommands: string | undefined
   let commandWaiter: (() => void) | null = null
@@ -647,7 +641,7 @@ async function createSession(
     const u = notification.update
     if (u.sessionUpdate === 'config_option_update') {
       state.metadata.configOptions = u.configOptions
-      if (state.reverting && state.loading && !state.replay) return
+      if (silentReload) return
       if (configState({ ...state.metadata, fullAccess: false }).mode === 'plan')
         state.metadata.fullAccess = false
       publishConfig()
@@ -678,8 +672,8 @@ async function createSession(
         u.size,
         100,
       )
-      if (state.reverting && state.loading && !state.replay) {
-        revertLoadedUsage = { ...revertLoadedUsage, ...next }
+      if (silentReload) {
+        silentReload.loadedUsage = { ...silentReload.loadedUsage, ...next }
       } else if (!state.loading || state.replay) {
         if (state.turn) state.turnHadContextUsage = true
         publishUsage(next)
@@ -752,13 +746,6 @@ async function createSession(
           u.sessionUpdate === 'tool_call')
       )
         state.turnHadModelOutput = true
-      if (
-        !state.loading &&
-        (u.sessionUpdate === 'tool_call' ||
-          u.sessionUpdate === 'tool_call_update')
-      ) {
-        trackJournalEdit(u, u.status === 'completed' || u.status === 'failed')
-      }
       // Timeline.update already tracks the ACP item.
       const item = timeline.update(u, state.deniedToolCallIds)
       if (item) {
@@ -807,36 +794,6 @@ async function createSession(
         } else publishItem(item)
       }
     }
-  }
-  function trackJournalEdit(
-    toolObj: unknown,
-    toolCompleted: boolean,
-  ): Promise<void> {
-    const active = state.activeCheckpoint
-    if (!active || active.kind !== 'journal' || !state.nativeId) {
-      return Promise.resolve()
-    }
-    const raw = record(toolObj)
-    const toolCallId =
-      typeof raw.toolCallId === 'string' && raw.toolCallId
-        ? raw.toolCallId
-        : undefined
-    const targets = extractToolEditTargets(raw)
-    if (targets.length === 0) return Promise.resolve()
-    const pending = Promise.all(
-      targets.map((target) =>
-        recordJournalToolEdit(
-          appDataDir,
-          state.nativeId,
-          active.id,
-          cwd,
-          target.filePath,
-          { oldText: target.oldText, toolCompleted, toolCallId },
-        ).catch(() => undefined),
-      ),
-    ).then(() => undefined)
-    state.pendingJournalEdits.push(pending)
-    return pending
   }
   function publishConfig() {
     if (!state.opened || state.closing || state.failed || state.silenced) return
@@ -999,11 +956,6 @@ async function createSession(
       if (!input.success) return { outcome: { outcome: 'cancelled' as const } }
       const detail = toolDetail(request.toolCall)
       const kind = permissionKind(request, detail)
-      // Persist pre-edit journal snapshot before granting or even asking permission.
-      await trackJournalEdit(request.toolCall, false)
-      if (!state.turn || state.closing || state.failed) {
-        return { outcome: { outcome: 'cancelled' as const } }
-      }
       const preapproved = isPreapprovedMcpTool(
         request.toolCall.title,
         input.data,
@@ -1088,6 +1040,90 @@ async function createSession(
   let currentTransport = startRuntime(state.skipPermissions)
   try {
     let currentInitialized = await initializeRuntime(currentTransport)
+    async function reloadSessionSilently(opts: {
+      targetNativeId: string
+      previousMetadata: SessionMetadata
+      skipPermissions: boolean
+      replayMode: boolean
+      preloaded?: NewSessionResponse
+      useResume?: boolean
+      onRegistered?: () => void
+    }): Promise<{
+      configChanged: boolean
+      loadedUsage?: ProviderUsage
+      aborted: boolean
+    }> {
+      const prev = configState(opts.previousMetadata)
+      const prevModels = opts.previousMetadata.models
+      const nativeMode = configState({
+        ...opts.previousMetadata,
+        fullAccess: false,
+      }).mode
+      const params = sessionParams(cwd, config)
+      const next = currentTransport
+      const reloadCtx: { loadedUsage?: ProviderUsage } = {}
+      silentReload = reloadCtx
+      state.loading = true
+      state.replay = false
+      let configChanged = false
+      try {
+        const loaded =
+          opts.preloaded ??
+          (await next.request(
+            opts.useResume
+              ? next.rpc.resumeSession({
+                  ...params,
+                  sessionId: opts.targetNativeId,
+                })
+              : next.rpc.loadSession({
+                  ...params,
+                  sessionId: opts.targetNativeId,
+                }),
+          ))
+        opts.onRegistered?.()
+        state.metadata = {
+          ...loaded,
+          sessionId: opts.targetNativeId,
+          models: next.models ?? prevModels,
+          fullAccess: opts.skipPermissions,
+        }
+        await drain()
+        if (state.closing) return { configChanged: false, aborted: true }
+        if (state.failed || next.closed)
+          throw new Error('ACP runtime exited during reload')
+        for (const [k, v] of [
+          ['model', prev.model],
+          ['thought_level', prev.thinkingOption],
+          ['mode', opts.replayMode ? nativeMode : undefined],
+        ] as const) {
+          const applied = await applyNativeConfigOption(
+            next,
+            opts.targetNativeId,
+            state.metadata,
+            k,
+            v,
+          )
+          configChanged ||= applied
+        }
+        await drain()
+        if (state.closing) return { configChanged: false, aborted: true }
+        if (state.failed || next.closed)
+          throw new Error('ACP runtime exited during reload')
+        state.metadata.fullAccess = opts.skipPermissions
+        return {
+          configChanged:
+            configChanged ||
+            JSON.stringify(configState(state.metadata)) !==
+              JSON.stringify(prev),
+          loadedUsage: reloadCtx.loadedUsage,
+          aborted: false,
+        }
+      } finally {
+        silentReload = null
+        state.loading = false
+        state.replay = true
+      }
+    }
     async function doRelaunch(
       skipPermissions: boolean,
       force = false,
@@ -1101,12 +1137,7 @@ async function createSession(
           !currentInitialized.agentCapabilities?.loadSession)
       )
         return
-      const prev = configState(state.metadata)
-      const prevModels = state.metadata.models
-      const nativeMode = configState({
-        ...state.metadata,
-        fullAccess: false,
-      }).mode
+      const previousMetadata = state.metadata
       state.observation?.stop()
       state.loading = true
       state.replay = false
@@ -1127,38 +1158,14 @@ async function createSession(
         if (state.failed || next.closed)
           throw new Error('ACP runtime exited during relaunch')
         state.skipPermissions = skipPermissions
-        state.metadata = {
-          ...(await next.request(
-            next.rpc.loadSession({
-              ...sessionParams(cwd, config),
-              sessionId: state.nativeId,
-            }),
-          )),
-          sessionId: state.nativeId,
-          models: next.models ?? prevModels,
-          fullAccess: skipPermissions,
-        }
-        await drain()
-        if (state.closing) return
-        if (state.failed || next.closed)
-          throw new Error('ACP runtime exited during relaunch')
-        for (const [k, v] of [
-          ['model', prev.model],
-          ['thought_level', prev.thinkingOption],
-          ['mode', force ? nativeMode : undefined],
-        ] as const) {
-          await applyNativeConfigOption(
-            next,
-            state.nativeId,
-            state.metadata,
-            k,
-            v,
-          )
-        }
-        await drain()
-        if (state.closing) return
-        if (state.failed || next.closed)
-          throw new Error('ACP runtime exited during relaunch')
+        const reloaded = await reloadSessionSilently({
+          targetNativeId: state.nativeId,
+          previousMetadata,
+          skipPermissions,
+          replayMode: force,
+        })
+        if (reloaded.aborted) return
+        if (force && reloaded.configChanged) publishConfig()
       } catch (error) {
         if (state.closing) return
         onExit(error instanceof Error ? error : new Error(String(error)))
@@ -1298,6 +1305,7 @@ async function createSession(
         const result = await revertSession({
           appDataDir,
           nativeId: state.nativeId,
+          cwd,
           scope,
           token,
           supportsReload: Boolean(
@@ -1320,14 +1328,7 @@ async function createSession(
             if (state.closing || state.failed) {
               throw new Error('Session is closed')
             }
-            const prev = configState(previousMetadata)
-            const prevModels = previousMetadata.models
             const prevFullAccess = Boolean(previousMetadata.fullAccess)
-            const nativeMode = configState({
-              ...previousMetadata,
-              fullAccess: false,
-            }).mode
-            const params = sessionParams(cwd, config)
             const canResume = Boolean(
               currentInitialized.agentCapabilities?.sessionCapabilities?.resume,
             )
@@ -1339,58 +1340,20 @@ async function createSession(
               throw new Error('agy does not support session/load')
             }
 
-            let configChanged = false
-            state.loading = true
-            state.replay = false
             state.nativeId = forkedNativeId
-            revertLoadedUsage = undefined
-            let fallbackUsage: ProviderUsage | undefined
-            try {
-              const loaded =
-                freshSessionResponse ??
-                (await currentTransport.request(
-                  canResume
-                    ? currentTransport.rpc.resumeSession({
-                        ...params,
-                        sessionId: forkedNativeId,
-                      })
-                    : currentTransport.rpc.loadSession({
-                        ...params,
-                        sessionId: forkedNativeId,
-                      }),
-                ))
-              registeredOnTransport = true
-              state.metadata = {
-                ...loaded,
-                sessionId: forkedNativeId,
-                models: currentTransport.models ?? prevModels,
-                fullAccess: prevFullAccess,
-              }
-              await drain()
-              if (state.closing || state.failed) {
-                throw new Error('Session is closed')
-              }
-              for (const [k, v] of [
-                ['model', prev.model],
-                ['thought_level', prev.thinkingOption],
-                ['mode', nativeMode],
-              ] as const) {
-                const applied = await applyNativeConfigOption(
-                  currentTransport,
-                  state.nativeId,
-                  state.metadata,
-                  k,
-                  v,
-                )
-                configChanged ||= applied
-              }
-              await drain()
-              state.metadata.fullAccess = prevFullAccess
-              fallbackUsage = revertLoadedUsage
-            } finally {
-              state.loading = false
-              state.replay = true
-              revertLoadedUsage = undefined
+            const reloaded = await reloadSessionSilently({
+              targetNativeId: forkedNativeId,
+              previousMetadata,
+              skipPermissions: prevFullAccess,
+              replayMode: true,
+              preloaded: freshSessionResponse,
+              useResume: canResume,
+              onRegistered: () => {
+                registeredOnTransport = true
+              },
+            })
+            if (reloaded.aborted || state.closing || state.failed) {
+              throw new Error('Session is closed')
             }
 
             if (scope === 'both' && result.checkpointId) {
@@ -1400,11 +1363,7 @@ async function createSession(
                 result.checkpointId,
               )
             }
-            if (
-              configChanged ||
-              JSON.stringify(configState(state.metadata)) !==
-                JSON.stringify(prev)
-            ) {
+            if (reloaded.configChanged) {
               publishConfig()
             }
             if (
@@ -1466,8 +1425,8 @@ async function createSession(
                   ? { contextWindowMaxTokens: this.contextWindowMaxTokens }
                   : {}),
               })
-            } else if (fallbackUsage) {
-              publishUsage(fallbackUsage)
+            } else if (reloaded.loadedUsage) {
+              publishUsage(reloaded.loadedUsage)
             }
             if (
               config?.persist === false &&
@@ -1502,8 +1461,6 @@ async function createSession(
               )
             }
             throw error
-          } finally {
-            revertLoadedUsage = undefined
           }
         }
         return result
@@ -1882,10 +1839,6 @@ async function promptSession(
       ).catch(() => undefined)
       if (checkpoint) {
         checkpointId = checkpoint.id
-        session.state.activeCheckpoint = {
-          id: checkpoint.id,
-          kind: checkpoint.kind,
-        }
       }
     }
     turnAbort.signal.throwIfAborted()
@@ -1894,11 +1847,6 @@ async function promptSession(
       session.state.turn === turnId &&
       session.state.turnAbort === turnAbort
     ) {
-      if (session.state.activeCheckpoint) {
-        clearCheckpointToolOwners(session.state.activeCheckpoint.id)
-      }
-      session.state.activeCheckpoint = undefined
-      session.state.pendingJournalEdits.length = 0
       session.state.turnAbort = null
       session.state.turn = ''
       session.state.wakeup.suppressEcho = false
@@ -2007,17 +1955,12 @@ async function promptSession(
   const disposeTurnWork = async () => {
     turnAbort.signal.removeEventListener('abort', stopObservation)
     await observation?.dispose()
-    await Promise.allSettled(session.state.pendingJournalEdits.splice(0))
   }
   const resetTurnState = () => {
     if (
       session.state.turn === turnId &&
       session.state.turnAbort === turnAbort
     ) {
-      if (session.state.activeCheckpoint) {
-        clearCheckpointToolOwners(session.state.activeCheckpoint.id)
-      }
-      session.state.activeCheckpoint = undefined
       session.state.observation = null
       session.state.wakeup.suppressEcho = false
       session.state.inSettle = false

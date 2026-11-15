@@ -1,7 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { createHash } from 'node:crypto'
 import {
   chmod,
   lstat,
@@ -26,8 +25,8 @@ import {
 import {
   captureTurnFileCheckpoint,
   forkSessionCheckpoints,
+  isGitWorkspace,
   readSessionCheckpoints,
-  recordJournalToolEdit,
   removeSessionCheckpoints,
   restoreSessionFileCheckpoint,
   validateSessionFileCheckpoint,
@@ -590,6 +589,7 @@ test('conversation revert branches all 7 SQLite tables, Brain chunks/messages, s
   const home = await mkdtemp(join(tmpdir(), 'agy-revert-conv-'))
   const workDir = join(home, 'ws')
   await mkdir(workDir, { recursive: true })
+  await runGit(workDir, ['init'])
   const oldNativeId = '11111111-1111-4111-8111-111111111111'
   const childDropId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
   const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
@@ -1347,23 +1347,18 @@ test('Unborn root Git repo (0 commits) checkpoints and reverts files cleanly', a
   }
 })
 
-test('Non-Git journal revert restores content, preserves 0o755 mode, and resists leaf symlink escape and EISDIR', async () => {
+test('Non-Git workspace fails closed on file and both revert without mutating files or DB while conversation revert succeeds', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-revert-nongit-'))
   const workDir = join(home, 'workspace')
-  const outsideVictim = join(home, 'outside-journal-victim.txt')
-  const outsideKeep = join(home, 'outside-journal-keep.txt')
-  await writeFile(outsideVictim, 'secret-victim')
-  await writeFile(outsideKeep, 'secret-keep')
-
   await mkdir(workDir, { recursive: true })
   await writeFile(join(workDir, 'existing.txt'), 'before-v1')
-  await writeFile(join(workDir, 'oldtext-only.txt'), 'from-diff')
-  await chmod(join(workDir, 'oldtext-only.txt'), 0o755)
-  await writeFile(join(workDir, 'unchanged.txt'), 'stay')
+  const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
+  assert.equal(await isGitWorkspace(workDir), false)
 
   const h = await openHarness(workDir, {
     HOME: home,
     AGY_TEST_REVERT_DIR: workDir,
+    AGY_TEST_CHECKPOINT_HISTORY: '1',
   })
   try {
     await h.provider.send({
@@ -1373,8 +1368,37 @@ test('Non-Git journal revert restores content, preserves 0o755 mode, and resists
       config: h.config,
       history: 'replay',
     })
-    await h.wait((e) => e.type === 'session.ready')
+    const opened = await h.wait(
+      (e) => e.type === 'session.opened' && e.sessionId === 's-nongit',
+    )
+    assert(opened.type === 'session.opened')
+    const origNativeId = (opened.persistence?.data as { sessionId: string })
+      .sessionId
+    await h.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 's-nongit',
+    )
 
+    const t0Start = h.events.length
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's-nongit',
+      prompt: {
+        clientMessageId: 'ng-0',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'revert-seed-turn0' }],
+        },
+      },
+    })
+    await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t0Start &&
+        e.type === 'session.turn' &&
+        e.state === 'completed',
+    )
+
+    const t1Start = h.events.length
     await h.provider.send({
       type: 'session.prompt',
       sessionId: 's-nongit',
@@ -1383,31 +1407,39 @@ test('Non-Git journal revert restores content, preserves 0o755 mode, and resists
         delivery: 'auto',
         input: {
           type: 'message',
-          content: [{ type: 'text', text: 'revert-journal-edit' }],
+          content: [{ type: 'text', text: 'revert-file-edit' }],
         },
       },
     })
-    const perm = await h.wait((e) => e.type === 'session.permission')
+    const perm = await h.wait(
+      (e) => h.events.indexOf(e) >= t1Start && e.type === 'session.permission',
+    )
     assert(perm.type === 'session.permission')
+    const userItem1 = await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t1Start &&
+        e.type === 'timeline.item' &&
+        e.item.type === 'user_message' &&
+        e.item.clientMessageId === 'ng-1',
+    )
+    assert(
+      userItem1.type === 'timeline.item' &&
+        userItem1.item.type === 'user_message',
+    )
+    const token1 = userItem1.item.revertToken
+    assert(token1 !== undefined)
     await h.provider.send({
       type: 'session.permission',
       sessionId: 's-nongit',
       permissionId: perm.request.id,
       response: { behavior: 'allow', selectedActionId: 'allow' },
     })
-    const userItem = await h.wait(
+    await h.wait(
       (e) =>
-        e.type === 'timeline.item' &&
-        e.item.type === 'user_message' &&
-        e.item.clientMessageId === 'ng-1',
+        h.events.indexOf(e) >= t1Start &&
+        e.type === 'session.turn' &&
+        e.state === 'completed',
     )
-    assert(
-      userItem.type === 'timeline.item' &&
-        userItem.item.type === 'user_message',
-    )
-    const token = userItem.item.revertToken
-    assert(token !== undefined)
-    await h.wait((e) => e.type === 'session.turn' && e.state === 'completed')
 
     assert.equal(
       await readFile(join(workDir, 'existing.txt'), 'utf8'),
@@ -1417,76 +1449,102 @@ test('Non-Git journal revert restores content, preserves 0o755 mode, and resists
       await readFile(join(workDir, 'new-file.txt'), 'utf8'),
       'created',
     )
-    assert.equal(
-      await readFile(join(workDir, 'oldtext-only.txt'), 'utf8'),
-      'to-diff',
-    )
-
-    // Replace targets with symlink traps and an EISDIR directory before reverting.
-    await rm(join(workDir, 'existing.txt'))
-    await symlink(outsideVictim, join(workDir, 'existing.txt'))
-    await rm(join(workDir, 'new-file.txt'))
-    await symlink(outsideKeep, join(workDir, 'new-file.txt'))
-    await rm(join(workDir, 'oldtext-only.txt'))
-    await mkdir(join(workDir, 'oldtext-only.txt', 'nested'), {
-      recursive: true,
-    })
-    await writeFile(
-      join(workDir, 'oldtext-only.txt', 'nested', 'f.txt'),
-      'dir-trap',
-    )
 
     await h.provider.send({
       type: 'session.revert',
       requestId: 'rev-ng-files',
       sessionId: 's-nongit',
       scope: 'files',
-      token,
+      token: token1,
     })
-    await h.wait(
-      (e) => e.type === 'request.completed' && e.requestId === 'rev-ng-files',
+    const errFiles = await h.wait(
+      (e) => e.type === 'request.failed' && e.requestId === 'rev-ng-files',
     )
+    assert(errFiles.type === 'request.failed')
+    assert.match(errFiles.error.message, /requires a Git repository/)
+
+    await h.provider.send({
+      type: 'session.revert',
+      requestId: 'rev-ng-both',
+      sessionId: 's-nongit',
+      scope: 'both',
+      token: token1,
+    })
+    const errBoth = await h.wait(
+      (e) => e.type === 'request.failed' && e.requestId === 'rev-ng-both',
+    )
+    assert(errBoth.type === 'request.failed')
+    assert.match(errBoth.error.message, /requires a Git repository/)
 
     assert.equal(
-      (await lstat(join(workDir, 'existing.txt'))).isSymbolicLink(),
-      false,
-    )
-    assert.equal(
       await readFile(join(workDir, 'existing.txt'), 'utf8'),
-      'before-v1',
+      'after-v2',
     )
     assert.equal(
-      (await lstat(join(workDir, 'oldtext-only.txt'))).isDirectory(),
-      false,
+      await readFile(join(workDir, 'new-file.txt'), 'utf8'),
+      'created',
     )
-    assert.equal(
-      await readFile(join(workDir, 'oldtext-only.txt'), 'utf8'),
-      'from-diff',
+    assert.deepEqual(await readdir(join(appDataDir, 'conversations')), [
+      `${origNativeId}.db`,
+    ])
+
+    const revConvStart = h.events.length
+    await h.provider.send({
+      type: 'session.revert',
+      requestId: 'rev-ng-conv',
+      sessionId: 's-nongit',
+      scope: 'conversation',
+      token: token1,
+    })
+    await h.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'rev-ng-conv',
     )
-    assert.equal(
-      (await stat(join(workDir, 'oldtext-only.txt'))).mode & 0o777,
-      0o755,
+    const persist = h.events
+      .slice(revConvStart)
+      .find(
+        (e) => e.type === 'session.persistence' && e.sessionId === 's-nongit',
+      )
+    assert(persist?.type === 'session.persistence')
+    assert.notEqual(
+      (persist.persistence.data as { sessionId: string }).sessionId,
+      origNativeId,
     )
-    assert.equal(await readFile(join(workDir, 'unchanged.txt'), 'utf8'), 'stay')
-    await assert.rejects(lstat(join(workDir, 'new-file.txt')))
-    assert.equal(await readFile(outsideVictim, 'utf8'), 'secret-victim')
-    assert.equal(await readFile(outsideKeep, 'utf8'), 'secret-keep')
+
+    const postStart = h.events.length
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's-nongit',
+      prompt: {
+        clientMessageId: 'ng-post',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'usage-after-failed-revert' }],
+        },
+      },
+    })
+    await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= postStart &&
+        e.type === 'session.turn' &&
+        e.state === 'completed',
+    )
   } finally {
     await h.provider.close()
     await rm(home, { recursive: true, force: true })
   }
 })
 
-test('Mixed journal to git workspace transition restores edits across both turns when reverting to the journal turn', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'agy-revert-mixed-'))
+test('Mid-session git init refuses file rollback for pre-Git turn while restoring post-init Git turn', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-midgit-'))
   const workDir = join(home, 'workspace')
   await mkdir(workDir, { recursive: true })
   await writeFile(join(workDir, 'existing.txt'), 'before-v1')
-  await writeFile(join(workDir, 'oldtext-only.txt'), 'from-diff')
 
   const h = await openHarness(workDir, {
     HOME: home,
     AGY_TEST_REVERT_DIR: workDir,
+    AGY_TEST_CHECKPOINT_HISTORY: '1',
   })
   try {
     await h.provider.send({
@@ -1496,8 +1554,9 @@ test('Mixed journal to git workspace transition restores edits across both turns
       config: h.config,
       history: 'replay',
     })
-    await h.wait((e) => e.type === 'session.ready')
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's-mixed')
 
+    const t0Start = h.events.length
     await h.provider.send({
       type: 'session.prompt',
       sessionId: 's-mixed',
@@ -1506,20 +1565,13 @@ test('Mixed journal to git workspace transition restores edits across both turns
         delivery: 'auto',
         input: {
           type: 'message',
-          content: [{ type: 'text', text: 'revert-journal-edit' }],
+          content: [{ type: 'text', text: 'revert-seed-turn0' }],
         },
       },
     })
-    const perm1 = await h.wait((e) => e.type === 'session.permission')
-    assert(perm1.type === 'session.permission')
-    await h.provider.send({
-      type: 'session.permission',
-      sessionId: 's-mixed',
-      permissionId: perm1.request.id,
-      response: { behavior: 'allow', selectedActionId: 'allow' },
-    })
     const userItem1 = await h.wait(
       (e) =>
+        h.events.indexOf(e) >= t0Start &&
         e.type === 'timeline.item' &&
         e.item.type === 'user_message' &&
         e.item.clientMessageId === 'mixed-t1',
@@ -1530,9 +1582,17 @@ test('Mixed journal to git workspace transition restores edits across both turns
     )
     const token1 = userItem1.item.revertToken
     assert(token1 !== undefined)
-    await h.wait((e) => e.type === 'session.turn' && e.state === 'completed')
+    await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t0Start &&
+        e.type === 'session.turn' &&
+        e.state === 'completed',
+    )
 
-    // Initialize git before Turn 2 so Turn 2 captures a `git` checkpoint after Turn 1's `journal` checkpoint.
+    await writeFile(join(workDir, 'existing.txt'), 'after-v2')
+    await writeFile(join(workDir, 'new-file.txt'), 'created')
+
+    // Initialize git before Turn 2 so Turn 2 captures a `git` checkpoint after pre-Git Turn 1.
     await runGit(workDir, ['init'])
 
     const perm2WaitStart = h.events.length
@@ -1548,6 +1608,19 @@ test('Mixed journal to git workspace transition restores edits across both turns
         },
       },
     })
+    const userItem2 = await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= perm2WaitStart &&
+        e.type === 'timeline.item' &&
+        e.item.type === 'user_message' &&
+        e.item.clientMessageId === 'mixed-t2',
+    )
+    assert(
+      userItem2.type === 'timeline.item' &&
+        userItem2.item.type === 'user_message',
+    )
+    const token2 = userItem2.item.revertToken
+    assert(token2 !== undefined)
     const perm2 = await h.wait(
       (e) =>
         e.type === 'session.permission' &&
@@ -1571,24 +1644,43 @@ test('Mixed journal to git workspace transition restores edits across both turns
 
     await h.provider.send({
       type: 'session.revert',
-      requestId: 'rev-mixed',
+      requestId: 'rev-pregit-fail',
       sessionId: 's-mixed',
       scope: 'files',
       token: token1,
     })
+    const preGitErr = await h.wait(
+      (e) => e.type === 'request.failed' && e.requestId === 'rev-pregit-fail',
+    )
+    assert(preGitErr.type === 'request.failed')
+    assert.match(
+      preGitErr.error.message,
+      /No workspace file checkpoint recorded/,
+    )
+    assert.equal(
+      await readFile(join(workDir, 'existing.txt'), 'utf8'),
+      'after-git-v3',
+    )
+
+    await h.provider.send({
+      type: 'session.revert',
+      requestId: 'rev-postgit-ok',
+      sessionId: 's-mixed',
+      scope: 'files',
+      token: token2,
+    })
     await h.wait(
-      (e) => e.type === 'request.completed' && e.requestId === 'rev-mixed',
+      (e) => e.type === 'request.completed' && e.requestId === 'rev-postgit-ok',
     )
 
     assert.equal(
       await readFile(join(workDir, 'existing.txt'), 'utf8'),
-      'before-v1',
+      'after-v2',
     )
     assert.equal(
-      await readFile(join(workDir, 'oldtext-only.txt'), 'utf8'),
-      'from-diff',
+      await readFile(join(workDir, 'new-file.txt'), 'utf8'),
+      'created',
     )
-    await assert.rejects(lstat(join(workDir, 'new-file.txt')))
     await assert.rejects(lstat(join(workDir, 'git-turn-added.txt')))
   } finally {
     await h.provider.close()
@@ -1733,114 +1825,66 @@ test('Failed conversation revert activation rolls back metadata, closes aborted 
   }
 })
 
-test('Interleaved journal -> git -> journal file checkpoints fail closed without mutating workspace', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'agy-revert-interleaved-'))
+test('forkSessionCheckpoints retains intermediate checkpoints before cutoff and removeSessionCheckpoints cleans manifests without blobs', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-fork-cp-'))
   const workDir = join(home, 'workspace')
   await mkdir(workDir, { recursive: true })
   const filePath = join(workDir, 'a.txt')
   await writeFile(filePath, 'v0')
   const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
-  const nativeId = '55555555-5555-4555-8555-555555555555'
+  const oldNativeId = '66666666-6666-4666-8666-666666666666'
+  const newNativeId = '77777777-7777-4777-8777-777777777777'
+  const zeroCutoffId = '99999999-9999-4999-8999-999999999999'
+  const sessionsDir = join(appDataDir, 'paseo-checkpoints', 'sessions')
 
   try {
-    const cp0 = await captureTurnFileCheckpoint(
-      appDataDir,
-      nativeId,
-      workDir,
-      -1,
-    )
-    await recordJournalToolEdit(appDataDir, nativeId, cp0.id, workDir, filePath)
-    await writeFile(filePath, 'v1-journal')
-
     await runGit(workDir, ['init'])
     await runGit(workDir, ['config', 'user.name', 'Test'])
     await runGit(workDir, ['config', 'user.email', 'test@example.com'])
     await runGit(workDir, ['add', 'a.txt'])
     await runGit(workDir, ['commit', '-m', 'init'])
-    await captureTurnFileCheckpoint(appDataDir, nativeId, workDir, 0)
-    await writeFile(filePath, 'v2-git')
 
-    await rm(join(workDir, '.git'), { recursive: true, force: true })
-    const cp2 = await captureTurnFileCheckpoint(
-      appDataDir,
-      nativeId,
-      workDir,
-      1,
-    )
-    await recordJournalToolEdit(appDataDir, nativeId, cp2.id, workDir, filePath)
-    await writeFile(filePath, 'v3-journal')
-
-    await assert.rejects(
-      restoreSessionFileCheckpoint(appDataDir, nativeId, cp0.id),
-      /Cannot restore files across interleaved non-git and git turns/,
-    )
-    assert.equal(await readFile(filePath, 'utf8'), 'v3-journal')
-  } finally {
-    await rm(home, { recursive: true, force: true })
-  }
-})
-
-test('removeSessionCheckpoints prunes orphaned blobs while preserving blobs shared with a forked session', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'agy-revert-blobs-'))
-  const workDir = join(home, 'workspace')
-  await mkdir(workDir, { recursive: true })
-  const sharedPath = join(workDir, 'shared.txt')
-  const onlyOldPath = join(workDir, 'only-old.txt')
-  await writeFile(sharedPath, 'shared-v0')
-  await writeFile(onlyOldPath, 'old-v0')
-  const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
-  const oldNativeId = '66666666-6666-4666-8666-666666666666'
-  const newNativeId = '77777777-7777-4777-8777-777777777777'
-  const sharedHash = createHash('sha256').update('shared-v0').digest('hex')
-  const onlyOldHash = createHash('sha256').update('old-v0').digest('hex')
-  const sessionsDir = join(appDataDir, 'paseo-checkpoints', 'sessions')
-  const blobsDir = join(appDataDir, 'paseo-checkpoints', 'blobs')
-
-  try {
     const cp0 = await captureTurnFileCheckpoint(
       appDataDir,
       oldNativeId,
       workDir,
       -1,
     )
-    await recordJournalToolEdit(
-      appDataDir,
-      oldNativeId,
-      cp0.id,
-      workDir,
-      sharedPath,
-    )
-    const cp1 = await captureTurnFileCheckpoint(
+    assert(cp0 !== undefined)
+    await writeFile(filePath, 'v1')
+    const cpCompact = await captureTurnFileCheckpoint(
       appDataDir,
       oldNativeId,
       workDir,
-      0,
+      2,
     )
-    await recordJournalToolEdit(
+    assert(cpCompact !== undefined)
+    await writeFile(filePath, 'v2')
+    const cpTarget = await captureTurnFileCheckpoint(
       appDataDir,
       oldNativeId,
-      cp1.id,
       workDir,
-      onlyOldPath,
+      4,
     )
-    await forkSessionCheckpoints(appDataDir, oldNativeId, newNativeId, 0)
+    assert(cpTarget !== undefined)
 
+    await forkSessionCheckpoints(appDataDir, oldNativeId, newNativeId, 4)
     assert.deepEqual(
-      (await readdir(blobsDir)).sort(),
-      [onlyOldHash, sharedHash].sort(),
+      (await readSessionCheckpoints(appDataDir, newNativeId)).map((c) => c.id),
+      [cp0.id, cpCompact.id],
+    )
+
+    await forkSessionCheckpoints(appDataDir, oldNativeId, zeroCutoffId, 0)
+    assert.deepEqual(
+      (await readSessionCheckpoints(appDataDir, zeroCutoffId)).map((c) => c.id),
+      [cp0.id],
     )
 
     await removeSessionCheckpoints(appDataDir, oldNativeId)
-    await assert.rejects(lstat(join(sessionsDir, `${oldNativeId}.json`)))
-    await assert.rejects(lstat(join(blobsDir, onlyOldHash)))
-    assert.equal(
-      await readFile(join(blobsDir, sharedHash), 'utf8'),
-      'shared-v0',
-    )
-
     await removeSessionCheckpoints(appDataDir, newNativeId)
-    await assert.rejects(lstat(join(sessionsDir, `${newNativeId}.json`)))
-    assert.deepEqual(await readdir(blobsDir), [])
+    await removeSessionCheckpoints(appDataDir, zeroCutoffId)
+    assert.deepEqual(await readdir(sessionsDir), [])
+    await assert.rejects(lstat(join(appDataDir, 'paseo-checkpoints', 'blobs')))
   } finally {
     await rm(home, { recursive: true, force: true })
   }
@@ -1871,6 +1915,7 @@ test('restoreGitTree rejects reverting across a directory replaced by an externa
       workDir,
       -1,
     )
+    assert(cp0 !== undefined)
     await writeFile(join(workDir, '.gitignore'), 'nested\n')
     await rm(join(workDir, 'nested'), { recursive: true, force: true })
     await symlink(outsideDir, join(workDir, 'nested'))
@@ -1892,6 +1937,7 @@ test('Failed non-USER_INPUT and zero-row turns revert files and prune error step
   const home = await mkdtemp(join(tmpdir(), 'agy-revert-nonuser-fail-'))
   const workDir = join(home, 'workspace')
   await mkdir(workDir, { recursive: true })
+  await runGit(workDir, ['init'])
   await writeFile(join(workDir, 'existing.txt'), 'before-v1')
   const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
 
@@ -2159,8 +2205,8 @@ test('Revert refuses atomically before touching workspace files when runtime sup
   const home = await mkdtemp(join(tmpdir(), 'agy-revert-no-reload-'))
   const workDir = join(home, 'workspace')
   await mkdir(workDir, { recursive: true })
+  await runGit(workDir, ['init'])
   await writeFile(join(workDir, 'existing.txt'), 'before-v1')
-  await writeFile(join(workDir, 'oldtext-only.txt'), 'from-diff')
   const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
 
   const h = await openHarness(workDir, {
@@ -2216,7 +2262,7 @@ test('Revert refuses atomically before touching workspace files when runtime sup
         delivery: 'auto',
         input: {
           type: 'message',
-          content: [{ type: 'text', text: 'revert-journal-edit' }],
+          content: [{ type: 'text', text: 'revert-file-edit' }],
         },
       },
     })
@@ -2284,8 +2330,8 @@ test('config.persist === false revert omits session.persistence and cleans previ
   const home = await mkdtemp(join(tmpdir(), 'agy-revert-nopersist-'))
   const workDir = join(home, 'workspace')
   await mkdir(workDir, { recursive: true })
+  await runGit(workDir, ['init'])
   await writeFile(join(workDir, 'existing.txt'), 'before-v1')
-  await writeFile(join(workDir, 'oldtext-only.txt'), 'from-diff')
   const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
 
   const h = await openHarness(workDir, {
@@ -2336,7 +2382,7 @@ test('config.persist === false revert omits session.persistence and cleans previ
         delivery: 'auto',
         input: {
           type: 'message',
-          content: [{ type: 'text', text: 'revert-journal-edit' }],
+          content: [{ type: 'text', text: 'revert-file-edit' }],
         },
       },
     })
@@ -2415,10 +2461,7 @@ test('config.persist === false revert omits session.persistence and cleans previ
       await readdir(join(appDataDir, 'paseo-checkpoints', 'sessions')),
       [],
     )
-    assert.deepEqual(
-      await readdir(join(appDataDir, 'paseo-checkpoints', 'blobs')),
-      [],
-    )
+    await assert.rejects(lstat(join(appDataDir, 'paseo-checkpoints', 'blobs')))
     const sumDb = new DatabaseSync(
       join(appDataDir, 'conversation_summaries.db'),
       { readOnly: true },
@@ -2434,24 +2477,26 @@ test('config.persist === false revert omits session.persistence and cleans previ
   }
 })
 
-test('Git and Journal checkpoints restore 0o444 read-only files and ..-prefixed directories like ..env', async () => {
+test('Git checkpoints restore 0o444 read-only files, 0o755 executable permissions, leaf symlink traps, and ..-prefixed directories like ..env', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-revert-ro-dotdot-'))
   const repoDir = join(home, 'repo')
-  const journalDir = join(home, 'journal-ws')
+  const outsideVictim = join(home, 'outside-victim.txt')
   const appDataDirGit = dataDirectory(undefined, { HOME: home }, repoDir)
-  const appDataDirJournal = dataDirectory(undefined, { HOME: home }, journalDir)
   const gitNativeId = '12121212-1212-4121-8121-121212121212'
-  const journalNativeId = '34343434-3434-4343-8343-343434343434'
 
   try {
     await mkdir(join(repoDir, '..env'), { recursive: true })
+    await writeFile(outsideVictim, 'keep-outside')
     await runGit(repoDir, ['init'])
     await runGit(repoDir, ['config', 'user.name', 'Test'])
     await runGit(repoDir, ['config', 'user.email', 'test@example.com'])
     const gitRo = join(repoDir, 'readonly.txt')
+    const gitExec = join(repoDir, 'run.sh')
     const gitEnv = join(repoDir, '..env', 'secret.txt')
     await writeFile(gitRo, 'v1')
     await chmod(gitRo, 0o644)
+    await writeFile(gitExec, '#!/bin/sh\necho v1\n')
+    await chmod(gitExec, 0o755)
     await writeFile(gitEnv, 'env-v1')
     await runGit(repoDir, ['add', '.'])
     await runGit(repoDir, ['commit', '-m', 'init'])
@@ -2462,65 +2507,26 @@ test('Git and Journal checkpoints restore 0o444 read-only files and ..-prefixed 
       repoDir,
       -1,
     )
+    assert(gitCp !== undefined)
     await writeFile(gitRo, 'v2')
     await chmod(gitRo, 0o444)
+    await chmod(gitExec, 0o644)
+    await writeFile(gitExec, 'mutated')
     await writeFile(gitEnv, 'env-v2')
+    await symlink(outsideVictim, join(repoDir, 'trap.txt'))
 
     await validateSessionFileCheckpoint(appDataDirGit, gitNativeId, gitCp.id)
     await restoreSessionFileCheckpoint(appDataDirGit, gitNativeId, gitCp.id)
 
     assert.equal(await readFile(gitRo, 'utf8'), 'v1')
     assert.equal((await stat(gitRo)).mode & 0o777, 0o644)
+    assert.equal(await readFile(gitExec, 'utf8'), '#!/bin/sh\necho v1\n')
+    assert.equal((await stat(gitExec)).mode & 0o777, 0o755)
     assert.equal(await readFile(gitEnv, 'utf8'), 'env-v1')
-
-    await mkdir(join(journalDir, '..env'), { recursive: true })
-    const jRo = join(journalDir, 'readonly.txt')
-    const jEnv = join(journalDir, '..env', 'secret.txt')
-    await writeFile(jRo, 'j-v1')
-    await chmod(jRo, 0o644)
-    await writeFile(jEnv, 'j-env-v1')
-
-    const journalCp = await captureTurnFileCheckpoint(
-      appDataDirJournal,
-      journalNativeId,
-      journalDir,
-      -1,
-    )
-    await recordJournalToolEdit(
-      appDataDirJournal,
-      journalNativeId,
-      journalCp.id,
-      journalDir,
-      jRo,
-    )
-    await recordJournalToolEdit(
-      appDataDirJournal,
-      journalNativeId,
-      journalCp.id,
-      journalDir,
-      jEnv,
-    )
-    await writeFile(jRo, 'j-v2')
-    await chmod(jRo, 0o444)
-    await writeFile(jEnv, 'j-env-v2')
-
-    await validateSessionFileCheckpoint(
-      appDataDirJournal,
-      journalNativeId,
-      journalCp.id,
-    )
-    await restoreSessionFileCheckpoint(
-      appDataDirJournal,
-      journalNativeId,
-      journalCp.id,
-    )
-
-    assert.equal(await readFile(jRo, 'utf8'), 'j-v1')
-    assert.equal((await stat(jRo)).mode & 0o777, 0o644)
-    assert.equal(await readFile(jEnv, 'utf8'), 'j-env-v1')
+    await assert.rejects(lstat(join(repoDir, 'trap.txt')))
+    assert.equal(await readFile(outsideVictim, 'utf8'), 'keep-outside')
   } finally {
     await chmod(join(repoDir, 'readonly.txt'), 0o644).catch(() => undefined)
-    await chmod(join(journalDir, 'readonly.txt'), 0o644).catch(() => undefined)
     await rm(home, { recursive: true, force: true })
   }
 })
@@ -2529,8 +2535,8 @@ test('Revert preserves fullAccess across streamed plan config_option_update and 
   const home = await mkdtemp(join(tmpdir(), 'agy-revert-plan-cfg-'))
   const workDir = join(home, 'workspace')
   await mkdir(workDir, { recursive: true })
+  await runGit(workDir, ['init'])
   await writeFile(join(workDir, 'existing.txt'), 'before-v1')
-  await writeFile(join(workDir, 'oldtext-only.txt'), 'from-diff')
 
   const h = await openHarness(workDir, {
     HOME: home,
@@ -2589,7 +2595,7 @@ test('Revert preserves fullAccess across streamed plan config_option_update and 
         delivery: 'auto',
         input: {
           type: 'message',
-          content: [{ type: 'text', text: 'revert-journal-edit' }],
+          content: [{ type: 'text', text: 'revert-file-edit' }],
         },
       },
     })
@@ -2655,8 +2661,8 @@ test('Revert preserves fullAccess across streamed plan config_option_update and 
   const home2 = await mkdtemp(join(tmpdir(), 'agy-revert-both-failcfg-'))
   const workDir2 = join(home2, 'workspace')
   await mkdir(workDir2, { recursive: true })
+  await runGit(workDir2, ['init'])
   await writeFile(join(workDir2, 'existing.txt'), 'before-v1')
-  await writeFile(join(workDir2, 'oldtext-only.txt'), 'from-diff')
   const appDataDir2 = dataDirectory(undefined, { HOME: home2 }, workDir2)
 
   const h2 = await openHarness(workDir2, {
@@ -2723,7 +2729,7 @@ test('Revert preserves fullAccess across streamed plan config_option_update and 
         delivery: 'auto',
         input: {
           type: 'message',
-          content: [{ type: 'text', text: 'revert-journal-edit' }],
+          content: [{ type: 'text', text: 'revert-file-edit' }],
         },
       },
     })
