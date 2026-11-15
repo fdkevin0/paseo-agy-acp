@@ -20,7 +20,7 @@ export interface HistoryEntry {
 const userRequestPattern =
   /<USER_REQUEST>\r?\n([\s\S]*)\r?\n<\/USER_REQUEST>(?:\r?\n<ADDITIONAL_METADATA>[\s\S]*<\/ADDITIONAL_METADATA>)?\s*$/
 
-function normalizeUserText(text: string): string {
+export function normalizeUserText(text: string): string {
   return text.match(userRequestPattern)?.[1] ?? text
 }
 

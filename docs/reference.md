@@ -39,7 +39,7 @@ Model, mode and thinking controls derive from native `configOptions`, enriched w
 
 The provider waits up to one second for the current native session's initial `available_commands_update` before readiness so draft and live composers can query fresh commands. Command lists are not cached across sessions. An empty list also resolves the wait; close or failure releases it. If the deadline expires, readiness proceeds without an initial list. Changed command lists from later updates are forwarded; duplicate lists within a session are suppressed.
 
-The connection negotiates these capabilities with Paseo and validates incoming operations against the negotiated set: `prompt.message`, `prompt.command`, `prompt.image`, `session.configure`, `session.list`, `session.persistence`, `session.can_stop_runtime`, `permission`, `permission.tool_policy`, and `session.subsession`.
+The connection negotiates these capabilities with Paseo and validates incoming operations against the negotiated set: `prompt.message`, `prompt.command`, `prompt.image`, `session.configure`, `session.list`, `session.persistence`, `session.revert.conversation`, `session.revert.files`, `session.revert.both`, `session.can_stop_runtime`, `permission`, `permission.tool_policy`, and `session.subsession`.
 
 ## Attachments and tool cards
 
@@ -127,7 +127,7 @@ Control RPCs time out after 30 seconds. Prompt generation remains open until com
 
 Protocol disconnection drains `stderr` and exit status before closing the readable stream, then terminates the child even if the process is still alive. Provider connection shutdown awaits all in-flight operations, terminates all active transports, and waits for shutdown to finish.
 
-Steering, rewind, archive operations and structured output are unsupported.
+Session revert (`session.revert.conversation`, `session.revert.files`, and `session.revert.both`) is supported on idle sessions via per-turn `revertToken` handles attached to both live and replayed `user_message` timeline items. Conversation revert forks the native SQLite conversation database (`conversations/<id>.db`), Brain transcript/step/subagent/message artifacts, and checkpoints prior to the target turn (`idx < cutoffStepIndex`, or opens a fresh empty native session when rewinding the first user turn), then publishes the new handle via `session.persistence` before `request.completed`. File revert restores pre-turn workspace snapshots captured via isolated shadow Git trees inside Git repositories or pre-edit journals outside Git (refusing file/both revert if no checkpoint was recorded for that turn). Steering, archive operations and structured output are unsupported.
 
 ## Context window occupancy
 

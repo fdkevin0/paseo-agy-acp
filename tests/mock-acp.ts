@@ -395,6 +395,76 @@ new AgentSideConnection((client) => {
         })
         return { stopReason: 'end_turn' }
       }
+      if (text === 'revert-journal-edit') {
+        const targetDir = process.env.AGY_TEST_REVERT_DIR
+        if (!targetDir) throw new Error('AGY_TEST_REVERT_DIR required')
+        const existingPath = join(targetDir, 'existing.txt')
+        const perm = await client.requestPermission({
+          sessionId,
+          toolCall: {
+            toolCallId: 'journal-perm-edit',
+            title: 'replace_file_content',
+            rawInput: { TargetFile: existingPath },
+          },
+          options: [
+            { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+            { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+          ],
+        })
+        if (perm.outcome.outcome === 'selected') {
+          writeFileSync(existingPath, 'after-v2')
+        }
+        const createdPath = join(targetDir, 'new-file.txt')
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'journal-create',
+            title: 'write_to_file',
+            kind: 'edit',
+            status: 'in_progress',
+            rawInput: { TargetFile: createdPath },
+          },
+        })
+        writeFileSync(createdPath, 'created')
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: 'journal-create',
+            status: 'completed',
+            content: [
+              {
+                type: 'diff',
+                path: createdPath,
+                oldText: null,
+                newText: 'created',
+              },
+            ],
+          },
+        })
+        const oldTextOnlyPath = join(targetDir, 'oldtext-only.txt')
+        writeFileSync(oldTextOnlyPath, 'to-diff')
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: 'journal-diff-only',
+            title: 'replace_file_content',
+            kind: 'edit',
+            status: 'completed',
+            content: [
+              {
+                type: 'diff',
+                path: oldTextOnlyPath,
+                oldText: 'from-diff',
+                newText: 'to-diff',
+              },
+            ],
+          },
+        })
+        return { stopReason: 'end_turn' as const }
+      }
       if (text === 'must-not-run-after-interrupt') {
         log('unexpected-prompt')
         return { stopReason: 'end_turn' as const }
