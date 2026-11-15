@@ -31,6 +31,16 @@ const execFileAsync = promisify(execFile)
 const GIT_TIMEOUT_MS = 5000
 const GIT_DIFF_MAX_BUFFER = 32 * 1024 * 1024
 
+function gitEnv(extra?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    ...extra,
+    LC_ALL: 'C',
+    LANG: 'C',
+    LANGUAGE: 'C',
+  }
+}
+
 const TurnFileCheckpointSchema = z.object({
   id: z.string(),
   afterStepIndex: z.number().int().min(-1),
@@ -180,10 +190,11 @@ async function resolveGitRepo(
   cwd: string,
 ): Promise<{ repoRoot: string; gitDir: string; commonDir: string } | null> {
   try {
+    const env = gitEnv()
     const { stdout: topOut } = await execFileAsync(
       'git',
       ['-C', cwd, 'rev-parse', '--show-toplevel'],
-      { encoding: 'utf8', timeout: 2000 },
+      { encoding: 'utf8', env, timeout: 2000 },
     )
     const rawRoot = topOut.trim()
     if (!rawRoot) return null
@@ -192,10 +203,11 @@ async function resolveGitRepo(
       execFileAsync(
         'git',
         ['-C', repoRoot, 'rev-parse', '--absolute-git-dir'],
-        { encoding: 'utf8', timeout: 2000 },
+        { encoding: 'utf8', env, timeout: 2000 },
       ),
       execFileAsync('git', ['-C', repoRoot, 'rev-parse', '--git-common-dir'], {
         encoding: 'utf8',
+        env,
         timeout: 2000,
       }),
     ])
@@ -223,35 +235,55 @@ async function ensureShadowGitRepo(
   commonGitDir: string,
 ): Promise<string> {
   const shadowDir = shadowGitDirForRepo(appDataDir, repoRoot)
-  try {
-    await lstat(join(shadowDir, 'HEAD'))
-  } catch (error) {
-    if (!isMissingError(error)) throw error
-    await mkdir(shadowDir, { recursive: true })
-    await execFileAsync('git', ['init', '--bare', shadowDir], {
-      encoding: 'utf8',
-      timeout: GIT_TIMEOUT_MS,
-    })
-  }
-  // Point alternates at the real repo's object store (read-only) so tracked unchanged blobs aren't re-hashed.
-  const realObjectsDir = await realpath(join(commonGitDir, 'objects')).catch(
-    () => join(commonGitDir, 'objects'),
-  )
-  const alternatesPath = join(shadowDir, 'objects', 'info', 'alternates')
-  await mkdir(dirname(alternatesPath), { recursive: true })
-  await writeFile(alternatesPath, `${realObjectsDir}\n`, 'utf8')
-  const srcExclude = join(realGitDir, 'info', 'exclude')
-  const dstExclude = join(shadowDir, 'info', 'exclude')
-  try {
-    const excludeInfo = await lstat(srcExclude)
-    if (!excludeInfo.isSymbolicLink() && excludeInfo.isFile()) {
-      await mkdir(dirname(dstExclude), { recursive: true })
-      await copyFile(srcExclude, dstExclude)
+  return await queueSessionOp(`shadow:${shadowDir}`, async () => {
+    const env = gitEnv()
+    try {
+      await lstat(join(shadowDir, 'HEAD'))
+    } catch (error) {
+      if (!isMissingError(error)) throw error
+      await mkdir(shadowDir, { recursive: true })
+      await execFileAsync('git', ['init', '--bare', shadowDir], {
+        encoding: 'utf8',
+        env,
+        timeout: GIT_TIMEOUT_MS,
+      })
     }
-  } catch (error) {
-    if (!isMissingError(error)) throw error
-  }
-  return shadowDir
+    // Point alternates at the real repo's object store (read-only) so tracked unchanged blobs aren't re-hashed.
+    const realObjectsDir = await realpath(join(commonGitDir, 'objects')).catch(
+      () => join(commonGitDir, 'objects'),
+    )
+    const alternatesPath = join(shadowDir, 'objects', 'info', 'alternates')
+    const expectedAlternates = `${realObjectsDir}\n`
+    const currentAlternates = await readFile(alternatesPath, 'utf8').catch(
+      () => null,
+    )
+    if (currentAlternates !== expectedAlternates) {
+      await mkdir(dirname(alternatesPath), { recursive: true })
+      const tmpAlternates = `${alternatesPath}.tmp-${randomUUID()}`
+      await writeFile(tmpAlternates, expectedAlternates, 'utf8')
+      await rename(tmpAlternates, alternatesPath).catch(async (error) => {
+        await rm(tmpAlternates, { force: true }).catch(() => undefined)
+        throw error
+      })
+    }
+    const srcExclude = join(realGitDir, 'info', 'exclude')
+    const dstExclude = join(shadowDir, 'info', 'exclude')
+    try {
+      const excludeInfo = await lstat(srcExclude)
+      if (!excludeInfo.isSymbolicLink() && excludeInfo.isFile()) {
+        await mkdir(dirname(dstExclude), { recursive: true })
+        const tmpExclude = `${dstExclude}.tmp-${randomUUID()}`
+        await copyFile(srcExclude, tmpExclude)
+        await rename(tmpExclude, dstExclude).catch(async (error) => {
+          await rm(tmpExclude, { force: true }).catch(() => undefined)
+          throw error
+        })
+      }
+    } catch (error) {
+      if (!isMissingError(error)) throw error
+    }
+    return shadowDir
+  })
 }
 
 function parseUnbornGitPaths(error: unknown): string[] {
@@ -274,12 +306,11 @@ async function captureGitTree(
   realGitDir: string,
 ): Promise<{ treeHash: string; unbornDirs: string[] }> {
   const tempIndex = join(shadowDir, `tmp-index-${randomUUID()}`)
-  const env = {
-    ...process.env,
+  const env = gitEnv({
     GIT_DIR: shadowDir,
     GIT_WORK_TREE: repoRoot,
     GIT_INDEX_FILE: tempIndex,
-  }
+  })
   const excluded: string[] = []
   const excludedSet = new Set<string>()
   let captured = false
@@ -406,7 +437,7 @@ async function validateGitCheckpoint(
   await execFileAsync(
     'git',
     [`--git-dir=${shadowDir}`, 'cat-file', '-e', `${treeHash}^{tree}`],
-    { cwd: resolvedRoot, timeout: GIT_TIMEOUT_MS },
+    { cwd: resolvedRoot, env: gitEnv(), timeout: GIT_TIMEOUT_MS },
   )
   return { resolvedRoot, git, shadowDir }
 }
@@ -449,6 +480,7 @@ async function restoreGitTree(
     ],
     {
       cwd: resolvedRoot,
+      env: gitEnv(),
       encoding: 'buffer',
       maxBuffer: GIT_DIFF_MAX_BUFFER,
       timeout: GIT_TIMEOUT_MS,
@@ -479,6 +511,7 @@ async function restoreGitTree(
       [`--git-dir=${shadowDir}`, 'cat-file', 'blob', entry.hashOld],
       {
         cwd: resolvedRoot,
+        env: gitEnv(),
         encoding: 'buffer',
         maxBuffer: GIT_DIFF_MAX_BUFFER,
         timeout: GIT_TIMEOUT_MS,

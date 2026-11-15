@@ -1296,6 +1296,7 @@ async function createSession(
       async revert(scope: RevertScope, token: unknown) {
         let freshSessionResponse: NewSessionResponse | undefined
         const previousNativeId = state.nativeId
+        const previousPersisted = state.persisted
         const previousMetadata = {
           ...state.metadata,
           ...(state.metadata.configOptions
@@ -1381,11 +1382,8 @@ async function createSession(
                 .catch(() => undefined)
             }
 
-            if (config?.persist !== false) state.persisted = true
-            state.lastKnownStepIndex =
-              result.cutoffStepIndex !== undefined && result.cutoffStepIndex > 0
-                ? result.cutoffStepIndex - 1
-                : -1
+            state.persisted = config?.persist !== false
+            state.lastKnownStepIndex = result.lastRetainedStepIndex ?? -1
             state.wakeup = {
               pendingReplay: false,
               suppressEcho: false,
@@ -1430,6 +1428,7 @@ async function createSession(
             }
             if (
               config?.persist === false &&
+              !previousPersisted &&
               previousNativeId &&
               previousNativeId !== state.nativeId &&
               sessionIdPattern.test(previousNativeId)
@@ -1441,6 +1440,7 @@ async function createSession(
             }
           } catch (error) {
             state.nativeId = previousNativeId
+            state.persisted = previousPersisted
             state.metadata = previousMetadata
             if (
               forkedNativeId !== previousNativeId &&

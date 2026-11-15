@@ -208,6 +208,7 @@ export async function revertSession(options: {
 }): Promise<{
   newNativeId?: string
   cutoffStepIndex?: number
+  lastRetainedStepIndex?: number
   checkpointId?: string
 }> {
   const { appDataDir, nativeId, cwd, scope, createFreshSession } = options
@@ -255,13 +256,17 @@ export async function revertSession(options: {
     return {}
   }
 
-  const { newNativeId, forked, retainedCutoffStepIndex } =
-    await forkAgyConversationStorage({
-      appDataDir,
-      oldNativeId: nativeId,
-      cutoffStepIndex: cutoffStepIndex!,
-      createFreshSession,
-    })
+  const {
+    newNativeId,
+    forked,
+    retainedCutoffStepIndex,
+    lastRetainedStepIndex,
+  } = await forkAgyConversationStorage({
+    appDataDir,
+    oldNativeId: nativeId,
+    cutoffStepIndex: cutoffStepIndex!,
+    createFreshSession,
+  })
 
   if (forked) {
     try {
@@ -297,6 +302,7 @@ export async function revertSession(options: {
   return {
     newNativeId,
     cutoffStepIndex: cutoffStepIndex!,
+    lastRetainedStepIndex,
     ...(scope === 'both' && checkpointId ? { checkpointId } : {}),
   }
 }

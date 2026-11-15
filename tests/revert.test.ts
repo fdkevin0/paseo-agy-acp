@@ -22,6 +22,7 @@ import {
   PROVIDER_CAPABILITIES,
   type ProviderCapability,
 } from '@getpaseo/plugin/server/provider'
+import { forkAgyConversationStorage } from '../server/agy-fork.ts'
 import {
   captureTurnFileCheckpoint,
   forkSessionCheckpoints,
@@ -2787,5 +2788,443 @@ test('Revert preserves fullAccess across streamed plan config_option_update and 
   } finally {
     await h2.provider.close()
     await rm(home2, { recursive: true, force: true })
+  }
+})
+
+test('Imported persisted session opened with config.persist === false preserves saved artifacts and deletes the unannounced fork on close', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-import-np-'))
+  const workDir = join(home, 'ws')
+  await mkdir(workDir, { recursive: true })
+  await runGit(workDir, ['init'])
+  const savedId = '12341234-1234-4123-8123-123412341234'
+  const childDropId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+  const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
+  await seedNativeSessionArtifacts(appDataDir, savedId)
+
+  const h = await openHarness(workDir, {
+    HOME: home,
+    AGY_TEST_CHECKPOINT_HISTORY: '1',
+  })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-imp-np',
+      sessionId: 's-imp-np',
+      config: { ...h.config, persist: false },
+      persistence: { version: 1, data: { sessionId: savedId } },
+      history: 'replay',
+    })
+    await h.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 's-imp-np',
+    )
+    await h.wait(
+      (e) =>
+        e.type === 'session.ready' &&
+        e.sessionId === `s-imp-np:child:${childDropId}`,
+    )
+
+    const token2 = h.events
+      .filter(
+        (
+          e,
+        ): e is Extract<
+          (typeof h.events)[number],
+          { type: 'timeline.item' }
+        > & {
+          item: Extract<
+            Extract<
+              (typeof h.events)[number],
+              { type: 'timeline.item' }
+            >['item'],
+            { type: 'user_message' }
+          >
+        } =>
+          e.type === 'timeline.item' &&
+          e.sessionId === 's-imp-np' &&
+          e.item.type === 'user_message',
+      )
+      .map((e) => e.item)[1].revertToken
+    assert(token2 !== undefined)
+
+    await h.provider.send({
+      type: 'session.revert',
+      requestId: 'rev-imp-np',
+      sessionId: 's-imp-np',
+      scope: 'conversation',
+      token: token2,
+    })
+    await h.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'rev-imp-np',
+    )
+
+    assert.equal(
+      h.events.some(
+        (e) => e.type === 'session.persistence' && e.sessionId === 's-imp-np',
+      ),
+      false,
+    )
+    const convMid = await readdir(join(appDataDir, 'conversations'))
+    assert.equal(convMid.length, 2)
+    assert.equal(convMid.includes(`${savedId}.db`), true)
+
+    await h.provider.send({
+      type: 'session.close',
+      requestId: 'close-imp-np',
+      sessionId: 's-imp-np',
+    })
+    await h.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'close-imp-np',
+    )
+
+    assert.deepEqual(await readdir(join(appDataDir, 'conversations')), [
+      `${savedId}.db`,
+    ])
+    assert.deepEqual(
+      (await readdir(join(appDataDir, 'brain'))).sort(),
+      [childDropId, savedId].sort(),
+    )
+    const sumDb = new DatabaseSync(
+      join(appDataDir, 'conversation_summaries.db'),
+      { readOnly: true },
+    )
+    try {
+      assert.deepEqual(
+        (
+          sumDb
+            .prepare('SELECT conversation_id FROM conversation_summaries')
+            .all() as Array<{ conversation_id: string }>
+        ).map((r) => r.conversation_id),
+        [savedId],
+      )
+    } finally {
+      sumDb.close()
+    }
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('Unborn nested Git repo checkpoint captures and restores under non-English locale and concurrent sessions', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-locale-'))
+  const workDir = join(home, 'workspace')
+  await mkdir(join(workDir, 'sub'), { recursive: true })
+  const restoreLocaleEnv = (['LC_ALL', 'LANG', 'LANGUAGE'] as const).map(
+    (key) => {
+      const hasKey = Object.prototype.hasOwnProperty.call(process.env, key)
+      const prevVal = process.env[key]
+      const apply: Record<'true' | 'false', () => void> = {
+        true: () => {
+          process.env[key] = prevVal
+        },
+        false: () => {
+          delete process.env[key]
+        },
+      }
+      return apply[String(hasKey) as 'true' | 'false']
+    },
+  )
+
+  try {
+    await writeFile(join(workDir, 'base.txt'), 'v1')
+    await runGit(workDir, ['init'])
+    await runGit(workDir, ['config', 'user.name', 'Test'])
+    await runGit(workDir, ['config', 'user.email', 'test@example.com'])
+    await runGit(workDir, ['add', 'base.txt'])
+    await runGit(workDir, ['commit', '-m', 'init'])
+
+    await writeFile(join(workDir, 'sub', 'inner.txt'), 'nested')
+    await runGit(join(workDir, 'sub'), ['init'])
+
+    process.env.LC_ALL = 'zh_CN.UTF-8'
+    process.env.LANG = 'zh_CN.UTF-8'
+    process.env.LANGUAGE = 'zh_CN.UTF-8'
+
+    const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
+    const [cpA, cpB] = await Promise.all([
+      captureTurnFileCheckpoint(
+        appDataDir,
+        'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1',
+        workDir,
+        -1,
+      ),
+      captureTurnFileCheckpoint(
+        appDataDir,
+        'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2',
+        workDir,
+        -1,
+      ),
+    ])
+    assert(cpA !== undefined)
+    assert(cpB !== undefined)
+    assert.deepEqual(cpA.unbornDirs, ['sub'])
+    assert.deepEqual(cpB.unbornDirs, ['sub'])
+
+    await writeFile(join(workDir, 'base.txt'), 'v2')
+    await restoreSessionFileCheckpoint(
+      appDataDir,
+      'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1',
+      cpA.id,
+    )
+    assert.equal(await readFile(join(workDir, 'base.txt'), 'utf8'), 'v1')
+    assert.equal(
+      await readFile(join(workDir, 'sub', 'inner.txt'), 'utf8'),
+      'nested',
+    )
+  } finally {
+    restoreLocaleEnv.forEach((fn) => fn())
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('Chained forkAgyConversationStorage preserves consumed background-task wakeup messages and read.json parity across multiple reverts', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-wakeup-chain-'))
+  const workDir = join(home, 'ws')
+  await mkdir(workDir, { recursive: true })
+  const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
+  const origId = '11111111-1111-4111-8111-111111111112'
+  await mkdir(join(appDataDir, 'conversations'), { recursive: true })
+
+  const db = new DatabaseSync(join(appDataDir, 'conversations', `${origId}.db`))
+  try {
+    db.exec(`
+      CREATE TABLE trajectory_meta (cascade_id TEXT PRIMARY KEY, trajectory_id TEXT, source INTEGER);
+      CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, data BLOB, size INTEGER);
+    `)
+    db.prepare(
+      'INSERT INTO trajectory_meta (cascade_id, trajectory_id, source) VALUES (?, ?, ?)',
+    ).run(origId, 'traj-wakeup', 1)
+    ;[
+      [0, 14, 'turn 0'],
+      [1, 22, 'wakeup 0'],
+      [2, 14, 'turn 1'],
+      [3, 15, 'resp 1'],
+      [4, 14, 'turn 2'],
+    ].forEach(([idx, stepType, label]) => {
+      const data = pbStr(1, String(label))
+      db.prepare(
+        'INSERT INTO steps (idx, step_type, data, size) VALUES (?, ?, ?, ?)',
+      ).run(idx, stepType, data, data.byteLength)
+    })
+  } finally {
+    db.close()
+  }
+
+  const brainDir = join(appDataDir, 'brain')
+  await writeBrainTranscript(brainDir, origId, [
+    {
+      step_index: 0,
+      type: 'USER_INPUT',
+      created_at: '2026-01-01T00:00:00.000Z',
+      content: '<USER_REQUEST>\nturn 0\n</USER_REQUEST>',
+    },
+    {
+      step_index: 1,
+      type: 'SYSTEM_MESSAGE',
+      created_at: '2026-01-01T00:00:01.000Z',
+      content: `[Message] timestamp=2026-01-01T00:00:00.500Z sender=${origId}/task-1 priority=MESSAGE_PRIORITY_HIGH\nwakeup 0`,
+    },
+    {
+      step_index: 2,
+      type: 'USER_INPUT',
+      created_at: '2026-01-01T00:00:02.000Z',
+      content: '<USER_REQUEST>\nturn 1\n</USER_REQUEST>',
+    },
+    {
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-01-01T00:00:03.000Z',
+      content: 'resp 1',
+    },
+    {
+      step_index: 4,
+      type: 'USER_INPUT',
+      created_at: '2026-01-01T00:00:04.000Z',
+      content: '<USER_REQUEST>\nturn 2\n</USER_REQUEST>',
+    },
+  ])
+  const msgDir = join(brainDir, origId, '.system_generated', 'messages')
+  await mkdir(msgDir, { recursive: true })
+  await writeFile(
+    join(msgDir, 'msg-wakeup-0.json'),
+    JSON.stringify({
+      id: 'msg-wakeup-0',
+      sender: `${origId}/task-1`,
+      recipient: origId,
+      timestamp: '2026-01-01T00:00:00.500Z',
+      priority: 'MESSAGE_PRIORITY_HIGH',
+      content: 'wakeup 0',
+    }),
+  )
+  await writeFile(
+    join(msgDir, 'read.json'),
+    JSON.stringify({ 'msg-wakeup-0': true }),
+  )
+
+  try {
+    const fork1 = await forkAgyConversationStorage({
+      appDataDir,
+      oldNativeId: origId,
+      cutoffStepIndex: 4,
+      createFreshSession: async () => 'unused',
+    })
+    assert.equal(fork1.forked, true)
+    assert.equal(fork1.lastRetainedStepIndex, 3)
+
+    const fork2 = await forkAgyConversationStorage({
+      appDataDir,
+      oldNativeId: fork1.newNativeId,
+      cutoffStepIndex: 2,
+      createFreshSession: async () => 'unused',
+    })
+    assert.equal(fork2.forked, true)
+    assert.equal(fork2.lastRetainedStepIndex, 1)
+
+    const fork2MsgDir = join(
+      brainDir,
+      fork2.newNativeId,
+      '.system_generated',
+      'messages',
+    )
+    const keptMsg = JSON.parse(
+      await readFile(join(fork2MsgDir, 'msg-wakeup-0.json'), 'utf8'),
+    ) as { sender?: string; recipient?: string }
+    assert.equal(keptMsg.sender, `${origId}/task-1`)
+    assert.equal(keptMsg.recipient, fork2.newNativeId)
+    assert.deepEqual(
+      JSON.parse(await readFile(join(fork2MsgDir, 'read.json'), 'utf8')),
+      { 'msg-wakeup-0': true },
+    )
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('Conversation revert falling back to fresh session resets lastKnownStepIndex to -1 for subsequent prompts', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-fresh-step-'))
+  const workDir = join(home, 'ws')
+  await mkdir(workDir, { recursive: true })
+  const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
+  const seedNativeId = '11111111-1111-4111-8111-111111111113'
+
+  // Seed Brain transcript only (no SQLite conversations/<id>.db) so Turn 2 revert falls back to a fresh session.
+  await writeBrainTranscript(join(appDataDir, 'brain'), seedNativeId, [
+    {
+      step_index: 0,
+      type: 'USER_INPUT',
+      created_at: '2026-01-01T00:00:00.000Z',
+      content: '<USER_REQUEST>\nturn 1\n</USER_REQUEST>',
+    },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-01-01T00:00:01.000Z',
+      content: 'ans 1',
+    },
+    {
+      step_index: 2,
+      type: 'USER_INPUT',
+      created_at: '2026-01-01T00:00:02.000Z',
+      content: '<USER_REQUEST>\nturn 2\n</USER_REQUEST>',
+    },
+    {
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-01-01T00:00:03.000Z',
+      content: 'ans 2',
+    },
+  ])
+
+  const h = await openHarness(workDir, {
+    HOME: home,
+    AGY_TEST_CHECKPOINT_HISTORY: '1',
+  })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-fresh-step',
+      sessionId: 's-fresh-step',
+      config: h.config,
+      persistence: { version: 1, data: { sessionId: seedNativeId } },
+      history: 'replay',
+    })
+    await h.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 's-fresh-step',
+    )
+
+    const token2 = h.events
+      .filter(
+        (
+          e,
+        ): e is Extract<
+          (typeof h.events)[number],
+          { type: 'timeline.item' }
+        > & {
+          item: Extract<
+            Extract<
+              (typeof h.events)[number],
+              { type: 'timeline.item' }
+            >['item'],
+            { type: 'user_message' }
+          >
+        } =>
+          e.type === 'timeline.item' &&
+          e.sessionId === 's-fresh-step' &&
+          e.item.type === 'user_message',
+      )
+      .map((e) => e.item)[1].revertToken
+    assert(token2 !== undefined)
+
+    await h.provider.send({
+      type: 'session.revert',
+      requestId: 'rev-fresh-step',
+      sessionId: 's-fresh-step',
+      scope: 'conversation',
+      token: token2,
+    })
+    await h.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'rev-fresh-step',
+    )
+
+    const postStart = h.events.length
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's-fresh-step',
+      prompt: {
+        clientMessageId: 'after-fresh-fallback',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'usage-after-failed-revert' }],
+        },
+      },
+    })
+    const postUser = await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= postStart &&
+        e.type === 'timeline.item' &&
+        e.item.type === 'user_message' &&
+        e.item.clientMessageId === 'after-fresh-fallback',
+    )
+    assert(
+      postUser.type === 'timeline.item' &&
+        postUser.item.type === 'user_message',
+    )
+    assert.equal(
+      (postUser.item.revertToken as { afterStepIndex?: number }).afterStepIndex,
+      -1,
+    )
+    await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= postStart &&
+        e.type === 'session.turn' &&
+        e.state === 'completed',
+    )
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
   }
 })

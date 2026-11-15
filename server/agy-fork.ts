@@ -535,6 +535,7 @@ function rewriteMessageIdentity(
 ): void {
   if (raw.recipient === oldNativeId) raw.recipient = newNativeId
   if (
+    !isWakeupCandidateMessage(raw) &&
     typeof raw.sender === 'string' &&
     raw.sender.startsWith(`${oldNativeId}/`)
   ) {
@@ -1196,6 +1197,7 @@ export async function forkAgyConversationStorage(options: {
   newNativeId: string
   forked: boolean
   retainedCutoffStepIndex: number
+  lastRetainedStepIndex: number
 }> {
   const { appDataDir, oldNativeId, cutoffStepIndex, createFreshSession } =
     options
@@ -1205,6 +1207,7 @@ export async function forkAgyConversationStorage(options: {
       newNativeId: await createFreshSession(),
       forked: false,
       retainedCutoffStepIndex: 0,
+      lastRetainedStepIndex: -1,
     }
   }
 
@@ -1221,6 +1224,7 @@ export async function forkAgyConversationStorage(options: {
       newNativeId: await createFreshSession(),
       forked: false,
       retainedCutoffStepIndex: 0,
+      lastRetainedStepIndex: -1,
     }
   }
   await assertWithinDir(conversationsDir, oldDbPath)
@@ -1274,6 +1278,7 @@ export async function forkAgyConversationStorage(options: {
           newNativeId: await createFreshSession(),
           forked: false,
           retainedCutoffStepIndex: 0,
+          lastRetainedStepIndex: -1,
         }
       }
 
@@ -1441,6 +1446,7 @@ export async function forkAgyConversationStorage(options: {
       newNativeId,
       forked: true,
       retainedCutoffStepIndex: Math.max(0, maxKeptStepIndex),
+      lastRetainedStepIndex: maxKeptStepIndex,
     }
   } catch (error) {
     await Promise.all([
