@@ -8,6 +8,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { WritableStream } from 'node:stream/web'
 import { Readable, Writable } from 'node:stream'
 let nativeId = ''
@@ -144,7 +145,7 @@ new AgentSideConnection((client) => {
       return {
         protocolVersion: 1,
         agentCapabilities: {
-          loadSession: true,
+          loadSession: !process.env.AGY_TEST_NO_LOAD_CAP,
           sessionCapabilities: {
             list: {},
             ...(process.env.AGY_TEST_RESUME_CAP ? { resume: {} } : {}),
@@ -497,6 +498,205 @@ new AgentSideConnection((client) => {
           },
         })
         return { stopReason: 'end_turn' as const }
+      }
+      if (
+        text === 'revert-seed-turn0' ||
+        text === 'revert-nonuser-fail' ||
+        text === 'revert-post-turn' ||
+        text === 'revert-zerorow-fail'
+      ) {
+        const targetDir = process.env.AGY_TEST_REVERT_DIR
+        if (!targetDir) throw new Error('AGY_TEST_REVERT_DIR required')
+        const appDataDir = join(process.env.HOME!, '.gemini/antigravity-cli')
+        const convDir = join(appDataDir, 'conversations')
+        const logsDir = join(
+          appDataDir,
+          'brain',
+          sessionId,
+          '.system_generated/logs',
+        )
+        const appendTranscriptRows = (rows: object[]) => {
+          mkdirSync(logsDir, { recursive: true })
+          const lines = rows.map((row) => JSON.stringify(row) + '\n').join('')
+          appendFileSync(join(logsDir, 'transcript.jsonl'), lines)
+          appendFileSync(join(logsDir, 'transcript_full.jsonl'), lines)
+        }
+        if (text === 'revert-seed-turn0') {
+          mkdirSync(convDir, { recursive: true })
+          const convDb = new DatabaseSync(join(convDir, `${sessionId}.db`))
+          try {
+            convDb.exec(`
+              CREATE TABLE IF NOT EXISTS trajectory_meta (
+                cascade_id TEXT PRIMARY KEY,
+                trajectory_id TEXT,
+                source INTEGER
+              );
+              CREATE TABLE IF NOT EXISTS steps (
+                idx INTEGER PRIMARY KEY,
+                step_type INTEGER,
+                data BLOB
+              );
+            `)
+            convDb
+              .prepare(
+                'INSERT OR REPLACE INTO trajectory_meta (cascade_id, trajectory_id, source) VALUES (?, ?, ?)',
+              )
+              .run(sessionId, 'traj-seed', 1)
+            convDb
+              .prepare(
+                'INSERT OR REPLACE INTO steps (idx, step_type, data) VALUES (?, ?, ?)',
+              )
+              .run(0, 14, Buffer.from('revert-seed-turn0'))
+            convDb
+              .prepare(
+                'INSERT OR REPLACE INTO steps (idx, step_type, data) VALUES (?, ?, ?)',
+              )
+              .run(1, 15, Buffer.from('seeded-turn0'))
+          } finally {
+            convDb.close()
+          }
+          const sumDb = new DatabaseSync(
+            join(appDataDir, 'conversation_summaries.db'),
+          )
+          try {
+            sumDb.exec(`
+              CREATE TABLE IF NOT EXISTS conversation_summaries (
+                conversation_id TEXT PRIMARY KEY,
+                step_count INTEGER,
+                last_modified_time TEXT,
+                last_user_input_step_index INTEGER,
+                not_fully_idle INTEGER,
+                killed INTEGER,
+                raw_summary BLOB
+              );
+            `)
+            sumDb
+              .prepare(
+                'INSERT OR REPLACE INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?)',
+              )
+              .run(
+                sessionId,
+                2,
+                '2026-11-15 00:00:00+00:00',
+                0,
+                0,
+                0,
+                Buffer.alloc(0),
+              )
+          } finally {
+            sumDb.close()
+          }
+          appendTranscriptRows([
+            { step_index: 0, type: 'USER_INPUT', content: 'revert-seed-turn0' },
+            {
+              step_index: 1,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'seeded-turn0',
+              input_tokens: 100,
+              output_tokens: 10,
+            },
+          ])
+          await client.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'seeded-turn0' },
+            },
+          })
+          return { stopReason: 'end_turn' as const }
+        }
+        if (text === 'revert-nonuser-fail') {
+          const existingPath = join(targetDir, 'existing.txt')
+          const perm = await client.requestPermission({
+            sessionId,
+            toolCall: {
+              toolCallId: 'nonuser-fail-edit',
+              title: 'replace_file_content',
+              kind: 'edit',
+              rawInput: { TargetFile: existingPath },
+            },
+            options: [
+              { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+              { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+            ],
+          })
+          if (perm.outcome.outcome === 'selected') {
+            writeFileSync(existingPath, 'dirty-from-failed-turn')
+          }
+          const convDb = new DatabaseSync(join(convDir, `${sessionId}.db`))
+          try {
+            convDb
+              .prepare(
+                'INSERT OR REPLACE INTO steps (idx, step_type, data) VALUES (?, ?, ?)',
+              )
+              .run(2, 8, Buffer.from('upstream failure'))
+          } finally {
+            convDb.close()
+          }
+          appendTranscriptRows([
+            {
+              step_index: 2,
+              type: 'ERROR_MESSAGE',
+              content: 'upstream failure',
+            },
+          ])
+          throw new Error('Turn failed before user step')
+        }
+        if (text === 'revert-post-turn') {
+          const convDb = new DatabaseSync(join(convDir, `${sessionId}.db`))
+          try {
+            convDb
+              .prepare(
+                'INSERT OR REPLACE INTO steps (idx, step_type, data) VALUES (?, ?, ?)',
+              )
+              .run(3, 14, Buffer.from('revert-post-turn'))
+            convDb
+              .prepare(
+                'INSERT OR REPLACE INTO steps (idx, step_type, data) VALUES (?, ?, ?)',
+              )
+              .run(4, 15, Buffer.from('post-turn-ok'))
+          } finally {
+            convDb.close()
+          }
+          appendTranscriptRows([
+            { step_index: 3, type: 'USER_INPUT', content: 'revert-post-turn' },
+            {
+              step_index: 4,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'post-turn-ok',
+              input_tokens: 50,
+              output_tokens: 10,
+            },
+          ])
+          await client.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'post-turn-ok' },
+            },
+          })
+          return { stopReason: 'end_turn' as const }
+        }
+        const existingPath = join(targetDir, 'existing.txt')
+        const perm = await client.requestPermission({
+          sessionId,
+          toolCall: {
+            toolCallId: 'zerorow-fail-edit',
+            title: 'replace_file_content',
+            kind: 'edit',
+            rawInput: { TargetFile: existingPath },
+          },
+          options: [
+            { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+            { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+          ],
+        })
+        if (perm.outcome.outcome === 'selected') {
+          writeFileSync(existingPath, 'dirty-zero-row')
+        }
+        throw new Error('Failed before writing any step')
       }
       if (text === 'must-not-run-after-interrupt') {
         log('unexpected-prompt')

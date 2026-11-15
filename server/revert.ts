@@ -33,10 +33,11 @@ import {
   str,
 } from './common.ts'
 import { normalizeUserText, type HistoryEntry } from './history.ts'
+import { removeSessionArtifacts } from './preflight.ts'
 
 export type RevertScope = 'files' | 'conversation' | 'both'
 
-export const AgyRevertTokenSchema = z.object({
+const AgyRevertTokenSchema = z.object({
   version: z.literal(1),
   kind: z.literal('agy-acp-turn'),
   clientMessageId: z.string().min(1).optional(),
@@ -50,6 +51,20 @@ export const AgyRevertTokenSchema = z.object({
 export type AgyRevertToken = z.infer<typeof AgyRevertTokenSchema>
 
 const TRANSCRIPT_CHUNK_BYTES = 102_400
+
+const TRANSCRIPT_CHUNK_TARGET_BY_REL: Record<
+  string,
+  { flag: 'hasTranscriptChunks' | 'hasTranscriptFullChunks'; chunkDir: string }
+> = {
+  '.system_generated/logs/transcript.jsonl': {
+    flag: 'hasTranscriptChunks',
+    chunkDir: '.system_generated/logs/chunks/transcript',
+  },
+  '.system_generated/logs/transcript_full.jsonl': {
+    flag: 'hasTranscriptFullChunks',
+    chunkDir: '.system_generated/logs/chunks/transcript_full',
+  },
+}
 
 interface ProtoField {
   fieldNumber: number
@@ -271,7 +286,7 @@ export function makeRevertToken(fields: {
   return token
 }
 
-export function parseRevertToken(token: unknown): AgyRevertToken {
+function parseRevertToken(token: unknown): AgyRevertToken {
   const parsed = AgyRevertTokenSchema.safeParse(token)
   if (!parsed.success) {
     throw new Error('Invalid or missing revert token for this message')
@@ -296,8 +311,8 @@ export function extractUserStepRows(
   return result
 }
 
-/** Resolve the native step_index at which the target user turn starts (exclusive upper bound to keep). */
-export async function resolveCutoffStepIndex(
+/** Resolve the native step_index at which the target turn starts (exclusive upper bound to keep). */
+async function resolveCutoffStepIndex(
   brainRoot: string,
   nativeId: string,
   token: AgyRevertToken,
@@ -308,39 +323,60 @@ export async function resolveCutoffStepIndex(
     throw error
   })
   const userSteps = extractUserStepRows(rows)
+  const stepIndices = rows
+    .map((r) => num(r.step_index))
+    .filter(
+      (n): n is number => n !== undefined && Number.isInteger(n) && n >= 0,
+    )
+  const maxStepIndex = stepIndices.length > 0 ? Math.max(...stepIndices) : -1
+  const normalizeCutoff = (stepIndex: number): number =>
+    userSteps.length === 0 || stepIndex <= userSteps[0].stepIndex
+      ? 0
+      : stepIndex
 
   if (token.stepIndex !== undefined) {
     if (userSteps.length === 0) return token.stepIndex
     const exact = userSteps.find((s) => s.stepIndex === token.stepIndex)
-    if (exact) {
-      return exact.stepIndex <= userSteps[0].stepIndex ? 0 : exact.stepIndex
+    if (exact) return normalizeCutoff(exact.stepIndex)
+  }
+
+  if (token.afterStepIndex !== undefined) {
+    const postSteps = stepIndices.filter((idx) => idx > token.afterStepIndex!)
+    if (postSteps.length > 0) {
+      const minPostStep = Math.min(...postSteps)
+      const afterMatches = userSteps.filter(
+        (s) => s.stepIndex > token.afterStepIndex!,
+      )
+      const exactText =
+        token.text !== undefined
+          ? afterMatches.find((s) => s.text === token.text)
+          : undefined
+      if (exactText) {
+        const hasEarlierUserAfter = afterMatches.some(
+          (s) => s.stepIndex < exactText.stepIndex,
+        )
+        return normalizeCutoff(
+          token.afterStepIndex >= 0 && !hasEarlierUserAfter
+            ? Math.min(minPostStep, exactText.stepIndex)
+            : exactText.stepIndex,
+        )
+      }
+      return normalizeCutoff(minPostStep)
+    }
+    if (token.afterStepIndex === -1) return 0
+    if (token.afterStepIndex >= 0 && token.afterStepIndex <= maxStepIndex) {
+      return normalizeCutoff(token.afterStepIndex + 1)
     }
   }
 
   if (userSteps.length === 0) {
-    if (token.turnOrdinal === 0 || token.afterStepIndex === -1) return 0
+    if (token.turnOrdinal === 0) return 0
     throw new Error('Unable to locate target turn in session transcript')
   }
 
   let matched: UserStepRow | undefined
 
-  if (token.afterStepIndex !== undefined) {
-    const afterMatches = userSteps.filter(
-      (s) => s.stepIndex > token.afterStepIndex!,
-    )
-    if (afterMatches.length > 0) {
-      matched =
-        (token.text !== undefined
-          ? afterMatches.find((s) => s.text === token.text)
-          : undefined) ?? afterMatches[0]
-    }
-  }
-
-  if (
-    !matched &&
-    token.turnOrdinal !== undefined &&
-    token.turnOrdinal < userSteps.length
-  ) {
+  if (token.turnOrdinal !== undefined && token.turnOrdinal < userSteps.length) {
     const candidate = userSteps[token.turnOrdinal]
     if (token.text === undefined || candidate.text === token.text) {
       matched = candidate
@@ -357,7 +393,7 @@ export async function resolveCutoffStepIndex(
   }
 
   // Rewinding the very first user turn leaves no conversation history; start clean.
-  return matched.stepIndex <= userSteps[0].stepIndex ? 0 : matched.stepIndex
+  return normalizeCutoff(matched.stepIndex)
 }
 
 interface BrainFilterContext {
@@ -854,30 +890,16 @@ async function copyBrainDirectoryFiltered(
         nextParts,
       )
     } else if (entry.isFile()) {
-      if (relPath === '.system_generated/logs/transcript.jsonl') {
+      const target = TRANSCRIPT_CHUNK_TARGET_BY_REL[relPath]
+      if (target) {
         const filtered = await filterJsonlTranscript(
           srcEntry,
           destEntry,
           ctx.cutoffStepIndex,
         )
-        if (ctx.hasTranscriptChunks) {
+        if (ctx[target.flag]) {
           await writeTranscriptChunks(
-            join(destBrainRoot, '.system_generated/logs/chunks/transcript'),
-            filtered,
-          )
-        }
-      } else if (relPath === '.system_generated/logs/transcript_full.jsonl') {
-        const filtered = await filterJsonlTranscript(
-          srcEntry,
-          destEntry,
-          ctx.cutoffStepIndex,
-        )
-        if (ctx.hasTranscriptFullChunks) {
-          await writeTranscriptChunks(
-            join(
-              destBrainRoot,
-              '.system_generated/logs/chunks/transcript_full',
-            ),
+            join(destBrainRoot, target.chunkDir),
             filtered,
           )
         }
@@ -913,43 +935,60 @@ function rewriteIndexedBlobRows(
   })
 }
 
+function branchIndexedProtoTable(
+  db: DatabaseSync,
+  tableName: string,
+  cols: ReadonlySet<string>,
+  cutoffStepIndex: number,
+  filterRow: (fields: ProtoField[], raw: Buffer) => Buffer | undefined,
+  options?: { trackSize?: boolean; extraRow?: Buffer },
+): void {
+  if (!cols.has('data')) {
+    db.prepare(`DELETE FROM ${tableName} WHERE idx >= ?`).run(cutoffStepIndex)
+    return
+  }
+  const rows = db
+    .prepare(`SELECT idx, data FROM ${tableName} ORDER BY idx ASC`)
+    .all() as Array<{ idx: number; data: unknown }>
+  const kept: Array<{ data: Buffer }> = []
+  for (const row of rows) {
+    if (!(row.data instanceof Uint8Array)) continue
+    const raw = Buffer.from(row.data)
+    const fields = parseProtoFields(row.data)
+    if (!fields) {
+      if (row.idx < cutoffStepIndex) kept.push({ data: raw })
+      continue
+    }
+    const transformed = filterRow(fields, raw)
+    if (transformed) kept.push({ data: transformed })
+  }
+  if (options?.extraRow) kept.push({ data: options.extraRow })
+  rewriteIndexedBlobRows(db, tableName, kept, options?.trackSize)
+}
+
 function branchGenMetadata(
   db: DatabaseSync,
   cols: ReadonlySet<string>,
   cutoffStepIndex: number,
 ): void {
-  if (!cols.has('data')) {
-    db.prepare('DELETE FROM gen_metadata WHERE idx >= ?').run(cutoffStepIndex)
-    return
-  }
-  const rows = db
-    .prepare('SELECT idx, data FROM gen_metadata ORDER BY idx ASC')
-    .all() as Array<{ idx: number; data: unknown }>
-  const kept: Array<{ data: Buffer }> = []
-  for (const row of rows) {
-    if (!(row.data instanceof Uint8Array)) continue
-    const fields = parseProtoFields(row.data)
-    if (!fields) {
-      if (row.idx < cutoffStepIndex) {
-        kept.push({ data: Buffer.from(row.data) })
-      }
-      continue
-    }
-    const stepIndices = decodeGenStepIndices(fields)
-    if (stepIndices.length === 0 || stepIndices[0] >= cutoffStepIndex) continue
-    const filteredSteps = stepIndices.filter((s) => s < cutoffStepIndex)
-    if (filteredSteps.length === stepIndices.length) {
-      kept.push({ data: Buffer.from(row.data) })
-    } else {
+  branchIndexedProtoTable(
+    db,
+    'gen_metadata',
+    cols,
+    cutoffStepIndex,
+    (fields, raw) => {
+      const stepIndices = decodeGenStepIndices(fields)
+      const filteredSteps = stepIndices.filter((s) => s < cutoffStepIndex)
+      if (filteredSteps.length === 0) return undefined
+      if (filteredSteps.length === stepIndices.length) return raw
       const packed = Buffer.concat(filteredSteps.map((s) => encodeVarint(s)))
-      const rebuilt = replaceProtoFields(
+      return replaceProtoFields(
         fields,
         new Map([[2, encodeBytesField(2, packed)]]),
       )
-      kept.push({ data: rebuilt })
-    }
-  }
-  rewriteIndexedBlobRows(db, 'gen_metadata', kept, cols.has('size'))
+    },
+    { trackSize: cols.has('size') },
+  )
 }
 
 function branchExecutorMetadata(
@@ -957,29 +996,14 @@ function branchExecutorMetadata(
   cols: ReadonlySet<string>,
   cutoffStepIndex: number,
 ): void {
-  if (!cols.has('data')) {
-    db.prepare('DELETE FROM executor_metadata WHERE idx >= ?').run(
-      cutoffStepIndex,
-    )
-    return
-  }
-  const rows = db
-    .prepare('SELECT idx, data FROM executor_metadata ORDER BY idx ASC')
-    .all() as Array<{ idx: number; data: unknown }>
-  const kept: Array<{ data: Buffer }> = []
-  for (const row of rows) {
-    if (!(row.data instanceof Uint8Array)) continue
-    const fields = parseProtoFields(row.data)
-    if (!fields) {
-      if (row.idx < cutoffStepIndex) kept.push({ data: Buffer.from(row.data) })
-      continue
-    }
-    const lastStepIdx = protoVarint(fields, 3)
-    if (lastStepIdx < cutoffStepIndex) {
-      kept.push({ data: Buffer.from(row.data) })
-    }
-  }
-  rewriteIndexedBlobRows(db, 'executor_metadata', kept)
+  branchIndexedProtoTable(
+    db,
+    'executor_metadata',
+    cols,
+    cutoffStepIndex,
+    (fields, raw) =>
+      protoVarint(fields, 3) < cutoffStepIndex ? raw : undefined,
+  )
 }
 
 function branchBattleModeInfos(
@@ -987,30 +1011,17 @@ function branchBattleModeInfos(
   cols: ReadonlySet<string>,
   cutoffStepIndex: number,
 ): void {
-  if (!cols.has('data')) {
-    db.prepare('DELETE FROM battle_mode_infos WHERE idx >= ?').run(
-      cutoffStepIndex,
-    )
-    return
-  }
-  const rows = db
-    .prepare('SELECT idx, data FROM battle_mode_infos ORDER BY idx ASC')
-    .all() as Array<{ idx: number; data: unknown }>
-  const kept: Array<{ data: Buffer }> = []
-  for (const row of rows) {
-    if (!(row.data instanceof Uint8Array)) continue
-    const fields = parseProtoFields(row.data)
-    if (!fields) {
-      if (row.idx < cutoffStepIndex) kept.push({ data: Buffer.from(row.data) })
-      continue
-    }
-    const winningConvId = protoString(fields, 2)
-    const startStepIdx = protoVarint(fields, 3)
-    if (startStepIdx < cutoffStepIndex && winningConvId.length > 0) {
-      kept.push({ data: Buffer.from(row.data) })
-    }
-  }
-  rewriteIndexedBlobRows(db, 'battle_mode_infos', kept)
+  branchIndexedProtoTable(
+    db,
+    'battle_mode_infos',
+    cols,
+    cutoffStepIndex,
+    (fields, raw) =>
+      protoVarint(fields, 3) < cutoffStepIndex &&
+      protoString(fields, 2).length > 0
+        ? raw
+        : undefined,
+  )
 }
 
 function branchParentReferences(
@@ -1020,28 +1031,6 @@ function branchParentReferences(
   oldMeta: { trajectoryId: string; source: number; lastKeptStepType: number },
   oldNativeId: string,
 ): void {
-  if (!cols.has('data')) {
-    db.prepare('DELETE FROM parent_references WHERE idx >= ?').run(
-      cutoffStepIndex,
-    )
-    return
-  }
-  const rows = db
-    .prepare('SELECT idx, data FROM parent_references ORDER BY idx ASC')
-    .all() as Array<{ idx: number; data: unknown }>
-  const kept: Array<{ data: Buffer }> = []
-  for (const row of rows) {
-    if (!(row.data instanceof Uint8Array)) continue
-    const fields = parseProtoFields(row.data)
-    if (!fields) {
-      if (row.idx < cutoffStepIndex) kept.push({ data: Buffer.from(row.data) })
-      continue
-    }
-    const stepIdx = protoVarint(fields, 2)
-    if (stepIdx < cutoffStepIndex) {
-      kept.push({ data: Buffer.from(row.data) })
-    }
-  }
   const branchParts: Buffer[] = []
   if (oldMeta.trajectoryId) {
     branchParts.push(
@@ -1058,8 +1047,16 @@ function branchParentReferences(
   }
   branchParts.push(encodeVarintField(5, 2))
   branchParts.push(encodeBytesField(6, Buffer.from(oldNativeId, 'utf8')))
-  kept.push({ data: Buffer.concat(branchParts) })
-  rewriteIndexedBlobRows(db, 'parent_references', kept)
+
+  branchIndexedProtoTable(
+    db,
+    'parent_references',
+    cols,
+    cutoffStepIndex,
+    (fields, raw) =>
+      protoVarint(fields, 2) < cutoffStepIndex ? raw : undefined,
+    { extraRow: Buffer.concat(branchParts) },
+  )
 }
 
 function updateTrajectoryMetadataBlob(
@@ -1139,20 +1136,14 @@ async function openSummariesTable(
   }
 }
 
-/** Remove on-disk artifacts created for a forked conversation that failed to activate. */
+/** Remove on-disk artifacts and summary row created for a forked or disposable conversation. */
 export async function removeForkedConversation(
   appDataDir: string,
   nativeId: string,
 ): Promise<void> {
   assertSafeNativeId(nativeId)
-  const dbPath = join(appDataDir, 'conversations', `${nativeId}.db`)
-  const brainPath = join(appDataDir, 'brain', nativeId)
   await Promise.all([
-    rm(dbPath, { force: true }).catch(() => undefined),
-    rm(`${dbPath}-wal`, { force: true }).catch(() => undefined),
-    rm(`${dbPath}-shm`, { force: true }).catch(() => undefined),
-    rm(brainPath, { recursive: true, force: true }).catch(() => undefined),
-    removeSessionCheckpoints(appDataDir, nativeId).catch(() => undefined),
+    removeSessionArtifacts(appDataDir, nativeId).catch(() => undefined),
     (async () => {
       const opened = await openSummariesTable(appDataDir).catch(() => undefined)
       if (!opened) return
@@ -1226,11 +1217,44 @@ async function syncConversationSummary(
   }
 }
 
+async function conversationForkNeedsReload(
+  appDataDir: string,
+  nativeId: string,
+  cutoffStepIndex: number,
+): Promise<boolean> {
+  assertSafeNativeId(nativeId)
+  if (cutoffStepIndex <= 0) return false
+  const conversationsDir = join(appDataDir, 'conversations')
+  const oldDbPath = join(conversationsDir, `${nativeId}.db`)
+  const oldDbStat = await lstat(oldDbPath).catch((error) => {
+    if (isMissingError(error)) return undefined
+    throw error
+  })
+  if (!oldDbStat) return false
+  await assertWithinDir(conversationsDir, oldDbPath)
+  const db = new DatabaseSync(oldDbPath, { readOnly: true })
+  try {
+    db.exec('PRAGMA busy_timeout = 3000')
+    const hasSteps = db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'steps'",
+      )
+      .get()
+    if (!hasSteps) return true
+    const countRow = db
+      .prepare('SELECT COUNT(*) AS cnt FROM steps WHERE idx < ?')
+      .get(cutoffStepIndex) as { cnt?: number | bigint } | undefined
+    return Number(countRow?.cnt ?? 0) > 0
+  } finally {
+    db.close()
+  }
+}
+
 /**
  * Fork the native Agy SQLite DB + Brain directory up to `cutoffStepIndex` (keeping `idx < cutoffStepIndex`),
  * or allocate a brand-new empty native session when `cutoffStepIndex <= 0`.
  */
-export async function forkNativeConversation(
+async function forkNativeConversation(
   appDataDir: string,
   oldNativeId: string,
   cutoffStepIndex: number,
@@ -1466,6 +1490,7 @@ export async function revertSession(options: {
   scope: RevertScope
   token: unknown
   checkpoints?: readonly TurnFileCheckpoint[]
+  supportsReload?: boolean
   createFreshSession: () => Promise<string>
 }): Promise<{ newNativeId?: string; cutoffStepIndex?: number }> {
   const { appDataDir, nativeId, scope, createFreshSession } = options
@@ -1479,6 +1504,14 @@ export async function revertSession(options: {
     cutoffStepIndex = await resolveCutoffStepIndex(brainRoot, nativeId, parsed)
   }
 
+  if (
+    scope !== 'files' &&
+    options.supportsReload === false &&
+    (await conversationForkNeedsReload(appDataDir, nativeId, cutoffStepIndex!))
+  ) {
+    throw new Error('agy does not support session/load')
+  }
+
   if (scope === 'files' || scope === 'both') {
     if (!checkpointId && cutoffStepIndex !== undefined) {
       const [checkpoints, rows] = await Promise.all([
@@ -1488,15 +1521,13 @@ export async function revertSession(options: {
         ),
       ])
       const userSteps = extractUserStepRows(rows)
-      const userPos =
-        cutoffStepIndex === 0 && userSteps.length > 0
-          ? 0
-          : userSteps.findIndex((u) => u.stepIndex === cutoffStepIndex)
-      const targetStep =
-        userPos >= 0
-          ? userSteps[userPos].stepIndex
-          : (parsed.stepIndex ?? cutoffStepIndex)
-      const prevUserStep = userPos > 0 ? userSteps[userPos - 1].stepIndex : -1
+      const prevUserStep =
+        userSteps.filter((u) => u.stepIndex < cutoffStepIndex!).at(-1)
+          ?.stepIndex ?? -1
+      const targetUserStep = userSteps.find(
+        (u) => u.stepIndex >= cutoffStepIndex!,
+      )?.stepIndex
+      const targetStep = targetUserStep ?? parsed.stepIndex ?? cutoffStepIndex
       checkpointId = findCheckpointForUserStep(
         checkpoints,
         prevUserStep,

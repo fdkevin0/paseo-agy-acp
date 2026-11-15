@@ -384,7 +384,11 @@ export class SessionManager {
       session.state.reverting = true
       try {
         const result = await session.revert(scope, input.token)
-        if (scope !== 'files' && result.newNativeId) {
+        if (
+          scope !== 'files' &&
+          result.newNativeId &&
+          session.config?.persist !== false
+        ) {
           emit({
             type: 'session.persistence',
             sessionId: session.id,
@@ -1294,6 +1298,10 @@ async function createSession(
           nativeId: state.nativeId,
           scope,
           token,
+          supportsReload: Boolean(
+            currentInitialized.agentCapabilities?.sessionCapabilities?.resume ||
+            currentInitialized.agentCapabilities?.loadSession,
+          ),
           createFreshSession: async () => {
             const fresh = await currentTransport.request(
               currentTransport.rpc.newSession(sessionParams(cwd, config)),
@@ -1397,7 +1405,7 @@ async function createSession(
                 .catch(() => undefined)
             }
 
-            state.persisted = true
+            if (config?.persist !== false) state.persisted = true
             state.lastKnownStepIndex =
               result.cutoffStepIndex !== undefined && result.cutoffStepIndex > 0
                 ? result.cutoffStepIndex - 1
@@ -1443,6 +1451,17 @@ async function createSession(
               })
             } else if (fallbackUsage) {
               publishUsage(fallbackUsage)
+            }
+            if (
+              config?.persist === false &&
+              previousNativeId &&
+              previousNativeId !== state.nativeId &&
+              sessionIdPattern.test(previousNativeId)
+            ) {
+              await removeForkedConversation(
+                appDataDir,
+                previousNativeId,
+              ).catch(() => undefined)
             }
           } catch (error) {
             state.nativeId = previousNativeId
@@ -1593,9 +1612,11 @@ async function createSession(
             () => false,
           )
           if (disposable && stopped)
-            await removeSessionArtifacts(dir, state.nativeId).catch(
-              () => undefined,
-            )
+            await (
+              config?.persist === false
+                ? removeForkedConversation
+                : removeSessionArtifacts
+            )(dir, state.nativeId).catch(() => undefined)
         })()
         return closing
       },
@@ -2288,6 +2309,9 @@ async function promptSession(
     }
     settleTurnUsageAndWakeup(false)
     await disposeTurnWork()
+    if (status !== 'completed') {
+      await syncTurnCountFromTranscript(session)
+    }
     session.finishTurnOnce(turnId, status, turnError)
     resetTurnState()
   } catch (error) {
@@ -2312,10 +2336,33 @@ async function promptSession(
         : 'failed'
     const message = formatErrorMessage(turnError)
     await disposeTurnWork()
+    await syncTurnCountFromTranscript(session)
     session.finishTurnOnce(turnId, status, message)
     resetTurnState()
   } finally {
     await disposeTurnWork()
     resetTurnState()
   }
+}
+
+async function syncTurnCountFromTranscript(session: {
+  brainRoot: string
+  state: {
+    closing: boolean
+    nativeId: string
+    userTurnCount: number
+  }
+}): Promise<void> {
+  if (session.state.closing || !sessionIdPattern.test(session.state.nativeId)) {
+    return
+  }
+  const rows = await readTranscriptRows(
+    session.brainRoot,
+    session.state.nativeId,
+  ).catch(() => null)
+  if (rows === null) return
+  session.state.userTurnCount =
+    rows.length > 0
+      ? extractUserStepRows(rows).length
+      : Math.max(0, session.state.userTurnCount - 1)
 }

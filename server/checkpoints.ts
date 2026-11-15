@@ -29,7 +29,7 @@ const execFileAsync = promisify(execFile)
 const GIT_TIMEOUT_MS = 5000
 const GIT_DIFF_MAX_BUFFER = 32 * 1024 * 1024
 
-export const JournalFileSnapshotSchema = z.discriminatedUnion('existed', [
+const JournalFileSnapshotSchema = z.discriminatedUnion('existed', [
   z.object({ existed: z.literal(false) }),
   z.object({
     existed: z.literal(true),
@@ -38,9 +38,9 @@ export const JournalFileSnapshotSchema = z.discriminatedUnion('existed', [
   }),
 ])
 
-export type JournalFileSnapshot = z.infer<typeof JournalFileSnapshotSchema>
+type JournalFileSnapshot = z.infer<typeof JournalFileSnapshotSchema>
 
-export const TurnFileCheckpointSchema = z.discriminatedUnion('kind', [
+const TurnFileCheckpointSchema = z.discriminatedUnion('kind', [
   z.object({
     id: z.string(),
     afterStepIndex: z.number().int().min(-1),
@@ -574,11 +574,10 @@ function collectReferencedBlobHashes(
   return hashes
 }
 
-async function pruneUnreferencedBlobs(
+async function pruneUnreferencedBlobHashes(
   appDataDir: string,
-  candidates: readonly TurnFileCheckpoint[],
+  candidateHashes: ReadonlySet<string>,
 ): Promise<void> {
-  const candidateHashes = collectReferencedBlobHashes(candidates)
   if (candidateHashes.size === 0) return
   const sessionsDir = join(checkpointsRoot(appDataDir), 'sessions')
   const entries = await readdir(sessionsDir).catch((error: unknown) => {
@@ -600,6 +599,16 @@ async function pruneUnreferencedBlobs(
     if (referenced.has(hash) || (inFlightBlobs.get(hash) ?? 0) > 0) continue
     await rm(join(dir, hash), { force: true }).catch(() => undefined)
   }
+}
+
+async function pruneUnreferencedBlobs(
+  appDataDir: string,
+  candidates: readonly TurnFileCheckpoint[],
+): Promise<void> {
+  await pruneUnreferencedBlobHashes(
+    appDataDir,
+    collectReferencedBlobHashes(candidates),
+  )
 }
 
 /** Capture a pre-turn workspace checkpoint before dispatching `session/prompt`. */
@@ -717,6 +726,8 @@ export async function recordJournalToolEdit(
   }
 
   const baseSnapshot = snapshot
+  let saved = false
+  let replacedHash: string | undefined
   try {
     await queueSessionOp(nativeId, async () => {
       const existing = await readSessionCheckpoints(appDataDir, nativeId)
@@ -742,7 +753,7 @@ export async function recordJournalToolEdit(
         toolOwners.set(absPath, options.toolCallId)
       }
       const preservedMode = previous?.existed ? previous.mode : undefined
-      target.edits[absPath] = baseSnapshot.existed
+      const nextSnapshot = baseSnapshot.existed
         ? {
             ...baseSnapshot,
             ...(preservedMode !== undefined
@@ -752,10 +763,27 @@ export async function recordJournalToolEdit(
                 : {}),
           }
         : baseSnapshot
+      target.edits[absPath] = nextSnapshot
       await writeSessionCheckpoints(appDataDir, nativeId, existing)
+      saved = true
+      if (
+        previous?.existed &&
+        (!nextSnapshot.existed ||
+          previous.blobSha256 !== nextSnapshot.blobSha256)
+      ) {
+        replacedHash = previous.blobSha256
+      }
     })
   } finally {
     if (pinnedHash) unpinBlob(pinnedHash)
+    const toPrune = new Set<string>()
+    if (!saved && pinnedHash) toPrune.add(pinnedHash)
+    if (replacedHash) toPrune.add(replacedHash)
+    if (toPrune.size > 0) {
+      await pruneUnreferencedBlobHashes(appDataDir, toPrune).catch(
+        () => undefined,
+      )
+    }
   }
 }
 

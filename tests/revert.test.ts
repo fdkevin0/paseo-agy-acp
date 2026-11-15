@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import {
   chmod,
   lstat,
@@ -22,7 +23,14 @@ import {
   PROVIDER_CAPABILITIES,
   type ProviderCapability,
 } from '@getpaseo/plugin/server/provider'
-import { readSessionCheckpoints } from '../server/checkpoints.ts'
+import {
+  captureTurnFileCheckpoint,
+  forkSessionCheckpoints,
+  readSessionCheckpoints,
+  recordJournalToolEdit,
+  removeSessionCheckpoints,
+  restoreSessionFileCheckpoint,
+} from '../server/checkpoints.ts'
 import { dataDirectory } from '../server/preflight.ts'
 import { createProvider } from '../server/provider.ts'
 import { AgyUsageSource } from '../server/usage.ts'
@@ -1718,6 +1726,707 @@ test('Failed conversation revert activation rolls back metadata, closes aborted 
         e.type === 'session.turn' &&
         e.state === 'completed',
     )
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('Interleaved journal -> git -> journal file checkpoints fail closed without mutating workspace', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-interleaved-'))
+  const workDir = join(home, 'workspace')
+  await mkdir(workDir, { recursive: true })
+  const filePath = join(workDir, 'a.txt')
+  await writeFile(filePath, 'v0')
+  const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
+  const nativeId = '55555555-5555-4555-8555-555555555555'
+
+  try {
+    const cp0 = await captureTurnFileCheckpoint(
+      appDataDir,
+      nativeId,
+      workDir,
+      -1,
+    )
+    await recordJournalToolEdit(appDataDir, nativeId, cp0.id, workDir, filePath)
+    await writeFile(filePath, 'v1-journal')
+
+    await runGit(workDir, ['init'])
+    await runGit(workDir, ['config', 'user.name', 'Test'])
+    await runGit(workDir, ['config', 'user.email', 'test@example.com'])
+    await runGit(workDir, ['add', 'a.txt'])
+    await runGit(workDir, ['commit', '-m', 'init'])
+    await captureTurnFileCheckpoint(appDataDir, nativeId, workDir, 0)
+    await writeFile(filePath, 'v2-git')
+
+    await rm(join(workDir, '.git'), { recursive: true, force: true })
+    const cp2 = await captureTurnFileCheckpoint(
+      appDataDir,
+      nativeId,
+      workDir,
+      1,
+    )
+    await recordJournalToolEdit(appDataDir, nativeId, cp2.id, workDir, filePath)
+    await writeFile(filePath, 'v3-journal')
+
+    await assert.rejects(
+      restoreSessionFileCheckpoint(appDataDir, nativeId, cp0.id),
+      /Cannot restore files across interleaved non-git and git turns/,
+    )
+    assert.equal(await readFile(filePath, 'utf8'), 'v3-journal')
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('removeSessionCheckpoints prunes orphaned blobs while preserving blobs shared with a forked session', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-blobs-'))
+  const workDir = join(home, 'workspace')
+  await mkdir(workDir, { recursive: true })
+  const sharedPath = join(workDir, 'shared.txt')
+  const onlyOldPath = join(workDir, 'only-old.txt')
+  await writeFile(sharedPath, 'shared-v0')
+  await writeFile(onlyOldPath, 'old-v0')
+  const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
+  const oldNativeId = '66666666-6666-4666-8666-666666666666'
+  const newNativeId = '77777777-7777-4777-8777-777777777777'
+  const sharedHash = createHash('sha256').update('shared-v0').digest('hex')
+  const onlyOldHash = createHash('sha256').update('old-v0').digest('hex')
+  const sessionsDir = join(appDataDir, 'paseo-checkpoints', 'sessions')
+  const blobsDir = join(appDataDir, 'paseo-checkpoints', 'blobs')
+
+  try {
+    const cp0 = await captureTurnFileCheckpoint(
+      appDataDir,
+      oldNativeId,
+      workDir,
+      -1,
+    )
+    await recordJournalToolEdit(
+      appDataDir,
+      oldNativeId,
+      cp0.id,
+      workDir,
+      sharedPath,
+    )
+    const cp1 = await captureTurnFileCheckpoint(
+      appDataDir,
+      oldNativeId,
+      workDir,
+      0,
+    )
+    await recordJournalToolEdit(
+      appDataDir,
+      oldNativeId,
+      cp1.id,
+      workDir,
+      onlyOldPath,
+    )
+    await forkSessionCheckpoints(appDataDir, oldNativeId, newNativeId, 0)
+
+    assert.deepEqual(
+      (await readdir(blobsDir)).sort(),
+      [onlyOldHash, sharedHash].sort(),
+    )
+
+    await removeSessionCheckpoints(appDataDir, oldNativeId)
+    await assert.rejects(lstat(join(sessionsDir, `${oldNativeId}.json`)))
+    await assert.rejects(lstat(join(blobsDir, onlyOldHash)))
+    assert.equal(
+      await readFile(join(blobsDir, sharedHash), 'utf8'),
+      'shared-v0',
+    )
+
+    await removeSessionCheckpoints(appDataDir, newNativeId)
+    await assert.rejects(lstat(join(sessionsDir, `${newNativeId}.json`)))
+    assert.deepEqual(await readdir(blobsDir), [])
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('restoreGitTree rejects reverting across a directory replaced by an external symlink', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-symlink-dir-'))
+  const workDir = join(home, 'workspace')
+  const outsideDir = join(home, 'outside')
+  await mkdir(join(workDir, 'nested', 'sub'), { recursive: true })
+  await mkdir(outsideDir, { recursive: true })
+  await writeFile(join(workDir, 'base.txt'), 'base')
+  await writeFile(join(workDir, 'nested', 'sub', 'item.txt'), 'inside-v1')
+  await writeFile(join(outsideDir, 'secret.txt'), 'keep-secret')
+  const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
+  const nativeId = '88888888-8888-4888-8888-888888888888'
+
+  try {
+    await runGit(workDir, ['init'])
+    await runGit(workDir, ['config', 'user.name', 'Test'])
+    await runGit(workDir, ['config', 'user.email', 'test@example.com'])
+    await runGit(workDir, ['add', 'base.txt'])
+    await runGit(workDir, ['commit', '-m', 'init'])
+
+    const cp0 = await captureTurnFileCheckpoint(
+      appDataDir,
+      nativeId,
+      workDir,
+      -1,
+    )
+    await writeFile(join(workDir, '.gitignore'), 'nested\n')
+    await rm(join(workDir, 'nested'), { recursive: true, force: true })
+    await symlink(outsideDir, join(workDir, 'nested'))
+
+    await assert.rejects(
+      restoreSessionFileCheckpoint(appDataDir, nativeId, cp0.id),
+      /Refusing to restore file across symlink: nested\/sub\/item\.txt/,
+    )
+    assert.equal(
+      await readFile(join(outsideDir, 'secret.txt'), 'utf8'),
+      'keep-secret',
+    )
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('Failed non-USER_INPUT and zero-row turns revert files and prune error steps while keeping turnOrdinal aligned', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-nonuser-fail-'))
+  const workDir = join(home, 'workspace')
+  await mkdir(workDir, { recursive: true })
+  await writeFile(join(workDir, 'existing.txt'), 'before-v1')
+  const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
+
+  const h = await openHarness(workDir, {
+    HOME: home,
+    AGY_TEST_REVERT_DIR: workDir,
+    AGY_TEST_CHECKPOINT_HISTORY: '1',
+  })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-nu',
+      sessionId: 's-nu',
+      config: h.config,
+      history: 'replay',
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's-nu')
+
+    const t0Start = h.events.length
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's-nu',
+      prompt: {
+        clientMessageId: 'nu-t0',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'revert-seed-turn0' }],
+        },
+      },
+    })
+    await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t0Start &&
+        e.type === 'session.turn' &&
+        e.state === 'completed',
+    )
+
+    const t1Start = h.events.length
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's-nu',
+      prompt: {
+        clientMessageId: 'nu-t1',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'revert-nonuser-fail' }],
+        },
+      },
+    })
+    const perm1 = await h.wait(
+      (e) => h.events.indexOf(e) >= t1Start && e.type === 'session.permission',
+    )
+    assert(perm1.type === 'session.permission')
+    const userItem1 = await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t1Start &&
+        e.type === 'timeline.item' &&
+        e.item.type === 'user_message' &&
+        e.item.clientMessageId === 'nu-t1',
+    )
+    assert(
+      userItem1.type === 'timeline.item' &&
+        userItem1.item.type === 'user_message',
+    )
+    const token1 = userItem1.item.revertToken
+    assert(token1 !== undefined)
+    await h.provider.send({
+      type: 'session.permission',
+      sessionId: 's-nu',
+      permissionId: perm1.request.id,
+      response: { behavior: 'allow', selectedActionId: 'allow' },
+    })
+    await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t1Start &&
+        e.type === 'session.turn' &&
+        e.state === 'failed',
+    )
+    assert.equal(
+      await readFile(join(workDir, 'existing.txt'), 'utf8'),
+      'dirty-from-failed-turn',
+    )
+
+    const t2Start = h.events.length
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's-nu',
+      prompt: {
+        clientMessageId: 'nu-t2',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'revert-post-turn' }],
+        },
+      },
+    })
+    const userItem2 = await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t2Start &&
+        e.type === 'timeline.item' &&
+        e.item.type === 'user_message' &&
+        e.item.clientMessageId === 'nu-t2',
+    )
+    assert(
+      userItem2.type === 'timeline.item' &&
+        userItem2.item.type === 'user_message',
+    )
+    assert.equal(
+      (userItem2.item.revertToken as { turnOrdinal?: number }).turnOrdinal,
+      1,
+    )
+    await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t2Start &&
+        e.type === 'session.turn' &&
+        e.state === 'completed',
+    )
+
+    const rev1Start = h.events.length
+    await h.provider.send({
+      type: 'session.revert',
+      requestId: 'rev-nu-1',
+      sessionId: 's-nu',
+      scope: 'both',
+      token: token1,
+    })
+    const persist1 = await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= rev1Start && e.type === 'session.persistence',
+    )
+    assert(persist1.type === 'session.persistence')
+    const fork1Id = (persist1.persistence.data as { sessionId: string })
+      .sessionId
+    await h.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'rev-nu-1',
+    )
+    assert.equal(
+      await readFile(join(workDir, 'existing.txt'), 'utf8'),
+      'before-v1',
+    )
+
+    const db1 = new DatabaseSync(
+      join(appDataDir, 'conversations', `${fork1Id}.db`),
+      {
+        readOnly: true,
+      },
+    )
+    const stepIndices1 = (
+      db1.prepare('SELECT idx FROM steps ORDER BY idx ASC').all() as Array<{
+        idx: number
+      }>
+    ).map((r) => r.idx)
+    db1.close()
+    assert.deepEqual(stepIndices1, [0, 1])
+
+    const brainSteps1 = (
+      await readFile(
+        join(
+          appDataDir,
+          'brain',
+          fork1Id,
+          '.system_generated/logs/transcript.jsonl',
+        ),
+        'utf8',
+      )
+    )
+      .trim()
+      .split('\n')
+      .map((line) => (JSON.parse(line) as { step_index: number }).step_index)
+    assert.deepEqual(brainSteps1, [0, 1])
+
+    const t3Start = h.events.length
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's-nu',
+      prompt: {
+        clientMessageId: 'nu-t3',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'revert-zerorow-fail' }],
+        },
+      },
+    })
+    const perm3 = await h.wait(
+      (e) => h.events.indexOf(e) >= t3Start && e.type === 'session.permission',
+    )
+    assert(perm3.type === 'session.permission')
+    const userItem3 = await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t3Start &&
+        e.type === 'timeline.item' &&
+        e.item.type === 'user_message' &&
+        e.item.clientMessageId === 'nu-t3',
+    )
+    assert(
+      userItem3.type === 'timeline.item' &&
+        userItem3.item.type === 'user_message',
+    )
+    const token3 = userItem3.item.revertToken
+    assert(token3 !== undefined)
+    assert.equal((token3 as { turnOrdinal?: number }).turnOrdinal, 1)
+    await h.provider.send({
+      type: 'session.permission',
+      sessionId: 's-nu',
+      permissionId: perm3.request.id,
+      response: { behavior: 'allow', selectedActionId: 'allow' },
+    })
+    await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t3Start &&
+        e.type === 'session.turn' &&
+        e.state === 'failed',
+    )
+    assert.equal(
+      await readFile(join(workDir, 'existing.txt'), 'utf8'),
+      'dirty-zero-row',
+    )
+
+    const rev3Start = h.events.length
+    await h.provider.send({
+      type: 'session.revert',
+      requestId: 'rev-nu-3',
+      sessionId: 's-nu',
+      scope: 'both',
+      token: token3,
+    })
+    const persist3 = await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= rev3Start && e.type === 'session.persistence',
+    )
+    assert(persist3.type === 'session.persistence')
+    const fork3Id = (persist3.persistence.data as { sessionId: string })
+      .sessionId
+    await h.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'rev-nu-3',
+    )
+    assert.equal(
+      await readFile(join(workDir, 'existing.txt'), 'utf8'),
+      'before-v1',
+    )
+
+    const db3 = new DatabaseSync(
+      join(appDataDir, 'conversations', `${fork3Id}.db`),
+      {
+        readOnly: true,
+      },
+    )
+    const stepIndices3 = (
+      db3.prepare('SELECT idx FROM steps ORDER BY idx ASC').all() as Array<{
+        idx: number
+      }>
+    ).map((r) => r.idx)
+    db3.close()
+    assert.deepEqual(stepIndices3, [0, 1])
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('Revert refuses atomically before touching workspace files when runtime supports neither loadSession nor resume', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-no-reload-'))
+  const workDir = join(home, 'workspace')
+  await mkdir(workDir, { recursive: true })
+  await writeFile(join(workDir, 'existing.txt'), 'before-v1')
+  await writeFile(join(workDir, 'oldtext-only.txt'), 'from-diff')
+  const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
+
+  const h = await openHarness(workDir, {
+    HOME: home,
+    AGY_TEST_REVERT_DIR: workDir,
+    AGY_TEST_CHECKPOINT_HISTORY: '1',
+    AGY_TEST_NO_LOAD_CAP: '1',
+  })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-noload',
+      sessionId: 's-noload',
+      config: h.config,
+      history: 'replay',
+    })
+    const initOpened = await h.wait(
+      (e) => e.type === 'session.opened' && e.sessionId === 's-noload',
+    )
+    assert(initOpened.type === 'session.opened')
+    const origNativeId = (initOpened.persistence?.data as { sessionId: string })
+      .sessionId
+    await h.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 's-noload',
+    )
+
+    const t0Start = h.events.length
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's-noload',
+      prompt: {
+        clientMessageId: 'nl-t0',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'revert-seed-turn0' }],
+        },
+      },
+    })
+    await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t0Start &&
+        e.type === 'session.turn' &&
+        e.state === 'completed',
+    )
+
+    const t1Start = h.events.length
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's-noload',
+      prompt: {
+        clientMessageId: 'nl-t1',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'revert-journal-edit' }],
+        },
+      },
+    })
+    const perm1 = await h.wait(
+      (e) => h.events.indexOf(e) >= t1Start && e.type === 'session.permission',
+    )
+    assert(perm1.type === 'session.permission')
+    const userItem1 = await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t1Start &&
+        e.type === 'timeline.item' &&
+        e.item.type === 'user_message' &&
+        e.item.clientMessageId === 'nl-t1',
+    )
+    assert(
+      userItem1.type === 'timeline.item' &&
+        userItem1.item.type === 'user_message',
+    )
+    const token1 = userItem1.item.revertToken
+    assert(token1 !== undefined)
+    await h.provider.send({
+      type: 'session.permission',
+      sessionId: 's-noload',
+      permissionId: perm1.request.id,
+      response: { behavior: 'allow', selectedActionId: 'allow' },
+    })
+    await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t1Start &&
+        e.type === 'session.turn' &&
+        e.state === 'completed',
+    )
+
+    await h.provider.send({
+      type: 'session.revert',
+      requestId: 'rev-noload',
+      sessionId: 's-noload',
+      scope: 'both',
+      token: token1,
+    })
+    const err = await h.wait(
+      (e) => e.type === 'request.failed' && e.requestId === 'rev-noload',
+    )
+    assert(err.type === 'request.failed')
+    assert.match(err.error.message, /does not support session\/load/)
+
+    assert.equal(
+      await readFile(join(workDir, 'existing.txt'), 'utf8'),
+      'after-v2',
+    )
+    assert.equal(
+      await readFile(join(workDir, 'new-file.txt'), 'utf8'),
+      'created',
+    )
+    assert.deepEqual(await readdir(join(appDataDir, 'conversations')), [
+      `${origNativeId}.db`,
+    ])
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('config.persist === false revert omits session.persistence and cleans previous, forked, checkpoint, and summary artifacts on close', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-nopersist-'))
+  const workDir = join(home, 'workspace')
+  await mkdir(workDir, { recursive: true })
+  await writeFile(join(workDir, 'existing.txt'), 'before-v1')
+  await writeFile(join(workDir, 'oldtext-only.txt'), 'from-diff')
+  const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
+
+  const h = await openHarness(workDir, {
+    HOME: home,
+    AGY_TEST_REVERT_DIR: workDir,
+    AGY_TEST_CHECKPOINT_HISTORY: '1',
+  })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-np',
+      sessionId: 's-np',
+      config: { ...h.config, persist: false },
+      history: 'replay',
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's-np')
+
+    const t0Start = h.events.length
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's-np',
+      prompt: {
+        clientMessageId: 'np-t0',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'revert-seed-turn0' }],
+        },
+      },
+    })
+    await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t0Start &&
+        e.type === 'session.turn' &&
+        e.state === 'completed',
+    )
+    const convBefore = await readdir(join(appDataDir, 'conversations'))
+    assert.equal(convBefore.length, 1)
+    const oldDbName = convBefore[0]
+    const oldNativeId = oldDbName.replace(/\.db$/, '')
+
+    const t1Start = h.events.length
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's-np',
+      prompt: {
+        clientMessageId: 'np-t1',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'revert-journal-edit' }],
+        },
+      },
+    })
+    const perm1 = await h.wait(
+      (e) => h.events.indexOf(e) >= t1Start && e.type === 'session.permission',
+    )
+    assert(perm1.type === 'session.permission')
+    const userItem1 = await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t1Start &&
+        e.type === 'timeline.item' &&
+        e.item.type === 'user_message' &&
+        e.item.clientMessageId === 'np-t1',
+    )
+    assert(
+      userItem1.type === 'timeline.item' &&
+        userItem1.item.type === 'user_message',
+    )
+    const token1 = userItem1.item.revertToken
+    assert(token1 !== undefined)
+    await h.provider.send({
+      type: 'session.permission',
+      sessionId: 's-np',
+      permissionId: perm1.request.id,
+      response: { behavior: 'allow', selectedActionId: 'allow' },
+    })
+    await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t1Start &&
+        e.type === 'session.turn' &&
+        e.state === 'completed',
+    )
+
+    await h.provider.send({
+      type: 'session.revert',
+      requestId: 'rev-np',
+      sessionId: 's-np',
+      scope: 'both',
+      token: token1,
+    })
+    await h.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'rev-np',
+    )
+
+    assert.equal(
+      h.events.some(
+        (e) => e.type === 'session.persistence' && e.sessionId === 's-np',
+      ),
+      false,
+    )
+    assert.equal(
+      await readFile(join(workDir, 'existing.txt'), 'utf8'),
+      'before-v1',
+    )
+    await assert.rejects(lstat(join(workDir, 'new-file.txt')))
+
+    const convAfterRevert = await readdir(join(appDataDir, 'conversations'))
+    assert.equal(convAfterRevert.length, 1)
+    assert.notEqual(convAfterRevert[0], oldDbName)
+    const brainAfterRevert = await readdir(join(appDataDir, 'brain'))
+    assert.equal(brainAfterRevert.length, 1)
+    assert.notEqual(brainAfterRevert[0], oldNativeId)
+
+    await h.provider.send({
+      type: 'session.close',
+      requestId: 'close-np',
+      sessionId: 's-np',
+    })
+    await h.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'close-np',
+    )
+
+    assert.deepEqual(await readdir(join(appDataDir, 'conversations')), [])
+    assert.deepEqual(await readdir(join(appDataDir, 'brain')), [])
+    assert.deepEqual(
+      await readdir(join(appDataDir, 'paseo-checkpoints', 'sessions')),
+      [],
+    )
+    assert.deepEqual(
+      await readdir(join(appDataDir, 'paseo-checkpoints', 'blobs')),
+      [],
+    )
+    const sumDb = new DatabaseSync(
+      join(appDataDir, 'conversation_summaries.db'),
+      { readOnly: true },
+    )
+    const sumRows = sumDb
+      .prepare('SELECT conversation_id FROM conversation_summaries')
+      .all()
+    sumDb.close()
+    assert.deepEqual(sumRows, [])
   } finally {
     await h.provider.close()
     await rm(home, { recursive: true, force: true })
