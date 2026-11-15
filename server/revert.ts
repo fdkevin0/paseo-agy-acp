@@ -22,6 +22,7 @@ import {
   readSessionCheckpoints,
   removeSessionCheckpoints,
   restoreSessionFileCheckpoint,
+  validateSessionFileCheckpoint,
   type TurnFileCheckpoint,
 } from './checkpoints.ts'
 import {
@@ -48,7 +49,7 @@ const AgyRevertTokenSchema = z.object({
   text: z.string().optional(),
 })
 
-export type AgyRevertToken = z.infer<typeof AgyRevertTokenSchema>
+type AgyRevertToken = z.infer<typeof AgyRevertTokenSchema>
 
 const TRANSCRIPT_CHUNK_BYTES = 102_400
 
@@ -430,6 +431,43 @@ async function readConsumedMessageIds(
   return ids
 }
 
+function visitTranscriptCutoff(
+  raw: string,
+  cutoffStepIndex: number,
+  handlers: {
+    onKept: (line: string, parsed: Record<string, unknown>) => void
+    onCut?: (parsed: Record<string, unknown>) => void
+    onUnparsedKept?: (line: string) => void
+  },
+): void {
+  let truncated = false
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) continue
+    try {
+      const parsed = record(JSON.parse(line))
+      const stepIndex = num(parsed.step_index)
+      if (
+        stepIndex !== undefined &&
+        Number.isInteger(stepIndex) &&
+        stepIndex >= cutoffStepIndex
+      ) {
+        truncated = true
+        handlers.onCut?.(parsed)
+        continue
+      }
+      if (
+        truncated &&
+        (stepIndex === undefined || !Number.isInteger(stepIndex))
+      ) {
+        continue
+      }
+      handlers.onKept(line, parsed)
+    } catch {
+      if (!truncated) handlers.onUnparsedKept?.(line)
+    }
+  }
+}
+
 async function scanTranscriptState(
   brainDir: string,
   cutoffStepIndex: number,
@@ -445,46 +483,25 @@ async function scanTranscriptState(
     if (!raw) continue
     let earliest: number | undefined
     const keptWakeupDeliveriesBySender = new Map<string, number>()
-    let truncated = false
-    for (const line of raw.split(/\r?\n/)) {
-      if (!line.trim()) continue
-      try {
-        const parsed = record(JSON.parse(line))
-        const stepIndex = num(parsed.step_index)
-        if (
-          stepIndex !== undefined &&
-          Number.isInteger(stepIndex) &&
-          stepIndex >= cutoffStepIndex
-        ) {
-          truncated = true
-          const ts =
-            typeof parsed.created_at === 'string'
-              ? Date.parse(parsed.created_at)
-              : Number.NaN
-          if (
-            Number.isFinite(ts) &&
-            (earliest === undefined || ts < earliest)
-          ) {
-            earliest = ts
-          }
-          continue
+    visitTranscriptCutoff(raw, cutoffStepIndex, {
+      onCut(parsed) {
+        const ts =
+          typeof parsed.created_at === 'string'
+            ? Date.parse(parsed.created_at)
+            : Number.NaN
+        if (Number.isFinite(ts) && (earliest === undefined || ts < earliest)) {
+          earliest = ts
         }
-        if (
-          truncated &&
-          (stepIndex === undefined || !Number.isInteger(stepIndex))
-        ) {
-          continue
-        }
+      },
+      onKept(_line, parsed) {
         for (const sender of extractRowMessageSenders(parsed)) {
           keptWakeupDeliveriesBySender.set(
             sender,
             (keptWakeupDeliveriesBySender.get(sender) ?? 0) + 1,
           )
         }
-      } catch {
-        // Ignore unparseable lines while scanning cutoff state.
-      }
-    }
+      },
+    })
     return { cutoffTimestampMs: earliest, keptWakeupDeliveriesBySender }
   }
   return {
@@ -550,31 +567,14 @@ async function filterJsonlTranscript(
 ): Promise<Buffer> {
   const raw = await readFile(srcPath, 'utf8')
   const kept: string[] = []
-  let truncated = false
-  for (const line of raw.split(/\r?\n/)) {
-    if (!line.trim()) continue
-    try {
-      const parsed = JSON.parse(line) as unknown
-      const stepIndex = num(record(parsed).step_index)
-      if (
-        stepIndex !== undefined &&
-        Number.isInteger(stepIndex) &&
-        stepIndex >= cutoffStepIndex
-      ) {
-        truncated = true
-        continue
-      }
-      if (
-        truncated &&
-        (stepIndex === undefined || !Number.isInteger(stepIndex))
-      ) {
-        continue
-      }
+  visitTranscriptCutoff(raw, cutoffStepIndex, {
+    onKept(line) {
       kept.push(line)
-    } catch {
-      if (!truncated) kept.push(line)
-    }
-  }
+    },
+    onUnparsedKept(line) {
+      kept.push(line)
+    },
+  })
   const output = Buffer.from(
     kept.length > 0 ? `${kept.join('\n')}\n` : '',
     'utf8',
@@ -594,12 +594,10 @@ async function filterBrainSystemSubagents(
     if (!entry.isFile() || !entry.name.endsWith('.json')) continue
     const srcFile = join(srcDir, entry.name)
     try {
-      const raw = JSON.parse(await readFile(srcFile, 'utf8')) as Record<
-        string,
-        unknown
-      >
-      const spawnStepIndex = Number(raw.spawnStepIndex)
+      const raw = record(JSON.parse(await readFile(srcFile, 'utf8')))
+      const spawnStepIndex = num(raw.spawnStepIndex)
       if (
+        spawnStepIndex !== undefined &&
         Number.isInteger(spawnStepIndex) &&
         spawnStepIndex >= cutoffStepIndex
       ) {
@@ -1491,8 +1489,13 @@ export async function revertSession(options: {
   token: unknown
   checkpoints?: readonly TurnFileCheckpoint[]
   supportsReload?: boolean
+  deferFileRestore?: boolean
   createFreshSession: () => Promise<string>
-}): Promise<{ newNativeId?: string; cutoffStepIndex?: number }> {
+}): Promise<{
+  newNativeId?: string
+  cutoffStepIndex?: number
+  checkpointId?: string
+}> {
   const { appDataDir, nativeId, scope, createFreshSession } = options
   const parsed = parseRevertToken(options.token)
   const brainRoot = join(appDataDir, 'brain')
@@ -1537,11 +1540,12 @@ export async function revertSession(options: {
     if (!checkpointId) {
       throw new Error('No workspace file checkpoint recorded for this message')
     }
-    // Restore files before forking the conversation so a missing checkpoint leaves history intact.
-    await restoreSessionFileCheckpoint(appDataDir, nativeId, checkpointId)
+    // Validate checkpoint readability before forking so missing backups leave history and files intact.
+    await validateSessionFileCheckpoint(appDataDir, nativeId, checkpointId)
   }
 
   if (scope === 'files') {
+    await restoreSessionFileCheckpoint(appDataDir, nativeId, checkpointId!)
     return {}
   }
 
@@ -1551,7 +1555,23 @@ export async function revertSession(options: {
     cutoffStepIndex!,
     createFreshSession,
   )
-  return { newNativeId, cutoffStepIndex: cutoffStepIndex! }
+  if (scope === 'both' && !options.deferFileRestore) {
+    try {
+      await restoreSessionFileCheckpoint(appDataDir, nativeId, checkpointId!)
+    } catch (error) {
+      if (newNativeId !== nativeId) {
+        await removeForkedConversation(appDataDir, newNativeId).catch(
+          () => undefined,
+        )
+      }
+      throw error
+    }
+  }
+  return {
+    newNativeId,
+    cutoffStepIndex: cutoffStepIndex!,
+    ...(scope === 'both' && checkpointId ? { checkpointId } : {}),
+  }
 }
 
 /** Attach `revertToken` to replayed `user_message` entries aligned against Brain user steps and saved checkpoints. */

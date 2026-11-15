@@ -30,6 +30,7 @@ import {
   recordJournalToolEdit,
   removeSessionCheckpoints,
   restoreSessionFileCheckpoint,
+  validateSessionFileCheckpoint,
 } from '../server/checkpoints.ts'
 import { dataDirectory } from '../server/preflight.ts'
 import { createProvider } from '../server/provider.ts'
@@ -2430,5 +2431,355 @@ test('config.persist === false revert omits session.persistence and cleans previ
   } finally {
     await h.provider.close()
     await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('Git and Journal checkpoints restore 0o444 read-only files and ..-prefixed directories like ..env', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-ro-dotdot-'))
+  const repoDir = join(home, 'repo')
+  const journalDir = join(home, 'journal-ws')
+  const appDataDirGit = dataDirectory(undefined, { HOME: home }, repoDir)
+  const appDataDirJournal = dataDirectory(undefined, { HOME: home }, journalDir)
+  const gitNativeId = '12121212-1212-4121-8121-121212121212'
+  const journalNativeId = '34343434-3434-4343-8343-343434343434'
+
+  try {
+    await mkdir(join(repoDir, '..env'), { recursive: true })
+    await runGit(repoDir, ['init'])
+    await runGit(repoDir, ['config', 'user.name', 'Test'])
+    await runGit(repoDir, ['config', 'user.email', 'test@example.com'])
+    const gitRo = join(repoDir, 'readonly.txt')
+    const gitEnv = join(repoDir, '..env', 'secret.txt')
+    await writeFile(gitRo, 'v1')
+    await chmod(gitRo, 0o644)
+    await writeFile(gitEnv, 'env-v1')
+    await runGit(repoDir, ['add', '.'])
+    await runGit(repoDir, ['commit', '-m', 'init'])
+
+    const gitCp = await captureTurnFileCheckpoint(
+      appDataDirGit,
+      gitNativeId,
+      repoDir,
+      -1,
+    )
+    await writeFile(gitRo, 'v2')
+    await chmod(gitRo, 0o444)
+    await writeFile(gitEnv, 'env-v2')
+
+    await validateSessionFileCheckpoint(appDataDirGit, gitNativeId, gitCp.id)
+    await restoreSessionFileCheckpoint(appDataDirGit, gitNativeId, gitCp.id)
+
+    assert.equal(await readFile(gitRo, 'utf8'), 'v1')
+    assert.equal((await stat(gitRo)).mode & 0o777, 0o644)
+    assert.equal(await readFile(gitEnv, 'utf8'), 'env-v1')
+
+    await mkdir(join(journalDir, '..env'), { recursive: true })
+    const jRo = join(journalDir, 'readonly.txt')
+    const jEnv = join(journalDir, '..env', 'secret.txt')
+    await writeFile(jRo, 'j-v1')
+    await chmod(jRo, 0o644)
+    await writeFile(jEnv, 'j-env-v1')
+
+    const journalCp = await captureTurnFileCheckpoint(
+      appDataDirJournal,
+      journalNativeId,
+      journalDir,
+      -1,
+    )
+    await recordJournalToolEdit(
+      appDataDirJournal,
+      journalNativeId,
+      journalCp.id,
+      journalDir,
+      jRo,
+    )
+    await recordJournalToolEdit(
+      appDataDirJournal,
+      journalNativeId,
+      journalCp.id,
+      journalDir,
+      jEnv,
+    )
+    await writeFile(jRo, 'j-v2')
+    await chmod(jRo, 0o444)
+    await writeFile(jEnv, 'j-env-v2')
+
+    await validateSessionFileCheckpoint(
+      appDataDirJournal,
+      journalNativeId,
+      journalCp.id,
+    )
+    await restoreSessionFileCheckpoint(
+      appDataDirJournal,
+      journalNativeId,
+      journalCp.id,
+    )
+
+    assert.equal(await readFile(jRo, 'utf8'), 'j-v1')
+    assert.equal((await stat(jRo)).mode & 0o777, 0o644)
+    assert.equal(await readFile(jEnv, 'utf8'), 'j-env-v1')
+  } finally {
+    await chmod(join(repoDir, 'readonly.txt'), 0o644).catch(() => undefined)
+    await chmod(join(journalDir, 'readonly.txt'), 0o644).catch(() => undefined)
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('Revert preserves fullAccess across streamed plan config_option_update and leaves scope=both files untouched on config failure', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-plan-cfg-'))
+  const workDir = join(home, 'workspace')
+  await mkdir(workDir, { recursive: true })
+  await writeFile(join(workDir, 'existing.txt'), 'before-v1')
+  await writeFile(join(workDir, 'oldtext-only.txt'), 'from-diff')
+
+  const h = await openHarness(workDir, {
+    HOME: home,
+    AGY_TEST_REVERT_DIR: workDir,
+    AGY_TEST_CHECKPOINT_HISTORY: '1',
+    AGY_TEST_REVERT_STREAM_PLAN_CONFIG: '1',
+  })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-cfg-ok',
+      sessionId: 's-cfg-ok',
+      config: h.config,
+      history: 'replay',
+    })
+    await h.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 's-cfg-ok',
+    )
+
+    await h.provider.send({
+      type: 'session.configure',
+      requestId: 'cfg-full-ok',
+      sessionId: 's-cfg-ok',
+      changes: { mode: 'full-access' },
+    })
+    await h.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'cfg-full-ok',
+    )
+
+    const t0Start = h.events.length
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's-cfg-ok',
+      prompt: {
+        clientMessageId: 'ok-t0',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'revert-seed-turn0' }],
+        },
+      },
+    })
+    await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t0Start &&
+        e.type === 'session.turn' &&
+        e.state === 'completed',
+    )
+
+    const t1Start = h.events.length
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's-cfg-ok',
+      prompt: {
+        clientMessageId: 'ok-t1',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'revert-journal-edit' }],
+        },
+      },
+    })
+    await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t1Start &&
+        e.type === 'session.turn' &&
+        e.state === 'completed',
+    )
+    const userItem1 = h.events
+      .slice(t1Start)
+      .find(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'user_message' &&
+          e.item.clientMessageId === 'ok-t1',
+      )
+    assert(
+      userItem1?.type === 'timeline.item' &&
+        userItem1.item.type === 'user_message',
+    )
+    const token1 = userItem1.item.revertToken
+    assert(token1 !== undefined)
+    assert.equal(
+      await readFile(join(workDir, 'existing.txt'), 'utf8'),
+      'after-v2',
+    )
+
+    const revStart = h.events.length
+    await h.provider.send({
+      type: 'session.revert',
+      requestId: 'rev-cfg-ok',
+      sessionId: 's-cfg-ok',
+      scope: 'both',
+      token: token1,
+    })
+    await h.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'rev-cfg-ok',
+    )
+
+    const revConfigEvents = h.events
+      .slice(revStart)
+      .filter((e) => e.type === 'session.config')
+    assert.equal(
+      revConfigEvents.some((e) => e.config.mode === 'plan'),
+      false,
+    )
+    const finalConfig = h.events
+      .filter((e) => e.type === 'session.config')
+      .at(-1)
+    assert(finalConfig?.type === 'session.config')
+    assert.equal(finalConfig.config.mode, 'full-access')
+    assert.equal(
+      await readFile(join(workDir, 'existing.txt'), 'utf8'),
+      'before-v1',
+    )
+    await assert.rejects(lstat(join(workDir, 'new-file.txt')))
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+
+  const home2 = await mkdtemp(join(tmpdir(), 'agy-revert-both-failcfg-'))
+  const workDir2 = join(home2, 'workspace')
+  await mkdir(workDir2, { recursive: true })
+  await writeFile(join(workDir2, 'existing.txt'), 'before-v1')
+  await writeFile(join(workDir2, 'oldtext-only.txt'), 'from-diff')
+  const appDataDir2 = dataDirectory(undefined, { HOME: home2 }, workDir2)
+
+  const h2 = await openHarness(workDir2, {
+    HOME: home2,
+    AGY_TEST_REVERT_DIR: workDir2,
+    AGY_TEST_CHECKPOINT_HISTORY: '1',
+    AGY_TEST_REVERT_STREAM_PLAN_CONFIG: '1',
+    AGY_TEST_FAIL_CONFIG_ON_REVERT: '1',
+  })
+  try {
+    await h2.provider.send({
+      type: 'session.open',
+      requestId: 'open-cfg-fail',
+      sessionId: 's-cfg-fail',
+      config: h2.config,
+      history: 'replay',
+    })
+    const opened2 = await h2.wait(
+      (e) => e.type === 'session.opened' && e.sessionId === 's-cfg-fail',
+    )
+    assert(opened2.type === 'session.opened')
+    const origNativeId = (opened2.persistence?.data as { sessionId: string })
+      .sessionId
+    await h2.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 's-cfg-fail',
+    )
+
+    await h2.provider.send({
+      type: 'session.configure',
+      requestId: 'cfg-full-fail',
+      sessionId: 's-cfg-fail',
+      changes: { mode: 'full-access' },
+    })
+    await h2.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'cfg-full-fail',
+    )
+
+    const t0Start2 = h2.events.length
+    await h2.provider.send({
+      type: 'session.prompt',
+      sessionId: 's-cfg-fail',
+      prompt: {
+        clientMessageId: 'fail-t0',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'revert-seed-turn0' }],
+        },
+      },
+    })
+    await h2.wait(
+      (e) =>
+        h2.events.indexOf(e) >= t0Start2 &&
+        e.type === 'session.turn' &&
+        e.state === 'completed',
+    )
+
+    const t1Start2 = h2.events.length
+    await h2.provider.send({
+      type: 'session.prompt',
+      sessionId: 's-cfg-fail',
+      prompt: {
+        clientMessageId: 'fail-t1',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'revert-journal-edit' }],
+        },
+      },
+    })
+    await h2.wait(
+      (e) =>
+        h2.events.indexOf(e) >= t1Start2 &&
+        e.type === 'session.turn' &&
+        e.state === 'completed',
+    )
+    const userItemFail = h2.events
+      .slice(t1Start2)
+      .find(
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'user_message' &&
+          e.item.clientMessageId === 'fail-t1',
+      )
+    assert(
+      userItemFail?.type === 'timeline.item' &&
+        userItemFail.item.type === 'user_message',
+    )
+    const tokenFail = userItemFail.item.revertToken
+    assert(tokenFail !== undefined)
+
+    const revFailStart = h2.events.length
+    await h2.provider.send({
+      type: 'session.revert',
+      requestId: 'rev-cfg-fail',
+      sessionId: 's-cfg-fail',
+      scope: 'both',
+      token: tokenFail,
+    })
+    const err = await h2.wait(
+      (e) => e.type === 'request.failed' && e.requestId === 'rev-cfg-fail',
+    )
+    assert(err.type === 'request.failed')
+    assert.match(err.error.message, /simulated config failure/)
+
+    assert.deepEqual(
+      h2.events.slice(revFailStart).filter((e) => e.type === 'session.config'),
+      [],
+    )
+    assert.equal(
+      await readFile(join(workDir2, 'existing.txt'), 'utf8'),
+      'after-v2',
+    )
+    assert.equal(
+      await readFile(join(workDir2, 'new-file.txt'), 'utf8'),
+      'created',
+    )
+    assert.deepEqual(await readdir(join(appDataDir2, 'conversations')), [
+      `${origNativeId}.db`,
+    ])
+    assert.deepEqual(await readdir(join(appDataDir2, 'brain')), [origNativeId])
+  } finally {
+    await h2.provider.close()
+    await rm(home2, { recursive: true, force: true })
   }
 })

@@ -55,6 +55,7 @@ import {
   extractToolEditTargets,
   readSessionCheckpoints,
   recordJournalToolEdit,
+  restoreSessionFileCheckpoint,
 } from './checkpoints.ts'
 import { projectReplayHistory, type HistoryEntry } from './history.ts'
 import { SubagentRegistry, isSubagentMessage } from './subagents.ts'
@@ -646,6 +647,7 @@ async function createSession(
     const u = notification.update
     if (u.sessionUpdate === 'config_option_update') {
       state.metadata.configOptions = u.configOptions
+      if (state.reverting && state.loading && !state.replay) return
       if (configState({ ...state.metadata, fullAccess: false }).mode === 'plan')
         state.metadata.fullAccess = false
       publishConfig()
@@ -1302,6 +1304,7 @@ async function createSession(
             currentInitialized.agentCapabilities?.sessionCapabilities?.resume ||
             currentInitialized.agentCapabilities?.loadSession,
           ),
+          deferFileRestore: true,
           createFreshSession: async () => {
             const fresh = await currentTransport.request(
               currentTransport.rpc.newSession(sessionParams(cwd, config)),
@@ -1382,6 +1385,7 @@ async function createSession(
                 configChanged ||= applied
               }
               await drain()
+              state.metadata.fullAccess = prevFullAccess
               fallbackUsage = revertLoadedUsage
             } finally {
               state.loading = false
@@ -1389,7 +1393,20 @@ async function createSession(
               revertLoadedUsage = undefined
             }
 
-            if (configChanged) publishConfig()
+            if (scope === 'both' && result.checkpointId) {
+              await restoreSessionFileCheckpoint(
+                appDataDir,
+                previousNativeId,
+                result.checkpointId,
+              )
+            }
+            if (
+              configChanged ||
+              JSON.stringify(configState(state.metadata)) !==
+                JSON.stringify(prev)
+            ) {
+              publishConfig()
+            }
             if (
               previousNativeId &&
               previousNativeId !== state.nativeId &&

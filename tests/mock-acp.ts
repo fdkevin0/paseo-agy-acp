@@ -187,6 +187,27 @@ new AgentSideConnection((client) => {
       if (append) log(`load:${append}`)
       else if (process.env.AGY_TEST_LOG_LOAD) log('load')
       sendCommands(sessionId)
+      const isRevertPlanStream = Boolean(
+        process.env.AGY_TEST_REVERT_STREAM_PLAN_CONFIG &&
+        initialSessionId &&
+        sessionId !== initialSessionId,
+      )
+      const loadConfigOptions = isRevertPlanStream
+        ? configOptions.map((o) =>
+            o.id === 'mode' ? { ...o, currentValue: 'plan' } : o,
+          )
+        : process.env.AGY_TEST_LOAD_USAGE
+          ? configOptions.filter((o) => o.id !== 'thought_level')
+          : configOptions
+      if (isRevertPlanStream) {
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'config_option_update',
+            configOptions: loadConfigOptions,
+          },
+        })
+      }
       if (process.env.AGY_TEST_CHECKPOINT_HISTORY) {
         const transcriptPath = join(
           process.env.HOME!,
@@ -219,7 +240,7 @@ new AgentSideConnection((client) => {
             })
           }
         }
-        return { configOptions }
+        return { configOptions: loadConfigOptions }
       }
       await client.sessionUpdate({
         sessionId,
@@ -256,9 +277,7 @@ new AgentSideConnection((client) => {
         })
       }
       return {
-        configOptions: process.env.AGY_TEST_LOAD_USAGE
-          ? configOptions.filter((o) => o.id !== 'thought_level')
-          : configOptions,
+        configOptions: loadConfigOptions,
       }
     },
     async resumeSession({ sessionId, _meta }) {

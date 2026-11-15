@@ -11,7 +11,9 @@ import {
   realpath,
   rename,
   rm,
+  stat,
   symlink,
+  utimes,
   writeFile,
 } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
@@ -33,7 +35,7 @@ const JournalFileSnapshotSchema = z.discriminatedUnion('existed', [
   z.object({ existed: z.literal(false) }),
   z.object({
     existed: z.literal(true),
-    blobSha256: z.string(),
+    blobSha256: z.string().regex(/^[a-f0-9]{64}$/),
     mode: z.number().int().optional(),
   }),
 ])
@@ -154,7 +156,8 @@ async function assertNoSymlinkEscape(
   targetPath: string,
 ): Promise<boolean> {
   const rel = relative(root, targetPath)
-  if (rel.startsWith('..') || isAbsolute(rel)) return false
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel))
+    return false
   if (!rel) return true
   const parts = rel.split(sep).filter(Boolean)
   let current = root
@@ -333,10 +336,14 @@ async function captureGitTree(
   let lastError: unknown
   try {
     for (let attempt = 0; attempt < 128; attempt++) {
-      // Seed tempIndex with a copy of the real git index so `git add -A` skips clean tracked files via stat cache.
-      await copyFile(join(realGitDir, 'index'), tempIndex).catch(
-        () => undefined,
-      )
+      // Seed tempIndex with the real git index while preserving its mtime so Git's racy-index check still re-hashes same-second edits.
+      const srcIndex = join(realGitDir, 'index')
+      const indexStat = await stat(srcIndex).catch(() => null)
+      if (indexStat) {
+        await copyFile(srcIndex, tempIndex)
+          .then(() => utimes(tempIndex, indexStat.atime, indexStat.mtime))
+          .catch(() => rm(tempIndex, { force: true }).catch(() => undefined))
+      }
       const addArgs =
         excluded.length > 0
           ? [
@@ -426,14 +433,18 @@ function parseNullDiffTree(buf: Buffer): DiffEntry[] {
   return entries
 }
 
-async function restoreGitTree(
+async function validateGitCheckpoint(
   appDataDir: string,
   checkpoint: Extract<TurnFileCheckpoint, { kind: 'git' }>,
-): Promise<void> {
-  const { repoRoot, treeHash: targetTreeHash } = checkpoint
-  const resolvedRoot = await realpath(repoRoot)
-  const git = await resolveGitRepo(resolvedRoot)
-  if (!git) {
+): Promise<{
+  resolvedRoot: string
+  git: { repoRoot: string; gitDir: string; commonDir: string }
+  shadowDir: string
+}> {
+  const { repoRoot, treeHash } = checkpoint
+  const resolvedRoot = await realpath(repoRoot).catch(() => null)
+  const git = resolvedRoot ? await resolveGitRepo(resolvedRoot) : null
+  if (!resolvedRoot || !git) {
     throw new Error(`Git repository is no longer available at ${repoRoot}`)
   }
   const shadowDir = await ensureShadowGitRepo(
@@ -441,6 +452,23 @@ async function restoreGitTree(
     resolvedRoot,
     git.gitDir,
     git.commonDir,
+  )
+  await execFileAsync(
+    'git',
+    [`--git-dir=${shadowDir}`, 'cat-file', '-e', `${treeHash}^{tree}`],
+    { cwd: resolvedRoot, timeout: GIT_TIMEOUT_MS },
+  )
+  return { resolvedRoot, git, shadowDir }
+}
+
+async function restoreGitTree(
+  appDataDir: string,
+  checkpoint: Extract<TurnFileCheckpoint, { kind: 'git' }>,
+): Promise<void> {
+  const { treeHash: targetTreeHash } = checkpoint
+  const { resolvedRoot, git, shadowDir } = await validateGitCheckpoint(
+    appDataDir,
+    checkpoint,
   )
   const current = await captureGitTree(resolvedRoot, shadowDir, git.gitDir)
   const baselineUnborn = new Set(checkpoint.unbornDirs ?? [])
@@ -517,9 +545,7 @@ async function restoreGitTree(
       await symlink(blob.toString('utf8'), absPath)
       continue
     }
-    if (currentStat?.isSymbolicLink() || currentStat?.isDirectory()) {
-      await removeExistingEntry(absPath, currentStat)
-    }
+    await removeExistingEntry(absPath, currentStat)
     await writeFile(absPath, blob)
     await chmod(absPath, entry.modeOld === '100755' ? 0o755 : 0o644)
   }
@@ -787,11 +813,18 @@ export async function recordJournalToolEdit(
   }
 }
 
-/** Restore the workspace to the state recorded by `checkpointId`. */
-export async function restoreSessionFileCheckpoint(
+async function withCheckpointPlan(
   appDataDir: string,
   nativeId: string,
   checkpointId: string,
+  handlers: {
+    onGit: (cp: Extract<TurnFileCheckpoint, { kind: 'git' }>) => Promise<void>
+    onJournalEntry: (
+      resolvedRoot: string,
+      absPath: string,
+      snap: JournalFileSnapshot,
+    ) => Promise<void>
+  },
 ): Promise<void> {
   assertSafeNativeId(nativeId)
   await queueSessionOp(nativeId, async () => {
@@ -802,7 +835,7 @@ export async function restoreSessionFileCheckpoint(
     }
     const target = checkpoints[idx]
     if (target.kind === 'git') {
-      await restoreGitTree(appDataDir, target)
+      await handlers.onGit(target)
       return
     }
     const earliestPostGitIdx = checkpoints.findIndex(
@@ -818,9 +851,7 @@ export async function restoreSessionFileCheckpoint(
     }
     if (earliestPostGitIdx >= 0) {
       const firstGit = checkpoints[earliestPostGitIdx]
-      if (firstGit.kind === 'git') {
-        await restoreGitTree(appDataDir, firstGit)
-      }
+      if (firstGit.kind === 'git') await handlers.onGit(firstGit)
     }
     const postGitEnd =
       earliestPostGitIdx >= 0 ? earliestPostGitIdx : checkpoints.length
@@ -831,31 +862,65 @@ export async function restoreSessionFileCheckpoint(
       const cp = checkpoints[i]
       if (cp.kind !== 'journal') continue
       for (const [absPath, snap] of Object.entries(cp.edits)) {
-        const contained = resolveContainedPath(resolvedRoot, absPath)
-        if (!contained) continue
-        if (!(await assertNoSymlinkEscape(resolvedRoot, dirname(contained)))) {
-          throw new Error(`Refusing to restore file across symlink: ${absPath}`)
-        }
-        const existingStat = await lstat(contained).catch(() => null)
-        if (!snap.existed) {
-          await removeExistingEntry(contained, existingStat)
-          await pruneEmptyParents(dirname(contained), resolvedRoot)
-          continue
-        }
-        const blobPath = join(blobsDir(appDataDir), snap.blobSha256)
-        const data = await readFile(blobPath)
-        await mkdir(dirname(contained), { recursive: true })
-        if (!(await assertNoSymlinkEscape(resolvedRoot, dirname(contained)))) {
-          throw new Error(`Refusing to restore file across symlink: ${absPath}`)
-        }
-        const leafStat = await lstat(contained).catch(() => null)
-        if (leafStat?.isSymbolicLink() || leafStat?.isDirectory()) {
-          await removeExistingEntry(contained, leafStat)
-        }
-        await writeFile(contained, data)
-        if (snap.mode !== undefined) await chmod(contained, snap.mode)
+        await handlers.onJournalEntry(resolvedRoot, absPath, snap)
       }
     }
+  })
+}
+
+/** Verify that `checkpointId` exists and its backing Git tree or journal blobs can be restored without mutating workspace files. */
+export async function validateSessionFileCheckpoint(
+  appDataDir: string,
+  nativeId: string,
+  checkpointId: string,
+): Promise<void> {
+  await withCheckpointPlan(appDataDir, nativeId, checkpointId, {
+    onGit: async (cp) => {
+      await validateGitCheckpoint(appDataDir, cp)
+    },
+    onJournalEntry: async (resolvedRoot, absPath, snap) => {
+      if (!resolveContainedPath(resolvedRoot, absPath) || !snap.existed) return
+      await lstat(join(blobsDir(appDataDir), snap.blobSha256))
+    },
+  })
+}
+
+/** Restore the workspace to the state recorded by `checkpointId`. */
+export async function restoreSessionFileCheckpoint(
+  appDataDir: string,
+  nativeId: string,
+  checkpointId: string,
+): Promise<void> {
+  await withCheckpointPlan(appDataDir, nativeId, checkpointId, {
+    onGit: (cp) => restoreGitTree(appDataDir, cp),
+    onJournalEntry: async (resolvedRoot, absPath, snap) => {
+      const contained = resolveContainedPath(resolvedRoot, absPath)
+      if (!contained) return
+      if (!(await assertNoSymlinkEscape(resolvedRoot, dirname(contained)))) {
+        throw new Error(`Refusing to restore file across symlink: ${absPath}`)
+      }
+      const existingStat = await lstat(contained).catch(() => null)
+      if (!snap.existed) {
+        await removeExistingEntry(contained, existingStat)
+        await pruneEmptyParents(dirname(contained), resolvedRoot)
+        return
+      }
+      const blobPath = join(blobsDir(appDataDir), snap.blobSha256)
+      const data = await readFile(blobPath)
+      await mkdir(dirname(contained), { recursive: true })
+      if (!(await assertNoSymlinkEscape(resolvedRoot, dirname(contained)))) {
+        throw new Error(`Refusing to restore file across symlink: ${absPath}`)
+      }
+      const leafStat = await lstat(contained).catch(() => null)
+      const fallbackMode =
+        !leafStat?.isSymbolicLink() && leafStat?.isFile()
+          ? leafStat.mode & 0o777
+          : undefined
+      await removeExistingEntry(contained, leafStat)
+      await writeFile(contained, data)
+      const finalMode = snap.mode ?? fallbackMode
+      if (finalMode !== undefined) await chmod(contained, finalMode)
+    },
   })
 }
 
