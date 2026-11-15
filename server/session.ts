@@ -48,9 +48,22 @@ import {
   type ForegroundAcpSegment,
 } from './brain.ts'
 import { readLatestStepUsage } from './brain-io.ts'
+import {
+  captureTurnFileCheckpoint,
+  extractToolEditTargets,
+  readSessionCheckpoints,
+  recordJournalToolEdit,
+} from './checkpoints.ts'
 import { projectReplayHistory, type HistoryEntry } from './history.ts'
 import { SubagentRegistry, isSubagentMessage } from './subagents.ts'
 import { dataDirectory, removeSessionArtifacts } from './preflight.ts'
+import {
+  attachReplayRevertTokens,
+  extractUserStepRows,
+  makeRevertToken,
+  revertSession,
+  type RevertScope,
+} from './revert.ts'
 import { connectAcp } from './transport.ts'
 import {
   PACKAGE_VERSION,
@@ -245,10 +258,19 @@ export class SessionManager {
           if (session.state.replay) {
             await session.replayTools()
           } else {
-            session.state.lastKnownStepIndex = await readLastStepIndex(
-              session.brainRoot,
-              session.state.nativeId,
-            ).catch(() => -1)
+            const [lastStep, existingRows] = await Promise.all([
+              readLastStepIndex(
+                session.brainRoot,
+                session.state.nativeId,
+              ).catch(() => -1),
+              readTranscriptRows(
+                session.brainRoot,
+                session.state.nativeId,
+              ).catch(() => [] as Record<string, unknown>[]),
+            ])
+            session.state.lastKnownStepIndex = lastStep
+            session.state.userTurnCount =
+              extractUserStepRows(existingRows).length
           }
         }
         session.state.turnToolCallIds = []
@@ -342,7 +364,30 @@ export class SessionManager {
     }
     if (input.type === 'session.configure')
       await configureSession(session, input.changes)
-    else if (input.type === 'session.interrupt') {
+    else if (input.type === 'session.revert') {
+      const scope = input.scope
+      const requiredCap = `session.revert.${scope}` as const
+      if (!this.options.capabilities.includes(requiredCap)) {
+        throw new Error(`Unsupported operation: ${requiredCap}`)
+      }
+      if (session.state.closing || session.state.failed)
+        throw new Error('Session is closed')
+      if (session.state.opening || session.state.loading)
+        throw new Error('Session is still opening')
+      if (session.state.turn || session.state.interrupting)
+        throw new Error('Cannot revert while a turn is active')
+      const result = await session.revert(scope, input.token)
+      if (scope !== 'files' && result.newNativeId) {
+        emit({
+          type: 'session.persistence',
+          sessionId: session.id,
+          persistence: {
+            version: 1,
+            data: { sessionId: result.newNativeId },
+          },
+        })
+      }
+    } else if (input.type === 'session.interrupt') {
       await session.interrupt()
     } else if (input.type === 'session.can_stop_runtime') {
       emit({
@@ -352,7 +397,10 @@ export class SessionManager {
         canStop: await session.canStop(),
       })
       return
-    } else throw new Error(`Unsupported operation: ${input.type}`)
+    } else {
+      const unsupported: { type: string } = input
+      throw new Error(`Unsupported operation: ${unsupported.type}`)
+    }
     emit({ type: 'request.completed', requestId: input.requestId })
   }
 
@@ -384,7 +432,17 @@ async function createSession(
   const { launch, capabilities, emit } = options
   const permissions = new Map<string, PendingPermission>()
   const timeline = new Timeline(id)
-  const brainRoot = join(dataDirectory(launch, config?.env, cwd), 'brain')
+  const appDataDir = dataDirectory(launch, config?.env, cwd)
+  const brainRoot = join(appDataDir, 'brain')
+  const supportsRevertAny = capabilities.some(
+    (c) =>
+      c === 'session.revert.conversation' ||
+      c === 'session.revert.files' ||
+      c === 'session.revert.both',
+  )
+  const supportsRevertFiles = capabilities.some(
+    (c) => c === 'session.revert.files' || c === 'session.revert.both',
+  )
   const state = {
     nativeId: '',
     opened: false,
@@ -414,6 +472,10 @@ async function createSession(
     turnForegroundAcp: [] as ForegroundAcpSegment[],
     deniedToolCallIds: new Set<string>(),
     lastKnownStepIndex: -1,
+    activeCheckpoint: undefined as
+      { id: string; kind: 'git' | 'journal' } | undefined,
+    pendingJournalEdits: [] as Promise<void>[],
+    userTurnCount: 0,
     wakeup: {
       pendingReplay: false,
       suppressEcho: false,
@@ -670,6 +732,13 @@ async function createSession(
           u.sessionUpdate === 'tool_call')
       )
         state.turnHadModelOutput = true
+      if (
+        !state.loading &&
+        (u.sessionUpdate === 'tool_call' ||
+          u.sessionUpdate === 'tool_call_update')
+      ) {
+        trackJournalEdit(u, u.status === 'completed' || u.status === 'failed')
+      }
       // Timeline.update already tracks the ACP item.
       const item = timeline.update(u, state.deniedToolCallIds)
       if (item) {
@@ -718,6 +787,36 @@ async function createSession(
         } else publishItem(item)
       }
     }
+  }
+  function trackJournalEdit(
+    toolObj: unknown,
+    toolCompleted: boolean,
+  ): Promise<void> {
+    const active = state.activeCheckpoint
+    if (!active || active.kind !== 'journal' || !state.nativeId) {
+      return Promise.resolve()
+    }
+    const raw = record(toolObj)
+    const toolCallId =
+      typeof raw.toolCallId === 'string' && raw.toolCallId
+        ? raw.toolCallId
+        : undefined
+    const targets = extractToolEditTargets(raw)
+    if (targets.length === 0) return Promise.resolve()
+    const pending = Promise.all(
+      targets.map((target) =>
+        recordJournalToolEdit(
+          appDataDir,
+          state.nativeId,
+          active.id,
+          cwd,
+          target.filePath,
+          { oldText: target.oldText, toolCompleted, toolCallId },
+        ).catch(() => undefined),
+      ),
+    ).then(() => undefined)
+    state.pendingJournalEdits.push(pending)
+    return pending
   }
   function publishConfig() {
     if (!state.opened || state.closing || state.failed || state.silenced) return
@@ -863,7 +962,7 @@ async function createSession(
         pending.entry.questions,
       )
     },
-    requestPermission: (request: RequestPermissionRequest) => {
+    requestPermission: async (request: RequestPermissionRequest) => {
       const parsed = RequestPermissionRequestSchema.safeParse(request)
       if (
         !parsed.success ||
@@ -873,14 +972,18 @@ async function createSession(
         state.closing ||
         state.failed
       )
-        return Promise.resolve({ outcome: { outcome: 'cancelled' as const } })
+        return { outcome: { outcome: 'cancelled' as const } }
       const input = z
         .record(z.string(), z.json())
         .safeParse(record(request.toolCall?.rawInput))
-      if (!input.success)
-        return Promise.resolve({ outcome: { outcome: 'cancelled' as const } })
+      if (!input.success) return { outcome: { outcome: 'cancelled' as const } }
       const detail = toolDetail(request.toolCall)
       const kind = permissionKind(request, detail)
+      // Persist pre-edit journal snapshot before granting or even asking permission.
+      await trackJournalEdit(request.toolCall, false)
+      if (!state.turn || state.closing || state.failed) {
+        return { outcome: { outcome: 'cancelled' as const } }
+      }
       const preapproved = isPreapprovedMcpTool(
         request.toolCall.title,
         input.data,
@@ -889,11 +992,11 @@ async function createSession(
       if (kind !== 'question' && (state.metadata.fullAccess || preapproved)) {
         const allow = pickPermissionOption(request.options, 'allow')
         if (!allow) state.deniedToolCallIds.add(request.toolCall.toolCallId)
-        return Promise.resolve({
+        return {
           outcome: allow
             ? { outcome: 'selected' as const, optionId: allow.optionId }
             : { outcome: 'cancelled' as const },
-        })
+        }
       }
       return new Promise<RequestPermissionResponse>((resolve) => {
         const permissionId = randomUUID()
@@ -1057,7 +1160,10 @@ async function createSession(
       id,
       cwd,
       config,
+      appDataDir,
       brainRoot,
+      supportsRevertAny,
+      supportsRevertFiles,
       stallTimeoutMs: options.stallTimeoutMs,
       retryTimeoutMs: options.retryTimeoutMs,
       state,
@@ -1121,10 +1227,13 @@ async function createSession(
       },
       async replayTools() {
         if (!state.replay) return
-        const [inbox, subagentRecords, rows] = await Promise.all([
+        const [inbox, subagentRecords, rows, checkpoints] = await Promise.all([
           readInboxState(brainRoot, state.nativeId),
           readSubagents(brainRoot, state.nativeId),
           readTranscriptRows(brainRoot, state.nativeId),
+          supportsRevertAny
+            ? readSessionCheckpoints(appDataDir, state.nativeId)
+            : Promise.resolve([]),
         ])
         subagents.rememberSubagents(subagentRecords)
         // Drain ACP session/load notifications first so turnToolCallIds and acpToolSnapshots are complete;
@@ -1141,9 +1250,13 @@ async function createSession(
           acpToolSnapshots,
           acpResultProvided,
         })
+        state.userTurnCount = extractUserStepRows(rows).length
+        const decoratedEntries = supportsRevertAny
+          ? attachReplayRevertTokens(entries, rows, checkpoints)
+          : entries
         if (lastKnownStepIndex > state.lastKnownStepIndex)
           state.lastKnownStepIndex = lastKnownStepIndex
-        for (const { item, timestamp } of entries) {
+        for (const { item, timestamp } of decoratedEntries) {
           await subagents.waitCurrentReady()
           emitItem(item, timestamp)
         }
@@ -1152,6 +1265,39 @@ async function createSession(
         // A child opened by the last replayed tool must read its history before a historical kill cancels it.
         await subagents.waitNestedReady()
         await subagents.syncKilledChildren(subagentRecords)
+      },
+      async revert(scope: RevertScope, token: unknown) {
+        const checkpoints = await readSessionCheckpoints(
+          appDataDir,
+          state.nativeId,
+        )
+        const result = await revertSession({
+          appDataDir,
+          nativeId: state.nativeId,
+          scope,
+          token,
+          checkpoints,
+          createFreshSession: async () => {
+            const fresh = await currentTransport.request(
+              currentTransport.rpc.newSession(sessionParams(cwd, config)),
+            )
+            return fresh.sessionId
+          },
+        })
+        if (scope !== 'files' && result.newNativeId) {
+          state.nativeId = result.newNativeId
+          state.persisted = true
+          state.lastKnownStepIndex =
+            result.cutoffStepIndex !== undefined && result.cutoffStepIndex > 0
+              ? result.cutoffStepIndex - 1
+              : -1
+          const nextRows = await readTranscriptRows(
+            brainRoot,
+            state.nativeId,
+          ).catch(() => [] as Record<string, unknown>[])
+          state.userTurnCount = extractUserStepRows(nextRows).length
+        }
+        return result
       },
       async canStop(): Promise<boolean> {
         if (
@@ -1499,16 +1645,68 @@ async function promptSession(
   session.state.wakeup.pendingReplay = false
   session.state.prompts.add(p.clientMessageId)
   session.timeline.boundary()
+  const turnOrdinal = session.state.userTurnCount++
+  const userText = blocks
+    .map((c) => (c.type === 'text' ? c.text : '[image]'))
+    .join('\n')
+  const nativeId = session.state.nativeId
+  let minStepIndex: number | undefined
+  let checkpointId: string | undefined
+  try {
+    const readStep = await readLastStepIndex(session.brainRoot, nativeId).catch(
+      () => -1,
+    )
+    minStepIndex = Math.max(session.state.lastKnownStepIndex, readStep)
+    session.state.lastKnownStepIndex = minStepIndex
+    if (session.supportsRevertFiles) {
+      const checkpoint = await captureTurnFileCheckpoint(
+        session.appDataDir,
+        nativeId,
+        session.cwd,
+        minStepIndex,
+      ).catch(() => undefined)
+      if (checkpoint) {
+        checkpointId = checkpoint.id
+        session.state.activeCheckpoint = {
+          id: checkpoint.id,
+          kind: checkpoint.kind,
+        }
+      }
+    }
+    turnAbort.signal.throwIfAborted()
+  } catch (error) {
+    if (
+      session.state.turn === turnId &&
+      session.state.turnAbort === turnAbort
+    ) {
+      session.state.activeCheckpoint = undefined
+      session.state.pendingJournalEdits.length = 0
+      session.state.turnAbort = null
+      session.state.turn = ''
+      session.state.wakeup.suppressEcho = false
+      session.state.prompts.delete(p.clientMessageId)
+      session.state.userTurnCount = Math.max(0, session.state.userTurnCount - 1)
+    }
+    throw error
+  }
+  const revertToken = session.supportsRevertAny
+    ? makeRevertToken({
+        clientMessageId: p.clientMessageId,
+        afterStepIndex: minStepIndex,
+        turnOrdinal,
+        checkpointId,
+        text: userText,
+      })
+    : undefined
   emit({
     type: 'timeline.item',
     sessionId: session.id,
     item: {
       type: 'user_message',
       id: `${session.id}:user:${p.clientMessageId}`,
-      text: blocks
-        .map((c) => (c.type === 'text' ? c.text : '[image]'))
-        .join('\n'),
+      text: userText,
       clientMessageId: p.clientMessageId,
+      ...(revertToken !== undefined ? { revertToken } : {}),
     },
   })
   emit({
@@ -1523,8 +1721,6 @@ async function promptSession(
     turnId,
     state: 'started',
   })
-  const nativeId = session.state.nativeId
-  let minStepIndex: number | undefined
   let observation: BrainTurnObservation | undefined
   let observationTransport = session.transport
   let continuationActive = false
@@ -1590,6 +1786,29 @@ async function promptSession(
     session.transport === observationTransport
   const stopObservation = () => observation?.stop()
   turnAbort.signal.addEventListener('abort', stopObservation, { once: true })
+  const disposeTurnWork = async () => {
+    turnAbort.signal.removeEventListener('abort', stopObservation)
+    await observation?.dispose()
+    await Promise.allSettled(session.state.pendingJournalEdits.splice(0))
+  }
+  const resetTurnState = () => {
+    if (
+      session.state.turn === turnId &&
+      session.state.turnAbort === turnAbort
+    ) {
+      session.state.activeCheckpoint = undefined
+      session.state.observation = null
+      session.state.wakeup.suppressEcho = false
+      session.state.inSettle = false
+      session.state.handledElicitations = []
+      session.state.suppressContinuationAcp = false
+      session.state.preStagedQuestion = undefined
+      session.state.turnAbort = null
+      session.state.turn = ''
+      session.timeline.boundary()
+      session.cancelPermissions()
+    }
+  }
   const waitPrompt = async (
     operation: ReturnType<typeof session.transport.rpc.prompt>,
   ) => {
@@ -1664,18 +1883,12 @@ async function promptSession(
       return snapshot?.lastStepUsage ?? observed
     })())
   try {
-    const readStep = await readLastStepIndex(
-      session.brainRoot,
-      session.state.nativeId,
-    ).catch(() => -1)
-    minStepIndex = Math.max(session.state.lastKnownStepIndex, readStep)
-    session.state.lastKnownStepIndex = minStepIndex
     turnAbort.signal.throwIfAborted()
     observation = new BrainTurnObservation(
       session.brainRoot,
       nativeId,
       session.id,
-      minStepIndex,
+      minStepIndex ?? session.state.lastKnownStepIndex,
       {
         isCurrent,
         onUsage: (usage) => {
@@ -1891,7 +2104,9 @@ async function promptSession(
       } else turnAbort.signal.throwIfAborted()
     }
     settleTurnUsageAndWakeup(false)
+    await disposeTurnWork()
     session.finishTurnOnce(turnId, status, turnError)
+    resetTurnState()
   } catch (error) {
     const restartError = session.state.closing
       ? undefined
@@ -1913,24 +2128,11 @@ async function promptSession(
         ? 'canceled'
         : 'failed'
     const message = formatErrorMessage(turnError)
+    await disposeTurnWork()
     session.finishTurnOnce(turnId, status, message)
+    resetTurnState()
   } finally {
-    turnAbort.signal.removeEventListener('abort', stopObservation)
-    await observation?.dispose()
-    if (
-      session.state.turn === turnId &&
-      session.state.turnAbort === turnAbort
-    ) {
-      session.state.observation = null
-      session.state.wakeup.suppressEcho = false
-      session.state.inSettle = false
-      session.state.handledElicitations = []
-      session.state.suppressContinuationAcp = false
-      session.state.preStagedQuestion = undefined
-      session.state.turnAbort = null
-      session.state.turn = ''
-      session.timeline.boundary()
-      session.cancelPermissions()
-    }
+    await disposeTurnWork()
+    resetTurnState()
   }
 }

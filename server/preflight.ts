@@ -9,6 +9,7 @@ import type {
   ProviderLaunch,
   ProviderStatus,
 } from '@getpaseo/plugin/server/provider'
+import { removeSessionCheckpoints } from './checkpoints.ts'
 import { formatErrorMessage, sessionIdPattern, setBounded } from './common.ts'
 
 const STATUS_CACHE_LIMIT = 100
@@ -153,4 +154,5 @@ export async function removeSessionArtifacts(
       await rm(path, { recursive: stat.isDirectory(), force: true })
     }
   }
+  await removeSessionCheckpoints(appData, sessionId)
 }
