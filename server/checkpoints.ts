@@ -7,6 +7,7 @@ import {
   lstat,
   mkdir,
   readFile,
+  readlink,
   realpath,
   rename,
   rm,
@@ -48,6 +49,7 @@ const TurnFileCheckpointSchema = z.object({
   repoRoot: z.string(),
   treeHash: z.string().regex(/^[a-f0-9]{40,64}$/i),
   unbornDirs: z.array(z.string()).optional(),
+  forceTrackedPaths: z.array(z.string()).optional(),
   createdAt: z.string(),
 })
 
@@ -260,30 +262,12 @@ async function removeShadowIndexCache(shadowDir: string): Promise<void> {
   await Promise.all([
     rm(join(shadowDir, 'index'), { force: true }),
     rm(join(shadowDir, 'real-index-stamp'), { force: true }),
-    rm(join(shadowDir, 'force-tracked.json'), { force: true }),
   ])
-}
-
-function parseForceTrackedList(raw: string | null): string[] | null {
-  if (raw === null) return null
-  try {
-    const parsed: unknown = JSON.parse(raw)
-    if (
-      Array.isArray(parsed) &&
-      parsed.every((item) => typeof item === 'string')
-    ) {
-      return parsed
-    }
-  } catch {
-    return null
-  }
-  return null
 }
 
 async function ensureShadowGitRepo(
   appDataDir: string,
   repoRoot: string,
-  realGitDir: string,
   commonGitDir: string,
 ): Promise<string> {
   const shadowDir = shadowGitDirForRepo(appDataDir, repoRoot)
@@ -316,31 +300,17 @@ async function ensureShadowGitRepo(
     const resolvedCommon = await realpath(commonGitDir).catch(
       () => commonGitDir,
     )
-    const resolvedReal = await realpath(realGitDir).catch(() => realGitDir)
-    const excludeCandidates =
-      resolvedCommon === resolvedReal
-        ? [join(resolvedCommon, 'info', 'exclude')]
-        : [
-            join(resolvedCommon, 'info', 'exclude'),
-            join(resolvedReal, 'info', 'exclude'),
-          ]
-    const excludeParts: string[] = []
-    for (const srcExclude of excludeCandidates) {
-      try {
-        const excludeInfo = await lstat(srcExclude)
-        if (!excludeInfo.isSymbolicLink() && excludeInfo.isFile()) {
-          excludeParts.push(await readFile(srcExclude, 'utf8'))
-        }
-      } catch (error) {
-        if (!isMissingError(error)) throw error
+    const srcExclude = join(resolvedCommon, 'info', 'exclude')
+    let expectedExclude: string | null = null
+    try {
+      const excludeInfo = await lstat(srcExclude)
+      if (!excludeInfo.isSymbolicLink() && excludeInfo.isFile()) {
+        const content = await readFile(srcExclude, 'utf8')
+        expectedExclude = content.endsWith('\n') ? content : `${content}\n`
       }
+    } catch (error) {
+      if (!isMissingError(error)) throw error
     }
-    const expectedExclude =
-      excludeParts.length > 0
-        ? excludeParts
-            .map((part) => (part.endsWith('\n') ? part : `${part}\n`))
-            .join('')
-        : null
     const excludeChanged = await syncTextFile(
       join(shadowDir, 'info', 'exclude'),
       expectedExclude,
@@ -366,11 +336,56 @@ function parseUnbornGitPaths(error: unknown): string[] {
   return paths
 }
 
+async function addForceTrackedPaths(
+  repoRoot: string,
+  excluded: readonly string[],
+  forceTrackedPaths: readonly string[],
+  configFlags: readonly string[],
+  env: NodeJS.ProcessEnv,
+): Promise<void> {
+  if (forceTrackedPaths.length === 0) return
+  const presentPaths: string[] = []
+  for (const relPath of forceTrackedPaths) {
+    if (
+      excluded.some((dir) => relPath === dir || relPath.startsWith(`${dir}/`))
+    ) {
+      continue
+    }
+    const abs = resolveContainedPath(repoRoot, relPath)
+    if (!abs || !(await assertNoSymlinkEscape(repoRoot, dirname(abs)))) {
+      continue
+    }
+    if (await lstat(abs).catch(() => null)) {
+      presentPaths.push(relPath)
+    }
+  }
+  const excludedArgs = excluded.map((dir) => `:(top,exclude,literal)${dir}`)
+  for (let i = 0; i < presentPaths.length; i += 256) {
+    const batch = presentPaths
+      .slice(i, i + 256)
+      .map((relPath) => `:(top,literal)${relPath}`)
+    await execFileAsync(
+      'git',
+      [...configFlags, 'add', '-f', '--', ...batch, ...excludedArgs],
+      {
+        cwd: repoRoot,
+        env,
+        encoding: 'utf8',
+        timeout: GIT_TIMEOUT_MS,
+      },
+    )
+  }
+}
+
 async function captureGitTree(
   repoRoot: string,
   shadowDir: string,
   realGitDir: string,
-): Promise<{ treeHash: string; unbornDirs: string[] }> {
+): Promise<{
+  treeHash: string
+  unbornDirs: string[]
+  forceTrackedPaths: string[]
+}> {
   return await queueSessionOp(`shadow:${shadowDir}`, async () => {
     const tempIndex = join(shadowDir, `tmp-index-${randomUUID()}`)
     const env = gitEnv({
@@ -383,21 +398,13 @@ async function captureGitTree(
     const realStamp = realStat ? `${realStat.mtimeMs}:${realStat.size}` : 'none'
     const shadowIndex = join(shadowDir, 'index')
     const stampPath = join(shadowDir, 'real-index-stamp')
-    const forceTrackedPath = join(shadowDir, 'force-tracked.json')
     const shadowStat = await stat(shadowIndex).catch(() => null)
     const savedStamp = await readFile(stampPath, 'utf8').catch(() => null)
-    const savedForceTracked = parseForceTrackedList(
-      await readFile(forceTrackedPath, 'utf8').catch(() => null),
-    )
-    const reuseShadowIndex = Boolean(
-      shadowStat && savedStamp === realStamp && savedForceTracked !== null,
-    )
+    const reuseShadowIndex = Boolean(shadowStat && savedStamp === realStamp)
     const seedPath = reuseShadowIndex ? shadowIndex : srcRealIndex
     const seedStat = reuseShadowIndex ? shadowStat : realStat
-    let forceTrackedPaths: string[]
-    if (reuseShadowIndex) {
-      forceTrackedPaths = savedForceTracked!
-    } else if (realStat) {
+    let forceTrackedPaths: string[] = []
+    if (realStat) {
       const { stdout: ignoredOut } = await execFileAsync(
         'git',
         [
@@ -425,8 +432,6 @@ async function captureGitTree(
         .toString('utf8')
         .split('\0')
         .filter(Boolean)
-    } else {
-      forceTrackedPaths = []
     }
     const configFlags = [
       '-c',
@@ -480,48 +485,13 @@ async function captureGitTree(
             )
           }
           if (reuseShadowIndex && forceTrackedPaths.length > 0) {
-            const presentPaths: string[] = []
-            for (const relPath of forceTrackedPaths) {
-              if (
-                excluded.some(
-                  (dir) => relPath === dir || relPath.startsWith(`${dir}/`),
-                )
-              ) {
-                continue
-              }
-              const abs = resolveContainedPath(repoRoot, relPath)
-              if (
-                !abs ||
-                !(await assertNoSymlinkEscape(repoRoot, dirname(abs)))
-              ) {
-                continue
-              }
-              if (await lstat(abs).catch(() => null)) {
-                presentPaths.push(relPath)
-              }
-            }
-            for (let i = 0; i < presentPaths.length; i += 256) {
-              const batch = presentPaths
-                .slice(i, i + 256)
-                .map((relPath) => `:(top,literal)${relPath}`)
-              await execFileAsync(
-                'git',
-                [
-                  ...configFlags,
-                  'add',
-                  '-f',
-                  '--',
-                  ...batch,
-                  ...excluded.map((dir) => `:(top,exclude,literal)${dir}`),
-                ],
-                {
-                  cwd: repoRoot,
-                  env,
-                  encoding: 'utf8',
-                  timeout: GIT_TIMEOUT_MS,
-                },
-              )
-            }
+            await addForceTrackedPaths(
+              repoRoot,
+              excluded,
+              forceTrackedPaths,
+              configFlags,
+              env,
+            )
           }
           captured = true
           break
@@ -557,11 +527,374 @@ async function captureGitTree(
       }
       await rename(tempIndex, shadowIndex)
       await writeAtomicText(stampPath, realStamp)
-      if (!reuseShadowIndex) {
-        await writeAtomicText(
-          forceTrackedPath,
-          JSON.stringify(forceTrackedPaths),
-        )
+      return { treeHash, unbornDirs: excluded, forceTrackedPaths }
+    } finally {
+      await rm(tempIndex, { force: true }).catch(() => undefined)
+    }
+  })
+}
+
+type TreeEntry = {
+  mode: string
+  hash: string
+  path: string
+}
+
+function parseNullLsTree(buf: Buffer): TreeEntry[] {
+  const entries: TreeEntry[] = []
+  let offset = 0
+  while (offset < buf.length) {
+    const end = buf.indexOf(0, offset)
+    if (end < 0) break
+    const line = buf.subarray(offset, end).toString('utf8')
+    offset = end + 1
+    const tab = line.indexOf('\t')
+    if (tab < 0) continue
+    const parts = line.slice(0, tab).split(' ')
+    const filePath = line.slice(tab + 1)
+    if (parts.length < 3 || !parts[0] || !parts[2] || !filePath) continue
+    entries.push({ mode: parts[0], hash: parts[2], path: filePath })
+  }
+  return entries
+}
+
+function isGitignorePath(relPath: string): boolean {
+  return relPath === '.gitignore' || relPath.endsWith('/.gitignore')
+}
+
+async function hasSymlinkAncestor(
+  root: string,
+  targetDir: string,
+): Promise<boolean> {
+  const rel = relative(root, targetDir)
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    return true
+  }
+  if (!rel) return false
+  let current = root
+  for (const part of rel.split(sep).filter(Boolean)) {
+    current = join(current, part)
+    try {
+      const info = await lstat(current)
+      if (info.isSymbolicLink()) return true
+      if (!info.isDirectory()) return false
+    } catch (error) {
+      if (isMissingError(error)) return false
+      return true
+    }
+  }
+  return false
+}
+
+async function ensureRealDirectory(
+  root: string,
+  targetDir: string,
+): Promise<void> {
+  if (await hasSymlinkAncestor(root, targetDir)) {
+    throw new Error(`Refusing to traverse symlink directory: ${targetDir}`)
+  }
+  const rel = relative(root, targetDir)
+  if (rel) {
+    let current = root
+    for (const part of rel.split(sep).filter(Boolean)) {
+      current = join(current, part)
+      const info = await lstat(current).catch((error: unknown) => {
+        if (isMissingError(error)) return null
+        throw error
+      })
+      if (!info) break
+      if (info.isSymbolicLink()) {
+        throw new Error(`Refusing to traverse symlink directory: ${current}`)
+      }
+      if (!info.isDirectory()) {
+        await rm(current, { force: true })
+        break
+      }
+    }
+  }
+  await mkdir(targetDir, { recursive: true })
+}
+
+async function restoreTreeBlob(
+  resolvedRoot: string,
+  shadowDir: string,
+  entry: TreeEntry,
+): Promise<void> {
+  const absPath = resolveContainedPath(resolvedRoot, entry.path)
+  if (!absPath) return
+  const parent = dirname(absPath)
+  if (await hasSymlinkAncestor(resolvedRoot, parent)) {
+    throw new Error(`Refusing to restore file across symlink: ${entry.path}`)
+  }
+  const { stdout: blob } = await execFileAsync(
+    'git',
+    [`--git-dir=${shadowDir}`, 'cat-file', 'blob', entry.hash],
+    {
+      cwd: resolvedRoot,
+      env: gitEnv(),
+      encoding: 'buffer',
+      maxBuffer: GIT_DIFF_MAX_BUFFER,
+      timeout: GIT_TIMEOUT_MS,
+    },
+  )
+  await ensureRealDirectory(resolvedRoot, parent)
+  if (!(await assertNoSymlinkEscape(resolvedRoot, parent))) {
+    throw new Error(`Refusing to restore file across symlink: ${entry.path}`)
+  }
+  const currentStat = await lstat(absPath).catch(() => null)
+  if (entry.mode === '120000') {
+    await removeExistingEntry(absPath, currentStat)
+    await symlink(blob.toString('utf8'), absPath)
+    return
+  }
+  await removeExistingEntry(absPath, currentStat)
+  await writeFile(absPath, blob)
+  await chmod(absPath, entry.mode === '100755' ? 0o755 : 0o644)
+}
+
+async function captureWorkspaceAgainstTarget(
+  resolvedRoot: string,
+  shadowDir: string,
+  checkpoint: TurnFileCheckpoint,
+  targetGitignorePaths: ReadonlySet<string>,
+): Promise<{ treeHash: string; unbornDirs: string[] }> {
+  return await queueSessionOp(`shadow:${shadowDir}`, async () => {
+    const tempIndex = join(shadowDir, `tmp-index-${randomUUID()}`)
+    const env = gitEnv({
+      GIT_DIR: shadowDir,
+      GIT_WORK_TREE: resolvedRoot,
+      GIT_INDEX_FILE: tempIndex,
+    })
+    const baselineUnborn = new Set(checkpoint.unbornDirs ?? [])
+    const isUnderBaselineUnborn = (relPath: string): boolean => {
+      for (const dir of baselineUnborn) {
+        if (relPath === dir || relPath.startsWith(`${dir}/`)) return true
+      }
+      return false
+    }
+    const isUntrackedGitignore = (relPath: string): boolean =>
+      !relPath.endsWith('/') &&
+      isGitignorePath(relPath) &&
+      !targetGitignorePaths.has(relPath) &&
+      !isUnderBaselineUnborn(relPath)
+    const configFlags = [
+      '-c',
+      'core.autocrlf=false',
+      '-c',
+      'core.safecrlf=false',
+      '-c',
+      'core.quotePath=false',
+    ]
+    const excluded: string[] = []
+    const excludedSet = new Set<string>()
+    let captured = false
+    let lastError: unknown
+    try {
+      await execFileAsync('git', ['read-tree', checkpoint.treeHash], {
+        cwd: resolvedRoot,
+        env,
+        encoding: 'utf8',
+        timeout: GIT_TIMEOUT_MS,
+      })
+      for (let pass = 0; pass < 16; pass++) {
+        const [{ stdout: untrackedOut }, { stdout: ignoredOut }] =
+          await Promise.all([
+            execFileAsync(
+              'git',
+              [
+                '-c',
+                'core.quotePath=false',
+                'ls-files',
+                '-o',
+                '-z',
+                '--exclude-standard',
+              ],
+              {
+                cwd: resolvedRoot,
+                env,
+                encoding: 'buffer',
+                maxBuffer: GIT_DIFF_MAX_BUFFER,
+                timeout: GIT_TIMEOUT_MS,
+              },
+            ),
+            execFileAsync(
+              'git',
+              [
+                '-c',
+                'core.quotePath=false',
+                'ls-files',
+                '-o',
+                '-i',
+                '-z',
+                '--exclude-standard',
+                '--directory',
+              ],
+              {
+                cwd: resolvedRoot,
+                env,
+                encoding: 'buffer',
+                maxBuffer: GIT_DIFF_MAX_BUFFER,
+                timeout: GIT_TIMEOUT_MS,
+              },
+            ),
+          ])
+        let removedAny = false
+        for (const relPath of untrackedOut
+          .toString('utf8')
+          .split('\0')
+          .filter(Boolean)) {
+          if (!isUntrackedGitignore(relPath)) continue
+          const absPath = resolveContainedPath(resolvedRoot, relPath)
+          if (
+            !absPath ||
+            !(await assertNoSymlinkEscape(resolvedRoot, dirname(absPath)))
+          ) {
+            continue
+          }
+          const info = await lstat(absPath).catch(() => null)
+          if (!info || info.isDirectory()) continue
+          await rm(absPath, { force: true })
+          await pruneEmptyParents(dirname(absPath), resolvedRoot)
+          removedAny = true
+        }
+        for (const relPath of ignoredOut
+          .toString('utf8')
+          .split('\0')
+          .filter(Boolean)) {
+          if (!isUntrackedGitignore(relPath)) continue
+          const checkOut = await execFileAsync(
+            'git',
+            [
+              '-c',
+              'core.quotePath=false',
+              'check-ignore',
+              '-v',
+              '--no-index',
+              '--',
+              relPath,
+            ],
+            {
+              cwd: resolvedRoot,
+              env,
+              encoding: 'utf8',
+              timeout: GIT_TIMEOUT_MS,
+            },
+          )
+            .then((res) => res.stdout)
+            .catch(() => '')
+          if (!checkOut.startsWith(`${relPath}:`)) continue
+          const absPath = resolveContainedPath(resolvedRoot, relPath)
+          if (
+            !absPath ||
+            !(await assertNoSymlinkEscape(resolvedRoot, dirname(absPath)))
+          ) {
+            continue
+          }
+          const info = await lstat(absPath).catch(() => null)
+          if (!info || info.isDirectory()) continue
+          const linkTarget = info.isSymbolicLink()
+            ? await readlink(absPath)
+            : null
+          const bytes = linkTarget === null ? await readFile(absPath) : null
+          await rm(absPath, { force: true })
+          const stillIgnored = await execFileAsync(
+            'git',
+            [
+              '-c',
+              'core.quotePath=false',
+              'check-ignore',
+              '-q',
+              '--no-index',
+              '--',
+              relPath,
+            ],
+            { cwd: resolvedRoot, env, timeout: GIT_TIMEOUT_MS },
+          ).then(
+            () => true,
+            () => false,
+          )
+          if (stillIgnored) {
+            if (linkTarget !== null) {
+              await symlink(linkTarget, absPath)
+            } else {
+              await writeFile(absPath, bytes!)
+              await chmod(absPath, info.mode & 0o777)
+            }
+          } else {
+            await pruneEmptyParents(dirname(absPath), resolvedRoot)
+            removedAny = true
+          }
+        }
+        if (!removedAny) break
+      }
+      for (let attempt = 0; attempt < 128; attempt++) {
+        if (attempt > 0) {
+          await execFileAsync('git', ['read-tree', checkpoint.treeHash], {
+            cwd: resolvedRoot,
+            env,
+            encoding: 'utf8',
+            timeout: GIT_TIMEOUT_MS,
+          })
+        }
+        const pathArgs =
+          excluded.length > 0
+            ? [
+                '--',
+                '.',
+                ...excluded.map((dir) => `:(top,exclude,literal)${dir}`),
+              ]
+            : ['--', '.']
+        try {
+          await execFileAsync(
+            'git',
+            [...configFlags, 'add', '-A', ...pathArgs],
+            {
+              cwd: resolvedRoot,
+              env,
+              encoding: 'utf8',
+              timeout: GIT_TIMEOUT_MS,
+            },
+          )
+          if ((checkpoint.forceTrackedPaths?.length ?? 0) > 0) {
+            await addForceTrackedPaths(
+              resolvedRoot,
+              excluded,
+              checkpoint.forceTrackedPaths!,
+              configFlags,
+              env,
+            )
+          }
+          captured = true
+          break
+        } catch (error) {
+          lastError = error
+          await rm(tempIndex, { force: true }).catch(() => undefined)
+          const discovered = parseUnbornGitPaths(error).filter(
+            (rel) => !excludedSet.has(rel),
+          )
+          if (discovered.length === 0) throw error
+          for (const rel of discovered) {
+            excludedSet.add(rel)
+            excluded.push(rel)
+          }
+        }
+      }
+      if (!captured) {
+        throw lastError instanceof Error
+          ? lastError
+          : new Error(
+              'Exceeded maximum unborn nested repository exclusions while capturing git tree',
+            )
+      }
+      const { stdout } = await execFileAsync('git', ['write-tree'], {
+        cwd: resolvedRoot,
+        env,
+        encoding: 'utf8',
+        timeout: GIT_TIMEOUT_MS,
+      })
+      const treeHash = stdout.trim()
+      if (!/^[a-f0-9]{40,64}$/i.test(treeHash)) {
+        throw new Error(`Invalid git tree hash: ${treeHash}`)
       }
       return { treeHash, unbornDirs: excluded }
     } finally {
@@ -621,7 +954,6 @@ async function validateGitCheckpoint(
   const shadowDir = await ensureShadowGitRepo(
     appDataDir,
     resolvedRoot,
-    git.gitDir,
     git.commonDir,
   )
   await execFileAsync(
@@ -637,37 +969,13 @@ async function restoreGitTree(
   checkpoint: TurnFileCheckpoint,
 ): Promise<void> {
   const { treeHash: targetTreeHash } = checkpoint
-  const { resolvedRoot, git, shadowDir } = await validateGitCheckpoint(
+  const { resolvedRoot, shadowDir } = await validateGitCheckpoint(
     appDataDir,
     checkpoint,
   )
-  const current = await captureGitTree(resolvedRoot, shadowDir, git.gitDir)
-  const baselineUnborn = new Set(checkpoint.unbornDirs ?? [])
-  for (const unbornDir of current.unbornDirs) {
-    if (baselineUnborn.has(unbornDir)) continue
-    const absPath = resolveContainedPath(resolvedRoot, unbornDir)
-    if (!absPath) continue
-    if (!(await assertNoSymlinkEscape(resolvedRoot, dirname(absPath)))) {
-      throw new Error(
-        `Refusing to remove directory across symlink: ${unbornDir}`,
-      )
-    }
-    const existing = await lstat(absPath).catch(() => null)
-    await removeExistingEntry(absPath, existing)
-    await pruneEmptyParents(dirname(absPath), resolvedRoot)
-  }
-  if (current.treeHash === targetTreeHash) return
-  const { stdout } = await execFileAsync(
+  const { stdout: lsTreeOut } = await execFileAsync(
     'git',
-    [
-      `--git-dir=${shadowDir}`,
-      'diff-tree',
-      '-r',
-      '-z',
-      '--no-renames',
-      targetTreeHash,
-      current.treeHash,
-    ],
+    [`--git-dir=${shadowDir}`, 'ls-tree', '-r', '-z', targetTreeHash],
     {
       cwd: resolvedRoot,
       env: gitEnv(),
@@ -676,11 +984,67 @@ async function restoreGitTree(
       timeout: GIT_TIMEOUT_MS,
     },
   )
-  const diffEntries = parseNullDiffTree(stdout).filter(
-    (entry) => entry.modeOld !== '160000',
+  const targetEntries = parseNullLsTree(lsTreeOut)
+  for (const entry of targetEntries) {
+    if (entry.mode === '160000') continue
+    const absPath = resolveContainedPath(resolvedRoot, entry.path)
+    if (!absPath) continue
+    if (await hasSymlinkAncestor(resolvedRoot, dirname(absPath))) {
+      throw new Error(`Refusing to restore file across symlink: ${entry.path}`)
+    }
+  }
+  const targetGitignores = targetEntries.filter(
+    (entry) => entry.mode !== '160000' && isGitignorePath(entry.path),
   )
-  // Remove added paths before restoring target entries so file/directory swaps cannot collide across phases.
+  const targetGitignorePaths = new Set(targetGitignores.map((e) => e.path))
+  const baselineUnborn = new Set(checkpoint.unbornDirs ?? [])
   try {
+    for (const entry of targetGitignores) {
+      await restoreTreeBlob(resolvedRoot, shadowDir, entry)
+    }
+    const current = await captureWorkspaceAgainstTarget(
+      resolvedRoot,
+      shadowDir,
+      checkpoint,
+      targetGitignorePaths,
+    )
+    for (const unbornDir of current.unbornDirs) {
+      if (baselineUnborn.has(unbornDir)) continue
+      const absPath = resolveContainedPath(resolvedRoot, unbornDir)
+      if (!absPath) continue
+      if (!(await assertNoSymlinkEscape(resolvedRoot, dirname(absPath)))) {
+        throw new Error(
+          `Refusing to remove directory across symlink: ${unbornDir}`,
+        )
+      }
+      const existing = await lstat(absPath).catch(() => null)
+      await removeExistingEntry(absPath, existing)
+      await pruneEmptyParents(dirname(absPath), resolvedRoot)
+    }
+    if (current.treeHash === targetTreeHash) return
+    const { stdout } = await execFileAsync(
+      'git',
+      [
+        `--git-dir=${shadowDir}`,
+        'diff-tree',
+        '-r',
+        '-z',
+        '--no-renames',
+        targetTreeHash,
+        current.treeHash,
+      ],
+      {
+        cwd: resolvedRoot,
+        env: gitEnv(),
+        encoding: 'buffer',
+        maxBuffer: GIT_DIFF_MAX_BUFFER,
+        timeout: GIT_TIMEOUT_MS,
+      },
+    )
+    const diffEntries = parseNullDiffTree(stdout).filter(
+      (entry) => entry.modeOld !== '160000',
+    )
+    // Remove added paths before restoring target entries so file/directory swaps cannot collide across phases.
     for (const entry of diffEntries) {
       if (entry.status !== 'A') continue
       const absPath = resolveContainedPath(resolvedRoot, entry.path)
@@ -697,35 +1061,11 @@ async function restoreGitTree(
     }
     for (const entry of diffEntries) {
       if (entry.status === 'A') continue
-      const absPath = resolveContainedPath(resolvedRoot, entry.path)
-      if (!absPath) continue
-      const { stdout: blob } = await execFileAsync(
-        'git',
-        [`--git-dir=${shadowDir}`, 'cat-file', 'blob', entry.hashOld],
-        {
-          cwd: resolvedRoot,
-          env: gitEnv(),
-          encoding: 'buffer',
-          maxBuffer: GIT_DIFF_MAX_BUFFER,
-          timeout: GIT_TIMEOUT_MS,
-        },
-      )
-      const parent = dirname(absPath)
-      if (!(await assertNoSymlinkEscape(resolvedRoot, parent))) {
-        throw new Error(
-          `Refusing to restore file across symlink: ${entry.path}`,
-        )
-      }
-      await mkdir(parent, { recursive: true })
-      const currentStat = await lstat(absPath).catch(() => null)
-      if (entry.modeOld === '120000') {
-        await removeExistingEntry(absPath, currentStat)
-        await symlink(blob.toString('utf8'), absPath)
-        continue
-      }
-      await removeExistingEntry(absPath, currentStat)
-      await writeFile(absPath, blob)
-      await chmod(absPath, entry.modeOld === '100755' ? 0o755 : 0o644)
+      await restoreTreeBlob(resolvedRoot, shadowDir, {
+        mode: entry.modeOld,
+        hash: entry.hashOld,
+        path: entry.path,
+      })
     }
   } finally {
     // Drop cached shadow index so resurrected force-tracked .gitignore files are re-seeded from realGitDir/index on next capture.
@@ -762,10 +1102,9 @@ export async function captureTurnFileCheckpoint(
   const shadowDir = await ensureShadowGitRepo(
     appDataDir,
     git.repoRoot,
-    git.gitDir,
     git.commonDir,
   )
-  const { treeHash, unbornDirs } = await captureGitTree(
+  const { treeHash, unbornDirs, forceTrackedPaths } = await captureGitTree(
     git.repoRoot,
     shadowDir,
     git.gitDir,
@@ -777,6 +1116,7 @@ export async function captureTurnFileCheckpoint(
     repoRoot: git.repoRoot,
     treeHash,
     ...(unbornDirs.length > 0 ? { unbornDirs } : {}),
+    ...(forceTrackedPaths.length > 0 ? { forceTrackedPaths } : {}),
     createdAt,
   }
   await queueSessionOp(nativeId, async () => {

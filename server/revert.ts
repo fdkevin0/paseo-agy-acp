@@ -349,29 +349,34 @@ export function attachReplayRevertTokens(
     }
   }
 
-  const acpUsers: Array<{ entryIndex: number; text: string }> = []
-  entries.forEach((entry, entryIndex) => {
+  const acpUsers: Array<{ itemId: string; text: string }> = []
+  const acpUserIndexById = new Map<string, number>()
+  for (const entry of entries) {
     if (
       entry.item.type === 'user_message' &&
       !/:step:(\d+)$/.test(entry.item.id)
     ) {
-      acpUsers.push({
-        entryIndex,
-        text: normalizeUserText(entry.item.text),
-      })
+      const text = normalizeUserText(entry.item.text)
+      const existingIdx = acpUserIndexById.get(entry.item.id)
+      if (existingIdx !== undefined) {
+        acpUsers[existingIdx].text = text
+      } else {
+        acpUserIndexById.set(entry.item.id, acpUsers.length)
+        acpUsers.push({ itemId: entry.item.id, text })
+      }
     }
-  })
+  }
 
   const M = userSteps.length
   const N = acpUsers.length
   const acpSlotMatch = new Map<
-    number,
+    string,
     { ordinal?: number; stepIndex?: number }
   >()
 
   if (M > 0 && M === N) {
     for (let k = 0; k < N; k++) {
-      acpSlotMatch.set(acpUsers[k].entryIndex, {
+      acpSlotMatch.set(acpUsers[k].itemId, {
         ordinal: k,
         stepIndex: userSteps[k].stepIndex,
       })
@@ -391,10 +396,10 @@ export function attachReplayRevertTokens(
     // Native-forked Brain transcripts begin at > 0 and contain only post-fork child turns.
     const acpOffset = matches.length === 1 ? matches[0] : N - M
     if (acpOffset > 0) {
-      acpSlotMatch.set(acpUsers[0].entryIndex, { stepIndex: 0 })
+      acpSlotMatch.set(acpUsers[0].itemId, { stepIndex: 0 })
     }
     for (let j = 0; j < M; j++) {
-      acpSlotMatch.set(acpUsers[acpOffset + j].entryIndex, {
+      acpSlotMatch.set(acpUsers[acpOffset + j].itemId, {
         ordinal: j,
         stepIndex: userSteps[j].stepIndex,
       })
@@ -406,7 +411,7 @@ export function attachReplayRevertTokens(
       let matched = false
       for (let i = cursor; i < M; i++) {
         if (userSteps[i].text === slot.text) {
-          acpSlotMatch.set(slot.entryIndex, {
+          acpSlotMatch.set(slot.itemId, {
             ordinal: i,
             stepIndex: userSteps[i].stepIndex,
           })
@@ -416,7 +421,7 @@ export function attachReplayRevertTokens(
         }
       }
       if (!matched && (firstTranscriptStepIndex ?? 0) === 0 && cursor < M) {
-        acpSlotMatch.set(slot.entryIndex, {
+        acpSlotMatch.set(slot.itemId, {
           ordinal: cursor,
           stepIndex: userSteps[cursor].stepIndex,
         })
@@ -427,14 +432,14 @@ export function attachReplayRevertTokens(
         M === 0 &&
         (firstTranscriptStepIndex ?? 0) === 0
       ) {
-        acpSlotMatch.set(slot.entryIndex, { ordinal: 0 })
+        acpSlotMatch.set(slot.itemId, { ordinal: 0 })
       }
     }
   }
 
-  return entries.map((entry, entryIndex) => {
+  return entries.map((entry) => {
     if (entry.item.type !== 'user_message') return entry
-    const normalizedText = normalizeUserText(entry.item.text)
+    let normalizedText = normalizeUserText(entry.item.text)
     let matchedOrdinal: number | undefined
     let matchedStepIndex: number | undefined
 
@@ -445,9 +450,13 @@ export function attachReplayRevertTokens(
       matchedStepIndex = found ? found.stepIndex : stepNum
       matchedOrdinal = found?.ordinal
     } else {
-      const slot = acpSlotMatch.get(entryIndex)
+      const slot = acpSlotMatch.get(entry.item.id)
       matchedOrdinal = slot?.ordinal
       matchedStepIndex = slot?.stepIndex
+      const canonicalIdx = acpUserIndexById.get(entry.item.id)
+      if (canonicalIdx !== undefined) {
+        normalizedText = acpUsers[canonicalIdx].text
+      }
     }
 
     let checkpointId: string | undefined

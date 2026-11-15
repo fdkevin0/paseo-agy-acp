@@ -444,11 +444,16 @@ export async function readSubagents(
           let spawn = spawnCache.get(spawnKey)
           if (!spawn) {
             const childInbox = await readInboxState(root, conversationId)
-            const init = childInbox.messages.find(
-              (m) =>
-                m.tool?.conversationId === nativeId &&
-                isNativeToolName(m.tool.name ?? '', 'invoke_subagent'),
-            )?.tool
+            const spawnTools = childInbox.messages
+              .map((m) => m.tool)
+              .filter(
+                (t): t is NonNullable<typeof t> =>
+                  t !== undefined &&
+                  isNativeToolName(t.name ?? '', 'invoke_subagent'),
+              )
+            const init =
+              spawnTools.find((t) => t.conversationId === nativeId) ??
+              (spawnTools.length === 1 ? spawnTools[0] : undefined)
             if (init) {
               spawn = { callId: init.callId, stepIndex: init.stepIndex }
               setBounded(spawnCache, spawnKey, spawn, SPAWN_CACHE_LIMIT)

@@ -20,10 +20,10 @@ import {
   rm,
   writeFile,
 } from 'node:fs/promises'
-import { join, sep } from 'node:path'
+import { dirname, join, sep } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { readTranscriptRows } from './brain.ts'
-import { extractRowMessageSenders } from './brain-io.ts'
+import { extractRowMessageSenders, readSubagents } from './brain-io.ts'
 import {
   assertSafeNativeId,
   isMissingError,
@@ -287,6 +287,7 @@ interface BrainFilterContext {
   newNativeId: string
   cutoffStepIndex: number
   droppedSubagentIds: ReadonlySet<string>
+  resolvedSpawnSteps: ReadonlyMap<string, number>
   readMessageIds: ReadonlySet<string>
   keptWakeupDeliveriesBySender: Map<string, number>
   cutoffTimestampMs?: number
@@ -395,9 +396,27 @@ async function scanTranscriptState(
   }
 }
 
+function parseSubagentDescriptor(
+  raw: Record<string, unknown>,
+  fileName: string,
+  cutoffStepIndex: number,
+  resolvedSpawnSteps: ReadonlyMap<string, number>,
+): { conversationId: string; stemId: string; dropped: boolean } {
+  const stemId = fileName.slice(0, -5)
+  const conversationId = str(raw.conversationId) ?? stemId
+  const spawnStepIndex =
+    resolvedSpawnSteps.get(conversationId) ?? num(raw.spawnStepIndex)
+  const dropped =
+    spawnStepIndex !== undefined &&
+    Number.isInteger(spawnStepIndex) &&
+    spawnStepIndex >= cutoffStepIndex
+  return { conversationId, stemId, dropped }
+}
+
 async function collectDroppedSubagentIds(
   subagentsDir: string,
   cutoffStepIndex: number,
+  resolvedSpawnSteps: ReadonlyMap<string, number>,
 ): Promise<Set<string>> {
   const dropped = new Set<string>()
   const entries = await readdir(subagentsDir, { withFileTypes: true }).catch(
@@ -409,16 +428,15 @@ async function collectDroppedSubagentIds(
       const raw = record(
         JSON.parse(await readFile(join(subagentsDir, entry.name), 'utf8')),
       )
-      const spawnStepIndex = num(raw.spawnStepIndex)
-      if (
-        spawnStepIndex !== undefined &&
-        Number.isInteger(spawnStepIndex) &&
-        spawnStepIndex >= cutoffStepIndex
-      ) {
-        const conversationId =
-          str(raw.conversationId) ?? entry.name.slice(0, -5)
-        dropped.add(conversationId)
-        dropped.add(entry.name.slice(0, -5))
+      const parsed = parseSubagentDescriptor(
+        raw,
+        entry.name,
+        cutoffStepIndex,
+        resolvedSpawnSteps,
+      )
+      if (parsed.dropped) {
+        dropped.add(parsed.conversationId)
+        dropped.add(parsed.stemId)
       }
     } catch {
       // Unreadable descriptors are retained by filterBrainSystemSubagents.
@@ -472,6 +490,7 @@ async function filterBrainSystemSubagents(
   srcDir: string,
   destDir: string,
   cutoffStepIndex: number,
+  resolvedSpawnSteps: ReadonlyMap<string, number>,
 ) {
   await mkdir(destDir, { recursive: true })
   const entries = await readdir(srcDir, { withFileTypes: true })
@@ -480,11 +499,13 @@ async function filterBrainSystemSubagents(
     const srcFile = join(srcDir, entry.name)
     try {
       const raw = record(JSON.parse(await readFile(srcFile, 'utf8')))
-      const spawnStepIndex = num(raw.spawnStepIndex)
       if (
-        spawnStepIndex !== undefined &&
-        Number.isInteger(spawnStepIndex) &&
-        spawnStepIndex >= cutoffStepIndex
+        parseSubagentDescriptor(
+          raw,
+          entry.name,
+          cutoffStepIndex,
+          resolvedSpawnSteps,
+        ).dropped
       ) {
         continue
       }
@@ -681,6 +702,13 @@ async function createBrainFilterContext(
   newNativeId: string,
   cutoffStepIndex: number,
 ): Promise<BrainFilterContext> {
+  const knownSubagents = await readSubagents(
+    dirname(oldBrainDir),
+    oldNativeId,
+  ).catch(() => [])
+  const resolvedSpawnSteps = new Map(
+    knownSubagents.map((s) => [s.conversationId, s.spawnStepIndex]),
+  )
   const [
     droppedSubagentIds,
     readMessageIds,
@@ -691,6 +719,7 @@ async function createBrainFilterContext(
     collectDroppedSubagentIds(
       join(oldBrainDir, '.system_generated/subagents'),
       cutoffStepIndex,
+      resolvedSpawnSteps,
     ),
     readConsumedMessageIds(
       join(oldBrainDir, '.system_generated/messages/read.json'),
@@ -708,6 +737,7 @@ async function createBrainFilterContext(
     newNativeId,
     cutoffStepIndex,
     droppedSubagentIds,
+    resolvedSpawnSteps,
     readMessageIds,
     keptWakeupDeliveriesBySender: transcriptState.keptWakeupDeliveriesBySender,
     cutoffTimestampMs: transcriptState.cutoffTimestampMs,
@@ -740,7 +770,12 @@ async function copyBrainDirectoryFiltered(
       continue
     }
     if (relPath === '.system_generated/subagents' && entry.isDirectory()) {
-      await filterBrainSystemSubagents(srcEntry, destEntry, ctx.cutoffStepIndex)
+      await filterBrainSystemSubagents(
+        srcEntry,
+        destEntry,
+        ctx.cutoffStepIndex,
+        ctx.resolvedSpawnSteps,
+      )
       continue
     }
     if (relPath === '.system_generated/messages' && entry.isDirectory()) {

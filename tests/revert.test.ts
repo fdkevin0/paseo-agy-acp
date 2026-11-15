@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import {
   chmod,
@@ -9,6 +10,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  realpath,
   rm,
   stat,
   symlink,
@@ -24,6 +26,7 @@ import {
   type ProviderCapability,
 } from '@getpaseo/plugin/server/provider'
 import { forkAgyConversationStorage } from '../server/agy-fork.ts'
+import { readSubagents } from '../server/brain-io.ts'
 import {
   captureTurnFileCheckpoint,
   forkSessionCheckpoints,
@@ -3828,6 +3831,349 @@ test('session.close racing mid-reload session.revert on a persist: false session
     }
   } finally {
     await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('restoreSessionFileCheckpoint aligns .gitignore before capture so ignored files survive without leaking into shadow git and newly ignored dirs clean up', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-gitignore-align-'))
+  const workDir = join(home, 'workspace')
+  await mkdir(join(workDir, 'node_modules', 'pkg'), { recursive: true })
+  const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
+  const nativeId = '90909090-9090-4090-8090-909090909090'
+
+  try {
+    await runGit(workDir, ['init'])
+    await runGit(workDir, ['config', 'user.name', 'Test'])
+    await runGit(workDir, ['config', 'user.email', 'test@example.com'])
+    await writeFile(join(workDir, 'base.txt'), 'v1\n')
+    await writeFile(
+      join(workDir, '.gitignore'),
+      '.env\n.env.forced\nnode_modules/\n',
+    )
+    await writeFile(join(workDir, '.env'), 'SECRET_NEVER_HASHED=1\n')
+    await writeFile(join(workDir, '.env.forced'), 'FORCED_LATER=1\n')
+    await writeFile(join(workDir, 'node_modules', 'pkg', '.gitignore'), '*\n')
+    await writeFile(
+      join(workDir, 'node_modules', 'pkg', 'dep.js'),
+      'module.exports = 1\n',
+    )
+    await runGit(workDir, ['add', 'base.txt', '.gitignore'])
+    await runGit(workDir, ['commit', '-m', 'init'])
+
+    const cp1 = await captureTurnFileCheckpoint(
+      appDataDir,
+      nativeId,
+      workDir,
+      -1,
+    )
+    assert(cp1 !== undefined)
+
+    await rm(join(workDir, '.gitignore'))
+    await runGit(workDir, ['add', '-f', '.env.forced'])
+
+    await restoreSessionFileCheckpoint(appDataDir, nativeId, cp1.id)
+    assert.equal(
+      await readFile(join(workDir, '.env'), 'utf8'),
+      'SECRET_NEVER_HASHED=1\n',
+    )
+    assert.equal(
+      await readFile(join(workDir, '.env.forced'), 'utf8'),
+      'FORCED_LATER=1\n',
+    )
+    assert.equal(
+      await readFile(
+        join(workDir, 'node_modules', 'pkg', '.gitignore'),
+        'utf8',
+      ),
+      '*\n',
+    )
+    assert.equal(
+      await readFile(join(workDir, '.gitignore'), 'utf8'),
+      '.env\n.env.forced\nnode_modules/\n',
+    )
+    const repoHash = createHash('sha256')
+      .update(await realpath(workDir))
+      .digest('hex')
+      .slice(0, 16)
+    const shadowDir = join(
+      appDataDir,
+      'paseo-checkpoints',
+      'git',
+      `${repoHash}.git`,
+    )
+    const objectsOut = await execFileAsync(
+      'git',
+      [`--git-dir=${shadowDir}`, 'cat-file', '--batch', '--batch-all-objects'],
+      { cwd: workDir, encoding: 'utf8' },
+    )
+    assert.equal(objectsOut.stdout.includes('SECRET_NEVER_HASHED=1'), false)
+
+    await mkdir(join(workDir, 'src'), { recursive: true })
+    await writeFile(join(workDir, 'src', 'app.ts'), 'export const x = 1\n')
+    await runGit(workDir, ['add', '.gitignore', 'base.txt', 'src/app.ts'])
+    await runGit(workDir, ['commit', '-m', 'add src'])
+
+    const cp2 = await captureTurnFileCheckpoint(
+      appDataDir,
+      nativeId,
+      workDir,
+      2,
+    )
+    assert(cp2 !== undefined)
+
+    await writeFile(
+      join(workDir, '.gitignore'),
+      '.env\n.env.forced\nnode_modules/\ndist/\n',
+    )
+    await mkdir(join(workDir, 'dist'), { recursive: true })
+    await writeFile(join(workDir, 'dist', 'bundle.js'), 'console.log(1)\n')
+    await mkdir(join(workDir, 'gen'), { recursive: true })
+    await writeFile(join(workDir, 'gen', '.gitignore'), '*\n')
+    await writeFile(join(workDir, 'gen', 'out.js'), 'console.log(2)\n')
+
+    await restoreSessionFileCheckpoint(appDataDir, nativeId, cp2.id)
+    const statusOut = await runGit(workDir, ['status', '--porcelain'])
+    assert.equal(statusOut.stdout, '')
+    assert.equal(await lstat(join(workDir, 'dist')).catch(() => null), null)
+    assert.equal(await lstat(join(workDir, 'gen')).catch(() => null), null)
+    assert.equal(
+      await readFile(join(workDir, '.env'), 'utf8'),
+      'SECRET_NEVER_HASHED=1\n',
+    )
+    assert.equal(
+      await readFile(
+        join(workDir, 'node_modules', 'pkg', '.gitignore'),
+        'utf8',
+      ),
+      '*\n',
+    )
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('attachReplayRevertTokens deduplicates multi-chunk streaming user_message entries sharing item.id', () => {
+  const rows: Record<string, unknown>[] = [
+    {
+      step_index: 0,
+      type: 'USER_INPUT',
+      status: 'DONE',
+      content: 'Hello world',
+    },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      content: 'Reply 1',
+    },
+    {
+      step_index: 2,
+      type: 'USER_INPUT',
+      status: 'DONE',
+      content: 'Second turn',
+    },
+    {
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      content: 'Reply 2',
+    },
+  ]
+  const checkpoints = [
+    {
+      id: 'cp-turn-1',
+      afterStepIndex: -1,
+      kind: 'git' as const,
+      repoRoot: '/tmp/repo',
+      treeHash: '0'.repeat(40),
+      createdAt: '2026-11-16T00:00:00.000Z',
+    },
+    {
+      id: 'cp-turn-2',
+      afterStepIndex: 1,
+      kind: 'git' as const,
+      repoRoot: '/tmp/repo',
+      treeHash: '1'.repeat(40),
+      createdAt: '2026-11-16T00:00:01.000Z',
+    },
+  ]
+  const entries: HistoryEntry[] = [
+    { item: { type: 'user_message', id: 's:message:1', text: 'Hello ' } },
+    { item: { type: 'user_message', id: 's:message:1', text: 'Hello world' } },
+    { item: { type: 'assistant_message', id: 's:message:2', text: 'Reply 1' } },
+    { item: { type: 'user_message', id: 's:message:3', text: 'Second turn' } },
+    { item: { type: 'assistant_message', id: 's:message:4', text: 'Reply 2' } },
+  ]
+
+  const tagged = attachReplayRevertTokens(entries, rows, checkpoints)
+  assert(tagged[0].item.type === 'user_message')
+  assert(tagged[1].item.type === 'user_message')
+  assert(tagged[3].item.type === 'user_message')
+  assert.deepEqual(tagged[0].item.revertToken, {
+    version: 1,
+    kind: 'agy-acp-turn',
+    stepIndex: 0,
+    turnOrdinal: 0,
+    checkpointId: 'cp-turn-1',
+    text: 'Hello world',
+  })
+  assert.deepEqual(tagged[1].item.revertToken, {
+    version: 1,
+    kind: 'agy-acp-turn',
+    stepIndex: 0,
+    turnOrdinal: 0,
+    checkpointId: 'cp-turn-1',
+    text: 'Hello world',
+  })
+  assert.deepEqual(tagged[3].item.revertToken, {
+    version: 1,
+    kind: 'agy-acp-turn',
+    stepIndex: 2,
+    turnOrdinal: 1,
+    checkpointId: 'cp-turn-2',
+    text: 'Second turn',
+  })
+})
+
+test('forkAgyConversationStorage and readSubagents preserve spawnCallId and inbox spawnStepIndex across forks', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-subagent-fork-'))
+  const workDir = join(home, 'workspace')
+  await mkdir(workDir, { recursive: true })
+  const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
+  const brainDir = join(appDataDir, 'brain')
+  const oldId = '91919191-9191-4191-8191-919191919191'
+  const keptChildId = '92929292-9292-4292-8292-929292929292'
+  const droppedChildId = '93939393-9393-4393-8393-939393939393'
+
+  try {
+    await mkdir(join(appDataDir, 'conversations'), { recursive: true })
+    createNativeSessionDb(appDataDir, oldId)
+    await writeBrainTranscript(brainDir, oldId, [
+      { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 't0' },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'r0',
+      },
+      { step_index: 2, type: 'USER_INPUT', status: 'DONE', content: 't1' },
+      {
+        step_index: 4,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'r1',
+      },
+    ])
+
+    await mkdir(join(brainDir, oldId, '.system_generated', 'subagents'), {
+      recursive: true,
+    })
+    await writeFile(
+      join(
+        brainDir,
+        oldId,
+        '.system_generated',
+        'subagents',
+        `${keptChildId}.json`,
+      ),
+      JSON.stringify({
+        conversationId: keptChildId,
+        state: 'SUBAGENT_STATE_ALIVE',
+        spawnStepIndex: 1,
+      }),
+    )
+    await mkdir(join(brainDir, keptChildId, '.system_generated', 'messages'), {
+      recursive: true,
+    })
+    await writeFile(
+      join(brainDir, keptChildId, '.system_generated', 'messages', 'init.json'),
+      JSON.stringify({
+        id: 'init',
+        sender: oldId,
+        recipient: keptChildId,
+        priority: 'MESSAGE_PRIORITY_HIGH',
+        content: 'kept work',
+        sourceMetadata: {
+          tool: {
+            conversationId: oldId,
+            stepIndex: 1,
+            toolCall: {
+              id: 'call_sub_kept',
+              name: 'default_api:invoke_subagent',
+              argumentsJson: '{}',
+            },
+          },
+        },
+      }),
+    )
+
+    await writeFile(
+      join(
+        brainDir,
+        oldId,
+        '.system_generated',
+        'subagents',
+        `${droppedChildId}.json`,
+      ),
+      JSON.stringify({
+        conversationId: droppedChildId,
+        state: 'SUBAGENT_STATE_ALIVE',
+        spawnStepIndex: 1,
+      }),
+    )
+    await mkdir(
+      join(brainDir, droppedChildId, '.system_generated', 'messages'),
+      {
+        recursive: true,
+      },
+    )
+    await writeFile(
+      join(
+        brainDir,
+        droppedChildId,
+        '.system_generated',
+        'messages',
+        'init.json',
+      ),
+      JSON.stringify({
+        id: 'init',
+        sender: oldId,
+        recipient: droppedChildId,
+        priority: 'MESSAGE_PRIORITY_HIGH',
+        content: 'dropped work',
+        sourceMetadata: {
+          tool: {
+            conversationId: oldId,
+            stepIndex: 4,
+            toolCall: {
+              id: 'call_sub_dropped',
+              name: 'default_api:invoke_subagent',
+              argumentsJson: '{}',
+            },
+          },
+        },
+      }),
+    )
+
+    const forked = await forkAgyConversationStorage({
+      appDataDir,
+      oldNativeId: oldId,
+      cutoffStepIndex: 2,
+      createFreshSession: async () => 'unused',
+    })
+    assert.equal(forked.forked, true)
+
+    const forkedSubs = await readSubagents(brainDir, forked.newNativeId)
+    assert.deepEqual(forkedSubs, [
+      {
+        conversationId: keptChildId,
+        state: 'SUBAGENT_STATE_ALIVE',
+        spawnStepIndex: 1,
+        spawnCallId: 'call_sub_kept',
+      },
+    ])
+  } finally {
     await rm(home, { recursive: true, force: true })
   }
 })
