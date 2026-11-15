@@ -111,6 +111,10 @@ new AgentSideConnection(
       // Like native agy, cancel ends the model turn but leaves background work alive.
       async cancel() {
         log('cancel')
+        await update({
+          sessionUpdate: 'available_commands_update',
+          availableCommands: [{ name: 'cancel-ack', description: 'ack' }],
+        })
       },
       async prompt(params) {
         const text = params.prompt

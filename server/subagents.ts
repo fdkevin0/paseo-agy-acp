@@ -24,6 +24,7 @@ export interface SubagentRegistryOptions {
   isLoading: () => boolean
   isUnavailable: () => boolean
   retryTimeoutMs?: number
+  readSubagents?: typeof readSubagents
 }
 
 /** Own child sub-session watchers, parent-child ownership, and resumption for one root session. */
@@ -112,9 +113,10 @@ export class SubagentRegistry {
   ): Promise<void> => {
     this.rememberSubagents(
       subagents ??
-        (await readSubagents(this.opts.brainRoot, parentNativeId).catch(
-          () => [],
-        )),
+        (await (this.opts.readSubagents ?? readSubagents)(
+          this.opts.brainRoot,
+          parentNativeId,
+        ).catch(() => [])),
       parentNativeId,
     )
     // Include descendants discovered by their own watchers, not just this parent's descriptors.
@@ -128,12 +130,30 @@ export class SubagentRegistry {
   refreshSubagents = async (): Promise<void> => {
     const rootNativeId = this.opts.getNativeId()
     // Optional ownership metadata must not poison the serialized ACP notification lane.
-    const subagents = await readSubagents(
+    const subagents = await (this.opts.readSubagents ?? readSubagents)(
       this.opts.brainRoot,
       rootNativeId,
     ).catch(() => [])
     if (this.opts.isLoading()) this.rememberSubagents(subagents)
     else await this.syncKilledChildren(subagents)
+  }
+
+  /** Strip raw childSessionId across async ownership refresh; return false if session became unavailable. */
+  async prepareMessageItem(item: ProviderTimelineItem): Promise<boolean> {
+    if (
+      item.type === 'tool_call' &&
+      item.detail.type === 'sub_agent' &&
+      isSubagentMessage(item.name)
+    ) {
+      // Terminalization may run while ownership is being read.
+      const nativeId = item.detail.childSessionId
+      delete item.detail.childSessionId
+      await this.refreshSubagents()
+      // Do not restore a native ID that a later terminalization could publish.
+      if (this.opts.isUnavailable()) return false
+      if (nativeId !== undefined) item.detail.childSessionId = nativeId
+    }
+    return true
   }
 
   private watchChild(

@@ -407,12 +407,10 @@ export async function settleBrainTurn(
     onQuestionSettled,
     onSubagents,
     observation,
-    onUsage,
     onWakeupState,
     isRpcActive,
   }: {
     observation?: BrainTurnObservation
-    onUsage?: (usage: StepUsage, wokeUp: boolean) => void
     onWakeupState?: (state: {
       wokeUp: boolean
       wakeupUsage?: StepUsage
@@ -489,7 +487,7 @@ export async function settleBrainTurn(
       minStepIndex,
       {
         isCurrent: () => !signal?.aborted,
-        onUsage: (usage) => onUsage?.(usage, fgReconciler.postRpc),
+        onUsage: () => {},
         onItem,
       },
       pollIntervalMs,

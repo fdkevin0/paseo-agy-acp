@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { EventEmitter, once } from 'node:events'
 import { test } from 'node:test'
 import {
   mkdtemp,
@@ -29,6 +30,7 @@ import {
   type BrainWatchHandle,
 } from '../server/brain.ts'
 import { waitUntil } from './helpers.ts'
+import { BrainTurnObservation } from '../server/brain-observer.ts'
 import { SubagentRegistry } from '../server/subagents.ts'
 import type {
   ProviderEvent,
@@ -2932,10 +2934,11 @@ test('stream retries preserve tool correlation and do not project historical err
   )
 })
 
-test('API/stream retries recover after 4s and multiple interruptions; unfinished response stays pending', async () => {
+test('API/stream retries recover after 4s and multiple interruptions; unfinished response stays pending', async (t) => {
   const f = await fixture()
   const items: ProviderTimelineItem[] = []
   try {
+    t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
     await f.put(parent, [
       { step_index: 1, type: 'USER_INPUT', content: 'work' },
       {
@@ -2946,17 +2949,38 @@ test('API/stream retries recover after 4s and multiple interruptions; unfinished
         error: 'API error (attempt 1): request failed: synthetic timeout',
       },
     ])
+    const stepEvents = new EventEmitter()
+    const onStep = (step: number) => {
+      stepEvents.emit(String(step))
+    }
+    const step2Seen = once(stepEvents, '2')
+    const step4Seen = once(stepEvents, '4')
+    const obs = new BrainTurnObservation(
+      f.root,
+      parent,
+      'p',
+      -1,
+      {
+        isCurrent: () => true,
+        onUsage: () => {},
+        onItem: (item) => items.push(item),
+      },
+      60_000,
+    )
     let finished = false
     const pending = alive(
       settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
-        pollIntervalMs: 5,
-        stallTimeoutMs: 10_000,
+        observation: obs,
+        stallTimeoutMs: 50,
+        onStep,
       }),
     ).then((result) => {
       finished = true
       return result
     })
-    await delay(4000)
+    await step2Seen
+    t.mock.timers.tick(4_000)
+    await obs.poll()
     await appendFile(
       f.path(parent),
       encode([
@@ -2969,9 +2993,11 @@ test('API/stream retries recover after 4s and multiple interruptions; unfinished
         },
       ]),
     )
-    await delay(25)
+    await obs.poll()
+    await step4Seen
     assert.equal(finished, false)
     await appendFile(f.path(parent), encode([done(5)]))
+    await obs.poll()
     assert.equal((await pending).status, 'completed')
     assert.equal(
       items.some((item) => item.type === 'error'),

@@ -135,7 +135,7 @@ async function replay(
     emit: (event) => events.push(structuredClone(event)),
   })
   try {
-    await manager.open({
+    await manager.handle({
       type: 'session.open',
       requestId: 'open',
       sessionId: 's',
@@ -956,15 +956,7 @@ test('null-result history recovery remains intact when the next turn cancels aft
     await manager.close()
     await rm(home, { recursive: true, force: true })
   })
-  const start = manager.start.bind(manager)
-  let session!: Awaited<ReturnType<typeof manager.start>>
-  t.mock.method(
-    manager,
-    'start',
-    async (...args: Parameters<typeof start>) =>
-      (session = await start(...args)),
-  )
-  await manager.open({
+  await manager.handle({
     type: 'session.open',
     requestId: 'open',
     sessionId: 's',
@@ -979,33 +971,32 @@ test('null-result history recovery remains intact when the next turn cancels aft
   assert.equal(restored.detail.content, 'read')
   assert.equal(restored.detail.filePath, '/acp')
   assert.equal(restored.detail.offset, 7)
-  t.mock.method(session.transport.rpc, 'prompt', async () => {
-    await writeFile(
-      path,
-      encode([
-        ...rows,
-        { step_index: 6, type: 'USER_INPUT', content: 'next' },
-        {
-          step_index: 7,
-          type: 'PLANNER_RESPONSE',
-          input_tokens: 100,
-          output_tokens: 2,
-        },
-        checkpoint(8),
-      ]) + '{"step_index":9',
-    )
-    return { stopReason: 'cancelled' as const }
-  })
+  await writeFile(
+    join(home, 'stage-transcript.jsonl'),
+    encode([
+      ...rows,
+      { step_index: 6, type: 'USER_INPUT', content: 'next' },
+      {
+        step_index: 7,
+        type: 'PLANNER_RESPONSE',
+        input_tokens: 100,
+        output_tokens: 2,
+      },
+      checkpoint(8),
+    ]) + '{"step_index":9',
+  )
   await manager.handle({
     type: 'session.prompt',
     sessionId: 's',
     prompt: {
       clientMessageId: 'next',
       delivery: 'auto',
-      input: { type: 'message', content: [{ type: 'text', text: 'next' }] },
+      input: {
+        type: 'message',
+        content: [{ type: 'text', text: 'stage-and-cancel' }],
+      },
     },
   })
-  assert.equal(session.state.lastKnownStepIndex, 8)
   const usage = events.findLast((event) => event.type === 'session.usage')
   assert.ok(usage?.type === 'session.usage')
   assert.equal(usage.usage.contextWindowUsedTokens, 102)
@@ -1014,13 +1005,47 @@ test('null-result history recovery remains intact when the next turn cancels aft
     undefined,
     'context-only cancellation does not create a bill',
   )
+  const usageCountBeforeFollowup = events.filter(
+    (event) => event.type === 'session.usage',
+  ).length
+  await writeFile(
+    path,
+    encode([
+      ...rows,
+      { step_index: 6, type: 'USER_INPUT', content: 'next' },
+      {
+        step_index: 7,
+        type: 'PLANNER_RESPONSE',
+        input_tokens: 999,
+        output_tokens: 2,
+      },
+      checkpoint(8),
+    ]),
+  )
+  await manager.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId: 'check-boundary-8',
+      delivery: 'auto',
+      input: {
+        type: 'message',
+        content: [{ type: 'text', text: 'cancel-only' }],
+      },
+    },
+  })
+  assert.equal(
+    events.filter((event) => event.type === 'session.usage').length,
+    usageCountBeforeFollowup,
+    'step 8 boundary excludes earlier step 7 after canceled compaction',
+  )
   assert.deepEqual(
     events.flatMap((event) =>
       event.type === 'session.turn' && event.state !== 'started'
         ? [event.state]
         : [],
     ),
-    ['canceled'],
+    ['canceled', 'canceled'],
   )
   assert.deepEqual(
     timeline(events)

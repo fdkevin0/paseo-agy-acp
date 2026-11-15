@@ -5,6 +5,8 @@ import { join } from 'node:path'
 import { WritableStream } from 'node:stream/web'
 import { Readable, Writable } from 'node:stream'
 let nativeId = ''
+if (process.env.AGY_TEST_PID_FILE)
+  writeFileSync(process.env.AGY_TEST_PID_FILE, String(process.pid))
 function log(method: string) {
   if (process.env.AGY_TEST_LOG)
     appendFileSync(process.env.AGY_TEST_LOG, method + '\n')
@@ -40,9 +42,32 @@ const configOptions = [
 const canceled = new Set<string>()
 const cancels = new Map<string, () => void>()
 let wokenStepBase = 0
+let holdSeq = 0
+const pendingBrainContinuation = new Map<string, { ignoreCancel: boolean }>()
 /** Sessions waiting on a woken ask_question, keyed to their transcript step base. */
 const wokenQuestions = new Map<string, number>()
 const readWokenMsgIds: Record<string, boolean> = {}
+
+function writeSessionTranscript(
+  sessionId: string,
+  body: string | object[],
+  mode: 'write' | 'append' = 'append',
+) {
+  const dir = join(
+    process.env.HOME!,
+    '.gemini/antigravity-cli/brain',
+    sessionId,
+    '.system_generated/logs',
+  )
+  mkdirSync(dir, { recursive: true })
+  const target = join(dir, 'transcript_full.jsonl')
+  const encoded =
+    typeof body === 'string'
+      ? body
+      : body.map((row) => JSON.stringify(row) + '\n').join('')
+  if (mode === 'write') writeFileSync(target, encoded)
+  else appendFileSync(target, encoded)
+}
 if (process.argv.includes('--dangerously-skip-permissions'))
   log('flag:--dangerously-skip-permissions')
 const stream = ndJsonStream(
@@ -180,9 +205,16 @@ new AgentSideConnection((client) => {
           ),
           'utf8',
         )
-          .trim()
           .split('\n')
-          .map((line) => JSON.parse(line))
+          .flatMap((line) => {
+            const trimmed = line.trim()
+            if (!trimmed) return []
+            try {
+              return [JSON.parse(trimmed)]
+            } catch {
+              return []
+            }
+          })
         for (const row of rows) {
           if (
             (row.type === 'USER_INPUT' || row.type === 'PLANNER_RESPONSE') &&
@@ -237,11 +269,7 @@ new AgentSideConnection((client) => {
           update: { sessionUpdate: 'usage_update', used: 900, size: 256_000 },
         })
       }
-      return {
-        configOptions: process.env.AGY_TEST_LOAD_USAGE
-          ? configOptions.filter((o) => o.id !== 'thought_level')
-          : configOptions,
-      }
+      return { configOptions }
     },
     async resumeSession({ sessionId, _meta }) {
       const append = (
@@ -279,6 +307,231 @@ new AgentSideConnection((client) => {
     async prompt({ sessionId, prompt }) {
       const text = prompt.map((c) => (c.type === 'text' ? c.text : '')).join('')
       if (process.env.AGY_TEST_LOG_ELICITATION_CAP) log(`prompt:${text}`)
+      const continuation = pendingBrainContinuation.get(sessionId)
+      if (continuation) {
+        pendingBrainContinuation.delete(sessionId)
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'available_commands_update',
+            availableCommands: [
+              { name: 'continuation-entered', description: '' },
+            ],
+          },
+        })
+        if (continuation.ignoreCancel) return await new Promise<never>(() => {})
+        await new Promise<void>((resolve) => {
+          if (canceled.has(sessionId)) resolve()
+          else cancels.set(sessionId, resolve)
+        })
+        cancels.delete(sessionId)
+        canceled.delete(sessionId)
+        return { stopReason: 'cancelled' as const }
+      }
+      if (
+        text === 'hold:cancel' ||
+        text === 'hold:cancel-throw' ||
+        text === 'hold:cancel-usage' ||
+        text === 'hold:cancel-throw-usage' ||
+        text === 'hold:never'
+      ) {
+        if (
+          text === 'hold:cancel-usage' ||
+          text === 'hold:cancel-throw-usage'
+        ) {
+          writeSessionTranscript(
+            sessionId,
+            [
+              { step_index: 1, type: 'USER_INPUT', content: text },
+              {
+                step_index: 2,
+                type: 'PLANNER_RESPONSE',
+                input_tokens: 10,
+                output_tokens: 1,
+              },
+            ],
+            'write',
+          )
+        }
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'available_commands_update',
+            availableCommands: [{ name: `hold-${++holdSeq}`, description: '' }],
+          },
+        })
+        if (text === 'hold:never') return await new Promise<never>(() => {})
+        await new Promise<void>((resolve) => {
+          if (canceled.has(sessionId)) resolve()
+          else cancels.set(sessionId, resolve)
+        })
+        cancels.delete(sessionId)
+        canceled.delete(sessionId)
+        if (text === 'hold:cancel-throw' || text === 'hold:cancel-throw-usage')
+          throw new Error('Synthetic RPC failure')
+        if (text === 'hold:cancel-usage')
+          return {
+            stopReason: 'cancelled' as const,
+            usage: {
+              inputTokens: 600000,
+              outputTokens: 4405,
+              totalTokens: 604405,
+            },
+          }
+        return { stopReason: 'cancelled' as const }
+      }
+      if (
+        text === 'brain-question-pending' ||
+        text === 'brain-question-ignore-cancel'
+      ) {
+        writeSessionTranscript(
+          sessionId,
+          [
+            { step_index: 1, type: 'USER_INPUT', content: 'work' },
+            {
+              step_index: 2,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'waiting',
+              input_tokens: 10,
+              output_tokens: 1,
+            },
+            {
+              step_index: 3,
+              type: 'SYSTEM_MESSAGE',
+              content:
+                '[Message] sender=system priority=MESSAGE_PRIORITY_HIGH content=wake',
+            },
+            {
+              step_index: 4,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              tool_calls: [
+                {
+                  id: 'ask',
+                  name: 'ask_question',
+                  args: {
+                    questions: [{ question: 'Choose', options: ['A', 'B'] }],
+                  },
+                },
+              ],
+            },
+          ],
+          'write',
+        )
+        pendingBrainContinuation.set(sessionId, {
+          ignoreCancel: text === 'brain-question-ignore-cancel',
+        })
+        return { stopReason: 'end_turn' as const }
+      }
+      if (text === 'flushed-cancel') {
+        writeSessionTranscript(
+          sessionId,
+          [
+            { step_index: 1, type: 'USER_INPUT', content: 'hold:cancel-usage' },
+            {
+              step_index: 2,
+              type: 'PLANNER_RESPONSE',
+              input_tokens: 70207,
+              output_tokens: 256,
+            },
+            { step_index: 3, type: 'GENERIC', status: 'CANCELED' },
+          ],
+          'write',
+        )
+        return { stopReason: 'cancelled' as const }
+      }
+      if (text === 'snapshot-only-cancel') {
+        const step = ++wokenStepBase * 10
+        writeSessionTranscript(sessionId, [
+          { step_index: step, type: 'USER_INPUT', content: text },
+          {
+            step_index: step + 1,
+            type: 'PLANNER_RESPONSE',
+            input_tokens: 20,
+            output_tokens: 2,
+          },
+        ])
+        return { stopReason: 'cancelled' as const }
+      }
+      if (text === 'cancelled-positive-usage') {
+        return {
+          stopReason: 'cancelled' as const,
+          usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
+        }
+      }
+      if (text === 'native-context-then-wakeup') {
+        await client.sessionUpdate({
+          sessionId,
+          update: { sessionUpdate: 'usage_update', used: 1234, size: 128000 },
+        })
+        writeSessionTranscript(
+          sessionId,
+          [
+            { step_index: 0, type: 'USER_INPUT', content: 'work' },
+            {
+              step_index: 1,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'Waiting',
+              input_tokens: 15000,
+              output_tokens: 1,
+            },
+            {
+              step_index: 2,
+              type: 'SYSTEM_MESSAGE',
+              content:
+                '[Message] sender=worker priority=MESSAGE_PRIORITY_HIGH content=ready',
+            },
+            {
+              step_index: 3,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'Finished',
+              input_tokens: 89744,
+              output_tokens: 256,
+            },
+          ],
+          'write',
+        )
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 15000, outputTokens: 1, totalTokens: 15001 },
+        }
+      }
+      if (text === 'late-history-initial') {
+        writeSessionTranscript(
+          sessionId,
+          [
+            {
+              step_index: 1,
+              type: 'PLANNER_RESPONSE',
+              input_tokens: 70,
+              output_tokens: 3,
+            },
+            { step_index: 2, type: 'GENERIC', status: 'CANCELED' },
+          ],
+          'write',
+        )
+        return { stopReason: 'cancelled' as const }
+      }
+      if (text === 'no-lf-snapshot-cancel' || text === 'no-lf-snapshot-error') {
+        writeSessionTranscript(
+          sessionId,
+          JSON.stringify({ step_index: 1, type: 'USER_INPUT' }) +
+            '\n' +
+            JSON.stringify({
+              step_index: 2,
+              type: 'PLANNER_RESPONSE',
+              input_tokens: 70207,
+              output_tokens: 256,
+            }),
+          'write',
+        )
+        if (text === 'no-lf-snapshot-error')
+          throw new Error('Synthetic RPC failure')
+        return { stopReason: 'cancelled' as const }
+      }
       if (
         text === 'checkpoint-turn' ||
         text === '/compact' ||
@@ -379,6 +632,102 @@ new AgentSideConnection((client) => {
         }
       }
 
+      if (text === 'dangling-tool') {
+        writeSessionTranscript(
+          sessionId,
+          [
+            { step_index: 1, type: 'USER_INPUT', content: text },
+            { step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE' },
+          ],
+          'write',
+        )
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'dangling-tool',
+            title: 'run_command',
+            status: 'in_progress',
+            rawInput: { CommandLine: 'echo dangling' },
+          },
+        })
+        return { stopReason: 'end_turn' as const }
+      }
+      if (text === 'cancel-only') {
+        return { stopReason: 'cancelled' as const }
+      }
+      if (text === 'dangling-permission') {
+        void client.requestPermission({
+          sessionId,
+          toolCall: {
+            toolCallId: 'dangling-tool',
+            title: 'run_command',
+            rawInput: { CommandLine: 'echo dangling' },
+          },
+          options: [
+            { optionId: 'yes', name: 'Allow', kind: 'allow_once' },
+            { optionId: 'no', name: 'Deny', kind: 'reject_once' },
+          ],
+        })
+        return { stopReason: 'end_turn' as const }
+      }
+      if (text === 'seed-woken-carry') {
+        const step = ++wokenStepBase * 10
+        writeSessionTranscript(sessionId, [
+          { step_index: step, type: 'USER_INPUT', content: text },
+          {
+            step_index: step + 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Foreground',
+            input_tokens: 100,
+            output_tokens: 10,
+          },
+          {
+            step_index: step + 2,
+            type: 'SYSTEM_MESSAGE',
+            content:
+              '<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-10T18:59:59+08:00 sender=bg-1 priority=MESSAGE_PRIORITY_HIGH content=ready\n</SYSTEM_MESSAGE>',
+          },
+          {
+            step_index: step + 3,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Woken done',
+            input_tokens: 40,
+            output_tokens: 4,
+          },
+        ])
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
+        }
+      }
+      if (text === 'corrupt-transcript-positive-usage') {
+        writeSessionTranscript(sessionId, '{corrupt\n')
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 120, outputTokens: 12, totalTokens: 132 },
+        }
+      }
+      if (text === 'clean-positive-usage') {
+        const step = ++wokenStepBase * 10
+        writeSessionTranscript(sessionId, [
+          { step_index: step, type: 'USER_INPUT', content: text },
+          {
+            step_index: step + 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Clean done',
+            input_tokens: 50,
+            output_tokens: 5,
+          },
+        ])
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 50, outputTokens: 5, totalTokens: 55 },
+        }
+      }
       if (text === 'message-refresh-boundary') {
         await client.sessionUpdate({
           sessionId,
@@ -1217,7 +1566,7 @@ new AgentSideConnection((client) => {
         setTimeout(() => {
           void (async () => {
             // Send elicitation/create after Brain's onQuestion has already popped the card.
-            const response = await elicit({
+            const pendingResponse = elicit({
               message: 'The agent has a question.',
               requestedSchema: {
                 type: 'object',
@@ -1233,6 +1582,16 @@ new AgentSideConnection((client) => {
                 },
               },
             })
+            await client.sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate: 'available_commands_update',
+                availableCommands: [
+                  { name: 'elicit-dispatched', description: 'sync' },
+                ],
+              },
+            })
+            const response = await pendingResponse
             appendFileSync(
               file,
               [

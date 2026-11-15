@@ -313,7 +313,7 @@ async function readMessageCached(path: string, fallbackId: string) {
 const SPAWN_CACHE_LIMIT = 4096
 const spawnCache = new Map<string, { callId?: string; stepIndex?: number }>()
 
-export async function resolveBrainPath(
+async function resolveBrainPath(
   root: string,
   nativeId: string,
   subpath: string,

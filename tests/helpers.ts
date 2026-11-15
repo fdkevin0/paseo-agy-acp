@@ -24,16 +24,68 @@ export async function waitUntil(
   }
 }
 
+/** Collect emitted `ProviderEvent` items with push-based waiting. */
+export function createEventCollector(onEvent?: (event: ProviderEvent) => void) {
+  const events: ProviderEvent[] = []
+  const listeners = new Set<() => void>()
+
+  function emit(event: ProviderEvent) {
+    const cloned = structuredClone(event)
+    events.push(cloned)
+    onEvent?.(cloned)
+    for (const notify of [...listeners]) notify()
+  }
+
+  async function wait(
+    predicate: (event: ProviderEvent) => boolean,
+    timeoutMs = 5000,
+    assertHealthy?: () => void,
+  ): Promise<ProviderEvent> {
+    assertHealthy?.()
+    const existing = events.find(predicate)
+    if (existing) return existing
+    let check!: () => void
+    let timer!: ReturnType<typeof setTimeout>
+    try {
+      return await new Promise<ProviderEvent>((resolve, reject) => {
+        check = () => {
+          try {
+            assertHealthy?.()
+          } catch (err) {
+            reject(err)
+            return
+          }
+          const match = events.find(predicate)
+          if (match) resolve(match)
+        }
+        timer = setTimeout(() => {
+          try {
+            assertHealthy?.()
+            assert.fail(`Timed out: ${JSON.stringify(events)}`)
+          } catch (err) {
+            reject(err)
+          }
+        }, timeoutMs)
+        listeners.add(check)
+        check()
+      })
+    } finally {
+      clearTimeout(timer)
+      listeners.delete(check)
+    }
+  }
+
+  return { events, emit, wait }
+}
+
 /** Validate and collect all events emitted on a `ProviderConnection`. */
 export function collectProviderEvents(
   provider: ProviderConnection,
   onEvent?: (event: ProviderEvent) => void,
 ) {
-  const events: ProviderEvent[] = []
   const opened = new Map<string, readonly string[]>()
   const protocolErrors: string[] = []
-
-  provider.onEvent((event) => {
+  const collector = createEventCollector((event) => {
     ProviderEventSchema.parse(event)
     if (event.type === 'session.opened') {
       if (
@@ -48,27 +100,19 @@ export function collectProviderEvents(
     } else if (event.type === 'session.closed') {
       opened.delete(event.sessionId)
     }
-    const cloned = structuredClone(event)
-    events.push(cloned)
-    onEvent?.(cloned)
+    onEvent?.(event)
   })
 
-  async function wait(
-    predicate: (event: ProviderEvent) => boolean,
-    timeoutMs = 5000,
-  ): Promise<ProviderEvent> {
-    const deadline = Date.now() + timeoutMs
-    while (Date.now() < deadline) {
-      assert.deepEqual(protocolErrors, [])
-      const match = events.find(predicate)
-      if (match) return match
-      await delay(10)
-    }
-    assert.deepEqual(protocolErrors, [])
-    assert.fail(`Timed out: ${JSON.stringify(events)}`)
-  }
+  provider.onEvent(collector.emit)
 
-  return { events, protocolErrors, wait }
+  return {
+    events: collector.events,
+    protocolErrors,
+    wait: (predicate: (event: ProviderEvent) => boolean, timeoutMs = 5000) =>
+      collector.wait(predicate, timeoutMs, () =>
+        assert.deepEqual(protocolErrors, []),
+      ),
+  }
 }
 
 /** Write JSONL rows to `<brainRoot>/<nativeId>/.system_generated/logs/transcript_full.jsonl`. */

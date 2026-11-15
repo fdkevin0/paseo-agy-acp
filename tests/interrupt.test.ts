@@ -4,7 +4,6 @@ import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { setTimeout as delay } from 'node:timers/promises'
 import {
   PROVIDER_CAPABILITIES,
   type ProviderEvent,
@@ -93,7 +92,6 @@ for (const mode of ['plan', 'full-access']) {
       await until(
         (event) => event.type === 'session.turn' && event.state === 'completed',
       )
-      await delay(750)
       const log = (await readFile(join(home, 'runtime.jsonl'), 'utf8'))
         .trim()
         .split('\n')
@@ -294,6 +292,11 @@ test('interrupt without active background work uses native session/cancel fast p
     await until(
       (event) =>
         event.type === 'request.completed' && event.requestId === 'interrupt',
+    )
+    await until(
+      (event) =>
+        event.type === 'session.commands' &&
+        event.commands.some((command) => command.name === 'cancel-ack'),
     )
     const log = (await readFile(join(home, 'runtime.jsonl'), 'utf8'))
       .trim()

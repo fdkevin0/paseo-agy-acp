@@ -98,7 +98,7 @@ function terminalToolStatus(
 }
 
 /** A checkpoint takes a step index between a response and its GENERIC rows; shift expected rows past it. */
-export function shiftPendingPastCheckpoint(
+function shiftPendingPastCheckpoint(
   pending: readonly { stepIndex: number }[],
   checkpointStep: number,
 ) {
@@ -106,7 +106,7 @@ export function shiftPendingPastCheckpoint(
 }
 
 /** Match by stepIndex first so an unlogged WAITING ask_question never steals a sibling tool's GENERIC row. */
-export function takePendingForGeneric<
+function takePendingForGeneric<
   T extends { stepIndex: number; isQuestion?: boolean },
 >(pending: T[], genericStep: number): T | undefined {
   let matchIndex = pending.findIndex((p) => p.stepIndex === genericStep)

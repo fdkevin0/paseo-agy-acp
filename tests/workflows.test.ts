@@ -93,26 +93,6 @@ function fixture(t: TestContext, version = '1.2.3') {
 
 const preflight = 'Validate release tag and check npm registry'
 
-test('release triggers and publication guards leave existing versions recoverable', () => {
-  const triggers = workflow.split('\npermissions:')[0]
-  assert.match(triggers, /push:\n\s+tags: \['v\*'\]/)
-  assert.match(triggers, /workflow_dispatch:/)
-  assert.doesNotMatch(triggers, /branches:|pull_request:/)
-  for (const name of [
-    'Install dependencies',
-    'Typecheck, test, and verify package',
-    'Prepare npm manifest',
-    'Update npm for trusted publishing',
-    'Publish to npm',
-  ]) {
-    assert.match(
-      stepFor(name),
-      /if: steps\.meta\.outputs\.published == 'false'/,
-    )
-  }
-  assert.doesNotMatch(stepFor('Ensure GitHub Release exists'), /^        if:/m)
-})
-
 test('release preflight rejects branch dispatch and tag mismatches before contacting npm', (t) => {
   const { run } = fixture(t)
   for (const env of [

@@ -47,9 +47,9 @@ import {
   settleBrainTurn,
   type ForegroundAcpSegment,
 } from './brain.ts'
-import { readLatestStepUsage } from './brain-io.ts'
+import { readLatestStepUsage, type TranscriptReader } from './brain-io.ts'
 import { projectReplayHistory, type HistoryEntry } from './history.ts'
-import { SubagentRegistry, isSubagentMessage } from './subagents.ts'
+import { SubagentRegistry } from './subagents.ts'
 import { dataDirectory, removeSessionArtifacts } from './preflight.ts'
 import { connectAcp } from './transport.ts'
 import {
@@ -103,6 +103,10 @@ interface SessionOptions {
   emit: (event: ProviderEvent) => void
   stallTimeoutMs?: number
   retryTimeoutMs?: number
+  cancelConvergenceTimeoutMs?: number
+  createTranscriptReader?: () => TranscriptReader
+  readSubagents?: typeof readSubagents
+  hasActiveBackgroundWork?: typeof hasActiveBackgroundWork
 }
 
 const SKIP_PERMISSIONS_FLAG = '--dangerously-skip-permissions'
@@ -155,7 +159,7 @@ export class SessionManager {
     return createSession(id, cwd, config, this.options, this.transports)
   }
 
-  async open(input: Open) {
+  private async open(input: Open) {
     const { emit, capabilities } = this.options
     if (this.sessions.has(input.sessionId) || this.opening.has(input.sessionId))
       throw new Error('Session already open')
@@ -455,6 +459,7 @@ async function createSession(
     isLoading: () => state.loading,
     isUnavailable: () => state.closing || state.failed,
     retryTimeoutMs: options.retryTimeoutMs,
+    readSubagents: options.readSubagents,
   })
   let notificationLane = Promise.resolve()
   let relaunching = Promise.resolve()
@@ -527,10 +532,12 @@ async function createSession(
     turnId: string,
     status: 'completed' | 'canceled' | 'failed',
     error?: string,
+    beforeEmit?: () => void,
   ) {
     if (state.turn !== turnId || state.turnFinished || state.silenced) return
     state.turnFinished = true
     terminalize(status, error)
+    beforeEmit?.()
     emit({
       type: 'session.turn',
       sessionId: id,
@@ -673,19 +680,7 @@ async function createSession(
       // Timeline.update already tracks the ACP item.
       const item = timeline.update(u, state.deniedToolCallIds)
       if (item) {
-        if (
-          item.type === 'tool_call' &&
-          item.detail.type === 'sub_agent' &&
-          isSubagentMessage(item.name)
-        ) {
-          // Terminalization may run while ownership is being read.
-          const nativeId = item.detail.childSessionId
-          delete item.detail.childSessionId
-          await subagents.refreshSubagents()
-          // Do not restore a native ID that a later terminalization could publish.
-          if (state.closing || state.failed) return
-          if (nativeId !== undefined) item.detail.childSessionId = nativeId
-        }
+        if (!(await subagents.prepareMessageItem(item))) return
         if (
           state.loading &&
           state.persisted &&
@@ -728,7 +723,9 @@ async function createSession(
     })
   }
   function cancelPermissions() {
-    for (const [permissionId, p] of permissions) {
+    const entries = [...permissions]
+    permissions.clear()
+    for (const [permissionId, p] of entries) {
       if (p.type === 'acp') {
         state.deniedToolCallIds.add(p.request.toolCall.toolCallId)
         p.resolve({ outcome: { outcome: 'cancelled' } })
@@ -743,7 +740,6 @@ async function createSession(
         })
       }
     }
-    permissions.clear()
   }
   function askUserQuestion(
     questions: NormalizedQuestion[],
@@ -1060,6 +1056,8 @@ async function createSession(
       brainRoot,
       stallTimeoutMs: options.stallTimeoutMs,
       retryTimeoutMs: options.retryTimeoutMs,
+      cancelConvergenceTimeoutMs: options.cancelConvergenceTimeoutMs,
+      createTranscriptReader: options.createTranscriptReader,
       state,
       get initialized() {
         return currentInitialized
@@ -1074,7 +1072,6 @@ async function createSession(
       publishConfig,
       publishUsage,
       flushDeferredUsage,
-      terminalize,
       finishTurnOnce,
       emitItem,
       resetWakeup() {
@@ -1123,7 +1120,7 @@ async function createSession(
         if (!state.replay) return
         const [inbox, subagentRecords, rows] = await Promise.all([
           readInboxState(brainRoot, state.nativeId),
-          readSubagents(brainRoot, state.nativeId),
+          (options.readSubagents ?? readSubagents)(brainRoot, state.nativeId),
           readTranscriptRows(brainRoot, state.nativeId),
         ])
         subagents.rememberSubagents(subagentRecords)
@@ -1164,7 +1161,9 @@ async function createSession(
           subagents.hasRunningChildren()
         )
           return false
-        return !(await hasActiveBackgroundWork(brainRoot, state.nativeId, {
+        return !(await (
+          options.hasActiveBackgroundWork ?? hasActiveBackgroundWork
+        )(brainRoot, state.nativeId, {
           includeDaemons: true,
           retryTimeoutMs: options.retryTimeoutMs,
         }).catch(() => true))
@@ -1189,9 +1188,13 @@ async function createSession(
           await Promise.all(canceling)
           let needsRelaunch =
             canceling.length > 0 ||
-            (await hasActiveBackgroundWork(brainRoot, state.nativeId, {
-              retryTimeoutMs: options.retryTimeoutMs,
-            }).catch(() => true))
+            (await (options.hasActiveBackgroundWork ?? hasActiveBackgroundWork)(
+              brainRoot,
+              state.nativeId,
+              {
+                retryTimeoutMs: options.retryTimeoutMs,
+              },
+            ).catch(() => true))
           if (state.closing) return
           if (state.failed)
             throw new Error('ACP runtime has exited; reopen the session')
@@ -1536,6 +1539,8 @@ async function promptSession(
   let turnWakeupUsage: StepUsage | undefined
   let nextCarriedWakeup: StepUsage | undefined
   let settledPendingReplay = false
+  let pendingFinish:
+    { status: 'completed' | 'canceled' | 'failed'; error?: string } | undefined
   let hasWakeupState = false
   const settleTurnUsageAndWakeup = (isError: boolean) => {
     const runtimeRelaunched = session.transport !== initialTransport
@@ -1612,7 +1617,10 @@ async function promptSession(
         if (session.state.closing) throw turnAbort.signal.reason
         // Cancel is a notification. Bound convergence with the existing control-request policy, not a flush sleep.
         try {
-          result = await transport.request(outcome, { fatalOnTimeout: false })
+          result = await transport.request(outcome, {
+            fatalOnTimeout: false,
+            timeoutMs: session.cancelConvergenceTimeoutMs,
+          })
         } catch (error) {
           if (!session.state.closing && session.transport === transport)
             await session.relaunch(session.state.skipPermissions, true)
@@ -1695,6 +1703,8 @@ async function promptSession(
             : Math.max(session.state.lastKnownStepIndex, index)
         },
       },
+      undefined,
+      session.createTranscriptReader?.(),
     )
     session.state.observation = observation
     observation.start()
@@ -1891,7 +1901,7 @@ async function promptSession(
       } else turnAbort.signal.throwIfAborted()
     }
     settleTurnUsageAndWakeup(false)
-    session.finishTurnOnce(turnId, status, turnError)
+    pendingFinish = { status, error: turnError }
   } catch (error) {
     const restartError = session.state.closing
       ? undefined
@@ -1913,24 +1923,43 @@ async function promptSession(
         ? 'canceled'
         : 'failed'
     const message = formatErrorMessage(turnError)
-    session.finishTurnOnce(turnId, status, message)
+    pendingFinish = { status, error: message }
   } finally {
     turnAbort.signal.removeEventListener('abort', stopObservation)
-    await observation?.dispose()
+    const disposing = observation?.dispose()
     if (
       session.state.turn === turnId &&
       session.state.turnAbort === turnAbort
     ) {
-      session.state.observation = null
-      session.state.wakeup.suppressEcho = false
-      session.state.inSettle = false
-      session.state.handledElicitations = []
-      session.state.suppressContinuationAcp = false
-      session.state.preStagedQuestion = undefined
-      session.state.turnAbort = null
-      session.state.turn = ''
-      session.timeline.boundary()
+      const clearTurnState = () => {
+        if (
+          session.state.turn !== turnId ||
+          session.state.turnAbort !== turnAbort
+        )
+          return
+        session.state.wakeup.suppressEcho = false
+        session.state.inSettle = false
+        session.state.handledElicitations = []
+        session.state.suppressContinuationAcp = false
+        session.state.preStagedQuestion = undefined
+        session.state.turnAbort = null
+        session.state.turn = ''
+        session.timeline.boundary()
+      }
       session.cancelPermissions()
+      if (pendingFinish) {
+        session.finishTurnOnce(
+          turnId,
+          pendingFinish.status,
+          pendingFinish.error,
+          clearTurnState,
+        )
+      }
+      clearTurnState()
+    }
+    await disposing
+    if (observation && session.state.observation === observation) {
+      session.state.observation = null
     }
   }
 }
