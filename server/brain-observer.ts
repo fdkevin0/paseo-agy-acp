@@ -3,6 +3,7 @@ import {
   TranscriptReader,
   StepDedupe,
   countRowMessages,
+  extractRowMessageSignatures,
   extractStepUsage,
   isMissing,
   stepErrorMessage,
@@ -81,11 +82,13 @@ export class BrainTurnObservation {
   missing = false
   private readError?: unknown
   private failure?: unknown
+  private readonly epochAfterStepIndex: number
   get error(): unknown {
     return this.failure ?? this.readError
   }
   lastStepIndex = -1
   historicalMessages = 0
+  postEpochSignatures = new Map<string, number>()
   revision = 0
   private waiters = new Set<() => void>()
   private notify() {
@@ -150,12 +153,14 @@ export class BrainTurnObservation {
     callbacks: BrainTurnObservation['callbacks'],
     pollIntervalMs = 200,
     reader = new TranscriptReader(),
+    epochAfterStepIndex = -1,
   ) {
     this.reader = reader
     this.root = root
     this.nativeId = nativeId
     this.sessionId = sessionId
     this.minStepIndex = minStepIndex
+    this.epochAfterStepIndex = epochAfterStepIndex
     this.callbacks = callbacks
     this.pollIntervalMs = pollIntervalMs
     this.usage = new ModelUsageObserver(minStepIndex, (usage) =>
@@ -212,13 +217,23 @@ export class BrainTurnObservation {
       this.bufferSnapshot = undefined
       this.lastStepIndex = -1
       this.historicalMessages = 0
+      this.postEpochSignatures.clear()
     }
     for (const row of read.rows) {
       const index = Number(row.step_index)
-      if (Number.isInteger(index))
+      if (Number.isInteger(index)) {
         this.lastStepIndex = Math.max(this.lastStepIndex, index)
-      if (index <= this.minStepIndex)
-        this.historicalMessages += countRowMessages(row, false)
+        if (index > this.epochAfterStepIndex) {
+          if (index <= this.minStepIndex)
+            this.historicalMessages += countRowMessages(row, false)
+          for (const sig of extractRowMessageSignatures(row)) {
+            this.postEpochSignatures.set(
+              sig,
+              (this.postEpochSignatures.get(sig) ?? 0) + 1,
+            )
+          }
+        }
+      }
     }
     if (this.mayPublish())
       this.callbacks.onBoundary?.(

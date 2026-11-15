@@ -3,6 +3,7 @@ import type {
   ProviderTimelineItem,
 } from '@getpaseo/plugin/server/provider'
 import { isNativeToolName, sessionIdPattern } from './common.ts'
+import type { TranscriptReader } from './brain-io.ts'
 import {
   readSubagents,
   watchBrain,
@@ -22,9 +23,11 @@ export interface SubagentRegistryOptions {
   getNativeId: () => string
   isParentTurnActive: () => boolean
   isLoading: () => boolean
+  isSuppressingReplay?: () => boolean
   isUnavailable: () => boolean
   retryTimeoutMs?: number
   readSubagents?: typeof readSubagents
+  createTranscriptReader?: () => TranscriptReader
 }
 
 /** Own child sub-session watchers, parent-child ownership, and resumption for one root session. */
@@ -32,7 +35,9 @@ export class SubagentRegistry {
   private children = new Map<string, BrainWatchHandle>()
   private childParents = new Map<string, string>()
   private killedChildren = new Set<string>()
-  private resuming = new Set<string>()
+  private resuming = new Map<string, Promise<void>>()
+  private cancelAllToken: object | null = null
+  private generation = 0
   private opts: SubagentRegistryOptions
 
   constructor(opts: SubagentRegistryOptions) {
@@ -60,17 +65,49 @@ export class SubagentRegistry {
   }
 
   hasRunningChildren(): boolean {
-    return [...this.children.values()].some((child) => child.isRunning())
+    return (
+      this.resuming.size > 0 ||
+      [...this.children.values()].some((child) => child.isRunning())
+    )
   }
 
   cancelRunning(): Promise<void>[] {
-    return [...this.children.values()]
-      .filter((child) => child.isRunning())
-      .map((child) => child.cancel())
+    this.generation++
+    const tasks = [...this.resuming.values()]
+    for (const child of this.children.values()) {
+      if (child.isRunning()) tasks.push(child.cancel())
+    }
+    return tasks
   }
 
-  cancelAll(): Promise<void>[] {
-    return [...this.children.values()].map((child) => child.cancel())
+  async cancelAll(): Promise<void> {
+    const token = {}
+    this.cancelAllToken = token
+    const seen = new Set<BrainWatchHandle>()
+    try {
+      while (this.cancelAllToken === token) {
+        this.generation++
+        const batch: Promise<void>[] = [...this.resuming.values()]
+        for (const child of this.children.values()) {
+          if (!seen.has(child)) {
+            seen.add(child)
+            batch.push(child.cancel())
+          }
+        }
+        if (batch.length === 0) break
+        await Promise.all(batch)
+      }
+    } finally {
+      if (this.cancelAllToken === token) this.cancelAllToken = null
+    }
+  }
+
+  /** Synchronously stop every active child watcher when bounded drain expires. */
+  forceStopAll(): void {
+    this.cancelAllToken = null
+    this.generation++
+    this.resuming.clear()
+    for (const child of this.children.values()) child.forceCancel()
   }
 
   async waitCurrentReady(): Promise<void> {
@@ -138,7 +175,7 @@ export class SubagentRegistry {
     else await this.syncKilledChildren(subagents)
   }
 
-  /** Strip raw childSessionId across async ownership refresh; return false if session became unavailable. */
+  /** Strip raw childSessionId across async ownership refresh; return false if session became unavailable or replay-suppressed. */
   async prepareMessageItem(item: ProviderTimelineItem): Promise<boolean> {
     if (
       item.type === 'tool_call' &&
@@ -146,11 +183,20 @@ export class SubagentRegistry {
       isSubagentMessage(item.name)
     ) {
       // Terminalization may run while ownership is being read.
+      const generation = this.generation
       const nativeId = item.detail.childSessionId
       delete item.detail.childSessionId
+      if (this.cancelAllToken !== null || this.opts.isSuppressingReplay?.())
+        return false
       await this.refreshSubagents()
       // Do not restore a native ID that a later terminalization could publish.
-      if (this.opts.isUnavailable()) return false
+      if (
+        this.cancelAllToken !== null ||
+        this.generation !== generation ||
+        this.opts.isSuppressingReplay?.() ||
+        this.opts.isUnavailable()
+      )
+        return false
       if (nativeId !== undefined) item.detail.childSessionId = nativeId
     }
     return true
@@ -176,6 +222,7 @@ export class SubagentRegistry {
       resume,
       (subagents) => this.rememberSubagents(subagents, nativeId),
       this.opts.retryTimeoutMs,
+      this.opts.createTranscriptReader?.(),
     )
     this.children.set(childId, child)
     void child.ready.then(() => {
@@ -189,18 +236,25 @@ export class SubagentRegistry {
     childId: string,
     existing: BrainWatchHandle,
   ) {
-    if (this.resuming.has(childId)) return
-    this.resuming.add(childId)
-    void existing.cancel().then(() => {
-      this.resuming.delete(childId)
-      if (
-        this.opts.isUnavailable() ||
-        this.killedChildren.has(childId) ||
-        this.children.get(childId) !== existing
-      )
-        return
-      this.watchChild(nativeId, childId, existing.resumePoint())
-    })
+    if (this.cancelAllToken !== null || this.resuming.has(childId)) return
+    const generation = this.generation
+    const task = existing
+      .cancel()
+      .then(() => {
+        if (
+          this.cancelAllToken !== null ||
+          this.generation !== generation ||
+          this.opts.isUnavailable() ||
+          this.killedChildren.has(childId) ||
+          this.children.get(childId) !== existing
+        )
+          return
+        this.watchChild(nativeId, childId, existing.resumePoint())
+      })
+      .finally(() => {
+        if (this.resuming.get(childId) === task) this.resuming.delete(childId)
+      })
+    this.resuming.set(childId, task)
   }
 
   canLinkChild = (
@@ -237,6 +291,12 @@ export class SubagentRegistry {
     parentNativeId: string,
     item: ProviderTimelineItem,
   ): void {
+    if (this.cancelAllToken !== null || this.opts.isSuppressingReplay?.()) {
+      if (item.type === 'tool_call' && item.detail.type === 'sub_agent') {
+        delete item.detail.childSessionId
+      }
+      return
+    }
     if (item.type === 'tool_call' && item.detail.type === 'sub_agent') {
       const nativeId = item.detail.childSessionId
       delete item.detail.childSessionId
@@ -278,6 +338,9 @@ export class SubagentRegistry {
   }
 
   closeAll(): void {
+    this.cancelAllToken = null
+    this.generation++
+    this.resuming.clear()
     for (const [childId, stop] of this.children) {
       stop()
       this.opts.emit({ type: 'session.closed', sessionId: childId })

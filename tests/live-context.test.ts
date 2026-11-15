@@ -963,28 +963,32 @@ test(
   'same-native runtime replacement invalidates a read already in flight without close/RPC dependency cycles',
   { timeout: 5000 },
   async (t) => {
-    const h = await harness(t),
-      held = await h.hold()
+    const reader = new SwappableTranscriptReader()
+    const h = await harness(t, {
+        createTranscriptReader: () => reader,
+        hasActiveBackgroundWork: async () => true,
+      }),
+      held = await h.holdLive('hold:cancel')
     await h.read()
     await h.write([user(1), model(2, 100), checkpoint(3)])
     const entered = deferred<void>(),
       release = deferred<void>(),
-      reader = held.observation.reader.read.bind(held.observation.reader)
-    t.mock.method(
-      held.observation.reader,
-      'read',
-      async (...args: Parameters<typeof reader>) => {
-        const result = await reader(...args)
-        entered.resolve()
-        await release.promise
-        return result
-      },
-    )
+      baseRead = reader.impl
+    reader.impl = async (root, id) => {
+      const result = await baseRead(root, id)
+      entered.resolve()
+      await release.promise
+      return result
+    }
     const pass = held.observation.poll()
     await entered.promise
     const oldTransport = h.session.transport,
       nativeId = h.session.state.nativeId
-    await h.session.relaunch(h.session.state.skipPermissions, true)
+    await h.manager.handle({
+      type: 'session.interrupt',
+      requestId: 'interrupt',
+      sessionId: 's',
+    })
     assert.equal(h.session.state.nativeId, nativeId)
     assert.notEqual(h.session.transport, oldTransport)
     const count = h.events.filter(
@@ -993,6 +997,7 @@ test(
         (event.type === 'timeline.item' && event.item.type === 'compaction'),
     ).length
     release.resolve()
+    reader.impl = baseRead
     await pass
     assert.equal(
       h.events.filter(
@@ -1002,10 +1007,11 @@ test(
       ).length,
       count,
     )
-    held.done.reject(new Error('old transport closed'))
     await held.running
-    assert.deepEqual(h.turns(), ['failed'])
+    assert.deepEqual(h.turns(), ['canceled'])
     assert.equal(held.observation.phase, 'disposed')
+    await h.prompt('cancel-only')
+    assert.deepEqual(h.turns(), ['canceled', 'canceled'])
   },
 )
 
