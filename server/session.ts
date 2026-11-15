@@ -1462,6 +1462,18 @@ async function createSession(
                 () => undefined,
               )
             }
+            if (
+              state.closing &&
+              !previousPersisted &&
+              (config?.persist === false || state.prompts.size === 0) &&
+              sessionIdPattern.test(previousNativeId)
+            ) {
+              await (
+                config?.persist === false
+                  ? removeForkedConversation
+                  : removeSessionArtifacts
+              )(appDataDir, previousNativeId).catch(() => undefined)
+            }
             throw error
           }
         }

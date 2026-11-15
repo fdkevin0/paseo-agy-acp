@@ -7,10 +7,10 @@ import {
   lstat,
   mkdir,
   readFile,
-  readdir,
   realpath,
   rename,
   rm,
+  rmdir,
   stat,
   symlink,
   utimes,
@@ -140,9 +140,13 @@ async function pruneEmptyParents(
   const resolvedStop = resolve(stopRoot)
   let current = resolve(startDir)
   while (current !== resolvedStop && current.startsWith(resolvedStop + sep)) {
-    const entries = await readdir(current).catch(() => null)
-    if (!entries || entries.length > 0) break
-    await rm(current, { recursive: false, force: true }).catch(() => undefined)
+    const info = await lstat(current).catch(() => null)
+    if (!info || info.isSymbolicLink() || !info.isDirectory()) break
+    const removed = await rmdir(current).then(
+      () => true,
+      () => false,
+    )
+    if (!removed) break
     current = dirname(current)
   }
 }
@@ -256,7 +260,24 @@ async function removeShadowIndexCache(shadowDir: string): Promise<void> {
   await Promise.all([
     rm(join(shadowDir, 'index'), { force: true }),
     rm(join(shadowDir, 'real-index-stamp'), { force: true }),
+    rm(join(shadowDir, 'force-tracked.json'), { force: true }),
   ])
+}
+
+function parseForceTrackedList(raw: string | null): string[] | null {
+  if (raw === null) return null
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (
+      Array.isArray(parsed) &&
+      parsed.every((item) => typeof item === 'string')
+    ) {
+      return parsed
+    }
+  } catch {
+    return null
+  }
+  return null
 }
 
 async function ensureShadowGitRepo(
@@ -362,11 +383,51 @@ async function captureGitTree(
     const realStamp = realStat ? `${realStat.mtimeMs}:${realStat.size}` : 'none'
     const shadowIndex = join(shadowDir, 'index')
     const stampPath = join(shadowDir, 'real-index-stamp')
+    const forceTrackedPath = join(shadowDir, 'force-tracked.json')
     const shadowStat = await stat(shadowIndex).catch(() => null)
     const savedStamp = await readFile(stampPath, 'utf8').catch(() => null)
-    const reuseShadowIndex = Boolean(shadowStat && savedStamp === realStamp)
+    const savedForceTracked = parseForceTrackedList(
+      await readFile(forceTrackedPath, 'utf8').catch(() => null),
+    )
+    const reuseShadowIndex = Boolean(
+      shadowStat && savedStamp === realStamp && savedForceTracked !== null,
+    )
     const seedPath = reuseShadowIndex ? shadowIndex : srcRealIndex
     const seedStat = reuseShadowIndex ? shadowStat : realStat
+    let forceTrackedPaths: string[]
+    if (reuseShadowIndex) {
+      forceTrackedPaths = savedForceTracked!
+    } else if (realStat) {
+      const { stdout: ignoredOut } = await execFileAsync(
+        'git',
+        [
+          '-c',
+          'core.quotePath=false',
+          'ls-files',
+          '-z',
+          '-c',
+          '-i',
+          '--exclude-standard',
+        ],
+        {
+          cwd: repoRoot,
+          env: gitEnv({
+            GIT_DIR: shadowDir,
+            GIT_WORK_TREE: repoRoot,
+            GIT_INDEX_FILE: srcRealIndex,
+          }),
+          encoding: 'buffer',
+          maxBuffer: GIT_DIFF_MAX_BUFFER,
+          timeout: GIT_TIMEOUT_MS,
+        },
+      )
+      forceTrackedPaths = ignoredOut
+        .toString('utf8')
+        .split('\0')
+        .filter(Boolean)
+    } else {
+      forceTrackedPaths = []
+    }
     const configFlags = [
       '-c',
       'core.autocrlf=false',
@@ -418,6 +479,50 @@ async function captureGitTree(
               },
             )
           }
+          if (reuseShadowIndex && forceTrackedPaths.length > 0) {
+            const presentPaths: string[] = []
+            for (const relPath of forceTrackedPaths) {
+              if (
+                excluded.some(
+                  (dir) => relPath === dir || relPath.startsWith(`${dir}/`),
+                )
+              ) {
+                continue
+              }
+              const abs = resolveContainedPath(repoRoot, relPath)
+              if (
+                !abs ||
+                !(await assertNoSymlinkEscape(repoRoot, dirname(abs)))
+              ) {
+                continue
+              }
+              if (await lstat(abs).catch(() => null)) {
+                presentPaths.push(relPath)
+              }
+            }
+            for (let i = 0; i < presentPaths.length; i += 256) {
+              const batch = presentPaths
+                .slice(i, i + 256)
+                .map((relPath) => `:(top,literal)${relPath}`)
+              await execFileAsync(
+                'git',
+                [
+                  ...configFlags,
+                  'add',
+                  '-f',
+                  '--',
+                  ...batch,
+                  ...excluded.map((dir) => `:(top,exclude,literal)${dir}`),
+                ],
+                {
+                  cwd: repoRoot,
+                  env,
+                  encoding: 'utf8',
+                  timeout: GIT_TIMEOUT_MS,
+                },
+              )
+            }
+          }
           captured = true
           break
         } catch (error) {
@@ -452,6 +557,12 @@ async function captureGitTree(
       }
       await rename(tempIndex, shadowIndex)
       await writeAtomicText(stampPath, realStamp)
+      if (!reuseShadowIndex) {
+        await writeAtomicText(
+          forceTrackedPath,
+          JSON.stringify(forceTrackedPaths),
+        )
+      }
       return { treeHash, unbornDirs: excluded }
     } finally {
       await rm(tempIndex, { force: true }).catch(() => undefined)
@@ -566,7 +677,7 @@ async function restoreGitTree(
     },
   )
   const diffEntries = parseNullDiffTree(stdout).filter(
-    (entry) => entry.modeOld !== '160000' && entry.modeNew !== '160000',
+    (entry) => entry.modeOld !== '160000',
   )
   // Remove added paths before restoring target entries so file/directory swaps cannot collide across phases.
   try {

@@ -159,7 +159,7 @@ async function resolveCutoffStepIndex(
     }
   }
 
-  if (!matched && token.text !== undefined) {
+  if (!matched && firstTranscriptStepIndex === 0 && token.text !== undefined) {
     const byText = userSteps.filter((s) => s.text === token.text)
     if (byText.length === 1) matched = byText[0]
   }

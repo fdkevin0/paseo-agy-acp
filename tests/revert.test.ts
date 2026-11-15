@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import {
   chmod,
   lstat,
@@ -37,7 +38,11 @@ import { dataDirectory } from '../server/preflight.ts'
 import { createProvider } from '../server/provider.ts'
 import { attachReplayRevertTokens, revertSession } from '../server/revert.ts'
 import { AgyUsageSource } from '../server/usage.ts'
-import { collectProviderEvents, writeBrainTranscript } from './helpers.ts'
+import {
+  collectProviderEvents,
+  waitUntil,
+  writeBrainTranscript,
+} from './helpers.ts'
 
 const execFileAsync = promisify(execFile)
 
@@ -3382,9 +3387,9 @@ test('Native-forked session replay aligns child revert tokens to suffix steps, p
       ).run(nativeId, 'traj-forked', 1)
       ;[
         [0, 14, 'parent 0'],
-        [5, 14, 'parent 1'],
+        [5, 14, 'continue'],
         [9, 15, 'parent ans 1'],
-        [10, 14, 'child 2'],
+        [10, 14, 'continue'],
         [11, 15, 'child ans 2'],
       ].forEach(([idx, stepType, label]) => {
         const data = pbStr(1, String(label))
@@ -3401,7 +3406,7 @@ test('Native-forked session replay aligns child revert tokens to suffix steps, p
         step_index: 10,
         type: 'USER_INPUT',
         created_at: '2026-01-01T00:00:10.000Z',
-        content: '<USER_REQUEST>\nchild 2\n</USER_REQUEST>',
+        content: '<USER_REQUEST>\ncontinue\n</USER_REQUEST>',
       },
       {
         step_index: 11,
@@ -3429,8 +3434,8 @@ test('Native-forked session replay aligns child revert tokens to suffix steps, p
         },
       },
       { item: { type: 'user_message', id: 'u-p0', text: 'parent 0' } },
-      { item: { type: 'user_message', id: 'u-p1', text: 'parent 1' } },
-      { item: { type: 'user_message', id: 'u-c2', text: 'child 2' } },
+      { item: { type: 'user_message', id: 'u-p1', text: 'continue' } },
+      { item: { type: 'user_message', id: 'u-c2', text: 'continue' } },
     ]
     const attached = attachReplayRevertTokens(entries, childRows, [cpChild])
     const tok0 = (attached[0].item as { revertToken?: Record<string, unknown> })
@@ -3583,6 +3588,244 @@ test('session.interrupt rejects while session.revert is in flight without aborti
           e.type === 'session.persistence' && e.sessionId === 's-int-guard',
       ),
     )
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('Git revert prunes empty parent dirs, removes new committed nested repos while keeping pre-existing gitlinks, and tracks recreated force-ignored files', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-dirs-sub-'))
+  const preSubSrc = join(home, 'pre-sub-src')
+  const repoDir = join(home, 'repo')
+  const appDataDir = dataDirectory(undefined, { HOME: home }, repoDir)
+  const nativeId = '44444444-4444-4444-8444-444444444441'
+
+  try {
+    await mkdir(preSubSrc, { recursive: true })
+    await runGit(preSubSrc, ['init'])
+    await runGit(preSubSrc, ['config', 'user.name', 'Test'])
+    await runGit(preSubSrc, ['config', 'user.email', 'test@example.com'])
+    await writeFile(join(preSubSrc, 'kept.txt'), 'pre-sub-v1')
+    await runGit(preSubSrc, ['add', 'kept.txt'])
+    await runGit(preSubSrc, ['commit', '-m', 'pre-sub'])
+
+    await mkdir(repoDir, { recursive: true })
+    await runGit(repoDir, ['init'])
+    await runGit(repoDir, ['config', 'user.name', 'Test'])
+    await runGit(repoDir, ['config', 'user.email', 'test@example.com'])
+    await writeFile(join(repoDir, '.gitignore'), '*.log\n')
+    await writeFile(join(repoDir, 'forced.log'), 'forced-v1\n')
+    await runGit(repoDir, [
+      '-c',
+      'protocol.file.allow=always',
+      'submodule',
+      'add',
+      preSubSrc,
+      'pre-sub',
+    ])
+    await runGit(repoDir, ['add', '.gitignore', '.gitmodules', 'pre-sub'])
+    await runGit(repoDir, ['add', '-f', 'forced.log'])
+    await runGit(repoDir, ['commit', '-m', 'init'])
+
+    const cp1 = await captureTurnFileCheckpoint(
+      appDataDir,
+      nativeId,
+      repoDir,
+      -1,
+    )
+    assert(cp1 !== undefined)
+
+    await mkdir(join(repoDir, 'deep', 'nested'), { recursive: true })
+    await writeFile(join(repoDir, 'deep', 'nested', 'added.txt'), 'temp')
+
+    await mkdir(join(repoDir, 'unborn-parent', 'unborn-leaf'), {
+      recursive: true,
+    })
+    await runGit(join(repoDir, 'unborn-parent', 'unborn-leaf'), ['init'])
+
+    const newSub = join(repoDir, 'sub-parent', 'new-committed-sub')
+    await mkdir(newSub, { recursive: true })
+    await runGit(newSub, ['init'])
+    await runGit(newSub, ['config', 'user.name', 'Test'])
+    await runGit(newSub, ['config', 'user.email', 'test@example.com'])
+    await writeFile(join(newSub, 'sub.txt'), 'sub-content')
+    await runGit(newSub, ['add', 'sub.txt'])
+    await runGit(newSub, ['commit', '-m', 'new-sub'])
+
+    // Unlink force-tracked .gitignore file without git rm, then recreate it in a later turn.
+    await rm(join(repoDir, 'forced.log'))
+    const cpDeleted = await captureTurnFileCheckpoint(
+      appDataDir,
+      nativeId,
+      repoDir,
+      1,
+    )
+    assert(cpDeleted !== undefined)
+
+    await writeFile(join(repoDir, 'forced.log'), 'recreated-v2\n')
+    const cpRecreated = await captureTurnFileCheckpoint(
+      appDataDir,
+      nativeId,
+      repoDir,
+      3,
+    )
+    assert(cpRecreated !== undefined)
+    assert.notEqual(cpRecreated.treeHash, cpDeleted.treeHash)
+
+    await restoreSessionFileCheckpoint(appDataDir, nativeId, cpDeleted.id)
+    await assert.rejects(lstat(join(repoDir, 'forced.log')))
+
+    await restoreSessionFileCheckpoint(appDataDir, nativeId, cpRecreated.id)
+    assert.equal(
+      await readFile(join(repoDir, 'forced.log'), 'utf8'),
+      'recreated-v2\n',
+    )
+
+    await restoreSessionFileCheckpoint(appDataDir, nativeId, cp1.id)
+    await assert.rejects(lstat(join(repoDir, 'deep')))
+    await assert.rejects(lstat(join(repoDir, 'unborn-parent')))
+    await assert.rejects(lstat(join(repoDir, 'sub-parent')))
+    assert.equal(
+      await readFile(join(repoDir, 'pre-sub', 'kept.txt'), 'utf8'),
+      'pre-sub-v1',
+    )
+    assert.equal(
+      await readFile(join(repoDir, 'forced.log'), 'utf8'),
+      'forced-v1\n',
+    )
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('session.close racing mid-reload session.revert on a persist: false session cleans up both previous and forked storage', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-close-race-'))
+  const workDir = join(home, 'ws')
+  await mkdir(workDir, { recursive: true })
+  const acpLog = join(home, 'acp.log')
+  const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
+
+  const h = await openHarness(workDir, {
+    HOME: home,
+    AGY_TEST_REVERT_DIR: workDir,
+    AGY_TEST_CHECKPOINT_HISTORY: '1',
+    AGY_TEST_LOG_LOAD: '1',
+    AGY_TEST_LOG: acpLog,
+  })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-close-race',
+      sessionId: 's-close-race',
+      config: { ...h.config, persist: false },
+      history: 'replay',
+    })
+    await h.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 's-close-race',
+    )
+
+    const t0Start = h.events.length
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's-close-race',
+      prompt: {
+        clientMessageId: 'cr-t0',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'revert-seed-turn0' }],
+        },
+      },
+    })
+    await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t0Start &&
+        e.type === 'session.turn' &&
+        e.state === 'completed',
+    )
+
+    const t1Start = h.events.length
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 's-close-race',
+      prompt: {
+        clientMessageId: 'cr-t1',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'revert-file-edit' }],
+        },
+      },
+    })
+    const perm = await h.wait(
+      (e) => h.events.indexOf(e) >= t1Start && e.type === 'session.permission',
+    )
+    assert(perm.type === 'session.permission')
+    const userItem = await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t1Start &&
+        e.type === 'timeline.item' &&
+        e.item.type === 'user_message' &&
+        e.item.clientMessageId === 'cr-t1',
+    )
+    assert(
+      userItem.type === 'timeline.item' &&
+        userItem.item.type === 'user_message',
+    )
+    const token = userItem.item.revertToken
+    assert(token !== undefined)
+    await h.provider.send({
+      type: 'session.permission',
+      sessionId: 's-close-race',
+      permissionId: perm.request.id,
+      response: { behavior: 'allow', selectedActionId: 'allow' },
+    })
+    await h.wait(
+      (e) =>
+        h.events.indexOf(e) >= t1Start &&
+        e.type === 'session.turn' &&
+        e.state === 'completed',
+    )
+
+    await h.provider.send({
+      type: 'session.revert',
+      requestId: 'rev-close-race',
+      sessionId: 's-close-race',
+      scope: 'conversation',
+      token,
+    })
+    await waitUntil(() => readFileSync(acpLog, 'utf8').includes('\nload\n'))
+    await h.provider.send({
+      type: 'session.close',
+      requestId: 'close-during-rev',
+      sessionId: 's-close-race',
+    })
+    await h.wait(
+      (e) =>
+        e.type === 'request.completed' && e.requestId === 'close-during-rev',
+    )
+    await h.provider.close()
+
+    assert.deepEqual(
+      await readdir(join(appDataDir, 'conversations')).catch(() => []),
+      [],
+    )
+    assert.deepEqual(
+      await readdir(join(appDataDir, 'brain')).catch(() => []),
+      [],
+    )
+    const sumDb = new DatabaseSync(
+      join(appDataDir, 'conversation_summaries.db'),
+    )
+    try {
+      const rows = sumDb
+        .prepare('SELECT conversation_id FROM conversation_summaries')
+        .all()
+      assert.deepEqual(rows, [])
+    } finally {
+      sumDb.close()
+    }
   } finally {
     await h.provider.close()
     await rm(home, { recursive: true, force: true })
