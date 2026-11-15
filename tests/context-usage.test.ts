@@ -131,7 +131,15 @@ test('tail snapshots accept complete JSON without LF but skip torn records and U
   await checkTail('only partial', Buffer.from('{"step_index":2'), -1, undefined)
 })
 
-function setupUsageManager(t: TestContext, home: string) {
+function setupUsageManager(
+  t: TestContext,
+  home: string,
+  options?: {
+    hasActiveBackgroundWork?: ConstructorParameters<
+      typeof SessionManager
+    >[0]['hasActiveBackgroundWork']
+  },
+) {
   const { events, emit, wait } = createEventCollector()
   const manager = new SessionManager({
     launch: {
@@ -142,6 +150,7 @@ function setupUsageManager(t: TestContext, home: string) {
     usage: new AgyUsageSource(),
     capabilities: ['prompt.message', 'session.configure'],
     emit,
+    hasActiveBackgroundWork: options?.hasActiveBackgroundWork,
   })
   t.after(async () => {
     await manager.close()
@@ -293,4 +302,260 @@ test('latest snapshot tail-read avoids unrelated large history and preserves com
     lastStepUsage: { inputTokens: 70, outputTokens: 3, cachedReadTokens: 0 },
     lastStepIndex: 22,
   })
+})
+
+function openFreshUsageSession(
+  manager: SessionManager,
+  home: string,
+  sessionId = 's',
+) {
+  return manager.handle({
+    type: 'session.open',
+    requestId: `open-${sessionId}`,
+    sessionId,
+    history: 'skip',
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+}
+
+function sendUsagePrompt(
+  manager: SessionManager,
+  clientMessageId: string,
+  text: string,
+  sessionId = 's',
+) {
+  return manager.handle({
+    type: 'session.prompt',
+    sessionId,
+    prompt: {
+      clientMessageId,
+      delivery: 'auto',
+      input: { type: 'message', content: [{ type: 'text', text }] },
+    },
+  })
+}
+
+async function runCancelSnapshotFollowsInterruptTest(
+  t: TestContext,
+  promptText: 'hold:cancel-usage' | 'hold:cancel-throw-usage',
+  expectedInputTokens: number | undefined,
+) {
+  const home = await mkdtemp(join(tmpdir(), 'agy-context-interrupt-'))
+  const flushed = [
+    { step_index: 1, type: 'USER_INPUT', content: promptText },
+    {
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      input_tokens: 70207,
+      output_tokens: 256,
+    },
+    { step_index: 3, type: 'GENERIC', status: 'CANCELED' },
+  ]
+  const { events, wait, manager, latestUsage } = setupUsageManager(t, home, {
+    hasActiveBackgroundWork: async (brainRoot, nativeId) => {
+      await writeFile(
+        join(
+          brainRoot,
+          nativeId,
+          '.system_generated/logs/transcript_full.jsonl',
+        ),
+        flushed.map((row) => JSON.stringify(row) + '\n').join(''),
+      )
+      return false
+    },
+  })
+  await openFreshUsageSession(manager, home)
+  const opened = events.find((e) => e.type === 'session.opened')
+  assert.ok(opened?.type === 'session.opened' && opened.persistence)
+  const nativeId = (opened.persistence.data as { sessionId: string }).sessionId
+  const transcriptPath = join(
+    home,
+    '.gemini/antigravity-cli/brain',
+    nativeId,
+    '.system_generated/logs/transcript_full.jsonl',
+  )
+  const commandsBefore = events.filter(
+    (e) => e.type === 'session.commands',
+  ).length
+  const running = sendUsagePrompt(manager, 'p1', promptText)
+  await wait(
+    () =>
+      events.filter((e) => e.type === 'session.commands').length >
+      commandsBefore,
+  )
+  await manager.handle({
+    type: 'session.interrupt',
+    requestId: 'interrupt',
+    sessionId: 's',
+  })
+  await running
+  assert.equal(latestUsage().contextWindowUsedTokens, 70463)
+  assert.equal(latestUsage().inputTokens, expectedInputTokens)
+  await writeFile(transcriptPath, '')
+  const usageCount = events.filter((e) => e.type === 'session.usage').length
+  await sendUsagePrompt(manager, 'p2', 'flushed-cancel')
+  assert.equal(
+    events.filter((e) => e.type === 'session.usage').length,
+    usageCount,
+    'an empty next-turn baseline cannot republish the canceled turn as new usage',
+  )
+}
+
+test('cancel snapshot follows interrupt work and advances cross-turn boundary (cancelled)', async (t) => {
+  await runCancelSnapshotFollowsInterruptTest(t, 'hold:cancel-usage', 600000)
+})
+
+test('cancel snapshot follows interrupt work and advances cross-turn boundary (throw)', async (t) => {
+  await runCancelSnapshotFollowsInterruptTest(
+    t,
+    'hold:cancel-throw-usage',
+    undefined,
+  )
+})
+
+test('snapshot-only cancellation preserves consumption and wakeup debt for the next bill', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-context-woken-debt-'))
+  const { manager, latestUsage } = setupUsageManager(t, home)
+  await openFreshUsageSession(manager, home)
+  await sendUsagePrompt(manager, 'p1', 'seed-woken-carry')
+  assert.equal(latestUsage().inputTokens, 140)
+  assert.equal(latestUsage().outputTokens, 14)
+
+  await sendUsagePrompt(manager, 'p2', 'snapshot-only-cancel')
+  assert.equal(latestUsage().contextWindowUsedTokens, 22)
+  assert.equal(latestUsage().inputTokens, 140)
+  assert.equal(latestUsage().outputTokens, 14)
+
+  await sendUsagePrompt(manager, 'p3', 'cancelled-positive-usage')
+  assert.equal(latestUsage().inputTokens, 60)
+  assert.equal(latestUsage().outputTokens, 6)
+})
+
+test('foreground native context does not freeze later wakeup occupancy or lose its size', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-context-fg-wakeup-'))
+  const { manager, latestUsage } = setupUsageManager(t, home)
+  await openFreshUsageSession(manager, home)
+  await sendUsagePrompt(manager, 'p1', 'native-context-then-wakeup')
+  assert.equal(latestUsage().contextWindowUsedTokens, 90000)
+  assert.equal(latestUsage().contextWindowMaxTokens, 128000)
+})
+
+test('late historical counters stay outside the next turn but remain recoverable on restore', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-context-late-history-'))
+  const { events, wait, manager, latestUsage } = setupUsageManager(t, home)
+  await openFreshUsageSession(manager, home)
+  const opened = events.find((e) => e.type === 'session.opened')
+  assert.ok(opened?.type === 'session.opened' && opened.persistence)
+  const nativeId = (opened.persistence.data as { sessionId: string }).sessionId
+  const transcriptPath = join(
+    home,
+    '.gemini/antigravity-cli/brain',
+    nativeId,
+    '.system_generated/logs/transcript_full.jsonl',
+  )
+  await sendUsagePrompt(manager, 'p1', 'late-history-initial')
+  assert.equal(latestUsage().contextWindowUsedTokens, 73)
+  await writeFile(
+    transcriptPath,
+    [
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        input_tokens: 700,
+        output_tokens: 30,
+      },
+      { step_index: 2, type: 'GENERIC', status: 'CANCELED' },
+    ]
+      .map((row) => JSON.stringify(row) + '\n')
+      .join(''),
+  )
+  const usageCount = events.filter((e) => e.type === 'session.usage').length
+  await sendUsagePrompt(manager, 'p2', 'cancel-only')
+  assert.equal(
+    events.filter((e) => e.type === 'session.usage').length,
+    usageCount,
+    'late previous-turn data must not become a new-turn bill or snapshot',
+  )
+  await manager.handle({
+    type: 'session.close',
+    requestId: 'close',
+    sessionId: 's',
+  })
+  await manager.handle({
+    type: 'session.open',
+    requestId: 'restore',
+    sessionId: 'restored',
+    history: 'skip',
+    persistence: opened.persistence,
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+  await wait((e) => e.type === 'session.usage' && e.sessionId === 'restored')
+  assert.equal(latestUsage().contextWindowUsedTokens, 730)
+  assert.equal(
+    latestUsage().inputTokens,
+    undefined,
+    'restoring late history does not create a consumption bill',
+  )
+})
+
+async function runNoLfSnapshotSurvivesTest(
+  t: TestContext,
+  promptText: 'no-lf-snapshot-cancel' | 'no-lf-snapshot-error',
+) {
+  const home = await mkdtemp(join(tmpdir(), 'agy-context-nolf-restore-'))
+  const { events, wait, manager, latestUsage } = setupUsageManager(t, home)
+  await openFreshUsageSession(manager, home)
+  const opened = events.find((e) => e.type === 'session.opened')
+  assert.ok(opened?.type === 'session.opened' && opened.persistence)
+  await sendUsagePrompt(manager, 'p1', promptText)
+  assert.equal(latestUsage().contextWindowUsedTokens, 70463)
+  const usageCount = events.filter((e) => e.type === 'session.usage').length
+  await sendUsagePrompt(manager, 'p2', 'cancel-only')
+  assert.equal(
+    events.filter((e) => e.type === 'session.usage').length,
+    usageCount,
+    'the complete previous-turn EOF record is not republished as this turn',
+  )
+  await manager.handle({
+    type: 'session.close',
+    requestId: 'close',
+    sessionId: 's',
+  })
+  await manager.handle({
+    type: 'session.open',
+    requestId: 'restore',
+    sessionId: 'restored',
+    history: 'skip',
+    persistence: opened.persistence,
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+  await wait((e) => e.type === 'session.usage' && e.sessionId === 'restored')
+  assert.equal(latestUsage().contextWindowUsedTokens, 70463)
+  assert.equal(latestUsage().inputTokens, undefined)
+}
+
+test('newline-less snapshot survives cancel, next-turn baseline and restore', async (t) => {
+  await runNoLfSnapshotSurvivesTest(t, 'no-lf-snapshot-cancel')
+})
+
+test('newline-less snapshot survives error, next-turn baseline and restore', async (t) => {
+  await runNoLfSnapshotSurvivesTest(t, 'no-lf-snapshot-error')
 })

@@ -1,5 +1,6 @@
 import { test, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import {
   mkdtemp,
   readFile,
@@ -419,6 +420,7 @@ test(
           () => 'ok',
           (err: unknown) => err,
         )
+    const bus = new EventEmitter()
     const turnActions = [
       () => {},
       () => {
@@ -427,16 +429,14 @@ test(
       () => {},
       () => {},
     ]
-    const hooks: Partial<Record<ProviderEvent['type'], () => void>> = {
-      'session.permission_resolved': () => {
-        reentrantOnPermission = promptNext('reentrant-perm')
-      },
-      'session.turn': () => {
-        turnActions.shift()?.()
-      },
-    }
+    bus.once('session.permission_resolved', () => {
+      reentrantOnPermission = promptNext('reentrant-perm')
+    })
+    bus.on('session.turn', () => {
+      turnActions.shift()!()
+    })
     const collector = createEventCollector((event) => {
-      hooks[event.type]?.()
+      bus.emit(event.type, event)
     })
     m = new SessionManager({
       launch: {
@@ -489,6 +489,90 @@ test(
           .map((e) => e.state),
         ['started', 'completed', 'started', 'canceled'],
       )
+    } finally {
+      await m.close()
+      await rm(home, { recursive: true, force: true })
+    }
+  },
+)
+
+test(
+  'synchronous session.close during terminalize timeline.item still emits terminal session.turn',
+  { timeout: 5000 },
+  async () => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-close-in-terminalize-'))
+    let m!: SessionManager
+    let closing: Promise<void> | undefined
+    const bus = new EventEmitter()
+    const timelineActions = [
+      () => {},
+      () => {},
+      () => {
+        closing = m.handle({
+          type: 'session.close',
+          requestId: 'close',
+          sessionId: 's',
+        })
+      },
+    ]
+    bus.on('timeline.item', () => {
+      timelineActions.shift()!()
+    })
+    const collector = createEventCollector((event) => {
+      bus.emit(event.type, event)
+    })
+    m = new SessionManager({
+      launch: {
+        command: process.execPath,
+        args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+        env: { HOME: home, PATH: process.env.PATH ?? '' },
+      },
+      usage: new AgyUsageSource(),
+      capabilities: ['prompt.message'],
+      emit: collector.emit,
+    })
+    try {
+      await m.handle({
+        type: 'session.open',
+        requestId: 'open',
+        sessionId: 's',
+        history: 'skip',
+        config: {
+          cwd: home,
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: true,
+        },
+      })
+      await m.handle({
+        type: 'session.prompt',
+        sessionId: 's',
+        prompt: {
+          clientMessageId: 'dangling-tool-turn',
+          delivery: 'auto',
+          input: {
+            type: 'message',
+            content: [{ type: 'text', text: 'dangling-tool' }],
+          },
+        },
+      })
+      assert.ok(closing)
+      await closing
+      const turnStates = collector.events
+        .filter(
+          (e): e is Extract<ProviderEvent, { type: 'session.turn' }> =>
+            e.type === 'session.turn',
+        )
+        .map((e) => e.state)
+      assert.deepEqual(turnStates, ['started', 'completed'])
+      const completedIdx = collector.events.findIndex(
+        (e) => e.type === 'session.turn' && e.state === 'completed',
+      )
+      const closedIdx = collector.events.findIndex(
+        (e) => e.type === 'session.closed',
+      )
+      assert.ok(completedIdx >= 0 && closedIdx > completedIdx)
     } finally {
       await m.close()
       await rm(home, { recursive: true, force: true })
@@ -733,9 +817,8 @@ test('ownership read failures do not poison subsequent ACP notifications', async
   }
 })
 
-test('history:skip coalesces restored context usage before ready and configure validates options before full-access relaunch', async () => {
+test('history:skip coalesces restored context usage before ready', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-skip-usage-config-'))
-  const log = join(home, 'calls.log')
   const events: ProviderEvent[] = []
   const m = new SessionManager({
     launch: {
@@ -745,12 +828,10 @@ test('history:skip coalesces restored context usage before ready and configure v
         HOME: home,
         PATH: process.env.PATH ?? '',
         AGY_TEST_LOAD_USAGE: '1',
-        AGY_TEST_LOG_LOAD: '1',
-        AGY_TEST_LOG: log,
       },
     },
     usage: new AgyUsageSource(),
-    capabilities: ['session.configure'],
+    capabilities: [],
     emit: (e) => events.push(structuredClone(e)),
   })
   try {

@@ -47,7 +47,7 @@ import {
   settleBrainTurn,
   type ForegroundAcpSegment,
 } from './brain.ts'
-import { readLatestStepUsage } from './brain-io.ts'
+import { readLatestStepUsage, type TranscriptReader } from './brain-io.ts'
 import { projectReplayHistory, type HistoryEntry } from './history.ts'
 import { SubagentRegistry } from './subagents.ts'
 import { dataDirectory, removeSessionArtifacts } from './preflight.ts'
@@ -103,6 +103,8 @@ interface SessionOptions {
   emit: (event: ProviderEvent) => void
   stallTimeoutMs?: number
   retryTimeoutMs?: number
+  cancelConvergenceTimeoutMs?: number
+  createTranscriptReader?: () => TranscriptReader
   readSubagents?: typeof readSubagents
   hasActiveBackgroundWork?: typeof hasActiveBackgroundWork
 }
@@ -536,7 +538,6 @@ async function createSession(
     state.turnFinished = true
     terminalize(status, error)
     beforeEmit?.()
-    if (state.silenced) return
     emit({
       type: 'session.turn',
       sessionId: id,
@@ -1055,6 +1056,8 @@ async function createSession(
       brainRoot,
       stallTimeoutMs: options.stallTimeoutMs,
       retryTimeoutMs: options.retryTimeoutMs,
+      cancelConvergenceTimeoutMs: options.cancelConvergenceTimeoutMs,
+      createTranscriptReader: options.createTranscriptReader,
       state,
       get initialized() {
         return currentInitialized
@@ -1117,7 +1120,7 @@ async function createSession(
         if (!state.replay) return
         const [inbox, subagentRecords, rows] = await Promise.all([
           readInboxState(brainRoot, state.nativeId),
-          readSubagents(brainRoot, state.nativeId),
+          (options.readSubagents ?? readSubagents)(brainRoot, state.nativeId),
           readTranscriptRows(brainRoot, state.nativeId),
         ])
         subagents.rememberSubagents(subagentRecords)
@@ -1158,7 +1161,9 @@ async function createSession(
           subagents.hasRunningChildren()
         )
           return false
-        return !(await hasActiveBackgroundWork(brainRoot, state.nativeId, {
+        return !(await (
+          options.hasActiveBackgroundWork ?? hasActiveBackgroundWork
+        )(brainRoot, state.nativeId, {
           includeDaemons: true,
           retryTimeoutMs: options.retryTimeoutMs,
         }).catch(() => true))
@@ -1612,7 +1617,10 @@ async function promptSession(
         if (session.state.closing) throw turnAbort.signal.reason
         // Cancel is a notification. Bound convergence with the existing control-request policy, not a flush sleep.
         try {
-          result = await transport.request(outcome, { fatalOnTimeout: false })
+          result = await transport.request(outcome, {
+            fatalOnTimeout: false,
+            timeoutMs: session.cancelConvergenceTimeoutMs,
+          })
         } catch (error) {
           if (!session.state.closing && session.transport === transport)
             await session.relaunch(session.state.skipPermissions, true)
@@ -1695,6 +1703,8 @@ async function promptSession(
             : Math.max(session.state.lastKnownStepIndex, index)
         },
       },
+      undefined,
+      session.createTranscriptReader?.(),
     )
     session.state.observation = observation
     observation.start()

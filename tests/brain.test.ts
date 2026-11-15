@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { EventEmitter, once } from 'node:events'
 import { test } from 'node:test'
 import {
   mkdtemp,
@@ -2948,14 +2949,12 @@ test('API/stream retries recover after 4s and multiple interruptions; unfinished
         error: 'API error (attempt 1): request failed: synthetic timeout',
       },
     ])
-    const gates = new Map<number, () => void>()
-    const onStep = (step: number) => gates.get(step)?.()
-    const step2Seen = new Promise<void>((resolve) => {
-      gates.set(2, resolve)
-    })
-    const step4Seen = new Promise<void>((resolve) => {
-      gates.set(4, resolve)
-    })
+    const stepEvents = new EventEmitter()
+    const onStep = (step: number) => {
+      stepEvents.emit(String(step))
+    }
+    const step2Seen = once(stepEvents, '2')
+    const step4Seen = once(stepEvents, '4')
     const obs = new BrainTurnObservation(
       f.root,
       parent,
