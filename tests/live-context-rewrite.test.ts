@@ -590,14 +590,12 @@ test('appended foreground checkpoint is not pruned by an older staged snapshot o
   await h.append([checkpoint(3)])
   await obs.poll()
 
-  t.mock.method(h.session.transport.rpc, 'cancel', async () => {
-    held.resolve({ stopReason: 'cancelled' })
-  })
   await h.manager.handle({
     type: 'session.interrupt',
     requestId: 'interrupt',
     sessionId: 's',
   })
+  held.resolve({ stopReason: 'cancelled' })
   await turnPromise
 
   const compactions = h.events.filter(
@@ -874,14 +872,12 @@ test('confirmed usage deletion invalidates the source cache without fabricating 
   await h.write([user(1)])
   await obs.poll()
   assert.equal(obs.usage.latest, undefined)
-  t.mock.method(h.session.transport.rpc, 'cancel', async () => {
-    done.resolve({ stopReason: 'cancelled' })
-  })
   await h.manager.handle({
     type: 'session.interrupt',
     requestId: 'interrupt',
     sessionId: 's',
   })
+  done.resolve({ stopReason: 'cancelled' })
   await running
   const usage = h.events.findLast((e) => e.type === 'session.usage')
   assert.ok(usage?.type === 'session.usage')

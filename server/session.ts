@@ -103,6 +103,8 @@ interface SessionOptions {
   emit: (event: ProviderEvent) => void
   stallTimeoutMs?: number
   retryTimeoutMs?: number
+  readSubagents?: typeof readSubagents
+  hasActiveBackgroundWork?: typeof hasActiveBackgroundWork
 }
 
 const SKIP_PERMISSIONS_FLAG = '--dangerously-skip-permissions'
@@ -455,6 +457,7 @@ async function createSession(
     isLoading: () => state.loading,
     isUnavailable: () => state.closing || state.failed,
     retryTimeoutMs: options.retryTimeoutMs,
+    readSubagents: options.readSubagents,
   })
   let notificationLane = Promise.resolve()
   let relaunching = Promise.resolve()
@@ -527,16 +530,13 @@ async function createSession(
     turnId: string,
     status: 'completed' | 'canceled' | 'failed',
     error?: string,
-    cleared = false,
+    beforeEmit?: () => void,
   ) {
-    if (
-      (!cleared && state.turn !== turnId) ||
-      state.turnFinished ||
-      state.silenced
-    )
-      return
+    if (state.turn !== turnId || state.turnFinished || state.silenced) return
     state.turnFinished = true
     terminalize(status, error)
+    beforeEmit?.()
+    if (state.silenced) return
     emit({
       type: 'session.turn',
       sessionId: id,
@@ -722,7 +722,9 @@ async function createSession(
     })
   }
   function cancelPermissions() {
-    for (const [permissionId, p] of permissions) {
+    const entries = [...permissions]
+    permissions.clear()
+    for (const [permissionId, p] of entries) {
       if (p.type === 'acp') {
         state.deniedToolCallIds.add(p.request.toolCall.toolCallId)
         p.resolve({ outcome: { outcome: 'cancelled' } })
@@ -737,7 +739,6 @@ async function createSession(
         })
       }
     }
-    permissions.clear()
   }
   function askUserQuestion(
     questions: NormalizedQuestion[],
@@ -1182,9 +1183,13 @@ async function createSession(
           await Promise.all(canceling)
           let needsRelaunch =
             canceling.length > 0 ||
-            (await hasActiveBackgroundWork(brainRoot, state.nativeId, {
-              retryTimeoutMs: options.retryTimeoutMs,
-            }).catch(() => true))
+            (await (options.hasActiveBackgroundWork ?? hasActiveBackgroundWork)(
+              brainRoot,
+              state.nativeId,
+              {
+                retryTimeoutMs: options.retryTimeoutMs,
+              },
+            ).catch(() => true))
           if (state.closing) return
           if (state.failed)
             throw new Error('ACP runtime has exited; reopen the session')
@@ -1911,30 +1916,40 @@ async function promptSession(
     pendingFinish = { status, error: message }
   } finally {
     turnAbort.signal.removeEventListener('abort', stopObservation)
-    await observation?.dispose()
-    const isCurrentTurn =
-      session.state.turn === turnId && session.state.turnAbort === turnAbort
-    const canEmitTurn =
-      isCurrentTurn && !session.state.turnFinished && !session.state.silenced
-    if (isCurrentTurn) {
-      session.state.observation = null
-      session.state.wakeup.suppressEcho = false
-      session.state.inSettle = false
-      session.state.handledElicitations = []
-      session.state.suppressContinuationAcp = false
-      session.state.preStagedQuestion = undefined
-      session.state.turnAbort = null
-      session.state.turn = ''
-      session.timeline.boundary()
+    const disposing = observation?.dispose()
+    if (
+      session.state.turn === turnId &&
+      session.state.turnAbort === turnAbort
+    ) {
+      const clearTurnState = () => {
+        if (
+          session.state.turn !== turnId ||
+          session.state.turnAbort !== turnAbort
+        )
+          return
+        session.state.wakeup.suppressEcho = false
+        session.state.inSettle = false
+        session.state.handledElicitations = []
+        session.state.suppressContinuationAcp = false
+        session.state.preStagedQuestion = undefined
+        session.state.turnAbort = null
+        session.state.turn = ''
+        session.timeline.boundary()
+      }
       session.cancelPermissions()
+      if (pendingFinish) {
+        session.finishTurnOnce(
+          turnId,
+          pendingFinish.status,
+          pendingFinish.error,
+          clearTurnState,
+        )
+      }
+      clearTurnState()
     }
-    if (canEmitTurn && pendingFinish) {
-      session.finishTurnOnce(
-        turnId,
-        pendingFinish.status,
-        pendingFinish.error,
-        true,
-      )
+    await disposing
+    if (observation && session.state.observation === observation) {
+      session.state.observation = null
     }
   }
 }

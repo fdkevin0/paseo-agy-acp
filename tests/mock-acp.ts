@@ -391,6 +391,21 @@ new AgentSideConnection((client) => {
       if (text === 'cancel-only') {
         return { stopReason: 'cancelled' as const }
       }
+      if (text === 'dangling-permission') {
+        void client.requestPermission({
+          sessionId,
+          toolCall: {
+            toolCallId: 'dangling-tool',
+            title: 'run_command',
+            rawInput: { CommandLine: 'echo dangling' },
+          },
+          options: [
+            { optionId: 'yes', name: 'Allow', kind: 'allow_once' },
+            { optionId: 'no', name: 'Deny', kind: 'reject_once' },
+          ],
+        })
+        return { stopReason: 'end_turn' as const }
+      }
       if (text === 'seed-woken-carry') {
         const dir = join(
           process.env.HOME!,

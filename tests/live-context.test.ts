@@ -61,7 +61,14 @@ const checkpoint = (step_index: number, content = 'summary'): Row => ({
   input_tokens: 999999,
 })
 
-async function harness(t: TestContext) {
+async function harness(
+  t: TestContext,
+  options?: {
+    hasActiveBackgroundWork?: ConstructorParameters<
+      typeof SessionManager
+    >[0]['hasActiveBackgroundWork']
+  },
+) {
   const home = await mkdtemp(join(tmpdir(), 'agy-live-context-'))
   const events: ProviderEvent[] = []
   const listeners = new Set<() => void>()
@@ -77,6 +84,7 @@ async function harness(t: TestContext) {
       events.push(structuredClone(event))
       for (const listener of listeners) listener()
     },
+    hasActiveBackgroundWork: options?.hasActiveBackgroundWork,
   })
   const start = manager.start.bind(manager)
   let session!: Awaited<ReturnType<typeof manager.start>>
@@ -427,15 +435,17 @@ async function runFinalPrefixPassTest(
   t: TestContext,
   settle: (done: ReturnType<typeof deferred<Result>>) => void,
 ) {
-  const h = await harness(t),
-    held = await h.hold()
-  h.session.publishUsage({ inputTokens: 1000, outputTokens: 100 })
   const local = deferred<void>()
   const cancelEntered = deferred<void>()
-  t.mock.method(h.session.transport.rpc, 'cancel', async () => {
-    cancelEntered.resolve()
-    await local.promise
-  })
+  const h = await harness(t, {
+      hasActiveBackgroundWork: async () => {
+        cancelEntered.resolve()
+        await local.promise
+        return false
+      },
+    }),
+    held = await h.hold()
+  h.session.publishUsage({ inputTokens: 1000, outputTokens: 100 })
   const interrupting = h.manager.handle({
     type: 'session.interrupt',
     requestId: 'interrupt',
@@ -674,14 +684,12 @@ test(
       held = await h.hold()
     await h.write([user(1), model(2, 10)])
     await h.read()
-    t.mock.method(h.session.transport.rpc, 'cancel', async () => {
-      held.done.resolve({ stopReason: 'cancelled' })
-    })
     await h.manager.handle({
       type: 'session.interrupt',
       requestId: 'interrupt',
       sessionId: 's',
     })
+    held.done.resolve({ stopReason: 'cancelled' })
     await held.running
     const count = h.events.length
     await h.append([model(3, 100), checkpoint(4)])
@@ -1029,14 +1037,12 @@ async function runNoLfEofSnapshotTest(
   await h.read()
   const streamingIndex = held.observation.lastStepIndex
   assert.equal(streamingIndex, 3, 'no-LF EOF is not a delivered streaming row')
-  t.mock.method(h.session.transport.rpc, 'cancel', async () => {
-    settle(held.done)
-  })
   await h.manager.handle({
     type: 'session.interrupt',
     requestId: 'interrupt',
     sessionId: 's',
   })
+  settle(held.done)
   await held.running
   assert.equal(h.latest().contextWindowUsedTokens, 73)
   assert.equal(h.session.state.lastKnownStepIndex, 4)
@@ -1203,12 +1209,14 @@ test(
   'already closing turn skips final snapshot and pending local interruption without waiting for the RPC',
   { timeout: 5000 },
   async (t) => {
-    const h = await harness(t),
-      held = await h.hold(),
-      local = deferred<void>()
-    t.mock.method(h.session.transport.rpc, 'cancel', async () => {
-      await local.promise
-    })
+    const local = deferred<void>()
+    const h = await harness(t, {
+        hasActiveBackgroundWork: async () => {
+          await local.promise
+          return false
+        },
+      }),
+      held = await h.hold()
     const interrupting = h.manager.handle({
       type: 'session.interrupt',
       requestId: 'interrupt',
@@ -1217,12 +1225,14 @@ test(
     await h.manager.close()
     await held.running
     assert.deepEqual(h.turns(), ['canceled'])
-    const count = h.events.length
+    const nonRequestEvents = () =>
+      h.events.filter((e) => e.type !== 'request.completed')
+    const count = nonRequestEvents().length
     local.resolve()
     held.done.resolve({ stopReason: 'cancelled' })
-    await interrupting.catch(() => undefined)
+    await interrupting
     await held.observation.poll()
-    assert.equal(h.events.length, count)
+    assert.equal(nonRequestEvents().length, count)
   },
 )
 
@@ -1479,7 +1489,6 @@ test(
     await h.entered.promise
     const oldTransport = h.session.transport
     const request = oldTransport.request.bind(oldTransport)
-    t.mock.method(oldTransport.rpc, 'cancel', async () => {})
     const handlers = [
       request,
       async () => {
@@ -1502,10 +1511,7 @@ test(
     assert.equal(h.session.state.inSettle, false)
     assert.deepEqual(h.turns(), ['canceled'])
     h.continued.resolve({ stopReason: 'cancelled' })
-    t.mock.method(h.session.transport.rpc, 'prompt', async () => ({
-      stopReason: 'cancelled' as const,
-    }))
-    await h.prompt('after-relaunch')
+    await h.prompt('cancel-only')
     assert.deepEqual(h.turns(), ['canceled', 'canceled'])
   },
 )
@@ -1650,16 +1656,7 @@ test(
     assert.equal(held.observation.wokeUp, false)
 
     // Foreground RPC ends with cumulative multi-model totals; turn stays open awaiting background task
-    const settlingStarted = deferred<void>()
-    const attach = held.observation.attach.bind(held.observation)
-    t.mock.method(
-      held.observation,
-      'attach',
-      async (...args: Parameters<typeof attach>) => {
-        await attach(...args)
-        settlingStarted.resolve()
-      },
-    )
+    const rev = held.observation.revision
     held.done.resolve({
       stopReason: 'end_turn',
       usage: {
@@ -1669,8 +1666,9 @@ test(
         totalTokens: 183_200,
       },
     })
-    await settlingStarted.promise
+    await held.observation.wait(rev)
     await h.read()
+    assert.equal(held.observation.phase, 'settling')
     assert.deepEqual(h.turns(), [])
     assert.equal(
       held.observation.wokeUp,

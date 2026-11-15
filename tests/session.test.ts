@@ -18,7 +18,6 @@ import {
   type ProviderTimelineItem,
 } from '@getpaseo/plugin/server/provider'
 import { readSubagents } from '../server/brain.ts'
-import { Timeline } from '../server/mapping.ts'
 import { createProvider } from '../server/provider.ts'
 import { SessionManager } from '../server/session.ts'
 import { SubagentRegistry } from '../server/subagents.ts'
@@ -205,15 +204,17 @@ test(
   },
 )
 
-function assertBlockedSubagentLink(opts: {
+async function assertBlockedSubagentLink(opts: {
   capabilities: readonly string[]
   unavailable: boolean
 }) {
+  const home = await mkdtemp(join(tmpdir(), 'agy-blocked-link-'))
+  const brainRoot = join(home, '.gemini/antigravity-cli/brain')
   const events: ProviderEvent[] = []
   const registry = new SubagentRegistry({
     sessionId: 's',
-    cwd: '/tmp',
-    brainRoot: '/tmp',
+    cwd: home,
+    brainRoot,
     capabilities: opts.capabilities,
     emit: (e) => events.push(structuredClone(e)),
     getNativeId: () => '11111111-1111-4111-8111-111111111111',
@@ -241,76 +242,110 @@ function assertBlockedSubagentLink(opts: {
     assert.equal(item.detail.childSessionId, undefined)
   } finally {
     registry.closeAll()
+    await rm(home, { recursive: true, force: true })
   }
 }
 
-test('subagent items clear native IDs when linking is blocked by closing', () => {
-  assertBlockedSubagentLink({
+test('subagent items clear native IDs when linking is blocked by unavailable session', async () => {
+  await assertBlockedSubagentLink({
     capabilities: ['session.subsession'],
     unavailable: true,
   })
 })
 
-test('subagent items clear native IDs when linking is blocked by failed', () => {
-  assertBlockedSubagentLink({
-    capabilities: ['session.subsession'],
-    unavailable: true,
-  })
-})
-
-test('subagent items clear native IDs when linking is blocked by capability', () => {
-  assertBlockedSubagentLink({
+test('subagent items clear native IDs when linking is blocked by capability', async () => {
+  await assertBlockedSubagentLink({
     capabilities: [],
     unavailable: false,
   })
 })
 
 async function assertRefreshBoundaryStripsNativeId(
-  t: TestContext,
   terminalStatus: 'canceled' | 'failed',
+  triggerUnavailable: (ctx: {
+    m: SessionManager
+    pidFile: string
+    collector: ReturnType<typeof createEventCollector>
+  }) => Promise<void>,
 ) {
-  const timeline = new Timeline('s')
-  let unavailable = false
-  const events: ProviderEvent[] = []
-  const registry = new SubagentRegistry({
-    sessionId: 's',
-    cwd: '/tmp',
-    brainRoot: '/tmp',
-    capabilities: ['session.subsession'],
-    emit: (e) => events.push(structuredClone(e)),
-    getNativeId: () => '11111111-1111-4111-8111-111111111111',
-    isParentTurnActive: () => true,
-    isLoading: () => false,
-    isUnavailable: () => unavailable,
+  const home = await mkdtemp(join(tmpdir(), 'agy-refresh-boundary-'))
+  const pidFile = join(home, 'child.pid')
+  const collector = createEventCollector()
+  let markRefreshEntered!: () => void
+  const refreshEntered = new Promise<void>((resolve) => {
+    markRefreshEntered = resolve
+  })
+  let releaseRefresh!: () => void
+  const refreshGate = new Promise<void>((resolve) => {
+    releaseRefresh = resolve
+  })
+  const reads = [
+    async () => [],
+    async () => {
+      markRefreshEntered()
+      await refreshGate
+      return []
+    },
+  ]
+  const m = new SessionManager({
+    launch: {
+      command: process.execPath,
+      args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+      env: {
+        HOME: home,
+        PATH: process.env.PATH ?? '',
+        AGY_TEST_PID_FILE: pidFile,
+      },
+    },
+    usage: new AgyUsageSource(),
+    capabilities: ['prompt.message', 'session.subsession'],
+    emit: collector.emit,
+    readSubagents: () => reads.shift()!(),
   })
   try {
-    const item = timeline.update({
-      sessionUpdate: 'tool_call',
-      toolCallId: 'message-refresh',
-      title: 'send_message',
-      status: 'in_progress',
-      rawInput: {
-        Recipient: '22222222-2222-4222-8222-222222222222',
-        Message: 'continue',
+    await m.handle({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'skip',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
       },
     })
-    assert.ok(item?.type === 'tool_call' && item.detail.type === 'sub_agent')
-    t.mock.method(registry, 'refreshSubagents', async () => {
-      unavailable = true
-      const terminal = timeline.terminalize(terminalStatus)
-      terminal.forEach((entry) =>
-        events.push({
-          type: 'timeline.item',
-          sessionId: 's',
-          item: structuredClone(entry),
-        }),
-      )
+    const running = m.handle({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'refresh-boundary',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'message-refresh-boundary' }],
+        },
+      },
     })
-    const ready = await registry.prepareMessageItem(item)
-    assert.equal(ready, false)
-    assert.equal(item.detail.childSessionId, undefined)
-    assert.equal(events.length, 1)
-    const emitted = events[0]
+    await refreshEntered
+    await triggerUnavailable({ m, pidFile, collector })
+    releaseRefresh()
+    await running
+    assert.equal(
+      collector.events.some(
+        (e) => e.type === 'session.opened' && e.parentSessionId !== undefined,
+      ),
+      false,
+    )
+    const toolEvents = collector.events.filter(
+      (e) =>
+        e.type === 'timeline.item' &&
+        e.item.type === 'tool_call' &&
+        e.item.callId === 'message-refresh',
+    )
+    assert.equal(toolEvents.length, 1)
+    const emitted = toolEvents[0]
     assert.ok(
       emitted?.type === 'timeline.item' &&
         emitted.item.type === 'tool_call' &&
@@ -319,17 +354,147 @@ async function assertRefreshBoundaryStripsNativeId(
     assert.equal(emitted.item.detail.childSessionId, undefined)
     assert.equal(emitted.item.status, terminalStatus)
   } finally {
-    registry.closeAll()
+    releaseRefresh()
+    await m.close()
+    await rm(home, { recursive: true, force: true })
   }
 }
 
-test('terminalizing during ownership refresh never exposes native IDs: closing', async (t) => {
-  await assertRefreshBoundaryStripsNativeId(t, 'canceled')
-})
+test(
+  'terminalizing during ownership refresh never exposes native IDs: closing',
+  { timeout: 5000 },
+  async () => {
+    await assertRefreshBoundaryStripsNativeId('canceled', async ({ m }) => {
+      await m.handle({
+        type: 'session.close',
+        requestId: 'close',
+        sessionId: 's',
+      })
+    })
+  },
+)
 
-test('terminalizing during ownership refresh never exposes native IDs: failed', async (t) => {
-  await assertRefreshBoundaryStripsNativeId(t, 'failed')
-})
+test(
+  'terminalizing during ownership refresh never exposes native IDs: failed',
+  { timeout: 5000 },
+  async () => {
+    await assertRefreshBoundaryStripsNativeId(
+      'failed',
+      async ({ pidFile, collector }) => {
+        const pid = Number((await readFile(pidFile, 'utf8')).trim())
+        assert.ok(Number.isInteger(pid) && pid > 0)
+        process.kill(pid, 'SIGKILL')
+        await collector.wait(
+          (e) => e.type === 'session.runtime_failed' && e.sessionId === 's',
+          2000,
+        )
+      },
+    )
+  },
+)
+
+test(
+  'turn teardown rejects re-entrant prompt on permission_resolved and allows immediate prompt on terminal session.turn',
+  { timeout: 5000 },
+  async () => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-teardown-reentry-'))
+    let m!: SessionManager
+    let reentrantOnPermission: Promise<unknown> | undefined
+    let followUpOnTurnEnd: Promise<unknown> | undefined
+    const promptNext = (clientMessageId: string) =>
+      m
+        .handle({
+          type: 'session.prompt',
+          sessionId: 's',
+          prompt: {
+            clientMessageId,
+            delivery: 'auto',
+            input: {
+              type: 'message',
+              content: [{ type: 'text', text: 'cancel-only' }],
+            },
+          },
+        })
+        .then(
+          () => 'ok',
+          (err: unknown) => err,
+        )
+    const turnActions = [
+      () => {},
+      () => {
+        followUpOnTurnEnd = promptNext('followup-turn')
+      },
+      () => {},
+      () => {},
+    ]
+    const hooks: Partial<Record<ProviderEvent['type'], () => void>> = {
+      'session.permission_resolved': () => {
+        reentrantOnPermission = promptNext('reentrant-perm')
+      },
+      'session.turn': () => {
+        turnActions.shift()?.()
+      },
+    }
+    const collector = createEventCollector((event) => {
+      hooks[event.type]?.()
+    })
+    m = new SessionManager({
+      launch: {
+        command: process.execPath,
+        args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+        env: { HOME: home, PATH: process.env.PATH ?? '' },
+      },
+      usage: new AgyUsageSource(),
+      capabilities: ['prompt.message', 'permission'],
+      emit: collector.emit,
+    })
+    try {
+      await m.handle({
+        type: 'session.open',
+        requestId: 'open',
+        sessionId: 's',
+        history: 'skip',
+        config: {
+          cwd: home,
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: true,
+        },
+      })
+      await m.handle({
+        type: 'session.prompt',
+        sessionId: 's',
+        prompt: {
+          clientMessageId: 'dangling-turn',
+          delivery: 'auto',
+          input: {
+            type: 'message',
+            content: [{ type: 'text', text: 'dangling-permission' }],
+          },
+        },
+      })
+      assert.ok(reentrantOnPermission)
+      const reentrantError = await reentrantOnPermission
+      assert.ok(reentrantError instanceof Error)
+      assert.match(reentrantError.message, /Session already has an active turn/)
+      assert.ok(followUpOnTurnEnd)
+      assert.equal(await followUpOnTurnEnd, 'ok')
+      assert.deepEqual(
+        collector.events
+          .filter(
+            (e): e is Extract<ProviderEvent, { type: 'session.turn' }> =>
+              e.type === 'session.turn',
+          )
+          .map((e) => e.state),
+        ['started', 'completed', 'started', 'canceled'],
+      )
+    } finally {
+      await m.close()
+      await rm(home, { recursive: true, force: true })
+    }
+  },
+)
 
 async function verifyGrandchildSyncKilled(
   setupExtra: (

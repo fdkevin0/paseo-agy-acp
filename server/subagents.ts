@@ -24,6 +24,7 @@ export interface SubagentRegistryOptions {
   isLoading: () => boolean
   isUnavailable: () => boolean
   retryTimeoutMs?: number
+  readSubagents?: typeof readSubagents
 }
 
 /** Own child sub-session watchers, parent-child ownership, and resumption for one root session. */
@@ -112,9 +113,10 @@ export class SubagentRegistry {
   ): Promise<void> => {
     this.rememberSubagents(
       subagents ??
-        (await readSubagents(this.opts.brainRoot, parentNativeId).catch(
-          () => [],
-        )),
+        (await (this.opts.readSubagents ?? readSubagents)(
+          this.opts.brainRoot,
+          parentNativeId,
+        ).catch(() => [])),
       parentNativeId,
     )
     // Include descendants discovered by their own watchers, not just this parent's descriptors.
@@ -128,7 +130,7 @@ export class SubagentRegistry {
   refreshSubagents = async (): Promise<void> => {
     const rootNativeId = this.opts.getNativeId()
     // Optional ownership metadata must not poison the serialized ACP notification lane.
-    const subagents = await readSubagents(
+    const subagents = await (this.opts.readSubagents ?? readSubagents)(
       this.opts.brainRoot,
       rootNativeId,
     ).catch(() => [])
