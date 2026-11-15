@@ -32,8 +32,10 @@ import {
   restoreSessionFileCheckpoint,
   validateSessionFileCheckpoint,
 } from '../server/checkpoints.ts'
+import type { HistoryEntry } from '../server/history.ts'
 import { dataDirectory } from '../server/preflight.ts'
 import { createProvider } from '../server/provider.ts'
+import { attachReplayRevertTokens, revertSession } from '../server/revert.ts'
 import { AgyUsageSource } from '../server/usage.ts'
 import { collectProviderEvents, writeBrainTranscript } from './helpers.ts'
 
@@ -3222,6 +3224,364 @@ test('Conversation revert falling back to fresh session resets lastKnownStepInde
         h.events.indexOf(e) >= postStart &&
         e.type === 'session.turn' &&
         e.state === 'completed',
+    )
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('Git checkpoint preserves verbatim CRLF, clean-filtered, force-tracked ignored, linked worktree excluded, and apostrophe unborn files', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-filters-'))
+  const mainRepo = join(home, 'main-repo')
+  const wtDir = join(home, 'linked-wt')
+  const binDir = join(home, 'bin')
+  const filterScript = join(binDir, 'xor-filter.mjs')
+  const nativeId = '11111111-1111-4111-8111-111111111114'
+
+  try {
+    await mkdir(binDir, { recursive: true })
+    await mkdir(mainRepo, { recursive: true })
+    await writeFile(
+      filterScript,
+      [
+        "import { readFileSync } from 'node:fs'",
+        "const clean = process.argv[2] === '--clean'",
+        "const input = readFileSync(0, 'utf8')",
+        "const from = clean ? 'PLAIN:' : 'CIPHER:'",
+        "const to = clean ? 'CIPHER:' : 'PLAIN:'",
+        'process.stdout.write(input.replaceAll(from, to))',
+      ].join('\n'),
+    )
+    await chmod(filterScript, 0o755)
+
+    await runGit(mainRepo, ['init'])
+    await runGit(mainRepo, ['config', 'user.name', 'Test'])
+    await runGit(mainRepo, ['config', 'user.email', 'test@example.com'])
+    await runGit(mainRepo, [
+      'config',
+      'filter.crypt.clean',
+      `"${process.execPath}" "${filterScript}" --clean`,
+    ])
+    await runGit(mainRepo, [
+      'config',
+      'filter.crypt.smudge',
+      `"${process.execPath}" "${filterScript}" --smudge`,
+    ])
+    await runGit(mainRepo, ['config', 'filter.crypt.required', 'true'])
+
+    await writeFile(
+      join(mainRepo, '.gitattributes'),
+      '*.bat text eol=crlf\n*.sec filter=crypt\n',
+    )
+    await writeFile(join(mainRepo, '.gitignore'), '*.log\n')
+    await writeFile(join(mainRepo, 'build.bat'), '@echo off\r\necho v1\r\n')
+    await writeFile(join(mainRepo, 'secret.sec'), 'PLAIN:v1\n')
+    await writeFile(join(mainRepo, 'forced.log'), 'forced-v1\n')
+    await runGit(mainRepo, [
+      'add',
+      '.gitattributes',
+      '.gitignore',
+      'build.bat',
+      'secret.sec',
+    ])
+    await runGit(mainRepo, ['add', '-f', 'forced.log'])
+    await runGit(mainRepo, ['commit', '-m', 'init'])
+    await mkdir(join(mainRepo, '.git', 'info'), { recursive: true })
+    await writeFile(
+      join(mainRepo, '.git', 'info', 'exclude'),
+      'wt-ignored.tmp\n',
+    )
+
+    await runGit(mainRepo, ['worktree', 'add', '-b', 'wt-branch', wtDir])
+    await writeFile(join(wtDir, 'wt-ignored.tmp'), 'keep-excluded\n')
+    const unbornPath = join(wtDir, "it's-a-dir", 'nested')
+    await mkdir(unbornPath, { recursive: true })
+    await runGit(unbornPath, ['init'])
+    await writeFile(join(unbornPath, 'inner.txt'), 'unborn-v1')
+
+    const appDataDir = dataDirectory(undefined, { HOME: home }, wtDir)
+    const cp1 = await captureTurnFileCheckpoint(appDataDir, nativeId, wtDir, -1)
+    assert(cp1 !== undefined)
+    assert.deepEqual(cp1.unbornDirs, ["it's-a-dir/nested"])
+
+    await writeFile(join(wtDir, 'build.bat'), '@echo off\r\necho mutated\r\n')
+    await writeFile(join(wtDir, 'secret.sec'), 'PLAIN:mutated\n')
+    await rm(join(wtDir, 'forced.log'))
+    await writeFile(join(wtDir, 'wt-ignored.tmp'), 'user-local-cache\n')
+    await writeFile(join(wtDir, 'extra.txt'), 'remove-me')
+
+    await restoreSessionFileCheckpoint(appDataDir, nativeId, cp1.id)
+
+    assert.equal(
+      await readFile(join(wtDir, 'build.bat'), 'utf8'),
+      '@echo off\r\necho v1\r\n',
+    )
+    assert.equal(
+      await readFile(join(wtDir, 'secret.sec'), 'utf8'),
+      'PLAIN:v1\n',
+    )
+    assert.equal(
+      await readFile(join(wtDir, 'forced.log'), 'utf8'),
+      'forced-v1\n',
+    )
+    assert.equal(
+      await readFile(join(wtDir, 'wt-ignored.tmp'), 'utf8'),
+      'user-local-cache\n',
+    )
+    assert.equal(
+      await readFile(join(unbornPath, 'inner.txt'), 'utf8'),
+      'unborn-v1',
+    )
+    await assert.rejects(lstat(join(wtDir, 'extra.txt')))
+    assert.equal(
+      (
+        await runGit(wtDir, ['status', '--porcelain', '--untracked-files=no'])
+      ).stdout.trim(),
+      '',
+    )
+    assert.equal(
+      (await runGit(wtDir, ['status', '--porcelain'])).stdout.trim(),
+      "?? it's-a-dir/",
+    )
+
+    // Repeat capture + delete + restore cycle to verify restoreGitTree invalidated shadow index cache.
+    const cp2 = await captureTurnFileCheckpoint(appDataDir, nativeId, wtDir, 1)
+    assert(cp2 !== undefined)
+    await rm(join(wtDir, 'forced.log'))
+    await restoreSessionFileCheckpoint(appDataDir, nativeId, cp2.id)
+    assert.equal(
+      await readFile(join(wtDir, 'forced.log'), 'utf8'),
+      'forced-v1\n',
+    )
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('Native-forked session replay aligns child revert tokens to suffix steps, preserves explicit :step:N anchors, and cuts at child stepIndex', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-fork-replay-'))
+  const workDir = join(home, 'ws')
+  await mkdir(workDir, { recursive: true })
+  await runGit(workDir, ['init'])
+  const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
+  const nativeId = '22222222-2222-4222-8222-222222222224'
+
+  try {
+    await mkdir(join(appDataDir, 'conversations'), { recursive: true })
+    const db = new DatabaseSync(
+      join(appDataDir, 'conversations', `${nativeId}.db`),
+    )
+    try {
+      db.exec(`
+        CREATE TABLE trajectory_meta (cascade_id TEXT PRIMARY KEY, trajectory_id TEXT, source INTEGER);
+        CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, data BLOB, size INTEGER);
+      `)
+      db.prepare(
+        'INSERT INTO trajectory_meta (cascade_id, trajectory_id, source) VALUES (?, ?, ?)',
+      ).run(nativeId, 'traj-forked', 1)
+      ;[
+        [0, 14, 'parent 0'],
+        [5, 14, 'parent 1'],
+        [9, 15, 'parent ans 1'],
+        [10, 14, 'child 2'],
+        [11, 15, 'child ans 2'],
+      ].forEach(([idx, stepType, label]) => {
+        const data = pbStr(1, String(label))
+        db.prepare(
+          'INSERT INTO steps (idx, step_type, data, size) VALUES (?, ?, ?, ?)',
+        ).run(idx, stepType, data, data.byteLength)
+      })
+    } finally {
+      db.close()
+    }
+
+    const childRows: Record<string, unknown>[] = [
+      {
+        step_index: 10,
+        type: 'USER_INPUT',
+        created_at: '2026-01-01T00:00:10.000Z',
+        content: '<USER_REQUEST>\nchild 2\n</USER_REQUEST>',
+      },
+      {
+        step_index: 11,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-01-01T00:00:11.000Z',
+        content: 'child ans 2',
+      },
+    ]
+    await writeBrainTranscript(join(appDataDir, 'brain'), nativeId, childRows)
+    const cpChild = await captureTurnFileCheckpoint(
+      appDataDir,
+      nativeId,
+      workDir,
+      9,
+    )
+    assert(cpChild !== undefined)
+
+    const entries: HistoryEntry[] = [
+      {
+        item: {
+          type: 'user_message',
+          id: 'anchor:step:0',
+          text: 'step zero anchor',
+        },
+      },
+      { item: { type: 'user_message', id: 'u-p0', text: 'parent 0' } },
+      { item: { type: 'user_message', id: 'u-p1', text: 'parent 1' } },
+      { item: { type: 'user_message', id: 'u-c2', text: 'child 2' } },
+    ]
+    const attached = attachReplayRevertTokens(entries, childRows, [cpChild])
+    const tok0 = (attached[0].item as { revertToken?: Record<string, unknown> })
+      .revertToken
+    const tokP0 = (
+      attached[1].item as { revertToken?: Record<string, unknown> }
+    ).revertToken
+    const tokP1 = (
+      attached[2].item as { revertToken?: Record<string, unknown> }
+    ).revertToken
+    const tokC2 = (
+      attached[3].item as { revertToken?: Record<string, unknown> }
+    ).revertToken
+
+    assert.equal(tok0?.stepIndex, 0)
+    assert.equal(tok0?.turnOrdinal, undefined)
+    assert.equal(tokP0?.stepIndex, 0)
+    assert.equal(tokP0?.turnOrdinal, undefined)
+    assert.equal(tokP1?.stepIndex, undefined)
+    assert.equal(tokP1?.turnOrdinal, undefined)
+    assert.equal(tokC2?.stepIndex, 10)
+    assert.equal(tokC2?.turnOrdinal, 0)
+    assert.equal(tokC2?.checkpointId, cpChild.id)
+
+    const revChild = await revertSession({
+      appDataDir,
+      nativeId,
+      scope: 'conversation',
+      token: tokC2,
+      createFreshSession: async () => 'unused-fresh',
+    })
+    assert.equal(revChild.cutoffStepIndex, 10)
+    assert.equal(revChild.lastRetainedStepIndex, 9)
+    const forkedDb = new DatabaseSync(
+      join(appDataDir, 'conversations', `${revChild.newNativeId}.db`),
+    )
+    try {
+      const keptIdxs = (
+        forkedDb.prepare('SELECT idx FROM steps ORDER BY idx').all() as Array<{
+          idx: number
+        }>
+      ).map((r) => r.idx)
+      assert.deepEqual(keptIdxs, [0, 5, 9])
+    } finally {
+      forkedDb.close()
+    }
+
+    await assert.rejects(
+      revertSession({
+        appDataDir,
+        nativeId,
+        scope: 'conversation',
+        token: tokP1,
+        createFreshSession: async () => 'unused-fresh',
+      }),
+      /Unable to locate target turn in session transcript/,
+    )
+
+    const revZero = await revertSession({
+      appDataDir,
+      nativeId,
+      scope: 'conversation',
+      token: tok0,
+      createFreshSession: async () => 'fresh-from-zero',
+    })
+    assert.equal(revZero.newNativeId, 'fresh-from-zero')
+    assert.equal(revZero.cutoffStepIndex, 0)
+    assert.equal(revZero.lastRetainedStepIndex, -1)
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('session.interrupt rejects while session.revert is in flight without aborting the revert', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-revert-int-guard-'))
+  const workDir = join(home, 'ws')
+  await mkdir(workDir, { recursive: true })
+  const oldNativeId = '33333333-3333-4333-8333-333333333335'
+  const appDataDir = dataDirectory(undefined, { HOME: home }, workDir)
+  await seedNativeSessionArtifacts(appDataDir, oldNativeId)
+
+  const h = await openHarness(workDir, {
+    HOME: home,
+    AGY_TEST_CHECKPOINT_HISTORY: '1',
+  })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-int-guard',
+      sessionId: 's-int-guard',
+      config: h.config,
+      persistence: { version: 1, data: { sessionId: oldNativeId } },
+      history: 'replay',
+    })
+    await h.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 's-int-guard',
+    )
+
+    const token2 = h.events
+      .filter(
+        (
+          e,
+        ): e is Extract<
+          (typeof h.events)[number],
+          { type: 'timeline.item' }
+        > & {
+          item: Extract<
+            Extract<
+              (typeof h.events)[number],
+              { type: 'timeline.item' }
+            >['item'],
+            { type: 'user_message' }
+          >
+        } =>
+          e.type === 'timeline.item' &&
+          e.sessionId === 's-int-guard' &&
+          e.item.type === 'user_message',
+      )
+      .map((e) => e.item)[1].revertToken
+    assert(token2 !== undefined)
+
+    await h.provider.send({
+      type: 'session.revert',
+      requestId: 'rev-inflight',
+      sessionId: 's-int-guard',
+      scope: 'conversation',
+      token: token2,
+    })
+    await h.provider.send({
+      type: 'session.interrupt',
+      requestId: 'int-during-rev',
+      sessionId: 's-int-guard',
+    })
+
+    const intFailed = await h.wait(
+      (e) => e.type === 'request.failed' && e.requestId === 'int-during-rev',
+    )
+    assert(intFailed.type === 'request.failed')
+    assert.match(
+      intFailed.error.message,
+      /Cannot interrupt while session is reverting/,
+    )
+
+    await h.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'rev-inflight',
+    )
+    assert.ok(
+      h.events.some(
+        (e) =>
+          e.type === 'session.persistence' && e.sessionId === 's-int-guard',
+      ),
     )
   } finally {
     await h.provider.close()

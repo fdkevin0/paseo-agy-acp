@@ -88,16 +88,26 @@ async function resolveCutoffStepIndex(
     .filter(
       (n): n is number => n !== undefined && Number.isInteger(n) && n >= 0,
     )
+  const firstTranscriptStepIndex =
+    stepIndices.length > 0 ? Math.min(...stepIndices) : 0
   const maxStepIndex = stepIndices.length > 0 ? Math.max(...stepIndices) : -1
   const normalizeCutoff = (stepIndex: number): number =>
-    userSteps.length === 0 || stepIndex <= userSteps[0].stepIndex
+    firstTranscriptStepIndex === 0 &&
+    (userSteps.length === 0 || stepIndex <= userSteps[0].stepIndex)
       ? 0
       : stepIndex
 
   if (token.stepIndex !== undefined) {
+    if (token.stepIndex === 0) return 0
     if (userSteps.length === 0) return token.stepIndex
     const exact = userSteps.find((s) => s.stepIndex === token.stepIndex)
     if (exact) return normalizeCutoff(exact.stepIndex)
+    if (
+      stepIndices.includes(token.stepIndex) ||
+      token.stepIndex < firstTranscriptStepIndex
+    ) {
+      return normalizeCutoff(token.stepIndex)
+    }
   }
 
   if (token.afterStepIndex !== undefined) {
@@ -115,12 +125,14 @@ async function resolveCutoffStepIndex(
         const hasEarlierUserAfter = afterMatches.some(
           (s) => s.stepIndex < exactText.stepIndex,
         )
+        if (!hasEarlierUserAfter && token.afterStepIndex === -1) return 0
         return normalizeCutoff(
           token.afterStepIndex >= 0 && !hasEarlierUserAfter
             ? Math.min(minPostStep, exactText.stepIndex)
             : exactText.stepIndex,
         )
       }
+      if (token.afterStepIndex === -1) return 0
       return normalizeCutoff(minPostStep)
     }
     if (token.afterStepIndex === -1) return 0
@@ -136,7 +148,11 @@ async function resolveCutoffStepIndex(
 
   let matched: UserStepRow | undefined
 
-  if (token.turnOrdinal !== undefined && token.turnOrdinal < userSteps.length) {
+  if (
+    firstTranscriptStepIndex === 0 &&
+    token.turnOrdinal !== undefined &&
+    token.turnOrdinal < userSteps.length
+  ) {
     const candidate = userSteps[token.turnOrdinal]
     if (token.text === undefined || candidate.text === token.text) {
       matched = candidate
@@ -322,8 +338,101 @@ export function attachReplayRevertTokens(
     byStep.set(step.stepIndex, { ...step, ordinal })
   })
 
-  let fallbackCursor = 0
-  return entries.map((entry) => {
+  let firstTranscriptStepIndex: number | undefined
+  for (const raw of rows) {
+    const idx = num(raw.step_index)
+    if (idx !== undefined && Number.isInteger(idx) && idx >= 0) {
+      firstTranscriptStepIndex =
+        firstTranscriptStepIndex === undefined
+          ? idx
+          : Math.min(firstTranscriptStepIndex, idx)
+    }
+  }
+
+  const acpUsers: Array<{ entryIndex: number; text: string }> = []
+  entries.forEach((entry, entryIndex) => {
+    if (
+      entry.item.type === 'user_message' &&
+      !/:step:(\d+)$/.test(entry.item.id)
+    ) {
+      acpUsers.push({
+        entryIndex,
+        text: normalizeUserText(entry.item.text),
+      })
+    }
+  })
+
+  const M = userSteps.length
+  const N = acpUsers.length
+  const acpSlotMatch = new Map<
+    number,
+    { ordinal?: number; stepIndex?: number }
+  >()
+
+  if (M > 0 && M === N) {
+    for (let k = 0; k < N; k++) {
+      acpSlotMatch.set(acpUsers[k].entryIndex, {
+        ordinal: k,
+        stepIndex: userSteps[k].stepIndex,
+      })
+    }
+  } else if (M > 0 && M < N && (firstTranscriptStepIndex ?? 0) > 0) {
+    const matches: number[] = []
+    for (let offset = 0; offset <= N - M; offset++) {
+      let ok = true
+      for (let j = 0; j < M; j++) {
+        if (acpUsers[offset + j].text !== userSteps[j].text) {
+          ok = false
+          break
+        }
+      }
+      if (ok) matches.push(offset)
+    }
+    // Native-forked Brain transcripts begin at > 0 and contain only post-fork child turns.
+    const acpOffset = matches.length === 1 ? matches[0] : N - M
+    if (acpOffset > 0) {
+      acpSlotMatch.set(acpUsers[0].entryIndex, { stepIndex: 0 })
+    }
+    for (let j = 0; j < M; j++) {
+      acpSlotMatch.set(acpUsers[acpOffset + j].entryIndex, {
+        ordinal: j,
+        stepIndex: userSteps[j].stepIndex,
+      })
+    }
+  } else {
+    let cursor = 0
+    for (let k = 0; k < N; k++) {
+      const slot = acpUsers[k]
+      let matched = false
+      for (let i = cursor; i < M; i++) {
+        if (userSteps[i].text === slot.text) {
+          acpSlotMatch.set(slot.entryIndex, {
+            ordinal: i,
+            stepIndex: userSteps[i].stepIndex,
+          })
+          cursor = i + 1
+          matched = true
+          break
+        }
+      }
+      if (!matched && (firstTranscriptStepIndex ?? 0) === 0 && cursor < M) {
+        acpSlotMatch.set(slot.entryIndex, {
+          ordinal: cursor,
+          stepIndex: userSteps[cursor].stepIndex,
+        })
+        cursor++
+      } else if (
+        !matched &&
+        k === 0 &&
+        M === 0 &&
+        (firstTranscriptStepIndex ?? 0) === 0
+      ) {
+        acpSlotMatch.set(slot.entryIndex, { ordinal: 0 })
+      }
+    }
+  }
+
+  return entries.map((entry, entryIndex) => {
     if (entry.item.type !== 'user_message') return entry
     const normalizedText = normalizeUserText(entry.item.text)
     let matchedOrdinal: number | undefined
@@ -333,41 +442,19 @@ export function attachReplayRevertTokens(
     if (stepMatch) {
       const stepNum = Number.parseInt(stepMatch[1], 10)
       const found = byStep.get(stepNum)
-      if (found) {
-        matchedOrdinal = found.ordinal
-        matchedStepIndex = found.stepIndex
-        if (found.ordinal >= fallbackCursor) fallbackCursor = found.ordinal + 1
-      } else {
-        matchedStepIndex = stepNum
-      }
-    }
-
-    if (matchedOrdinal === undefined) {
-      for (let i = fallbackCursor; i < userSteps.length; i++) {
-        if (userSteps[i].text === normalizedText) {
-          matchedOrdinal = i
-          matchedStepIndex = userSteps[i].stepIndex
-          fallbackCursor = i + 1
-          break
-        }
-      }
-    }
-
-    if (matchedOrdinal === undefined && fallbackCursor < userSteps.length) {
-      const fallback = userSteps[fallbackCursor]
-      if (fallback) {
-        matchedOrdinal = fallbackCursor
-        matchedStepIndex = fallback.stepIndex
-        fallbackCursor++
-      }
+      matchedStepIndex = found ? found.stepIndex : stepNum
+      matchedOrdinal = found?.ordinal
+    } else {
+      const slot = acpSlotMatch.get(entryIndex)
+      matchedOrdinal = slot?.ordinal
+      matchedStepIndex = slot?.stepIndex
     }
 
     let checkpointId: string | undefined
     if (matchedStepIndex !== undefined) {
       const prevUserStep =
-        matchedOrdinal !== undefined && matchedOrdinal > 0
-          ? userSteps[matchedOrdinal - 1].stepIndex
-          : -1
+        userSteps.filter((u) => u.stepIndex < matchedStepIndex!).at(-1)
+          ?.stepIndex ?? -1
       checkpointId = findCheckpointForUserStep(
         checkpoints,
         prevUserStep,

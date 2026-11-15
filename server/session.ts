@@ -400,6 +400,8 @@ export class SessionManager {
         session.state.reverting = false
       }
     } else if (input.type === 'session.interrupt') {
+      if (session.state.reverting)
+        throw new Error('Cannot interrupt while session is reverting')
       await session.interrupt()
     } else if (input.type === 'session.can_stop_runtime') {
       emit({
@@ -1489,6 +1491,8 @@ async function createSession(
         await notificationLane
       },
       async interrupt(): Promise<void> {
+        if (state.reverting)
+          throw new Error('Cannot interrupt while session is reverting')
         if (state.interrupting) return state.interrupting
         if (state.closing) return
         if (state.failed)
