@@ -8,7 +8,7 @@
   "minimumReleaseAge": "3 days",
   "constraints": {
     "node": "26",
-    "npm": "12"
+    "npm": "11"
   },
   "lockFileMaintenance": {
     "enabled": true,
