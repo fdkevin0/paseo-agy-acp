@@ -13,7 +13,7 @@ import { alignReplayTools } from '../server/history.ts'
 import { Timeline } from '../server/mapping.ts'
 import { SessionManager } from '../server/session.ts'
 import { AgyUsageSource } from '../server/usage.ts'
-import { zSessionUpdate } from '../node_modules/@agentclientprotocol/sdk/dist/schema/zod.gen.js'
+import { zSessionUpdate } from '../node_modules/@agentclientprotocol/sdk/dist/v1/unstable/schema/zod.gen.js'
 
 const native = '11111111-1111-4111-8111-111111111111'
 const child = '22222222-2222-4222-8222-222222222222'

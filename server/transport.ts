@@ -8,10 +8,22 @@ import { nativeModelsSchema, type SessionMetadata } from './mapping.ts'
 import { record } from './common.ts'
 import { Readable, Writable } from 'node:stream'
 import {
-  ClientSideConnection,
+  client as createAcpClient,
+  methods,
   ndJsonStream,
-  type Client,
-} from '@agentclientprotocol/sdk'
+  type CancelNotification,
+  type CloseSessionRequest,
+  type InitializeRequest,
+  type ListSessionsRequest,
+  type LoadSessionRequest,
+  type NewSessionRequest,
+  type PromptRequest,
+  type RequestPermissionRequest,
+  type RequestPermissionResponse,
+  type ResumeSessionRequest,
+  type SessionNotification,
+  type SetSessionConfigOptionRequest,
+} from '@agentclientprotocol/sdk/unstable'
 import { spawnProcess, terminateProcess } from '@getpaseo/plugin/server'
 import type { ProviderLaunch } from '@getpaseo/plugin/server/provider'
 
@@ -110,7 +122,11 @@ const TERMINATION_DEADLINE_MS = 1100
 const ACP_REQUEST_TIMEOUT_MS = 30_000
 const STDERR_DRAIN_MS = 50
 
-type AcpClient = Client & {
+type AcpClient = {
+  sessionUpdate: (params: SessionNotification) => Promise<void>
+  requestPermission: (
+    params: RequestPermissionRequest,
+  ) => Promise<RequestPermissionResponse>
   requestElicitation?: (
     params: Record<string, unknown>,
   ) => Promise<Record<string, unknown>>
@@ -272,18 +288,37 @@ export function connectAcp(
       },
     }),
   )
-  const rpc = new ClientSideConnection(
-    () => ({
-      sessionUpdate: async (params) => {
-        if (!stopping) await client.sessionUpdate(params)
-      },
-      requestPermission: async (params) =>
-        stopping
-          ? { outcome: { outcome: 'cancelled' } }
-          : client.requestPermission(params),
-    }),
-    { readable, writable },
-  )
+  const connection = createAcpClient()
+    .onNotification(methods.client.session.update, async ({ params }) => {
+      if (!stopping) await client.sessionUpdate(params)
+    })
+    .onRequest(methods.client.session.requestPermission, async ({ params }) =>
+      stopping
+        ? { outcome: { outcome: 'cancelled' } }
+        : client.requestPermission(params),
+    )
+    .connect({ readable, writable })
+  const rpc = {
+    closed: connection.closed,
+    initialize: (params: InitializeRequest) =>
+      connection.agent.request(methods.agent.initialize, params),
+    newSession: (params: NewSessionRequest) =>
+      connection.agent.request(methods.agent.session.new, params),
+    loadSession: (params: LoadSessionRequest) =>
+      connection.agent.request(methods.agent.session.load, params),
+    resumeSession: (params: ResumeSessionRequest) =>
+      connection.agent.request(methods.agent.session.resume, params),
+    listSessions: (params: ListSessionsRequest) =>
+      connection.agent.request(methods.agent.session.list, params),
+    closeSession: (params: CloseSessionRequest) =>
+      connection.agent.request(methods.agent.session.close, params),
+    setSessionConfigOption: (params: SetSessionConfigOptionRequest) =>
+      connection.agent.request(methods.agent.session.setConfigOption, params),
+    prompt: (params: PromptRequest) =>
+      connection.agent.request(methods.agent.session.prompt, params),
+    cancel: (params: CancelNotification) =>
+      connection.agent.notify(methods.agent.session.cancel, params),
+  }
   void rpc.closed.then(() => fail(formatExitError('ACP connection closed')))
   let closing: Promise<void> | undefined
   function close(): Promise<void> {

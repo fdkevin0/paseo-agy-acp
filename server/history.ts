@@ -6,7 +6,7 @@ import {
 } from './brain-projector.ts'
 import { record } from './common.ts'
 import { toolDetail } from './mapping.ts'
-import type { ToolCall } from '@agentclientprotocol/sdk'
+import type { ToolCall } from '@agentclientprotocol/sdk/unstable'
 import type { ProviderTimelineItem } from '@getpaseo/plugin/server/provider'
 
 export interface HistoryEntry {

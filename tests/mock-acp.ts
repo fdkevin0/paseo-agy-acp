@@ -1,4 +1,12 @@
-import { AgentSideConnection, ndJsonStream } from '@agentclientprotocol/sdk'
+import {
+  agent,
+  methods,
+  ndJsonStream,
+  type AgentConnection,
+  type CreateElicitationResponse,
+  type RequestPermissionRequest,
+  type SessionNotification,
+} from '@agentclientprotocol/sdk/unstable'
 import { randomUUID } from 'node:crypto'
 import { appendFileSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -106,89 +114,98 @@ stream.writable = new WritableStream({
     return output.write(message)
   },
 })
-new AgentSideConnection((client) => {
-  // agy's question forms (array items with oneOf, no `mode`) are not SDK-typed elicitation requests.
-  const elicit = (params: Record<string, unknown>) => {
-    if (process.env.AGY_TEST_LOG_ELICITATION_CAP) log('elicit')
-    return client.createElicitation(
-      params as unknown as Parameters<typeof client.createElicitation>[0],
-    )
-  }
-  async function staleEvents(sessionId: string) {
-    for (const update of [
-      {
-        sessionUpdate: 'agent_message_chunk' as const,
-        content: { type: 'text' as const, text: 'stale' },
-      },
-      {
-        sessionUpdate: 'available_commands_update' as const,
-        availableCommands: [{ name: 'stale', description: 'stale' }],
-      },
-      { sessionUpdate: 'usage_update' as const, used: 999, size: 1000 },
-      { sessionUpdate: 'config_option_update' as const, configOptions: [] },
-    ])
-      await client.sessionUpdate({ sessionId, update })
-    const result = await client.requestPermission({
+let connection!: AgentConnection
+const client = {
+  sessionUpdate: (params: SessionNotification) =>
+    connection.client.notify(methods.client.session.update, params),
+  requestPermission: (params: RequestPermissionRequest) =>
+    connection.client.request(methods.client.session.requestPermission, params),
+  createElicitation: (params: Record<string, unknown>) =>
+    connection.client.request<CreateElicitationResponse>(
+      methods.client.elicitation.create,
+      params,
+    ),
+}
+// agy's question forms (array items with oneOf, no `mode`) are not SDK-typed elicitation requests.
+const elicit = (params: Record<string, unknown>) => {
+  if (process.env.AGY_TEST_LOG_ELICITATION_CAP) log('elicit')
+  return client.createElicitation(params)
+}
+async function staleEvents(sessionId: string) {
+  for (const update of [
+    {
+      sessionUpdate: 'agent_message_chunk' as const,
+      content: { type: 'text' as const, text: 'stale' },
+    },
+    {
+      sessionUpdate: 'available_commands_update' as const,
+      availableCommands: [{ name: 'stale', description: 'stale' }],
+    },
+    { sessionUpdate: 'usage_update' as const, used: 999, size: 1000 },
+    { sessionUpdate: 'config_option_update' as const, configOptions: [] },
+  ])
+    await client.sessionUpdate({ sessionId, update })
+  const result = await client.requestPermission({
+    sessionId,
+    toolCall: { toolCallId: 'stale', title: 'stale' },
+    options: [{ optionId: 'yes', name: 'Allow', kind: 'allow_once' }],
+  })
+  log(`stale-permission:${result.outcome.outcome}`)
+}
+function sendCommands(sessionId: string) {
+  if (process.env.AGY_TEST_NO_COMMANDS) return
+  setTimeout(async () => {
+    if (process.env.AGY_TEST_STALE_EVENTS) await staleEvents(randomUUID())
+    await client.sessionUpdate({
       sessionId,
-      toolCall: { toolCallId: 'stale', title: 'stale' },
-      options: [{ optionId: 'yes', name: 'Allow', kind: 'allow_once' }],
+      update: {
+        sessionUpdate: 'available_commands_update',
+        availableCommands: [
+          { name: 'compact', description: 'Compact context' },
+        ],
+      },
     })
-    log(`stale-permission:${result.outcome.outcome}`)
-  }
-  function sendCommands(sessionId: string) {
-    if (process.env.AGY_TEST_NO_COMMANDS) return
-    setTimeout(async () => {
-      if (process.env.AGY_TEST_STALE_EVENTS) await staleEvents(randomUUID())
-      await client.sessionUpdate({
-        sessionId,
-        update: {
-          sessionUpdate: 'available_commands_update',
-          availableCommands: [
-            { name: 'compact', description: 'Compact context' },
-          ],
+  }, 20)
+}
+connection = agent()
+  .onRequest(methods.agent.initialize, async ({ params }) => {
+    if (
+      process.env.AGY_TEST_LOG_ELICITATION_CAP &&
+      params.clientCapabilities?.elicitation?.form
+    )
+      log('cap:elicitation.form')
+    return {
+      protocolVersion: 1,
+      agentCapabilities: {
+        loadSession: true,
+        sessionCapabilities: {
+          list: {},
+          ...(process.env.AGY_TEST_RESUME_CAP ? { resume: {} } : {}),
         },
-      })
-    }, 20)
-  }
-  return {
-    async initialize(params) {
-      if (
-        process.env.AGY_TEST_LOG_ELICITATION_CAP &&
-        params.clientCapabilities?.elicitation?.form
-      )
-        log('cap:elicitation.form')
-      return {
-        protocolVersion: 1,
-        agentCapabilities: {
-          loadSession: true,
-          sessionCapabilities: {
-            list: {},
-            ...(process.env.AGY_TEST_RESUME_CAP ? { resume: {} } : {}),
-          },
-        },
-      }
-    },
-    async authenticate() {
-      return {}
-    },
-    async newSession(params) {
-      const previousId = nativeId || randomUUID()
-      nativeId = randomUUID()
-      const append = (
-        params._meta?.antigravity as { systemPrompt?: { append?: string } }
-      )?.systemPrompt?.append
-      log(append ? `new:${append}` : 'new')
-      if (process.env.AGY_TEST_STALE_EVENTS) await staleEvents(previousId)
-      sendCommands(nativeId)
-      return { sessionId: nativeId, configOptions }
-    },
-    async closeSession({ sessionId }) {
-      log('close')
-      if (process.env.AGY_TEST_STALE_EVENTS) await staleEvents(sessionId)
-      if (process.env.AGY_TEST_CLOSE_ERROR) throw new Error('close failed')
-      return {}
-    },
-    async loadSession({ sessionId, _meta }) {
+      },
+    }
+  })
+  .onRequest(methods.agent.authenticate, async () => ({}))
+  .onRequest(methods.agent.session.new, async ({ params }) => {
+    const previousId = nativeId || randomUUID()
+    nativeId = randomUUID()
+    const append = (
+      params._meta?.antigravity as { systemPrompt?: { append?: string } }
+    )?.systemPrompt?.append
+    log(append ? `new:${append}` : 'new')
+    if (process.env.AGY_TEST_STALE_EVENTS) await staleEvents(previousId)
+    sendCommands(nativeId)
+    return { sessionId: nativeId, configOptions }
+  })
+  .onRequest(methods.agent.session.close, async ({ params: { sessionId } }) => {
+    log('close')
+    if (process.env.AGY_TEST_STALE_EVENTS) await staleEvents(sessionId)
+    if (process.env.AGY_TEST_CLOSE_ERROR) throw new Error('close failed')
+    return {}
+  })
+  .onRequest(
+    methods.agent.session.load,
+    async ({ params: { sessionId, _meta } }) => {
       const append = (
         _meta?.antigravity as { systemPrompt?: { append?: string } }
       )?.systemPrompt?.append
@@ -271,7 +288,10 @@ new AgentSideConnection((client) => {
       }
       return { configOptions }
     },
-    async resumeSession({ sessionId, _meta }) {
+  )
+  .onRequest(
+    methods.agent.session.resume,
+    async ({ params: { sessionId, _meta } }) => {
       const append = (
         _meta?.antigravity as { systemPrompt?: { append?: string } }
       )?.systemPrompt?.append
@@ -279,19 +299,20 @@ new AgentSideConnection((client) => {
       sendCommands(sessionId)
       return { configOptions }
     },
-    async listSessions({ cwd }) {
-      return {
-        sessions: [
-          {
-            sessionId: 'native-test',
-            cwd: cwd ?? process.cwd(),
-            title: 'Test session',
-            _meta: { description: 'Last prompt preview' },
-          },
-        ],
-      }
-    },
-    async setSessionConfigOption({ configId, value }) {
+  )
+  .onRequest(methods.agent.session.list, async ({ params: { cwd } }) => ({
+    sessions: [
+      {
+        sessionId: 'native-test',
+        cwd: cwd ?? process.cwd(),
+        title: 'Test session',
+        _meta: { description: 'Last prompt preview' },
+      },
+    ],
+  }))
+  .onRequest(
+    methods.agent.session.setConfigOption,
+    async ({ params: { configId, value } }) => {
       log(`configure:${configId}=${value}`)
       return {
         configOptions: configOptions.map((o) =>
@@ -299,12 +320,18 @@ new AgentSideConnection((client) => {
         ),
       }
     },
-    async cancel({ sessionId }) {
+  )
+  .onNotification(
+    methods.agent.session.cancel,
+    async ({ params: { sessionId } }) => {
       if (process.env.AGY_TEST_LOG_LOAD) log('cancel')
       canceled.add(sessionId)
       cancels.get(sessionId)?.()
     },
-    async prompt({ sessionId, prompt }) {
+  )
+  .onRequest(
+    methods.agent.session.prompt,
+    async ({ params: { sessionId, prompt } }) => {
       const text = prompt.map((c) => (c.type === 'text' ? c.text : '')).join('')
       if (process.env.AGY_TEST_LOG_ELICITATION_CAP) log(`prompt:${text}`)
       const continuation = pendingBrainContinuation.get(sessionId)
@@ -1995,5 +2022,5 @@ new AgentSideConnection((client) => {
         },
       }
     },
-  }
-}, stream)
+  )
+  .connect(stream)

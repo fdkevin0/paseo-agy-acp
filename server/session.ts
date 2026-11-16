@@ -14,7 +14,7 @@ import {
   type ContentBlock,
   type McpServer,
   type Usage,
-} from '@agentclientprotocol/sdk'
+} from '@agentclientprotocol/sdk/unstable'
 import type {
   ProviderLaunch,
   ProviderEvent,
@@ -1616,7 +1616,10 @@ async function applyNativeConfigOption(
 
 async function configureSession(
   session: Session,
-  changes: ProviderConfigChanges,
+  changes: Pick<
+    ProviderConfigChanges,
+    'model' | 'mode' | 'thinkingOption' | 'settings'
+  >,
   options?: { strictThinking?: boolean },
 ) {
   if (session.state.closing || session.state.failed)
