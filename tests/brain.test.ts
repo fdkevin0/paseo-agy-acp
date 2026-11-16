@@ -3646,7 +3646,7 @@ async function checkpointFixture(): Promise<Row> {
   )
 }
 
-test('completed checkpoint uses native compaction without guessing trigger or token counts and keeps tool offsets', async () => {
+test('completed checkpoint projects preTokens without guessing trigger or post-compaction usage and keeps tool offsets', async () => {
   const checkpoint = await checkpointFixture()
   const projector = new BrainTranscriptProjector('p')
   projector.project({
@@ -3658,8 +3658,25 @@ test('completed checkpoint uses native compaction without guessing trigger or to
     ],
   })
   assert.deepEqual(projector.project(checkpoint), [
-    { type: 'compaction', id: 'p:step:93:compaction', status: 'completed' },
+    {
+      type: 'compaction',
+      id: 'p:step:93:compaction',
+      status: 'completed',
+      preTokens: 268_740,
+    },
   ])
+  assert.deepEqual(
+    new BrainTranscriptProjector('p').project({
+      step_index: 99,
+      type: 'CHECKPOINT',
+      status: 'DONE',
+      input_tokens: 0,
+      cache_read_tokens: 0,
+      output_tokens: 4_200,
+      content: 'summary',
+    }),
+    [{ type: 'compaction', id: 'p:step:99:compaction', status: 'completed' }],
+  )
   const a = projector.project({
     step_index: 94,
     type: 'GENERIC',
@@ -3712,6 +3729,7 @@ test('foreground and wakeup project checkpoints without using checkpoint tokens 
             type: 'compaction',
             id: 'p:step:4:compaction',
             status: 'completed',
+            preTokens: 268_740,
           },
         ],
       )
@@ -3738,7 +3756,12 @@ test('a command-only checkpoint is visible without inventing a model response or
     assert.equal(result.status, 'completed')
     assert.equal(result.lastStepUsage, undefined)
     assert.deepEqual(items, [
-      { type: 'compaction', id: 'p:step:93:compaction', status: 'completed' },
+      {
+        type: 'compaction',
+        id: 'p:step:93:compaction',
+        status: 'completed',
+        preTokens: 268_740,
+      },
     ])
     const old: ProviderTimelineItem[] = []
     await alive(
@@ -3806,6 +3829,7 @@ test('child compaction stays on child timeline, survives cancellation drain, and
       type: 'compaction',
       id: 'child:step:2:compaction',
       status: 'completed',
+      preTokens: 268_740,
     })
   } finally {
     handle?.()

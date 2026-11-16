@@ -513,7 +513,6 @@ export function configState(response: SessionMetadata): ProviderConfigState {
       description:
         m.description ??
         available?.find((a) => a.modelId === m.id)?.description,
-      contextWindowMaxTokens: contextWindowForModel(m.id),
       thinkingOptions: efforts,
       ...(defaultThinkingOptionId ? { defaultThinkingOptionId } : {}),
     }
@@ -620,11 +619,6 @@ export function contextUsage(update: UsageUpdate): ProviderUsage | undefined {
   }
 }
 
-/** Native ACP model limits from agy 1.5.7 (observed usage_update size: 256000; 1M is TUI-only). */
-export function contextWindowForModel(modelId?: string): number {
-  return modelId?.startsWith('gpt-oss') ? 131_072 : 256_000
-}
-
 export type StepUsage = {
   inputTokens: number
   outputTokens: number
@@ -680,7 +674,6 @@ export function appliesCarriedWakeup(
 export function promptUsage(
   usage?: Usage | null,
   options?: {
-    model?: string
     preserveContext?: boolean
     contextWindowMaxTokens?: number
     lastStep?: StepUsage
@@ -736,9 +729,9 @@ export function promptUsage(
     ...(used !== undefined && used > 0 && !options?.preserveContext
       ? {
           contextWindowUsedTokens: used,
-          contextWindowMaxTokens:
-            options?.contextWindowMaxTokens ??
-            contextWindowForModel(options?.model),
+          ...(options?.contextWindowMaxTokens !== undefined
+            ? { contextWindowMaxTokens: options.contextWindowMaxTokens }
+            : {}),
         }
       : {}),
   }

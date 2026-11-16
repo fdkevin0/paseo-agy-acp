@@ -3,6 +3,7 @@ import {
   TranscriptReader,
   StepDedupe,
   countRowMessages,
+  extractCheckpointPreTokens,
   extractRowMessageSignatures,
   extractStepUsage,
   isMissing,
@@ -295,15 +296,18 @@ export class BrainTurnObservation {
         row.type === 'CHECKPOINT' &&
         row.status === 'DONE' &&
         this.checkpoints.fresh(row)
-      )
+      ) {
+        const preTokens = extractCheckpointPreTokens(row)
         this.callbacks.onItem(
           {
             type: 'compaction',
             id: `${this.sessionId}:step:${row.step_index}:compaction`,
             status: 'completed',
+            ...(preTokens !== undefined ? { preTokens } : {}),
           },
           typeof row.created_at === 'string' ? row.created_at : undefined,
         )
+      }
   }
   async attach(consumer: (read: BrainRead) => Promise<void>) {
     await this.inflight

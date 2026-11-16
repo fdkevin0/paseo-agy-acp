@@ -1615,7 +1615,7 @@ test(
     ])
     await h.read()
     assert.equal(h.latest().contextWindowUsedTokens, 45_800)
-    assert.equal(h.latest().contextWindowMaxTokens, 256_000)
+    assert.equal(h.latest().contextWindowMaxTokens, undefined)
 
     // Intra-turn planexecute handoff to Hydrogen + KV-cache miss + RUNNING background task
     await h.append([
@@ -1659,7 +1659,7 @@ test(
     ])
     await h.read()
     assert.equal(h.latest().contextWindowUsedTokens, 47_800)
-    assert.equal(h.latest().contextWindowMaxTokens, 256_000)
+    assert.equal(h.latest().contextWindowMaxTokens, undefined)
     assert.equal(held.observation.wokeUp, false)
 
     // Foreground RPC ends with cumulative multi-model totals; turn stays open awaiting background task
@@ -1748,7 +1748,7 @@ test(
     await held.running
     assert.deepEqual(h.turns(), ['completed'])
     assert.equal(h.latest().contextWindowUsedTokens, 49_500)
-    assert.equal(h.latest().contextWindowMaxTokens, 256_000)
+    assert.equal(h.latest().contextWindowMaxTokens, undefined)
     // Foreground (51,600) + woken steps 12 & 15 only (500 + 48,900 = 49,400); zero double-counting of foreground Hydrogen!
     assert.equal(h.latest().inputTokens, 101_000)
     assert.equal(h.latest().cachedInputTokens, 177_100)
@@ -1794,7 +1794,7 @@ test(
     await held2.running
     assert.deepEqual(h.turns(), ['completed', 'completed'])
     assert.equal(h.latest().contextWindowUsedTokens, 51_000)
-    assert.equal(h.latest().contextWindowMaxTokens, 256_000)
+    assert.equal(h.latest().contextWindowMaxTokens, undefined)
     assert.equal(h.latest().inputTokens, 1_200)
     assert.equal(h.latest().cachedInputTokens, 49_500)
     assert.equal(h.latest().outputTokens, 300)

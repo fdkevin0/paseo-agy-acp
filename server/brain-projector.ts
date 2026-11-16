@@ -14,6 +14,7 @@ import {
 import {
   SUBAGENT_ALIVE,
   TranscriptReader,
+  extractCheckpointPreTokens,
   extractRowMessageSenders,
   isCompletePlannerResponse,
   isPlanExecuteNotice,
@@ -659,17 +660,19 @@ export class BrainTranscriptProjector {
         }
         return []
       }
-      case 'CHECKPOINT':
+      case 'CHECKPOINT': {
         shiftPendingPastCheckpoint(this.pending, stepIndex)
-        return row.status === 'DONE'
-          ? [
-              {
-                type: 'compaction',
-                id: `${id}:compaction`,
-                status: 'completed',
-              },
-            ]
-          : []
+        if (row.status !== 'DONE') return []
+        const preTokens = extractCheckpointPreTokens(row)
+        return [
+          {
+            type: 'compaction',
+            id: `${id}:compaction`,
+            status: 'completed',
+            ...(preTokens !== undefined ? { preTokens } : {}),
+          },
+        ]
+      }
       case 'ERROR_MESSAGE':
         if (isRetryWarning(row)) return []
         this.retired = []

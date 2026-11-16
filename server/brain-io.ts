@@ -7,7 +7,8 @@ import {
   type FileHandle,
 } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
-import { join, sep } from 'node:path'
+import { dirname, join, sep } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import {
   isAskQuestionName,
   isNativeToolName,
@@ -212,6 +213,22 @@ export function extractStepUsage(
     cachedReadTokens: cachedRead,
     ...(cacheWrite !== undefined ? { cachedWriteTokens: cacheWrite } : {}),
   }
+}
+
+/** Pre-compaction context size recorded on CHECKPOINT rows, excluding summary output tokens. */
+export function extractCheckpointPreTokens(
+  row: Record<string, unknown>,
+): number | undefined {
+  if (row.type !== 'CHECKPOINT') return undefined
+  const input = nonnegative(row.input_tokens) ? row.input_tokens : 0
+  const cachedRead = nonnegative(row.cache_read_tokens)
+    ? row.cache_read_tokens
+    : 0
+  const cachedWrite = nonnegative(row.cache_write_tokens)
+    ? row.cache_write_tokens
+    : 0
+  const total = input + cachedRead + cachedWrite
+  return total > 0 ? total : undefined
 }
 
 function collectRowWakeupHeaders<T>(
@@ -805,4 +822,207 @@ export async function readLatestStepUsage(
     if (lastStepUsage) return { lastStepUsage, lastStepIndex }
   }
   return { lastStepIndex }
+}
+
+function readProtoVarint(
+  buf: Uint8Array,
+  start: number,
+): [bigint, number] | undefined {
+  let val = 0n
+  let shift = 0n
+  let pos = start
+  while (pos < buf.length && shift <= 63n) {
+    const b = buf[pos++]
+    val |= BigInt(b & 0x7f) << shift
+    if ((b & 0x80) === 0) return [val, pos]
+    shift += 7n
+  }
+  return undefined
+}
+
+function readProtoVarintPath(
+  buf: Uint8Array,
+  path: readonly number[],
+): number | undefined {
+  if (path.length === 0) return undefined
+  let pos = 0
+  let match: number | undefined
+  const maxSafe = BigInt(Number.MAX_SAFE_INTEGER)
+  while (pos < buf.length) {
+    const tagRead = readProtoVarint(buf, pos)
+    if (!tagRead) return undefined
+    const [tag, afterTag] = tagRead
+    pos = afterTag
+    const fieldNumber = Number(tag >> 3n)
+    const wireType = Number(tag & 7n)
+    if (wireType === 0) {
+      const valRead = readProtoVarint(buf, pos)
+      if (!valRead) return undefined
+      const [val, afterVal] = valRead
+      pos = afterVal
+      if (
+        path.length === 1 &&
+        fieldNumber === path[0] &&
+        val > 0n &&
+        val <= maxSafe
+      ) {
+        match = Number(val)
+      }
+    } else if (wireType === 1) {
+      pos += 8
+      if (pos > buf.length) return undefined
+    } else if (wireType === 2) {
+      const lenRead = readProtoVarint(buf, pos)
+      if (!lenRead) return undefined
+      const [rawLen, afterLen] = lenRead
+      if (rawLen < 0n || rawLen > maxSafe) return undefined
+      const len = Number(rawLen)
+      pos = afterLen
+      if (pos + len > buf.length) return undefined
+      if (path.length > 1 && fieldNumber === path[0]) {
+        const nested = readProtoVarintPath(
+          buf.subarray(pos, pos + len),
+          path.slice(1),
+        )
+        if (nested !== undefined) match = nested
+      }
+      pos += len
+    } else if (wireType === 5) {
+      pos += 4
+      if (pos > buf.length) return undefined
+    } else {
+      return undefined
+    }
+  }
+  return match
+}
+
+async function resolveConversationDbPath(
+  brainRoot: string,
+  nativeId: string,
+): Promise<string> {
+  const appRoot = await realpath(dirname(brainRoot))
+  const convCandidate = join(appRoot, 'conversations')
+  const convInfo = await lstat(convCandidate)
+  if (convInfo.isSymbolicLink() || !convInfo.isDirectory())
+    throw new BrainEscapeError()
+  const convRoot = await realpath(convCandidate)
+  const appPrefix = appRoot === sep ? sep : appRoot + sep
+  if (!convRoot.startsWith(appPrefix)) throw new BrainEscapeError()
+  const candidate = join(convRoot, `${nativeId}.db`)
+  const info = await lstat(candidate)
+  if (info.isSymbolicLink() || !info.isFile()) throw new BrainEscapeError()
+  for (const suffix of ['-wal', '-shm']) {
+    try {
+      const auxInfo = await lstat(`${candidate}${suffix}`)
+      if (auxInfo.isSymbolicLink() || !auxInfo.isFile())
+        throw new BrainEscapeError()
+    } catch (error) {
+      if (error instanceof BrainEscapeError) throw error
+      if (!isMissing(error)) throw error
+    }
+  }
+  const resolved = await realpath(candidate)
+  const prefix = convRoot === sep ? sep : convRoot + sep
+  if (!resolved.startsWith(prefix)) throw new BrainEscapeError()
+  return resolved
+}
+
+const GEN_MAX_CONTEXT_TOKENS_PATH = [1, 9, 10, 4] as const
+const EXECUTOR_MAX_TOKEN_LIMIT_PATH = [10, 2, 5] as const
+
+/** Read effective server-side auto-compaction window from conversations/<nativeId>.db after cursor indices. */
+export async function readConversationCompactionWindow(
+  brainRoot: string,
+  nativeId: string,
+  minGenIdx = -1,
+  minExeIdx = -1,
+): Promise<{ maxTokens?: number; genIdx: number; exeIdx: number }> {
+  if (!sessionIdPattern.test(nativeId))
+    return { genIdx: minGenIdx, exeIdx: minExeIdx }
+  let dbPath: string
+  try {
+    dbPath = await resolveConversationDbPath(brainRoot, nativeId)
+  } catch (error) {
+    if (error instanceof BrainEscapeError) throw error
+    return { genIdx: minGenIdx, exeIdx: minExeIdx }
+  }
+  let genIdx = minGenIdx
+  let exeIdx = minExeIdx
+  let maxTokens: number | undefined
+  let db: DatabaseSync | undefined
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true })
+    try {
+      const maxGenRow = db
+        .prepare('SELECT idx FROM gen_metadata ORDER BY idx DESC LIMIT 1')
+        .get() as { idx?: unknown } | undefined
+      if (
+        maxGenRow &&
+        typeof maxGenRow.idx === 'number' &&
+        Number.isInteger(maxGenRow.idx) &&
+        maxGenRow.idx >= 0
+      ) {
+        genIdx = Math.max(minGenIdx, maxGenRow.idx)
+      }
+      if (genIdx > minGenIdx) {
+        const rows = db
+          .prepare(
+            'SELECT data FROM gen_metadata WHERE idx > ? ORDER BY CASE WHEN length(data) < 32768 THEN 0 ELSE 1 END, idx DESC LIMIT 2',
+          )
+          .all(minGenIdx) as Array<{ data?: unknown }>
+        for (const row of rows) {
+          if (row.data instanceof Uint8Array) {
+            const parsed = readProtoVarintPath(
+              row.data,
+              GEN_MAX_CONTEXT_TOKENS_PATH,
+            )
+            if (parsed !== undefined) {
+              maxTokens = parsed
+              break
+            }
+          }
+        }
+      }
+    } catch {
+      /* Ignore missing/locked gen_metadata while agy flushes steps. */
+    }
+    try {
+      const maxExeRow = db
+        .prepare('SELECT idx FROM executor_metadata ORDER BY idx DESC LIMIT 1')
+        .get() as { idx?: unknown } | undefined
+      if (
+        maxExeRow &&
+        typeof maxExeRow.idx === 'number' &&
+        Number.isInteger(maxExeRow.idx) &&
+        maxExeRow.idx >= 0
+      ) {
+        exeIdx = Math.max(minExeIdx, maxExeRow.idx)
+      }
+      if (maxTokens === undefined && exeIdx > minExeIdx) {
+        const row = db
+          .prepare(
+            'SELECT data FROM executor_metadata WHERE idx > ? ORDER BY idx DESC LIMIT 1',
+          )
+          .get(minExeIdx) as { data?: unknown } | undefined
+        if (row?.data instanceof Uint8Array) {
+          maxTokens = readProtoVarintPath(
+            row.data,
+            EXECUTOR_MAX_TOKEN_LIMIT_PATH,
+          )
+        }
+      }
+    } catch {
+      /* Ignore missing/locked executor_metadata while agy flushes steps. */
+    }
+  } catch {
+    /* Ignore transient SQLite open/read errors without failing the turn. */
+  } finally {
+    db?.close()
+  }
+  return {
+    ...(maxTokens !== undefined ? { maxTokens } : {}),
+    genIdx,
+    exeIdx,
+  }
 }
