@@ -45,7 +45,7 @@ function fixture(t: TestContext, version = '1.2.3') {
   for (const [command, script] of Object.entries({
     curl: 'printf "curl %s\\n" "$*" >> "$CALLS_FILE"\nprintf "%s" "$HTTP_STATUS"\nexit "${CURL_EXIT:-0}"\n',
     gh: 'printf "gh %s\\n" "$*" >> "$CALLS_FILE"\ncase "$2" in\nview) exit "$VIEW_EXIT" ;;\ncreate) exit "$CREATE_EXIT" ;;\n*) exit 99 ;;\nesac\n',
-    npm: 'printf "npm %s\\n" "$*" >> "$CALLS_FILE"\nexit "${NPM_EXIT:-0}"\n',
+    npm: 'printf "npm %s\\n" "$*" >> "$CALLS_FILE"\nDEFAULT=\'[{"files":[{"path":"npm-shrinkwrap.json"}]}]\'\nprintf "%s" "${NPM_STDOUT:-$DEFAULT}"\nexit "${NPM_EXIT:-0}"\n',
   })) {
     writeFileSync(join(root, 'bin', command), `#!/bin/sh\n${script}`, {
       mode: 0o755,
@@ -173,13 +173,24 @@ test('npm manifest preparation removes only build and remains repeatable', (t) =
   const path = join(root, 'paseo-plugin.json')
   writeFileSync(path, JSON.stringify(manifest))
   const { build: _build, ...expected } = manifest
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const result = run('Prepare npm manifest')
-    assert.equal(result.status, 0, result.stderr)
-    assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), expected)
-    assert.ok(readFileSync(path, 'utf8').endsWith('\n'))
-    assert.equal(result.calls, 'npm pack --dry-run --ignore-scripts\n')
-  }
+  const first = run('Prepare npm manifest')
+  assert.equal(first.status, 0, first.stderr)
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), expected)
+  assert.ok(readFileSync(path, 'utf8').endsWith('\n'))
+  assert.equal(first.calls, 'npm pack --dry-run --json --ignore-scripts\n')
+  const second = run('Prepare npm manifest')
+  assert.equal(second.status, 0, second.stderr)
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), expected)
+  assert.ok(readFileSync(path, 'utf8').endsWith('\n'))
+  assert.equal(second.calls, 'npm pack --dry-run --json --ignore-scripts\n')
+  const missingShrinkwrap = run('Prepare npm manifest', {
+    NPM_STDOUT: '[{"files":[{"path":"package.json"}]}]',
+  })
+  assert.notEqual(missingShrinkwrap.status, 0)
+  assert.match(
+    missingShrinkwrap.stderr,
+    /npm pack omitted npm-shrinkwrap\.json/,
+  )
   assert.notEqual(run('Prepare npm manifest', { NPM_EXIT: '1' }).status, 0)
   writeFileSync(path, '{invalid')
   const invalid = run('Prepare npm manifest')
