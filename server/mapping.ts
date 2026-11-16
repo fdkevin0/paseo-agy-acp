@@ -8,7 +8,7 @@ import type {
   ContentBlock,
   UsageUpdate,
   Usage,
-} from '@agentclientprotocol/sdk'
+} from '@agentclientprotocol/sdk/unstable'
 import type {
   ProviderConfigState,
   ProviderMode,

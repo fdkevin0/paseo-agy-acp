@@ -1,4 +1,10 @@
-import { AgentSideConnection, ndJsonStream } from '@agentclientprotocol/sdk'
+import {
+  agent,
+  methods,
+  ndJsonStream,
+  type AgentConnection,
+  type SessionUpdate,
+} from '@agentclientprotocol/sdk/unstable'
 import {
   existsSync,
   mkdirSync,
@@ -81,77 +87,75 @@ process.stdin.on('end', () => {
   log('exit')
   process.exit(0)
 })
-new AgentSideConnection(
-  (client) => {
-    let probeLatePermissionOnCancel = false
-    let cancelHang: (() => void) | undefined
-    const update = (
-      update: Parameters<typeof client.sessionUpdate>[0]['update'],
-    ) => client.sessionUpdate({ sessionId: nativeId, update })
-    const commands = () =>
-      setTimeout(
-        () =>
-          void update({
-            sessionUpdate: 'available_commands_update',
-            availableCommands: [],
-          }),
-        0,
-      )
-    return {
-      async initialize() {
-        return {
-          protocolVersion: 1,
-          agentCapabilities: noReload
-            ? { loadSession: false }
-            : {
-                loadSession: true,
-                ...(resumeCap ? { sessionCapabilities: { resume: {} } } : {}),
-              },
-        }
-      },
-      async authenticate() {
-        return {}
-      },
-      async newSession(params) {
-        log('new', { params, nativeId })
-        commands()
-        return { sessionId: nativeId, configOptions }
-      },
-      async loadSession(params) {
-        log('load', { params, nativeId: params.sessionId })
-        await awaitReloadGate('load')
-        if (failReload) throw new Error('Simulated reload failure')
-        await update({
-          sessionUpdate: 'user_message_chunk',
-          content: { type: 'text', text: 'old prompt' },
-        })
-        await update({
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: 'HISTORY_REPLAY' },
-        })
-        await new Promise((resolve) => setTimeout(resolve, 40))
-        commands()
-        return { configOptions }
-      },
-      async resumeSession(params) {
-        log('resume', { params, nativeId: params.sessionId })
-        await awaitReloadGate('resume')
-        if (failReload) throw new Error('Simulated reload failure')
-        commands()
-        return { configOptions }
-      },
-      async setSessionConfigOption(params) {
-        if (typeof params.value !== 'string')
-          throw new Error('Expected select option')
-        configOptions.find(
-          (option) => option.id === params.configId,
-        )!.currentValue = params.value
-        if (
-          probeLatePermissionOnCancel &&
-          params.configId === 'thought_level'
-        ) {
-          probeLatePermissionOnCancel = false
-          const permission = await client.requestPermission({
+let connection!: AgentConnection
+let probeLatePermissionOnCancel = false
+let cancelHang: (() => void) | undefined
+const update = (update: SessionUpdate) =>
+  connection.client.notify(methods.client.session.update, {
+    sessionId: nativeId,
+    update,
+  })
+const commands = () =>
+  setTimeout(
+    () =>
+      void update({
+        sessionUpdate: 'available_commands_update',
+        availableCommands: [],
+      }),
+    0,
+  )
+connection = agent()
+  .onRequest(methods.agent.initialize, async () => ({
+    protocolVersion: 1,
+    agentCapabilities: noReload
+      ? { loadSession: false }
+      : {
+          loadSession: true,
+          ...(resumeCap ? { sessionCapabilities: { resume: {} } } : {}),
+        },
+  }))
+  .onRequest(methods.agent.authenticate, async () => ({}))
+  .onRequest(methods.agent.session.new, async ({ params }) => {
+    log('new', { params, nativeId })
+    commands()
+    return { sessionId: nativeId, configOptions }
+  })
+  .onRequest(methods.agent.session.load, async ({ params }) => {
+    log('load', { params, nativeId: params.sessionId })
+    await awaitReloadGate('load')
+    if (failReload) throw new Error('Simulated reload failure')
+    await update({
+      sessionUpdate: 'user_message_chunk',
+      content: { type: 'text', text: 'old prompt' },
+    })
+    await update({
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: 'HISTORY_REPLAY' },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    commands()
+    return { configOptions }
+  })
+  .onRequest(methods.agent.session.resume, async ({ params }) => {
+    log('resume', { params, nativeId: params.sessionId })
+    await awaitReloadGate('resume')
+    if (failReload) throw new Error('Simulated reload failure')
+    commands()
+    return { configOptions }
+  })
+  .onRequest(
+    methods.agent.session.setConfigOption,
+    async ({ params, client }) => {
+      if (typeof params.value !== 'string')
+        throw new Error('Expected select option')
+      configOptions.find(
+        (option) => option.id === params.configId,
+      )!.currentValue = params.value
+      if (probeLatePermissionOnCancel && params.configId === 'thought_level') {
+        probeLatePermissionOnCancel = false
+        const permission = await client.request(
+          methods.client.session.requestPermission,
+          {
             sessionId: nativeId,
             toolCall: {
               toolCallId: 'late-permission',
@@ -159,440 +163,434 @@ new AgentSideConnection(
               rawInput: {},
             },
             options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }],
-          })
-          log('late-permission', permission)
-        }
-        return { configOptions }
-      },
-      async closeSession() {
-        return {}
-      },
-      // Like native agy, cancel ends the model turn but leaves background work alive.
-      async cancel() {
-        log('cancel')
-        cancelHang?.()
-        cancelHang = undefined
-        await update({
-          sessionUpdate: 'available_commands_update',
-          availableCommands: [{ name: 'cancel-ack', description: 'ack' }],
-        })
-      },
-      async prompt(params) {
-        const text = params.prompt
-          .flatMap((block) => (block.type === 'text' ? [block.text] : []))
-          .join('')
-        log('prompt', {
-          text,
-          nativeId: params.sessionId,
-          config: Object.fromEntries(
-            configOptions.map((option) => [option.id, option.currentValue]),
-          ),
-          fullAccess,
-        })
-        await update({
-          sessionUpdate: 'user_message_chunk',
-          content: { type: 'text', text },
-        })
-        if (text === 'retry-foreground-active') {
-          rows(
-            [
-              { step_index: 0, type: 'USER_INPUT', content: text },
+          },
+        )
+        log('late-permission', permission)
+      }
+      return { configOptions }
+    },
+  )
+  .onRequest(methods.agent.session.close, async () => ({}))
+  // Like native agy, cancel ends the model turn but leaves background work alive.
+  .onNotification(methods.agent.session.cancel, async () => {
+    log('cancel')
+    cancelHang?.()
+    cancelHang = undefined
+    await update({
+      sessionUpdate: 'available_commands_update',
+      availableCommands: [{ name: 'cancel-ack', description: 'ack' }],
+    })
+  })
+  .onRequest(methods.agent.session.prompt, async ({ params, client }) => {
+    const text = params.prompt
+      .flatMap((block) => (block.type === 'text' ? [block.text] : []))
+      .join('')
+    log('prompt', {
+      text,
+      nativeId: params.sessionId,
+      config: Object.fromEntries(
+        configOptions.map((option) => [option.id, option.currentValue]),
+      ),
+      fullAccess,
+    })
+    await update({
+      sessionUpdate: 'user_message_chunk',
+      content: { type: 'text', text },
+    })
+    if (text === 'retry-foreground-active') {
+      rows(
+        [
+          { step_index: 0, type: 'USER_INPUT', content: text },
+          {
+            step_index: 1,
+            type: 'ERROR_MESSAGE',
+            status: 'DONE',
+            source: 'SYSTEM',
+            created_at: '2020-01-01T00:00:00Z',
+            error: 'API error (attempt 1): request failed: synthetic timeout',
+          },
+        ],
+        false,
+      )
+      log('held-foreground')
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      rows([
+        {
+          step_index: 2,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          thinking: 'Recovered silently',
+        },
+      ])
+    } else if (text === 'background' || text === 'retry-background') {
+      rows(
+        [
+          { step_index: 0, type: 'USER_INPUT', content: text },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            tool_calls: [
               {
-                step_index: 1,
-                type: 'ERROR_MESSAGE',
-                status: 'DONE',
-                source: 'SYSTEM',
-                created_at: '2020-01-01T00:00:00Z',
-                error:
-                  'API error (attempt 1): request failed: synthetic timeout',
+                name: 'run_command',
+                args: { CommandLine: 'background work' },
               },
             ],
-            false,
-          )
-          log('held-foreground')
-          await new Promise((resolve) => setTimeout(resolve, 150))
-          rows([
-            {
-              step_index: 2,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              thinking: 'Recovered silently',
+          },
+          {
+            step_index: 2,
+            type: 'GENERIC',
+            status: 'RUNNING',
+            content:
+              'Tool is running as a background task with task id: task-1',
+          },
+          {
+            step_index: 3,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'WAITING',
+          },
+        ],
+        false,
+      )
+      if (text === 'retry-background')
+        rows([
+          {
+            step_index: 4,
+            type: 'ERROR_MESSAGE',
+            status: 'DONE',
+            source: 'SYSTEM',
+            created_at: '2020-01-01T00:00:00Z',
+            error: 'API error (attempt 8): request failed: synthetic timeout',
+          },
+        ])
+      await update({
+        sessionUpdate: 'tool_call',
+        toolCallId: 'call-background',
+        title: 'background work',
+        rawInput: { CommandLine: 'background work' },
+        status: 'in_progress',
+      })
+      setTimeout(() => {
+        log('leaked-background')
+        writeFileSync(join(home, 'old-result'), 'OLD_RESULT')
+        void update({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'OLD_RESULT' },
+        })
+      }, 700)
+      await update({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'WAITING' },
+      })
+    } else if (text === 'error-step') {
+      rows(
+        [
+          { step_index: 0, type: 'USER_INPUT', content: text },
+          {
+            step_index: 1,
+            type: 'ERROR_MESSAGE',
+            content: 'Model quota exceeded',
+          },
+        ],
+        false,
+      )
+    } else if (text === 'stall') {
+      probeLatePermissionOnCancel = true
+      const step = nextStepIndex(4)
+      rows(
+        [
+          { step_index: step, type: 'USER_INPUT', content: text },
+          {
+            step_index: step + 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'RUNNING',
+          },
+        ],
+        true,
+      )
+    } else if (text === 'stale-everything') {
+      const staleChild = '44444444-4444-4444-8444-444444444444'
+      const brainBase = join(home, '.gemini/antigravity-cli/brain', nativeId)
+      const subagentsDir = join(brainBase, '.system_generated/subagents')
+      mkdirSync(subagentsDir, { recursive: true })
+      writeFileSync(
+        join(subagentsDir, `${staleChild}.json`),
+        JSON.stringify({
+          conversationId: staleChild,
+          subagentDescriptor: { typeName: 'research', role: 'Researcher' },
+          spawnStepIndex: 1,
+          state: 'SUBAGENT_STATE_ALIVE',
+        }),
+      )
+      const childMsgDir = join(
+        home,
+        '.gemini/antigravity-cli/brain',
+        staleChild,
+        '.system_generated/messages',
+      )
+      mkdirSync(childMsgDir, { recursive: true })
+      writeFileSync(
+        join(childMsgDir, 'init.json'),
+        JSON.stringify({
+          id: 'init',
+          sender: nativeId,
+          recipient: staleChild,
+          sourceMetadata: {
+            tool: {
+              conversationId: nativeId,
+              name: 'invoke_subagent',
+              stepIndex: 1,
+              toolCall: { id: 'inv-stale' },
             },
-          ])
-        } else if (text === 'background' || text === 'retry-background') {
-          rows(
-            [
-              { step_index: 0, type: 'USER_INPUT', content: text },
+          },
+        }),
+      )
+      const childLogs = join(
+        home,
+        '.gemini/antigravity-cli/brain',
+        staleChild,
+        '.system_generated/logs',
+      )
+      mkdirSync(childLogs, { recursive: true })
+      writeFileSync(
+        join(childLogs, 'transcript_full.jsonl'),
+        [
+          {
+            step_index: 0,
+            type: 'SYSTEM_MESSAGE',
+            content: `<SYSTEM_MESSAGE>\n1. [Message] sender=${nativeId} priority=MESSAGE_PRIORITY_HIGH content=stale work\n</SYSTEM_MESSAGE>`,
+          },
+          { step_index: 1, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+        ]
+          .map((r) => JSON.stringify(r) + '\n')
+          .join(''),
+      )
+      const msgDir = join(brainBase, '.system_generated/messages')
+      mkdirSync(msgDir, { recursive: true })
+      writeFileSync(
+        join(msgDir, 'msg-unread.json'),
+        JSON.stringify({
+          id: 'msg-unread',
+          sender: staleChild,
+          recipient: nativeId,
+          priority: 'MESSAGE_PRIORITY_HIGH',
+          content: 'stale unread',
+          timestamp: new Date().toISOString(),
+        }),
+      )
+      writeFileSync(
+        join(msgDir, 'msg-deficit.json'),
+        JSON.stringify({
+          id: 'msg-deficit',
+          sender: staleChild,
+          recipient: nativeId,
+          priority: 'MESSAGE_PRIORITY_HIGH',
+          content: 'stale deficit',
+          timestamp: new Date().toISOString(),
+        }),
+      )
+      writeFileSync(
+        join(msgDir, 'read.json'),
+        JSON.stringify({ 'msg-deficit': true }),
+      )
+      rows(
+        [
+          { step_index: 0, type: 'USER_INPUT', content: text },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            tool_calls: [
               {
-                step_index: 1,
-                type: 'PLANNER_RESPONSE',
-                status: 'DONE',
-                tool_calls: [
-                  {
-                    name: 'run_command',
-                    args: { CommandLine: 'background work' },
-                  },
-                ],
+                id: 'bg-stale',
+                name: 'run_command',
+                args: { CommandLine: 'bg stale' },
               },
               {
-                step_index: 2,
-                type: 'GENERIC',
-                status: 'RUNNING',
-                content:
-                  'Tool is running as a background task with task id: task-1',
-              },
-              {
-                step_index: 3,
-                type: 'PLANNER_RESPONSE',
-                status: 'DONE',
-                content: 'WAITING',
-              },
-            ],
-            false,
-          )
-          if (text === 'retry-background')
-            rows([
-              {
-                step_index: 4,
-                type: 'ERROR_MESSAGE',
-                status: 'DONE',
-                source: 'SYSTEM',
-                created_at: '2020-01-01T00:00:00Z',
-                error:
-                  'API error (attempt 8): request failed: synthetic timeout',
-              },
-            ])
-          await update({
-            sessionUpdate: 'tool_call',
-            toolCallId: 'call-background',
-            title: 'background work',
-            rawInput: { CommandLine: 'background work' },
-            status: 'in_progress',
-          })
-          setTimeout(() => {
-            log('leaked-background')
-            writeFileSync(join(home, 'old-result'), 'OLD_RESULT')
-            void update({
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text: 'OLD_RESULT' },
-            })
-          }, 700)
-          await update({
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: 'WAITING' },
-          })
-        } else if (text === 'error-step') {
-          rows(
-            [
-              { step_index: 0, type: 'USER_INPUT', content: text },
-              {
-                step_index: 1,
-                type: 'ERROR_MESSAGE',
-                content: 'Model quota exceeded',
-              },
-            ],
-            false,
-          )
-        } else if (text === 'stall') {
-          probeLatePermissionOnCancel = true
-          const step = nextStepIndex(4)
-          rows(
-            [
-              { step_index: step, type: 'USER_INPUT', content: text },
-              {
-                step_index: step + 1,
-                type: 'PLANNER_RESPONSE',
-                status: 'RUNNING',
-              },
-            ],
-            true,
-          )
-        } else if (text === 'stale-everything') {
-          const staleChild = '44444444-4444-4444-8444-444444444444'
-          const brainBase = join(
-            home,
-            '.gemini/antigravity-cli/brain',
-            nativeId,
-          )
-          const subagentsDir = join(brainBase, '.system_generated/subagents')
-          mkdirSync(subagentsDir, { recursive: true })
-          writeFileSync(
-            join(subagentsDir, `${staleChild}.json`),
-            JSON.stringify({
-              conversationId: staleChild,
-              subagentDescriptor: { typeName: 'research', role: 'Researcher' },
-              spawnStepIndex: 1,
-              state: 'SUBAGENT_STATE_ALIVE',
-            }),
-          )
-          const childMsgDir = join(
-            home,
-            '.gemini/antigravity-cli/brain',
-            staleChild,
-            '.system_generated/messages',
-          )
-          mkdirSync(childMsgDir, { recursive: true })
-          writeFileSync(
-            join(childMsgDir, 'init.json'),
-            JSON.stringify({
-              id: 'init',
-              sender: nativeId,
-              recipient: staleChild,
-              sourceMetadata: {
-                tool: {
-                  conversationId: nativeId,
-                  name: 'invoke_subagent',
-                  stepIndex: 1,
-                  toolCall: { id: 'inv-stale' },
+                id: 'cron-stale',
+                name: 'schedule',
+                args: {
+                  CronExpression: '0 * * * *',
+                  IsDaemon: true,
+                  Prompt: 'tick',
                 },
               },
-            }),
-          )
-          const childLogs = join(
-            home,
-            '.gemini/antigravity-cli/brain',
-            staleChild,
-            '.system_generated/logs',
-          )
-          mkdirSync(childLogs, { recursive: true })
-          writeFileSync(
-            join(childLogs, 'transcript_full.jsonl'),
-            [
               {
-                step_index: 0,
-                type: 'SYSTEM_MESSAGE',
-                content: `<SYSTEM_MESSAGE>\n1. [Message] sender=${nativeId} priority=MESSAGE_PRIORITY_HIGH content=stale work\n</SYSTEM_MESSAGE>`,
-              },
-              { step_index: 1, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
-            ]
-              .map((r) => JSON.stringify(r) + '\n')
-              .join(''),
-          )
-          const msgDir = join(brainBase, '.system_generated/messages')
-          mkdirSync(msgDir, { recursive: true })
-          writeFileSync(
-            join(msgDir, 'msg-unread.json'),
-            JSON.stringify({
-              id: 'msg-unread',
-              sender: staleChild,
-              recipient: nativeId,
-              priority: 'MESSAGE_PRIORITY_HIGH',
-              content: 'stale unread',
-              timestamp: new Date().toISOString(),
-            }),
-          )
-          writeFileSync(
-            join(msgDir, 'msg-deficit.json'),
-            JSON.stringify({
-              id: 'msg-deficit',
-              sender: staleChild,
-              recipient: nativeId,
-              priority: 'MESSAGE_PRIORITY_HIGH',
-              content: 'stale deficit',
-              timestamp: new Date().toISOString(),
-            }),
-          )
-          writeFileSync(
-            join(msgDir, 'read.json'),
-            JSON.stringify({ 'msg-deficit': true }),
-          )
-          rows(
-            [
-              { step_index: 0, type: 'USER_INPUT', content: text },
-              {
-                step_index: 1,
-                type: 'PLANNER_RESPONSE',
-                status: 'DONE',
-                tool_calls: [
-                  {
-                    id: 'bg-stale',
-                    name: 'run_command',
-                    args: { CommandLine: 'bg stale' },
-                  },
-                  {
-                    id: 'cron-stale',
-                    name: 'schedule',
-                    args: {
-                      CronExpression: '0 * * * *',
-                      IsDaemon: true,
-                      Prompt: 'tick',
-                    },
-                  },
-                  {
-                    id: 'inv-stale',
-                    name: 'invoke_subagent',
-                    args: { Role: 'Researcher' },
-                  },
-                ],
-              },
-              {
-                step_index: 2,
-                type: 'GENERIC',
-                status: 'RUNNING',
-                content: `Tool is running as a background task with task id: ${nativeId}/task-stale\n`,
-              },
-              {
-                step_index: 3,
-                type: 'GENERIC',
-                status: 'RUNNING',
-                content: `Tool is running as a background task with task id: ${nativeId}/cron-stale\n`,
-              },
-              {
-                step_index: 4,
-                type: 'GENERIC',
-                status: 'DONE',
-                content: `Launched subagent conversationId=${staleChild}`,
-              },
-              {
-                step_index: 5,
-                type: 'PLANNER_RESPONSE',
-                status: 'DONE',
-                content: 'WAITING_STALE',
+                id: 'inv-stale',
+                name: 'invoke_subagent',
+                args: { Role: 'Researcher' },
               },
             ],
-            false,
-          )
-          await update({
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: 'WAITING_STALE' },
-          })
-        } else if (text === 'enter-plan-bg') {
-          configOptions.find((option) => option.id === 'mode')!.currentValue =
-            'plan'
-          await update({
-            sessionUpdate: 'config_option_update',
-            configOptions,
-          })
-          rows(
-            [
-              { step_index: 0, type: 'USER_INPUT', content: text },
+          },
+          {
+            step_index: 2,
+            type: 'GENERIC',
+            status: 'RUNNING',
+            content: `Tool is running as a background task with task id: ${nativeId}/task-stale\n`,
+          },
+          {
+            step_index: 3,
+            type: 'GENERIC',
+            status: 'RUNNING',
+            content: `Tool is running as a background task with task id: ${nativeId}/cron-stale\n`,
+          },
+          {
+            step_index: 4,
+            type: 'GENERIC',
+            status: 'DONE',
+            content: `Launched subagent conversationId=${staleChild}`,
+          },
+          {
+            step_index: 5,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'WAITING_STALE',
+          },
+        ],
+        false,
+      )
+      await update({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'WAITING_STALE' },
+      })
+    } else if (text === 'enter-plan-bg') {
+      configOptions.find((option) => option.id === 'mode')!.currentValue =
+        'plan'
+      await update({
+        sessionUpdate: 'config_option_update',
+        configOptions,
+      })
+      rows(
+        [
+          { step_index: 0, type: 'USER_INPUT', content: text },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            tool_calls: [
               {
-                step_index: 1,
-                type: 'PLANNER_RESPONSE',
-                status: 'DONE',
-                tool_calls: [
-                  {
-                    id: 'bg-plan',
-                    name: 'run_command',
-                    args: { CommandLine: 'bg plan work' },
-                  },
-                ],
-              },
-              {
-                step_index: 2,
-                type: 'GENERIC',
-                status: 'RUNNING',
-                content: `Tool is running as a background task with task id: ${nativeId}/task-plan\n`,
-              },
-              {
-                step_index: 3,
-                type: 'PLANNER_RESPONSE',
-                status: 'DONE',
-                content: 'ENTERED_PLAN_BG',
+                id: 'bg-plan',
+                name: 'run_command',
+                args: { CommandLine: 'bg plan work' },
               },
             ],
-            false,
-          )
-          await update({
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: 'ENTERED_PLAN_BG' },
-          })
-        } else if (text === 'ignore-cancel') {
-          const step = nextStepIndex(4)
-          rows([{ step_index: step, type: 'USER_INPUT', content: text }])
-          await update({
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: 'IGNORE_CANCEL' },
-          })
-          await new Promise<void>(() => {})
-        } else if (text === 'hang') {
-          const step = nextStepIndex(4)
-          rows([{ step_index: step, type: 'USER_INPUT', content: text }])
-          await update({
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: 'HANGING' },
-          })
-          await new Promise<void>((resolve) => {
-            cancelHang = resolve
-          })
-          return { stopReason: 'cancelled' as const }
-        } else if (text === 'settle-bg') {
-          await update({
-            sessionUpdate: 'tool_call',
-            toolCallId: 'call-settle',
-            title: 'background settle work',
-            rawInput: { CommandLine: 'bg settle work' },
-            status: 'in_progress',
-          })
-          await update({
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: 'WAITING_SETTLE' },
-          })
-          rows(
-            [
-              { step_index: 0, type: 'USER_INPUT', content: text },
+          },
+          {
+            step_index: 2,
+            type: 'GENERIC',
+            status: 'RUNNING',
+            content: `Tool is running as a background task with task id: ${nativeId}/task-plan\n`,
+          },
+          {
+            step_index: 3,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'ENTERED_PLAN_BG',
+          },
+        ],
+        false,
+      )
+      await update({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'ENTERED_PLAN_BG' },
+      })
+    } else if (text === 'ignore-cancel') {
+      const step = nextStepIndex(4)
+      rows([{ step_index: step, type: 'USER_INPUT', content: text }])
+      await update({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'IGNORE_CANCEL' },
+      })
+      await new Promise<void>(() => {})
+    } else if (text === 'hang') {
+      const step = nextStepIndex(4)
+      rows([{ step_index: step, type: 'USER_INPUT', content: text }])
+      await update({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'HANGING' },
+      })
+      await new Promise<void>((resolve) => {
+        cancelHang = resolve
+      })
+      return { stopReason: 'cancelled' as const }
+    } else if (text === 'settle-bg') {
+      await update({
+        sessionUpdate: 'tool_call',
+        toolCallId: 'call-settle',
+        title: 'background settle work',
+        rawInput: { CommandLine: 'bg settle work' },
+        status: 'in_progress',
+      })
+      await update({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'WAITING_SETTLE' },
+      })
+      rows(
+        [
+          { step_index: 0, type: 'USER_INPUT', content: text },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            tool_calls: [
               {
-                step_index: 1,
-                type: 'PLANNER_RESPONSE',
-                status: 'DONE',
-                tool_calls: [
-                  {
-                    id: 'call-settle',
-                    name: 'run_command',
-                    args: { CommandLine: 'bg settle work' },
-                  },
-                ],
-              },
-              {
-                step_index: 2,
-                type: 'GENERIC',
-                status: 'RUNNING',
-                content:
-                  'Tool is running as a background task with task id: task-settle',
-              },
-              {
-                step_index: 3,
-                type: 'PLANNER_RESPONSE',
-                status: 'DONE',
-                content: 'WAITING_SETTLE',
+                id: 'call-settle',
+                name: 'run_command',
+                args: { CommandLine: 'bg settle work' },
               },
             ],
-            false,
-          )
-          return { stopReason: 'end_turn' as const }
-        } else {
-          if (fullAccess) {
-            const permission = await client.requestPermission({
-              sessionId: nativeId,
-              toolCall: {
-                toolCallId: 'permission',
-                title: 'probe',
-                rawInput: {},
-              },
-              options: [
-                { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
-              ],
-            })
-            log('permission', permission)
-          }
-          const step = nextStepIndex(4)
-          rows([
-            { step_index: step, type: 'USER_INPUT', content: text },
-            {
-              step_index: step + 1,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              content: 'NEW_REPLY',
+          },
+          {
+            step_index: 2,
+            type: 'GENERIC',
+            status: 'RUNNING',
+            content:
+              'Tool is running as a background task with task id: task-settle',
+          },
+          {
+            step_index: 3,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'WAITING_SETTLE',
+          },
+        ],
+        false,
+      )
+      return { stopReason: 'end_turn' as const }
+    } else {
+      if (fullAccess) {
+        const permission = await client.request(
+          methods.client.session.requestPermission,
+          {
+            sessionId: nativeId,
+            toolCall: {
+              toolCallId: 'permission',
+              title: 'probe',
+              rawInput: {},
             },
-          ])
-          await update({
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: 'NEW_REPLY' },
-          })
-        }
-        return { stopReason: 'end_turn' as const }
-      },
+            options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }],
+          },
+        )
+        log('permission', permission)
+      }
+      const step = nextStepIndex(4)
+      rows([
+        { step_index: step, type: 'USER_INPUT', content: text },
+        {
+          step_index: step + 1,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: 'NEW_REPLY',
+        },
+      ])
+      await update({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'NEW_REPLY' },
+      })
     }
-  },
-  ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin)),
-)
+    return { stopReason: 'end_turn' as const }
+  })
+  .connect(
+    ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin)),
+  )

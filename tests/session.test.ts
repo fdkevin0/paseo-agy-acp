@@ -872,41 +872,42 @@ test('interrupt rejects after runtime_failed without reviving or spawning a repl
   const home = await mkdtemp(join(tmpdir(), 'agy-interrupt-failed-'))
   const log = join(home, 'starts.log')
   const fixture = join(home, 'fixture-crash.mjs')
-  const sdkUrl = import.meta.resolve('@agentclientprotocol/sdk')
+  const sdkUrl = import.meta.resolve('@agentclientprotocol/sdk/unstable')
   await writeFile(
     fixture,
     `
-import { AgentSideConnection, ndJsonStream } from ${JSON.stringify(sdkUrl)}
+import { agent, methods, ndJsonStream } from ${JSON.stringify(sdkUrl)}
 import { appendFileSync } from 'node:fs'
 import { Readable, Writable } from 'node:stream'
 
 appendFileSync(process.env.AGY_TEST_LOG, 'start\\n')
 const nativeId = '11111111-1111-4111-8111-111111111111'
 const stream = ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin))
-new AgentSideConnection((client) => ({
-  async initialize() {
-    return { protocolVersion: 1, agentCapabilities: { loadSession: true } }
-  },
-  async authenticate() { return {} },
-  async newSession() {
+agent()
+  .onRequest(methods.agent.initialize, async () => ({
+    protocolVersion: 1,
+    agentCapabilities: { loadSession: true },
+  }))
+  .onRequest(methods.agent.authenticate, async () => ({}))
+  .onRequest(methods.agent.session.new, async ({ client }) => {
     setImmediate(() => {
-      void client.sessionUpdate({
+      void client.notify(methods.client.session.update, {
         sessionId: nativeId,
         update: { sessionUpdate: 'available_commands_update', availableCommands: [] },
       })
     })
     return { sessionId: nativeId, configOptions: [] }
-  },
-  async loadSession() {
+  })
+  .onRequest(methods.agent.session.load, async () => {
     appendFileSync(process.env.AGY_TEST_LOG, 'load\\n')
     return { configOptions: [] }
-  },
-  async cancel() {},
-  async prompt() {
+  })
+  .onNotification(methods.agent.session.cancel, async () => {})
+  .onRequest(methods.agent.session.prompt, async () => {
     process.stderr.write('fatal runtime crash\\n')
     process.exit(3)
-  },
-}), stream)
+  })
+  .connect(stream)
 `,
   )
   const events: ProviderEvent[] = []
@@ -1003,11 +1004,11 @@ test('relaunch surfaces replacement runtime crash during drain and emits runtime
   const home = await mkdtemp(join(tmpdir(), 'agy-relaunch-drain-crash-'))
   const log = join(home, 'relaunch.log')
   const fixture = join(home, 'fixture-relaunch-crash.mjs')
-  const sdkUrl = import.meta.resolve('@agentclientprotocol/sdk')
+  const sdkUrl = import.meta.resolve('@agentclientprotocol/sdk/unstable')
   await writeFile(
     fixture,
     `
-import { AgentSideConnection, ndJsonStream } from ${JSON.stringify(sdkUrl)}
+import { agent, methods, ndJsonStream } from ${JSON.stringify(sdkUrl)}
 import { appendFileSync, readFileSync } from 'node:fs'
 import { Readable, Writable } from 'node:stream'
 
@@ -1028,21 +1029,22 @@ const configOptions = [
   },
 ]
 const stream = ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin))
-new AgentSideConnection((client) => ({
-  async initialize() {
-    return { protocolVersion: 1, agentCapabilities: { loadSession: true } }
-  },
-  async authenticate() { return {} },
-  async newSession() {
+agent()
+  .onRequest(methods.agent.initialize, async () => ({
+    protocolVersion: 1,
+    agentCapabilities: { loadSession: true },
+  }))
+  .onRequest(methods.agent.authenticate, async () => ({}))
+  .onRequest(methods.agent.session.new, async ({ client }) => {
     setImmediate(() => {
-      void client.sessionUpdate({
+      void client.notify(methods.client.session.update, {
         sessionId: nativeId,
         update: { sessionUpdate: 'available_commands_update', availableCommands: [] },
       })
     })
     return { sessionId: nativeId, configOptions }
-  },
-  async loadSession() {
+  })
+  .onRequest(methods.agent.session.load, async () => {
     appendFileSync(process.env.AGY_TEST_LOG, 'load\\n')
     if (starts >= 2) {
       setImmediate(() => {
@@ -1051,17 +1053,15 @@ new AgentSideConnection((client) => ({
       })
     }
     return { configOptions }
-  },
-  async setSessionConfigOption({ configId, value }) {
-    return {
-      configOptions: configOptions.map((o) =>
-        o.id === configId ? { ...o, currentValue: String(value) } : o,
-      ),
-    }
-  },
-  async cancel() {},
-  async prompt() { return { stopReason: 'end_turn' } },
-}), stream)
+  })
+  .onRequest(methods.agent.session.setConfigOption, async ({ params: { configId, value } }) => ({
+    configOptions: configOptions.map((o) =>
+      o.id === configId ? { ...o, currentValue: String(value) } : o,
+    ),
+  }))
+  .onNotification(methods.agent.session.cancel, async () => {})
+  .onRequest(methods.agent.session.prompt, async () => ({ stopReason: 'end_turn' }))
+  .connect(stream)
 `,
   )
   const events: ProviderEvent[] = []
@@ -1610,11 +1610,11 @@ test(
     const home = await mkdtemp(join(tmpdir(), 'agy-orchestrator-session-'))
     const logPath = join(home, 'rpc.log')
     const fixturePath = join(home, 'orchestrator-acp.mjs')
-    const sdkUrl = import.meta.resolve('@agentclientprotocol/sdk')
+    const sdkUrl = import.meta.resolve('@agentclientprotocol/sdk/unstable')
     await writeFile(
       fixturePath,
       `
-import { AgentSideConnection, ndJsonStream } from ${JSON.stringify(sdkUrl)}
+import { agent, methods, ndJsonStream } from ${JSON.stringify(sdkUrl)}
 import { appendFileSync } from 'node:fs'
 import { WritableStream } from 'node:stream/web'
 import { Readable, Writable } from 'node:stream'
@@ -1730,37 +1730,34 @@ stream.writable = new WritableStream({
   },
 })
 
-new AgentSideConnection((client) => ({
-  async initialize() {
-    return { protocolVersion: 1, agentCapabilities: { loadSession: true } }
-  },
-  async authenticate() {
-    return {}
-  },
-  async newSession() {
+agent()
+  .onRequest(methods.agent.initialize, async () => ({
+    protocolVersion: 1,
+    agentCapabilities: { loadSession: true },
+  }))
+  .onRequest(methods.agent.authenticate, async () => ({}))
+  .onRequest(methods.agent.session.new, async ({ client }) => {
     const sessionId = '11111111-1111-4111-8111-111111111111'
     setTimeout(() => {
-      void client.sessionUpdate({
+      void client.notify(methods.client.session.update, {
         sessionId,
         update: { sessionUpdate: 'available_commands_update', availableCommands: [] },
       })
     }, 0)
     return { sessionId, configOptions: buildConfigOptions() }
-  },
-  async loadSession({ sessionId }) {
+  })
+  .onRequest(methods.agent.session.load, async ({ params: { sessionId }, client }) => {
     omitModelsNext = true
     setTimeout(() => {
-      void client.sessionUpdate({
+      void client.notify(methods.client.session.update, {
         sessionId,
         update: { sessionUpdate: 'available_commands_update', availableCommands: [] },
       })
     }, 0)
     return { configOptions: buildConfigOptions() }
-  },
-  async closeSession() {
-    return {}
-  },
-  async setSessionConfigOption({ configId, value }) {
+  })
+  .onRequest(methods.agent.session.close, async () => ({}))
+  .onRequest(methods.agent.session.setConfigOption, async ({ params: { configId, value } }) => {
     log('set:' + configId + '=' + value)
     const opts = buildConfigOptions()
     const target = opts.find((o) => o.id === configId)
@@ -1772,12 +1769,10 @@ new AgentSideConnection((client) => ({
     else if (configId === 'thought_level') currentThought = String(value)
     else if (configId === 'mode') currentMode = String(value)
     return { configOptions: buildConfigOptions() }
-  },
-  async prompt() {
-    return { stopReason: 'end_turn' }
-  },
-  async cancel() {},
-}), stream)
+  })
+  .onRequest(methods.agent.session.prompt, async () => ({ stopReason: 'end_turn' }))
+  .onNotification(methods.agent.session.cancel, async () => {})
+  .connect(stream)
 `,
     )
     const provider = await createProvider(new AgyUsageSource()).connect({

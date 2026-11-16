@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
-import { zSessionUpdate } from '../node_modules/@agentclientprotocol/sdk/dist/schema/zod.gen.js'
+import { zSessionUpdate } from '../node_modules/@agentclientprotocol/sdk/dist/v1/unstable/schema/zod.gen.js'
 import { BrainTranscriptProjector } from '../server/brain.ts'
 import { Timeline, toolDetail } from '../server/mapping.ts'
 
