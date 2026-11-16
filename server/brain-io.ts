@@ -33,12 +33,27 @@ export type BrainMessageRecord = {
   sender: string
   priority?: string
   hideFromUser?: boolean
+  signature: string
   tool?: {
     conversationId?: string
     stepIndex?: number
     callId?: string
     name?: string
   }
+}
+
+export function messageSignature(sender: string, content = ''): string {
+  const firstLine = content.split(/\r?\n/, 1)[0]
+  return `${sender}\0${createHash('sha1').update(firstLine).digest('hex')}`
+}
+
+export function isWakeupMessage(m: BrainMessageRecord): boolean {
+  return (
+    m.sender !== 'user' &&
+    !isNativeToolName(m.tool?.name ?? '', 'invoke_subagent') &&
+    !m.hideFromUser &&
+    m.priority !== 'MESSAGE_PRIORITY_LOW'
+  )
 }
 
 export type InboxState = {
@@ -64,7 +79,7 @@ const planExecuteNoticePattern = new RegExp(
 )
 
 const rowMessageHeaderPattern =
-  /(?:^|\n)(?:\d+\.\s+)?\[Message\]\s+(?:timestamp=\S+\s+)?sender=(\S+)(?:\s+priority=(\S+))?/g
+  /(?:^|\n)(?:\d+\.\s+)?\[Message\][ \t]+(?:timestamp=\S+[ \t]+)?sender=(\S+)(?:[ \t]+priority=(\S+))?(?:[ \t]+content=([^\r\n]*))?/g
 
 /**
  * agy logs a step once it reaches RUNNING, WAITING or DONE (or fails) and never appends it again.
@@ -199,24 +214,37 @@ export function extractStepUsage(
   }
 }
 
-export function extractRowMessageSenders(
+function collectRowWakeupHeaders<T>(
   row: Record<string, unknown>,
-): string[] {
+  project: (sender: string, content: string) => T,
+): T[] {
   if (
     row.type !== 'SYSTEM_MESSAGE' ||
     typeof row.content !== 'string' ||
     isRestartNotice(row)
   )
     return []
-  const senders: string[] = []
+  const items: T[] = []
   for (const match of row.content.matchAll(rowMessageHeaderPattern)) {
     const sender = match[1]
     const priority = match[2]
     if (sender !== 'user' && priority !== 'MESSAGE_PRIORITY_LOW') {
-      senders.push(sender)
+      items.push(project(sender, match[3] ?? ''))
     }
   }
-  return senders
+  return items
+}
+
+export function extractRowMessageSignatures(
+  row: Record<string, unknown>,
+): string[] {
+  return collectRowWakeupHeaders(row, messageSignature)
+}
+
+export function extractRowMessageSenders(
+  row: Record<string, unknown>,
+): string[] {
+  return collectRowWakeupHeaders(row, (sender) => sender)
 }
 
 export function countRowMessages(
@@ -258,11 +286,16 @@ function parseMessage(raw: Record<string, unknown>, fallbackId: string) {
     typeof toolMeta.conversationId === 'string'
       ? toolMeta.conversationId
       : undefined
+  const sender = typeof raw.sender === 'string' ? raw.sender : ''
   const message: BrainMessageRecord = {
     id: typeof raw.id === 'string' && raw.id ? raw.id : fallbackId,
-    sender: typeof raw.sender === 'string' ? raw.sender : '',
+    sender,
     priority: typeof raw.priority === 'string' ? raw.priority : undefined,
     hideFromUser: raw.hideFromUser === true,
+    signature: messageSignature(
+      sender,
+      typeof raw.content === 'string' ? raw.content : '',
+    ),
     ...(conversationId || stepIndex !== undefined || callId
       ? {
           tool: {
@@ -387,11 +420,6 @@ export async function readInboxState(
     }
     messages.push(message)
   }
-  const isWakeupMessage = (m: BrainMessageRecord) =>
-    m.sender !== 'user' &&
-    !isNativeToolName(m.tool?.name ?? '', 'invoke_subagent') &&
-    !m.hideFromUser &&
-    m.priority !== 'MESSAGE_PRIORITY_LOW'
   const unconsumedHighPriority = messages.filter(
     (m) => isWakeupMessage(m) && !readIds.has(m.id),
   )
@@ -641,7 +669,11 @@ export async function readTranscriptRows(
 ): Promise<Record<string, unknown>[]> {
   if (!sessionIdPattern.test(nativeId)) return []
   try {
-    return (await new TranscriptReader().read(root, nativeId)).rows
+    const reader = new TranscriptReader()
+    const first = await reader.read(root, nativeId)
+    if (first.reset && first.rows.length === 0)
+      return (await reader.read(root, nativeId)).rows
+    return first.rows
   } catch (error) {
     if (isMissing(error)) return []
     throw error

@@ -20,6 +20,7 @@ import {
   advanceForegroundCursor,
   BrainNode,
   BrainTranscriptProjector,
+  captureRuntimeEpoch,
   countRowMessages,
   hasActiveBackgroundWork,
   readInboxState,
@@ -29,7 +30,8 @@ import {
   watchBrain,
   type BrainWatchHandle,
 } from '../server/brain.ts'
-import { waitUntil } from './helpers.ts'
+import { createEventCollector, waitUntil } from './helpers.ts'
+import { TranscriptReader } from '../server/brain-io.ts'
 import { BrainTurnObservation } from '../server/brain-observer.ts'
 import { SubagentRegistry } from '../server/subagents.ts'
 import type {
@@ -3519,6 +3521,97 @@ test('child registry forwards the shared retry policy to its watcher', async () 
   }
 })
 
+test('SubagentRegistry resumeChild racing cancelRunning and cancelAll does not resurrect stopped watchers', async (t) => {
+  const f = await fixture()
+  const events: ProviderEvent[] = []
+  const registry = new SubagentRegistry({
+    sessionId: 'p',
+    cwd: f.root,
+    brainRoot: f.root,
+    capabilities: ['session.subsession'],
+    emit: (event) => events.push(event),
+    getNativeId: () => parent,
+    isParentTurnActive: () => true,
+    isLoading: () => false,
+    isUnavailable: () => false,
+  })
+  t.after(async () => {
+    registry.closeAll()
+    await f.close()
+  })
+  await f.put(child, [
+    message(0, parent, 'work'),
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+  ])
+  registry.linkSubsession('p', parent, {
+    type: 'tool_call',
+    id: 'spawn',
+    callId: 'spawn',
+    name: 'invoke_subagent',
+    status: 'completed',
+    error: null,
+    detail: { type: 'sub_agent', childSessionId: child, log: '' },
+  })
+  await until(() =>
+    events.some(
+      (event) =>
+        event.type === 'session.turn' &&
+        event.sessionId === `p:child:${child}` &&
+        event.state === 'started',
+    ),
+  )
+
+  await Promise.all(registry.cancelRunning())
+  assert.equal(registry.hasRunningChildren(), false)
+  assert.equal(registry.isChildResumable(child), true)
+
+  registry.linkSubsession('p', parent, {
+    type: 'tool_call',
+    id: 'msg-1',
+    callId: 'msg-1',
+    name: 'send_message',
+    status: 'completed',
+    error: null,
+    detail: { type: 'sub_agent', childSessionId: child, log: '' },
+  })
+  assert.equal(registry.hasRunningChildren(), true)
+  await Promise.all(registry.cancelRunning())
+  assert.equal(registry.hasRunningChildren(), false)
+  assert.equal(registry.isChildResumable(child), true)
+
+  registry.linkSubsession('p', parent, {
+    type: 'tool_call',
+    id: 'msg-2',
+    callId: 'msg-2',
+    name: 'send_message',
+    status: 'completed',
+    error: null,
+    detail: { type: 'sub_agent', childSessionId: child, log: '' },
+  })
+  await registry.cancelAll()
+  assert.equal(registry.hasRunningChildren(), false)
+
+  await appendFile(f.path(child), encode([done(2, 'child finished')]))
+  registry.linkSubsession('p', parent, {
+    type: 'tool_call',
+    id: 'msg-3',
+    callId: 'msg-3',
+    name: 'send_message',
+    status: 'completed',
+    error: null,
+    detail: { type: 'sub_agent', childSessionId: child, log: '' },
+  })
+  await until(() =>
+    events.some(
+      (event) =>
+        event.type === 'session.turn' &&
+        event.sessionId === `p:child:${child}` &&
+        event.state === 'completed',
+    ),
+  )
+  assert.equal(registry.hasRunningChildren(), false)
+})
+
 test('cancel wins after multiple exhausted warnings are ingested', async () => {
   const f = await fixture()
   const controller = new AbortController()
@@ -4601,3 +4694,502 @@ test('initial spawn prompt quoting task results or batched with a followup messa
   // Root countRowMessages(row, false) counts step-0 UUID wakeup without subtracting 1.
   assert.equal(countRowMessages(message(0, child, 'root wakeup'), false), 1)
 })
+
+test('isWokenActive and captureRuntimeEpoch fence pre-restart artifacts while detecting post-epoch work', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+  const staleParent = '44444444-4444-4444-8444-444444444444'
+  const wokenRows: Row[] = [
+    { step_index: 0, type: 'USER_INPUT', content: 'start' },
+    done(1, 'fg'),
+    message(2, child, 'wakeup'),
+    { step_index: 3, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+  ]
+  const wokenNode = new BrainNode(parent, 'p')
+  wokenRows.forEach((row) => wokenNode.ingest(row))
+  assert.equal(wokenNode.isWokenWorking(), false)
+  assert.equal(wokenNode.isWokenActive(), true)
+  await f.put(parent, wokenRows)
+  await f.deliver(parent, child, 'wakeup', true, 'm-woken')
+  assert.equal(await hasActiveBackgroundWork(f.root, parent), true)
+
+  await f.put(child, [
+    message(0, staleParent, 'work'),
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+  ])
+  await f.subagent(staleParent, child, 'SUBAGENT_STATE_ALIVE', 1, 'inv-1')
+  const racedChild = '77777777-7777-4777-8777-777777777777'
+  await f.subagent(
+    staleParent,
+    racedChild,
+    'SUBAGENT_STATE_ALIVE',
+    99,
+    'inv-raced',
+  )
+  await f.deliver(staleParent, child, 'unread', false, 'msg-unread')
+  await f.deliver(staleParent, child, 'deficit', true, 'msg-deficit')
+  await f.put(staleParent, [
+    { step_index: 0, type: 'USER_INPUT', content: 'old' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          id: 'bg-1',
+          name: 'run_command',
+          args: { CommandLine: 'sleep 30' },
+        },
+        {
+          id: 'cron-1',
+          name: 'schedule',
+          args: {
+            CronExpression: '0 * * * *',
+            IsDaemon: true,
+            Prompt: 'tick',
+          },
+        },
+        {
+          id: 'inv-1',
+          name: 'invoke_subagent',
+          args: { Role: 'Researcher' },
+        },
+      ],
+    },
+    {
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: `Tool is running as a background task with task id: ${staleParent}/task-1\n`,
+    },
+    {
+      step_index: 3,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: `Tool is running as a background task with task id: ${staleParent}/task-2\n`,
+    },
+    {
+      step_index: 4,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: `Launched subagent ${child}`,
+    },
+    done(5, 'old done'),
+  ])
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, staleParent, {
+      includeDaemons: true,
+    }),
+    true,
+  )
+
+  const epoch = await captureRuntimeEpoch(f.root, staleParent)
+  assert.ok(epoch)
+  assert.equal(epoch.afterStepIndex, 5)
+  assert.equal(epoch.preEpochReadIds.has('msg-deficit'), true)
+  assert.equal(epoch.ignoredMessages.has('msg-unread'), true)
+  assert.equal(epoch.ignoredSubagentIds.has(child), true)
+  assert.equal(epoch.ignoredSubagentIds.has(racedChild), true)
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, staleParent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    false,
+  )
+
+  await f.deliver(staleParent, child, 'unread', true, 'msg-unread')
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, staleParent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    false,
+  )
+  const clearedReadSettled = await alive(
+    settleBrainTurn(f.root, staleParent, 'sp-read', () => {}, {
+      pollIntervalMs: 5,
+      stallTimeoutMs: 50,
+      runtimeEpoch: epoch,
+    }),
+  )
+  assert.equal(clearedReadSettled.status, 'completed')
+
+  await f.deliver(staleParent, child, 'fresh', true, 'msg-fresh')
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, staleParent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    true,
+  )
+
+  await appendFile(
+    f.path(staleParent),
+    encode([
+      message(6, child, 'fresh'),
+      done(7, 'woken done'),
+      { step_index: 8, type: 'USER_INPUT', content: 'turn 2' },
+      done(9, 'turn 2 done'),
+    ]),
+  )
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, staleParent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    false,
+  )
+  const settled = await alive(
+    settleBrainTurn(f.root, staleParent, 'sp', () => {}, {
+      pollIntervalMs: 5,
+      stallTimeoutMs: 50,
+      runtimeEpoch: epoch,
+    }),
+  )
+  assert.equal(settled.status, 'completed')
+
+  await appendFile(
+    f.path(staleParent),
+    encode([
+      {
+        step_index: 10,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          {
+            id: 'cron-new',
+            name: 'schedule',
+            args: {
+              CronExpression: '*/5 * * * *',
+              Prompt: 'fresh',
+              IsDaemon: true,
+            },
+          },
+        ],
+      },
+      {
+        step_index: 11,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: `Tool is running as a background task with task id: ${staleParent}/task-3\n`,
+      },
+      done(12, 'cron scheduled'),
+    ]),
+  )
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, staleParent, {
+      includeDaemons: false,
+      runtimeEpoch: epoch,
+    }),
+    false,
+  )
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, staleParent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    true,
+  )
+})
+
+test('drained pre-epoch ignored wakeup that logs post-epoch cannot offset a later unflushed fresh wakeup', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+  await f.deliver(parent, child, 'already-read', true, 'msg-old')
+  await f.deliver(parent, child, 'unread', false, 'msg-unread')
+  await f.put(parent, [
+    { step_index: 1, type: 'USER_INPUT', content: 'old' },
+    done(2, 'old done'),
+  ])
+
+  const epoch = await captureRuntimeEpoch(f.root, parent)
+  assert.ok(epoch)
+  assert.equal(epoch.afterStepIndex, 2)
+  assert.equal(epoch.preEpochReadIds.has('msg-old'), true)
+  assert.equal(epoch.ignoredMessages.has('msg-unread'), true)
+
+  // Post-epoch turn drains the pre-epoch unread wakeup AND writes its SYSTEM_MESSAGE row.
+  await f.deliver(parent, child, 'unread', true, 'msg-unread')
+  await appendFile(
+    f.path(parent),
+    encode([
+      { step_index: 3, type: 'USER_INPUT', content: 'turn 1' },
+      message(4, child, 'unread'),
+      done(5, 'unread handled'),
+    ]),
+  )
+
+  // A later fresh wakeup is marked read before its SYSTEM_MESSAGE flushes; it must stay unprocessed.
+  await f.deliver(parent, child, 'fresh', true, 'msg-fresh')
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, parent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    true,
+  )
+
+  await appendFile(
+    f.path(parent),
+    encode([message(6, child, 'fresh'), done(7, 'fresh done')]),
+  )
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, parent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    false,
+  )
+  const settled = await alive(
+    settleBrainTurn(f.root, parent, 'p-drained', () => {}, {
+      pollIntervalMs: 5,
+      stallTimeoutMs: 50,
+      runtimeEpoch: epoch,
+    }),
+  )
+  assert.equal(settled.status, 'completed')
+})
+
+test('monotonic captureRuntimeEpoch preserves epoch fence across an O_TRUNC 0-byte rewrite window', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+  await f.subagent(parent, child, 'SUBAGENT_STATE_ALIVE', 1, 'inv-1')
+  await f.deliver(parent, child, 'old', true, 'msg-read')
+  await f.deliver(parent, child, 'unread', false, 'msg-unread')
+  const rows: Row[] = [
+    { step_index: 1, type: 'USER_INPUT', content: 'old' },
+    message(2, child, 'old'),
+    done(3, 'done'),
+  ]
+  await f.put(parent, rows)
+
+  const epoch1 = await captureRuntimeEpoch(f.root, parent)
+  assert.ok(epoch1)
+  assert.equal(epoch1.afterStepIndex, 3)
+
+  await f.rewrite(parent, rows, async () => {
+    const duringTruncate = await captureRuntimeEpoch(f.root, parent, {
+      minAfterStep: epoch1.afterStepIndex,
+      previous: epoch1,
+    })
+    assert.ok(duringTruncate)
+    assert.equal(duringTruncate.afterStepIndex, 3)
+    assert.equal(duringTruncate.preEpochReadIds.has('msg-read'), true)
+    assert.equal(duringTruncate.ignoredMessages.has('msg-unread'), true)
+    assert.equal(duringTruncate.ignoredSubagentIds.has(child), true)
+  })
+})
+
+test('no-LF pre-epoch SYSTEM_MESSAGE completed later stays fenced and does not skew post-epoch wakeups', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+  await f.deliver(parent, child, 'late', true, 'msg-late')
+  await f.put(parent, [
+    { step_index: 1, type: 'USER_INPUT', content: 'old' },
+    done(2, 'old'),
+  ])
+  await appendFile(f.path(parent), JSON.stringify(message(3, child, 'late')))
+
+  const epoch = await captureRuntimeEpoch(f.root, parent)
+  assert.ok(epoch)
+  assert.equal(epoch.afterStepIndex, 3)
+  assert.equal(epoch.preEpochReadIds.has('msg-late'), true)
+
+  await appendFile(
+    f.path(parent),
+    '\n' +
+      encode([
+        { step_index: 4, type: 'USER_INPUT', content: 'next' },
+        done(5, 'next done'),
+      ]),
+  )
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, parent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    false,
+  )
+  const settled = await alive(
+    settleBrainTurn(f.root, parent, 'p-nolf', () => {}, {
+      pollIntervalMs: 5,
+      stallTimeoutMs: 50,
+      runtimeEpoch: epoch,
+    }),
+  )
+  assert.equal(settled.status, 'completed')
+
+  await f.deliver(parent, child, 'after', true, 'msg-after')
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, parent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    true,
+  )
+  await appendFile(
+    f.path(parent),
+    encode([message(6, child, 'after'), done(7, 'after done')]),
+  )
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, parent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    false,
+  )
+})
+
+class GatedChildReader extends TranscriptReader {
+  private readonly shouldGate: (nativeId: string) => boolean
+  private readonly onEnter: () => void
+  private readonly gate: Promise<void>
+
+  constructor(
+    shouldGate: (nativeId: string) => boolean,
+    onEnter: () => void,
+    gate: Promise<void>,
+  ) {
+    super()
+    this.shouldGate = shouldGate
+    this.onEnter = onEnter
+    this.gate = gate
+  }
+
+  override async read(root: string, nativeId: string) {
+    if (this.shouldGate(nativeId)) {
+      this.onEnter()
+      await this.gate
+    }
+    return super.read(root, nativeId)
+  }
+}
+
+function createGatedChildReader(targetId: string) {
+  let armed = false
+  let resolveEntered!: () => void
+  const entered = new Promise<void>((resolve) => {
+    resolveEntered = resolve
+  })
+  let releaseGate!: () => void
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve
+  })
+  return {
+    arm() {
+      armed = true
+    },
+    entered,
+    release() {
+      releaseGate()
+    },
+    createTranscriptReader(): TranscriptReader {
+      return new GatedChildReader(
+        (id) => {
+          if (!armed || id !== targetId) return false
+          armed = false
+          return true
+        },
+        resolveEntered,
+        gate,
+      )
+    },
+  }
+}
+
+test(
+  'forceStopAll after slow child cancel unblocks SubagentRegistry and isolates later child turns from the stale cancelAll loop',
+  { timeout: 5000 },
+  async (t) => {
+    const f = await fixture()
+    const collector = createEventCollector()
+    const readerGate = createGatedChildReader(child)
+    const child2 = '44444444-4444-4444-8444-444444444444'
+    const registry = new SubagentRegistry({
+      sessionId: 'p',
+      cwd: f.root,
+      brainRoot: f.root,
+      capabilities: ['session.subsession'],
+      emit: collector.emit,
+      getNativeId: () => parent,
+      isParentTurnActive: () => true,
+      isLoading: () => false,
+      isUnavailable: () => false,
+      createTranscriptReader: readerGate.createTranscriptReader,
+    })
+    t.after(async () => {
+      readerGate.release()
+      registry.closeAll()
+      await f.close()
+    })
+
+    await f.put(child, [
+      message(0, parent, 'work'),
+      { step_index: 1, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+    ])
+    registry.linkSubsession('p', parent, {
+      type: 'tool_call',
+      id: 'spawn-1',
+      callId: 'spawn-1',
+      name: 'invoke_subagent',
+      status: 'completed',
+      error: null,
+      detail: { type: 'sub_agent', childSessionId: child, log: '' },
+    })
+    await registry.waitCurrentReady()
+    assert.equal(registry.hasRunningChildren(), true)
+
+    readerGate.arm()
+    const staleCancel = registry.cancelAll()
+    await readerGate.entered
+    registry.forceStopAll()
+
+    const msgItem: ProviderTimelineItem = {
+      type: 'tool_call',
+      id: 'msg-child2',
+      callId: 'msg-child2',
+      name: 'send_message',
+      status: 'completed',
+      error: null,
+      detail: { type: 'sub_agent', childSessionId: child2, log: '' },
+    }
+    await f.subagent(parent, child2)
+    assert.equal(await registry.prepareMessageItem(msgItem), true)
+    assert.deepEqual(msgItem.detail, {
+      type: 'sub_agent',
+      childSessionId: child2,
+      log: '',
+    })
+
+    await f.put(child2, [
+      message(0, parent, 'work 2'),
+      { step_index: 1, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+    ])
+    registry.linkSubsession('p', parent, msgItem)
+    await registry.waitCurrentReady()
+    assert.equal(registry.hasChild(child2), true)
+    assert.equal(registry.hasRunningChildren(), true)
+
+    readerGate.release()
+    await staleCancel
+    assert.equal(registry.hasRunningChildren(), true)
+
+    await appendFile(f.path(child2), encode([done(2, 'child2 finished')]))
+    await collector.wait(
+      (event) =>
+        event.type === 'session.turn' &&
+        event.sessionId === `p:child:${child2}` &&
+        event.state === 'completed',
+    )
+    assert.equal(
+      collector.events.some(
+        (event) =>
+          event.type === 'session.turn' &&
+          event.sessionId === `p:child:${child2}` &&
+          event.state === 'canceled',
+      ),
+      false,
+    )
+  },
+)
