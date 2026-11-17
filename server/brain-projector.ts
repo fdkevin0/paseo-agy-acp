@@ -132,7 +132,14 @@ export class BrainTranscriptProjector {
   }
   private background = new Map<string, PendingTool>()
   private daemons = new Map<string, number>()
-  private touchedSubagents = new Set<string>()
+  private subagentTouches: { childId: string; stepIndex: number }[] = []
+  private completedWakeups = new Map<number, string>()
+  private initialPromptStep: number
+  private lastRowSenders?: {
+    row: Record<string, unknown>
+    senders: readonly string[]
+    isInitialPrompt: boolean
+  }
   private stepCallIds = new Map<number, string>()
   private stepSubagents = new Map<number, SubagentRecord>()
   private callSubagents = new Map<string, SubagentRecord>()
@@ -146,12 +153,6 @@ export class BrainTranscriptProjector {
   private verifiedAcpToolIds?: ReadonlySet<string>
   private lastErrorCallId?: string
   private sessionId: string
-  private initialPromptStep: number
-  private lastEvaluatedRow?: {
-    row: Record<string, unknown>
-    senders: string[]
-    isInitialPrompt: boolean
-  }
   private onQuestionSettledByGeneric?: (
     questions: readonly NormalizedQuestion[],
     tool: PendingTool,
@@ -306,48 +307,6 @@ export class BrainTranscriptProjector {
     )
   }
 
-  private evaluateRowMessages(row: Record<string, unknown>): {
-    senders: string[]
-    isInitialPrompt: boolean
-  } {
-    if (!Number.isInteger(row.step_index)) {
-      return { senders: extractRowMessageSenders(row), isInitialPrompt: false }
-    }
-    if (this.lastEvaluatedRow?.row === row) return this.lastEvaluatedRow
-    const senders = extractRowMessageSenders(row)
-    let isInitialPrompt = false
-    const stepIndex = Number(row.step_index)
-    if (
-      stepIndex === this.initialPromptStep &&
-      row.type === 'SYSTEM_MESSAGE' &&
-      !isRestartNotice(row) &&
-      !(
-        this.background.size > 0 &&
-        hasSystemTaskResult(String(row.content ?? ''))
-      )
-    ) {
-      const initIdx = senders.findIndex((s) => sessionIdPattern.test(s))
-      if (initIdx >= 0) {
-        senders.splice(initIdx, 1)
-        isInitialPrompt = true
-        this.initialPromptStep = -1
-      } else if (senders.length === 0) {
-        this.initialPromptStep = stepIndex + 1
-      } else {
-        this.initialPromptStep = -1
-      }
-    } else {
-      this.initialPromptStep = -1
-    }
-    const result = { row, senders, isInitialPrompt }
-    this.lastEvaluatedRow = result
-    return result
-  }
-
-  consumeRowMessageSenders(row: Record<string, unknown>): string[] {
-    return this.evaluateRowMessages(row).senders
-  }
-
   consumePendingQuestion() {
     const next = this.pending.find((p) => !p.questionConsumed)
     if (!next?.isQuestion) return undefined
@@ -374,10 +333,14 @@ export class BrainTranscriptProjector {
     this.daemons.delete(taskId)
   }
 
-  touchedSubagentIds(): ReadonlySet<string> {
-    const ids = new Set(this.touchedSubagents)
+  touchedSubagentIds(minStepIndex = -1): ReadonlySet<string> {
+    const ids = new Set<string>()
+    for (const touch of this.subagentTouches) {
+      if (touch.stepIndex > minStepIndex) ids.add(touch.childId)
+    }
     for (const p of this.pending) {
       if (
+        p.stepIndex > minStepIndex &&
         isNativeToolName(p.name, 'send_message') &&
         typeof p.args.Recipient === 'string' &&
         sessionIdPattern.test(p.args.Recipient)
@@ -386,6 +349,51 @@ export class BrainTranscriptProjector {
       }
     }
     return ids
+  }
+
+  wokenSubagentIds(minStepIndex = -1): ReadonlySet<string> {
+    const ids = new Set<string>()
+    for (const [stepIndex, childId] of this.completedWakeups) {
+      if (stepIndex > minStepIndex) ids.add(childId)
+    }
+    return ids
+  }
+
+  consumeRowMessageSenders(row: Record<string, unknown>): string[] {
+    return [...this.evaluateRowSenders(row).senders]
+  }
+
+  private evaluateRowSenders(row: Record<string, unknown>) {
+    if (this.lastRowSenders?.row === row) return this.lastRowSenders
+    const stepIndex = Number(row.step_index)
+    const senders = extractRowMessageSenders(row)
+    let isInitialPrompt = false
+    if (
+      Number.isInteger(stepIndex) &&
+      stepIndex === this.initialPromptStep &&
+      row.type === 'SYSTEM_MESSAGE' &&
+      !isRestartNotice(row) &&
+      !(
+        this.background.size > 0 &&
+        hasSystemTaskResult(String(row.content ?? ''))
+      )
+    ) {
+      const initIdx = senders.findIndex((s) => sessionIdPattern.test(s))
+      if (initIdx >= 0) {
+        senders.splice(initIdx, 1)
+        isInitialPrompt = true
+        this.initialPromptStep = -1
+      } else if (senders.length === 0) {
+        this.initialPromptStep = stepIndex + 1
+      } else {
+        this.initialPromptStep = -1
+      }
+    } else if (Number.isInteger(stepIndex)) {
+      this.initialPromptStep = -1
+    }
+    const result = { row, senders, isInitialPrompt }
+    this.lastRowSenders = result
+    return result
   }
 
   private finishTool(
@@ -412,7 +420,13 @@ export class BrainTranscriptProjector {
       base.detail.type === 'sub_agent' &&
       base.detail.childSessionId
     ) {
-      this.touchedSubagents.add(base.detail.childSessionId)
+      this.subagentTouches.push({
+        childId: base.detail.childSessionId,
+        stepIndex: pending.stepIndex,
+      })
+      if (isNativeToolName(pending.name, 'send_message')) {
+        this.completedWakeups.set(pending.stepIndex, base.detail.childSessionId)
+      }
     }
     const item: ProviderTimelineItem =
       status === 'failed'
@@ -555,14 +569,10 @@ export class BrainTranscriptProjector {
   }
   project(value: unknown, continuingQuestion = false): ProviderTimelineItem[] {
     this.lastBackgroundGeneric = undefined
-    const cached = this.lastEvaluatedRow
-    this.lastEvaluatedRow = undefined
     const row = record(value)
     if (!Number.isInteger(row.step_index)) return []
     const stepIndex = Number(row.step_index)
-    const { isInitialPrompt } =
-      cached?.row === row ? cached : this.evaluateRowMessages(row)
-    this.lastEvaluatedRow = undefined
+    const { isInitialPrompt } = this.evaluateRowSenders(row)
     const id = `${this.sessionId}:step:${stepIndex}`
     const text = typeof row.content === 'string' ? row.content : ''
     switch (row.type) {
@@ -571,7 +581,7 @@ export class BrainTranscriptProjector {
         this.pending = []
         this.retired = []
         this.lastErrorCallId = undefined
-        if (!isContinuation) this.touchedSubagents.clear()
+        if (!isContinuation) this.subagentTouches.length = 0
         const mediaCount = Array.isArray(row.media) ? row.media.length : 0
         const combined = [
           text,
@@ -589,7 +599,7 @@ export class BrainTranscriptProjector {
           this.retired = []
           this.background.clear()
           this.daemons.clear()
-          this.touchedSubagents.clear()
+          this.subagentTouches.length = 0
           return []
         }
         const taskResults = [...text.matchAll(systemTaskResultPattern)]
@@ -680,7 +690,7 @@ export class BrainTranscriptProjector {
         this.lastErrorCallId = undefined
         this.background.clear()
         this.daemons.clear()
-        this.touchedSubagents.clear()
+        this.subagentTouches.length = 0
         return [
           {
             type: 'error',
@@ -777,14 +787,16 @@ export function activeChildIdsForTurn(
   minStepIndex: number,
   ignoredSubagentIds?: ReadonlySet<string>,
 ): string[] {
-  const touched = projector.touchedSubagentIds()
+  const touched = projector.touchedSubagentIds(minStepIndex)
+  const woken = projector.wokenSubagentIds(minStepIndex)
   const ids = new Set<string>()
   for (const sub of subagents) {
     if (
       sub.state === SUBAGENT_ALIVE &&
       ((sub.spawnStepIndex > minStepIndex &&
         !ignoredSubagentIds?.has(sub.conversationId)) ||
-        touched.has(sub.conversationId))
+        touched.has(sub.conversationId) ||
+        woken.has(sub.conversationId))
     ) {
       ids.add(sub.conversationId)
     }
@@ -803,6 +815,7 @@ export type BrainNodeOptions = {
   ) => void
   reader?: TranscriptReader
   allowInitialSpawnPrompt?: boolean
+  turnFloor?: number
 }
 
 export class BrainNode {
@@ -811,6 +824,7 @@ export class BrainNode {
   readonly children = new Map<string, BrainNode>()
   consumedMessages = 0
   turnStartStep = -1
+  turnFloor = -1
   promptPhase: BrainPromptPhase = 'foreground'
   // Turn-wide projection ownership survives synthetic continuation resets of promptPhase.
   wokeUp = false
@@ -824,6 +838,9 @@ export class BrainNode {
   private retrySince?: number
   private retryError?: string
   private retryStep = -1
+  private terminalError?: string
+  private terminalErrorStep = -1
+  private wakeupStepsBySender = new Map<string, number[]>()
   // Keyed by step index + error message so O_TRUNC replays keep the original deadline while in-place mutations refresh it.
   private retryObservedAt = new Map<
     number,
@@ -848,6 +865,7 @@ export class BrainNode {
     this.sessionId = sessionId
     this.onQuestionSettled = options.onQuestionSettled
     this.allowInitialSpawnPrompt = options.allowInitialSpawnPrompt ?? true
+    this.turnFloor = options.turnFloor ?? -1
     this.projector = this.createProjector()
   }
 
@@ -866,8 +884,17 @@ export class BrainNode {
     this.consumedMessages = 0
     this.turnStartStep = -1
     this.lastStep = undefined
+    this.wakeupStepsBySender.clear()
     // Intentionally retain retryObservedAt across O_TRUNC resets; only pruneRetrySteps releases deleted steps.
     this.resetPhase()
+  }
+
+  advanceTurnFloor(floor: number) {
+    if (floor > this.turnFloor) this.turnFloor = floor
+  }
+
+  currentTurnFloor(): number {
+    return Math.max(this.turnFloor, this.turnStartStep)
   }
 
   get foregroundIdleReached(): boolean {
@@ -878,6 +905,10 @@ export class BrainNode {
 
   get wokeUpSinceLastPrompt(): boolean {
     return this.promptPhase === 'woken'
+  }
+
+  wakeupStepsFrom(sender: string): readonly number[] {
+    return this.wakeupStepsBySender.get(sender) ?? []
   }
 
   pruneRetrySteps(stepIndices: ReadonlySet<number>) {
@@ -891,6 +922,8 @@ export class BrainNode {
     this.retrySince = undefined
     this.retryError = undefined
     this.retryStep = -1
+    this.terminalError = undefined
+    this.terminalErrorStep = -1
     this.promptPhase = 'foreground'
     this.wokeUp = false
     this.continuingQuestion = false
@@ -946,6 +979,7 @@ export class BrainNode {
     row: Record<string, unknown>,
     observedAt?: number,
   ): ProviderTimelineItem[] {
+    const stepIndex = Number(row.step_index)
     const now = Date.now()
     // Clamp file mtimeMs to Date.now() so future filesystem clock skew cannot extend the 15-minute deadline.
     const clampedObservedAt =
@@ -959,10 +993,12 @@ export class BrainNode {
       (row.type === 'USER_INPUT' && !continuingQuestion) ||
       isRestartNotice(row)
     )
-      this.turnStartStep = Number(row.step_index)
+      this.turnStartStep = stepIndex
     // A restart notice or a question-continuation USER_INPUT does not end a woken turn:
     // the rows after it are still Brain's to project.
-    const rowMessages = this.projector.consumeRowMessageSenders(row).length
+    const liveQuestionContinuation = continuingQuestion
+    const msgSenders = this.projector.consumeRowMessageSenders(row)
+    const rowMessages = msgSenders.length
     // shortcut: zero counts exclude user/low-priority headers; revisit if agy mixes headerless wakeups with handoffs.
     const purePlanExecuteNotice = isPlanExecuteNotice(row) && rowMessages === 0
     if (row.type === 'USER_INPUT') {
@@ -1011,9 +1047,26 @@ export class BrainNode {
     ) {
       this.retrySince = undefined
       this.retryError = undefined
+      if (row.type === 'ERROR_MESSAGE') {
+        this.terminalError = stepErrorMessage(row)
+        this.terminalErrorStep = Number.isInteger(stepIndex) ? stepIndex : -1
+      } else if (isRestartNotice(row) || row.type === 'PLANNER_RESPONSE') {
+        this.terminalError = undefined
+        this.terminalErrorStep = -1
+      }
     }
     this.consumedMessages += rowMessages
-    const items = this.projector.project(row, continuingQuestion)
+    if (Number.isInteger(stepIndex)) {
+      for (const sender of msgSenders) {
+        let steps = this.wakeupStepsBySender.get(sender)
+        if (!steps) {
+          steps = []
+          this.wakeupStepsBySender.set(sender, steps)
+        }
+        steps.push(stepIndex)
+      }
+    }
+    const items = this.projector.project(row, liveQuestionContinuation)
     if (row.type !== 'CHECKPOINT') this.lastStep = row
     if (this.promptPhase !== 'woken') {
       if (
@@ -1052,21 +1105,24 @@ export class BrainNode {
     return items
   }
 
-  retryPending(): boolean {
-    return this.retrySince !== undefined
+  retryPending(minStepIndex = this.currentTurnFloor()): boolean {
+    return this.retrySince !== undefined && this.retryStep > minStepIndex
   }
 
-  failure(timeoutMs = RETRY_IDLE_TIMEOUT_MS): string | undefined {
+  failure(
+    timeoutMs = RETRY_IDLE_TIMEOUT_MS,
+    minStepIndex = this.currentTurnFloor(),
+  ): string | undefined {
     if (
-      this.retrySince !== undefined &&
-      Date.now() - this.retrySince >= timeoutMs
+      this.retryPending(minStepIndex) &&
+      Date.now() - this.retrySince! >= timeoutMs
     )
       return `${this.retryError} No retry recovery was observed for ${Math.round(timeoutMs / 1000)}s; stopped waiting locally.`
     if (
-      this.lastStep?.type === 'ERROR_MESSAGE' &&
-      !isRetryWarning(this.lastStep)
+      this.terminalError !== undefined &&
+      this.terminalErrorStep > minStepIndex
     )
-      return stepErrorMessage(this.lastStep)
+      return this.terminalError
     return undefined
   }
 
@@ -1100,14 +1156,18 @@ export class BrainNode {
     )
   }
 
-  isSettled(inbox: InboxState): boolean {
+  isSettled(
+    inbox: InboxState,
+    minStepIndex = this.currentTurnFloor(),
+  ): boolean {
     return (
-      !this.retryPending() &&
+      !this.retryPending(minStepIndex) &&
       !this.hasUnprocessedMessages(inbox) &&
       !this.projector.hasPending() &&
       !this.projector.hasBackground() &&
       // An answered question's own ask-only response is not agy's reply to the answer.
-      Number(this.lastStep?.step_index ?? -1) > this.answeredQuestionStep &&
+      Number(this.lastStep?.step_index ?? -1) >
+        Math.max(minStepIndex, this.answeredQuestionStep) &&
       (isCompletePlannerResponse(this.lastStep) ||
         this.questionSettled ||
         (this.promptPhase !== 'woken' && this.abortedByDenial))

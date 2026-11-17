@@ -71,6 +71,18 @@ export class SubagentRegistry {
     )
   }
 
+  async flushActive(): Promise<void> {
+    const flushed = new Set<BrainWatchHandle>()
+    while (true) {
+      const batch = [...this.children.values()].filter(
+        (child) => !child.isStopping() && !flushed.has(child),
+      )
+      if (batch.length === 0) break
+      for (const child of batch) flushed.add(child)
+      await Promise.all(batch.map((child) => child.flush()))
+    }
+  }
+
   cancelRunning(): Promise<void>[] {
     this.generation++
     const tasks = [...this.resuming.values()]
