@@ -8,7 +8,6 @@ import {
   configState,
   contextUsage,
   promptUsage,
-  contextWindowForModel,
   promptContent,
 } from '../server/mapping.ts'
 
@@ -133,7 +132,7 @@ test('usage rejects invalid context, ignores foreign currency, and computes last
   }
   assert.deepEqual(
     promptUsage(usage, {
-      model: 'gpt-oss-120b',
+      contextWindowMaxTokens: 512_000,
       lastStep: { inputTokens: 40, cachedReadTokens: 20, outputTokens: 9 },
     }),
     {
@@ -141,7 +140,7 @@ test('usage rejects invalid context, ignores foreign currency, and computes last
       outputTokens: 9,
       cachedInputTokens: 40,
       contextWindowUsedTokens: 69,
-      contextWindowMaxTokens: 131_072,
+      contextWindowMaxTokens: 512_000,
     },
   )
   assert.deepEqual(promptUsage(usage, { preserveContext: true }), {
@@ -181,7 +180,6 @@ test('usage rejects invalid context, ignores foreign currency, and computes last
       outputTokens: 1,
       cachedInputTokens: 3,
       contextWindowUsedTokens: 13,
-      contextWindowMaxTokens: 256_000,
     },
   )
   assert.deepEqual(promptUsage(null), {})
@@ -202,7 +200,6 @@ test('usage rejects invalid context, ignores foreign currency, and computes last
       outputTokens: 6,
       cachedInputTokens: 15,
       contextWindowUsedTokens: 51,
-      contextWindowMaxTokens: 256_000,
     },
     'missing ACP cachedReadTokens still falls back to lastStep when carriedWakeup is deducted',
   )
@@ -219,11 +216,9 @@ test('usage rejects invalid context, ignores foreign currency, and computes last
       outputTokens: 12,
       cachedInputTokens: 15,
       contextWindowUsedTokens: 87,
-      contextWindowMaxTokens: 256_000,
     },
     'missing ACP cachedReadTokens falls back to lastStep even when wakeup step defaulted cachedReadTokens to 0',
   )
-  assert.equal(contextWindowForModel('gemini'), 256_000)
 })
 
 test('model metadata restricts effort variants and hides fixed-effort selectors', () => {
@@ -262,9 +257,9 @@ test('model metadata restricts effort variants and hides fixed-effort selectors'
     state.models[0].thinkingOptions?.map((o) => o.id),
     ['low', 'high'],
   )
-  assert.equal(state.models[0].contextWindowMaxTokens, 256000)
+  assert.equal(state.models[0].contextWindowMaxTokens, undefined)
   assert.equal(state.models[0].description, 'Model description')
-  assert.equal(state.models[1].contextWindowMaxTokens, 131072)
+  assert.equal(state.models[1].contextWindowMaxTokens, undefined)
   assert.deepEqual(state.thinkingOptions, [])
   assert.equal(state.thinkingOption, undefined)
   assert.deepEqual(state.modes, [
@@ -864,7 +859,7 @@ test('configState resolves canonical per-model efforts independently of Orchestr
   }
   assert.equal(
     byId.get('gemini-pro-orchestrator')?.contextWindowMaxTokens,
-    256_000,
+    undefined,
   )
   assert.deepEqual(byId.get('gemini-4-hydrogen')?.thinkingOptions, [
     { id: 'low', label: 'Low' },
@@ -1118,7 +1113,6 @@ test('hasPositivePromptUsage and appliesCarriedWakeup reject zero placeholders a
       outputTokens: 3,
       cachedInputTokens: 40,
       contextWindowUsedTokens: 63,
-      contextWindowMaxTokens: 256_000,
     },
   )
   const cacheOnlyDebt = {

@@ -1586,6 +1586,7 @@ test('native compaction has stable live/history identity, command-only visibilit
           type: 'compaction',
           id: event.item.id,
           status: 'completed',
+          preTokens: 268_740,
         })
       }
       const usage = events.findLast((event) => event.type === 'session.usage')

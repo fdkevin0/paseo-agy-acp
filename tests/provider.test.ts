@@ -1022,7 +1022,6 @@ test('background task wakeup settles before completing turn and deduplicates nex
       outputTokens: 7,
       cachedInputTokens: 10,
       contextWindowUsedTokens: 55,
-      contextWindowMaxTokens: 256_000,
     })
 
     h.events.length = 0
@@ -1062,7 +1061,6 @@ test('background task wakeup settles before completing turn and deduplicates nex
       outputTokens: 3,
       cachedInputTokens: 0,
       contextWindowUsedTokens: 23,
-      contextWindowMaxTokens: 256_000,
     })
   } finally {
     await h.provider.close()
@@ -1138,7 +1136,6 @@ test('Incident B: in-RPC high-priority continuation is emitted once and does not
       outputTokens: 13,
       cachedInputTokens: 15,
       contextWindowUsedTokens: 48,
-      contextWindowMaxTokens: 256_000,
     })
 
     // Turn 2: must NOT subtract Turn 1's step 6 tokens (30/10/8) via carriedUsage even though Turn 2 > 30/8.
@@ -1168,7 +1165,6 @@ test('Incident B: in-RPC high-priority continuation is emitted once and does not
       outputTokens: 10,
       cachedInputTokens: 0,
       contextWindowUsedTokens: 50,
-      contextWindowMaxTokens: 256_000,
     })
   } finally {
     await h.provider.close()

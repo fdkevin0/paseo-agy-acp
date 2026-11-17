@@ -50,7 +50,11 @@ import {
   type ForegroundAcpSegment,
   type RuntimeEpoch,
 } from './brain.ts'
-import { readLatestStepUsage, type TranscriptReader } from './brain-io.ts'
+import {
+  readConversationCompactionWindow,
+  readLatestStepUsage,
+  type TranscriptReader,
+} from './brain-io.ts'
 import { projectReplayHistory, type HistoryEntry } from './history.ts'
 import { SubagentRegistry } from './subagents.ts'
 import { dataDirectory, removeSessionArtifacts } from './preflight.ts'
@@ -290,6 +294,13 @@ export class SessionManager {
             : {}),
         })
         await session.refreshSubagents()
+        if (input.persistence) {
+          const persistedModel = configState(session.state.metadata).model
+          await session.refreshCompactionWindow({
+            allowExisting: true,
+            model: persistedModel,
+          })
+        }
         await session.flush()
         if (input.persistence) {
           if (session.state.replay) {
@@ -570,6 +581,48 @@ async function createSession(
   }
   const runtimeExitedError = () => sessionRuntimeExitedError(state.failureError)
   const nativeWindowSizes = new Map<string | undefined, number>()
+  const compactionWindowSizes = new Map<string | undefined, number>()
+  const sqlCursor = { genIdx: -1, exeIdx: -1 }
+  function activeModelWindow(): number | undefined {
+    const model = configState(state.metadata).model
+    return compactionWindowSizes.get(model) ?? nativeWindowSizes.get(model)
+  }
+  async function refreshCompactionWindow(options?: {
+    allowExisting?: boolean
+    model?: string
+  }): Promise<number | undefined> {
+    const snapshot = await readConversationCompactionWindow(
+      brainRoot,
+      state.nativeId,
+      options?.allowExisting ? -1 : sqlCursor.genIdx,
+      options?.allowExisting ? -1 : sqlCursor.exeIdx,
+    ).catch((error) => {
+      if (error instanceof Error && error.name === 'BrainEscapeError')
+        throw error
+      return undefined
+    })
+    if (!snapshot) return undefined
+    sqlCursor.genIdx = Math.max(sqlCursor.genIdx, snapshot.genIdx)
+    sqlCursor.exeIdx = Math.max(sqlCursor.exeIdx, snapshot.exeIdx)
+    if (snapshot.maxTokens !== undefined) {
+      const targetModel =
+        options && 'model' in options
+          ? options.model
+          : configState(state.metadata).model
+      setBounded(compactionWindowSizes, targetModel, snapshot.maxTokens, 100)
+    }
+    return snapshot.maxTokens
+  }
+  function syncModelContextWindow() {
+    const nextMax = activeModelWindow()
+    if (nextMax !== undefined) {
+      usage = { ...usage, contextWindowMaxTokens: nextMax }
+    } else if (usage.contextWindowMaxTokens !== undefined) {
+      const nextUsage = { ...usage }
+      delete nextUsage.contextWindowMaxTokens
+      usage = nextUsage
+    }
+  }
   let usage: ProviderUsage = {}
   let deferredUsage = false
   let commandsReceived = false
@@ -602,7 +655,14 @@ async function createSession(
   }
   function publishUsage(next: ProviderUsage) {
     if (!state.opened || state.silenced) return
-    usage = { ...usage, ...next }
+    const nextUsage = { ...usage, ...next }
+    if (
+      next.contextWindowUsedTokens !== undefined &&
+      next.contextWindowMaxTokens === undefined
+    ) {
+      delete nextUsage.contextWindowMaxTokens
+    }
+    usage = nextUsage
     deferredUsage = false
     emit({
       type: 'session.usage',
@@ -711,17 +771,18 @@ async function createSession(
       if (state.wakeup.suppressEcho || state.suppressContinuationAcp) return
       const next = contextUsage(u)
       if (!next) return
-      setBounded(
-        nativeWindowSizes,
-        configState(state.metadata).model,
-        u.size,
-        100,
-      )
+      const model = configState(state.metadata).model
+      setBounded(nativeWindowSizes, model, u.size, 100)
+      const learned = compactionWindowSizes.get(model)
+      const effective =
+        learned !== undefined
+          ? { ...next, contextWindowMaxTokens: learned }
+          : next
       if (!isSuppressingReplay()) {
         if (state.turn) state.turnHadContextUsage = true
-        publishUsage(next)
+        publishUsage(effective)
       } else if (!state.ready) {
-        usage = { ...usage, ...next }
+        usage = { ...usage, ...effective }
         deferredUsage = true
       }
     } else {
@@ -1325,21 +1386,31 @@ async function createSession(
       drain,
       waitForCommands,
       get contextWindowMaxTokens() {
-        return nativeWindowSizes.get(configState(state.metadata).model)
+        return activeModelWindow()
       },
+      get publishedContextWindowMaxTokens() {
+        return usage.contextWindowMaxTokens
+      },
+      get hasPublishedContextOccupancy() {
+        return usage.contextWindowUsedTokens !== undefined
+      },
+      refreshCompactionWindow,
+      syncModelContextWindow,
       publishStepContext(lastStep: StepUsage) {
         const { contextWindowUsedTokens, contextWindowMaxTokens } = promptUsage(
           null,
           {
-            model: configState(state.metadata).model,
-            contextWindowMaxTokens: nativeWindowSizes.get(
-              configState(state.metadata).model,
-            ),
+            contextWindowMaxTokens: activeModelWindow(),
             lastStep,
           },
         )
         if (contextWindowUsedTokens !== undefined)
-          publishUsage({ contextWindowUsedTokens, contextWindowMaxTokens })
+          publishUsage({
+            contextWindowUsedTokens,
+            ...(contextWindowMaxTokens !== undefined
+              ? { contextWindowMaxTokens }
+              : {}),
+          })
       },
       async restoreUsage() {
         if (usage?.contextWindowUsedTokens !== undefined) return
@@ -1644,6 +1715,9 @@ async function configureSession(
     if (!isAdvertisedConfigOption(session.state.metadata, initial, key))
       throw new Error(`agy does not advertise ${key}`)
   }
+  if (changes.model != null && changes.model !== initial.model) {
+    await session.refreshCompactionWindow({ model: initial.model })
+  }
   let mutated = false
   try {
     for (const [key, value] of entries) {
@@ -1702,8 +1776,16 @@ async function configureSession(
       mutated ||= applied
     }
   } catch (error) {
+    if (configState(session.state.metadata).model !== initial.model) {
+      await session.drain()
+      session.syncModelContextWindow()
+    }
     if (mutated) session.publishConfig()
     throw error
+  }
+  if (configState(session.state.metadata).model !== initial.model) {
+    await session.drain()
+    session.syncModelContextWindow()
   }
   session.publishConfig()
 }
@@ -1848,19 +1930,32 @@ async function promptSession(
           : prevCarried
     }
     const preserveContext = session.state.turnHadContextUsage && !turnWokeUp
+    const maxTokens = session.contextWindowMaxTokens
     if (effectiveUsage || turnWakeupUsage) {
-      session.publishUsage(
-        promptUsage(effectiveUsage, {
-          model: configState(session.state.metadata).model,
-          contextWindowMaxTokens: session.contextWindowMaxTokens,
-          preserveContext,
-          lastStep,
-          carriedWakeup: prevCarried,
-          wakeup: turnWakeupUsage,
-        }),
-      )
+      const next = promptUsage(effectiveUsage, {
+        contextWindowMaxTokens: maxTokens,
+        preserveContext,
+        lastStep,
+        carriedWakeup: prevCarried,
+        wakeup: turnWakeupUsage,
+      })
+      if (
+        preserveContext &&
+        maxTokens !== undefined &&
+        session.hasPublishedContextOccupancy
+      ) {
+        next.contextWindowMaxTokens = maxTokens
+      }
+      session.publishUsage(next)
     } else if (lastStep && !preserveContext && (!isError || isCurrent())) {
       session.publishStepContext(lastStep)
+    } else if (
+      maxTokens !== undefined &&
+      session.hasPublishedContextOccupancy &&
+      session.publishedContextWindowMaxTokens !== maxTokens &&
+      (!isError || isCurrent())
+    ) {
+      session.publishUsage({ contextWindowMaxTokens: maxTokens })
     }
   }
   const isCurrent = () =>
@@ -2205,6 +2300,8 @@ async function promptSession(
       }
     }
     lastStep = await reconcileFinalSnapshot(lastStep)
+    if (!session.state.closing && session.state.nativeId === nativeId)
+      await session.refreshCompactionWindow()
     turnWokeUp ||= observation?.wokeUp === true
     if (!session.state.closing && session.state.failed)
       throw sessionRuntimeExitedError(session.state.failureError)
@@ -2225,6 +2322,8 @@ async function promptSession(
     lastStep = await reconcileFinalSnapshot(lastStep).catch(
       () => observation?.usage.latest,
     )
+    if (!session.state.closing && session.state.nativeId === nativeId)
+      await session.refreshCompactionWindow().catch(() => undefined)
     turnWokeUp ||= observation?.wokeUp === true
     settleTurnUsageAndWakeup(true)
     const failure =

@@ -645,6 +645,17 @@ connection = agent()
             sessionId,
             update: { sessionUpdate: 'usage_update', used: 1234, size: 128000 },
           })
+        if (text.startsWith('usage-stream:')) {
+          const [, rawUsed, rawSize] = text.split(':')
+          await client.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: 'usage_update',
+              used: Number(rawUsed),
+              size: Number(rawSize),
+            },
+          })
+        }
         if (text === 'usage-error') throw new Error('Synthetic prompt failure')
         return {
           stopReason:
