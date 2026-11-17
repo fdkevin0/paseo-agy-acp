@@ -571,7 +571,14 @@ export class BrainTranscriptProjector {
         this.retired = []
         this.lastErrorCallId = undefined
         if (!isContinuation) this.touchedSubagents.clear()
-        return text ? [{ type: 'user_message', id, text }] : []
+        const mediaCount = Array.isArray(row.media) ? row.media.length : 0
+        const combined = [
+          text,
+          ...Array.from({ length: mediaCount }, () => '[image]'),
+        ]
+          .filter(Boolean)
+          .join('\n')
+        return combined ? [{ type: 'user_message', id, text: combined }] : []
       }
       case 'SYSTEM_MESSAGE': {
         this.lastErrorCallId = undefined
