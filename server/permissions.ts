@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { resolveMcpToolIdentity } from './mcp.ts'
 import type {
   ProviderToolCallDetail,
   ProviderToolPolicy,
@@ -99,25 +100,18 @@ export function permissionKind(
 
 /** Check whether an ACP tool call matches an exact MCP preapproval grant in config.toolPolicy. */
 export function isPreapprovedMcpTool(
-  title: string | null | undefined,
-  input: Record<string, unknown>,
+  call: { name?: unknown; title?: string | null; rawInput?: unknown },
   policy: ProviderToolPolicy | undefined,
+  serverNames: readonly string[] = [],
 ): boolean {
-  if (!policy?.preapproved.length) return false
-  const cleaned = cleanToolName(title ?? '')
-  const lazyServer = str(input.ServerName ?? input.serverName ?? input.server)
-  const lazyTool = str(input.ToolName ?? input.toolName ?? input.tool)
-  return policy.preapproved.some((grant) => {
-    if (grant.kind !== 'mcp') return false
-    if (
-      cleaned === 'call_mcp_tool' &&
-      lazyServer === grant.server &&
-      lazyTool === grant.tool
-    )
-      return true
-    return (
-      cleaned === `mcp__${grant.server}__${grant.tool}` ||
-      cleaned === `${grant.server}:${grant.tool}`
-    )
-  })
+  const identity = resolveMcpToolIdentity(call, serverNames)
+  return (
+    identity !== undefined &&
+    policy?.preapproved.some(
+      (grant) =>
+        grant.kind === 'mcp' &&
+        grant.server === identity.server &&
+        grant.tool === identity.tool,
+    ) === true
+  )
 }

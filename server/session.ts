@@ -458,7 +458,8 @@ async function createSession(
   }
   const { launch, capabilities, emit } = options
   const permissions = new Map<string, PendingPermission>()
-  const timeline = new Timeline(id)
+  const mcpServerNames = Object.keys(config?.mcpServers ?? {})
+  const timeline = new Timeline(id, mcpServerNames)
   const brainRoot = join(dataDirectory(launch, config?.env, cwd), 'brain')
   const state = {
     nativeId: '',
@@ -539,6 +540,7 @@ async function createSession(
     isSuppressingReplay,
     isUnavailable: () => state.closing || state.failed,
     retryTimeoutMs: options.retryTimeoutMs,
+    mcpServerNames,
     readSubagents: options.readSubagents,
     createTranscriptReader: options.createTranscriptReader,
   })
@@ -1054,9 +1056,9 @@ async function createSession(
       const detail = toolDetail(request.toolCall)
       const kind = permissionKind(request, detail)
       const preapproved = isPreapprovedMcpTool(
-        request.toolCall.title,
-        input.data,
+        request.toolCall,
         config?.toolPolicy,
+        mcpServerNames,
       )
       if (kind !== 'question' && (state.metadata.fullAccess || preapproved)) {
         const allow = pickPermissionOption(request.options, 'allow')
@@ -1452,6 +1454,7 @@ async function createSession(
           acpToolCallIds: state.turnToolCallIds,
           acpToolSnapshots,
           acpResultProvided,
+          mcpServerNames,
         })
         if (lastKnownStepIndex > state.lastKnownStepIndex)
           state.lastKnownStepIndex = lastKnownStepIndex
@@ -2148,6 +2151,7 @@ async function promptSession(
           signal: turnAbort.signal,
           observation,
           isRpcActive: () => continuationActive,
+          mcpServerNames: Object.keys(session.config?.mcpServers ?? {}),
           onSubagents: session.rememberSubagents,
           minStepIndex,
           runtimeEpoch: session.state.runtimeEpoch,

@@ -26,6 +26,7 @@ export interface SubagentRegistryOptions {
   isSuppressingReplay?: () => boolean
   isUnavailable: () => boolean
   retryTimeoutMs?: number
+  mcpServerNames?: readonly string[]
   readSubagents?: typeof readSubagents
   createTranscriptReader?: () => TranscriptReader
 }
@@ -234,6 +235,7 @@ export class SubagentRegistry {
       resume,
       (subagents) => this.rememberSubagents(subagents, nativeId),
       this.opts.retryTimeoutMs,
+      this.opts.mcpServerNames,
       this.opts.createTranscriptReader?.(),
     )
     this.children.set(childId, child)
