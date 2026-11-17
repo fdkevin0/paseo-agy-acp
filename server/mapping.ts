@@ -8,7 +8,7 @@ import type {
   ContentBlock,
   UsageUpdate,
   Usage,
-} from '@agentclientprotocol/sdk'
+} from '@agentclientprotocol/sdk/unstable'
 import type {
   ProviderConfigState,
   ProviderMode,
@@ -513,7 +513,6 @@ export function configState(response: SessionMetadata): ProviderConfigState {
       description:
         m.description ??
         available?.find((a) => a.modelId === m.id)?.description,
-      contextWindowMaxTokens: contextWindowForModel(m.id),
       thinkingOptions: efforts,
       ...(defaultThinkingOptionId ? { defaultThinkingOptionId } : {}),
     }
@@ -620,11 +619,6 @@ export function contextUsage(update: UsageUpdate): ProviderUsage | undefined {
   }
 }
 
-/** Native ACP model limits from agy 1.5.7 (observed usage_update size: 256000; 1M is TUI-only). */
-export function contextWindowForModel(modelId?: string): number {
-  return modelId?.startsWith('gpt-oss') ? 131_072 : 256_000
-}
-
 export type StepUsage = {
   inputTokens: number
   outputTokens: number
@@ -680,7 +674,6 @@ export function appliesCarriedWakeup(
 export function promptUsage(
   usage?: Usage | null,
   options?: {
-    model?: string
     preserveContext?: boolean
     contextWindowMaxTokens?: number
     lastStep?: StepUsage
@@ -736,9 +729,9 @@ export function promptUsage(
     ...(used !== undefined && used > 0 && !options?.preserveContext
       ? {
           contextWindowUsedTokens: used,
-          contextWindowMaxTokens:
-            options?.contextWindowMaxTokens ??
-            contextWindowForModel(options?.model),
+          ...(options?.contextWindowMaxTokens !== undefined
+            ? { contextWindowMaxTokens: options.contextWindowMaxTokens }
+            : {}),
         }
       : {}),
   }
@@ -814,7 +807,14 @@ export class Timeline {
       update.sessionUpdate === 'agent_message_chunk' ||
       update.sessionUpdate === 'agent_thought_chunk'
     ) {
-      if (update.content.type !== 'text') return
+      const chunk =
+        update.content.type === 'text'
+          ? update.content.text
+          : update.sessionUpdate === 'user_message_chunk' &&
+              update.content.type === 'image'
+            ? '[image]'
+            : undefined
+      if (chunk === undefined) return
       const type =
         update.sessionUpdate === 'user_message_chunk'
           ? 'user_message'
@@ -827,9 +827,18 @@ export class Timeline {
           type,
           text: '',
         }
+      const prev = this.message!.text
+      const sep =
+        type === 'user_message' &&
+        prev.length > 0 &&
+        !prev.endsWith('\n') &&
+        !chunk.startsWith('\n') &&
+        (update.content.type === 'image' || prev.endsWith('[image]'))
+          ? '\n'
+          : ''
       this.message = {
         ...this.message!,
-        text: this.message!.text + update.content.text,
+        text: prev + sep + chunk,
       }
       return this.message
     }

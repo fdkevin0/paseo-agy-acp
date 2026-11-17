@@ -1,4 +1,10 @@
-import { AgentSideConnection, ndJsonStream } from '@agentclientprotocol/sdk'
+import {
+  agent,
+  methods,
+  ndJsonStream,
+  type AgentConnection,
+  type SessionUpdate,
+} from '@agentclientprotocol/sdk/unstable'
 import {
   appendFileSync,
   existsSync,
@@ -155,282 +161,279 @@ function writeInboxMessage(
   else delete current[msgId]
   writeFileSync(readPath, JSON.stringify(current))
 }
-new AgentSideConnection(
-  (client) => {
-    const update = (
-      update: Parameters<typeof client.sessionUpdate>[0]['update'],
-    ) => client.sessionUpdate({ sessionId: nativeId, update })
-    async function tool(toolCallId: string, title: string, rawInput: object) {
-      await update({
-        sessionUpdate: 'tool_call',
-        toolCallId,
-        title,
-        rawInput,
-        status: 'in_progress',
-      })
-      await update({
-        sessionUpdate: 'tool_call_update',
-        toolCallId,
-        status: 'completed',
-      })
-    }
-    async function observedMessage() {
-      const deadline = Date.now() + 3000
-      while (!existsSync(join(process.env.HOME!, 'message-observed'))) {
-        if (Date.now() > deadline)
-          throw new Error('Message was not published during prompt')
-        await new Promise((resolve) => setTimeout(resolve, 5))
-      }
-    }
-    function seedMessageChild() {
-      writeSubagent(
-        nativeId,
-        childId,
-        scenario.endsWith('killed')
-          ? 'SUBAGENT_STATE_KILLED'
-          : 'SUBAGENT_STATE_ALIVE',
-        2,
-      )
-      transcript(childId, [childInit(nativeId), done(1)])
-    }
-    function commands() {
-      setTimeout(
-        () =>
-          void update({
-            sessionUpdate: 'available_commands_update',
-            availableCommands: [],
-          }),
-        0,
-      )
-    }
-    async function invoke() {
-      const input = { Prompt: 'work', Role: 'Child' }
-      transcript(childId, [childInit(nativeId), done(1)])
+let connection!: AgentConnection
+const update = (update: SessionUpdate) =>
+  connection.client.notify(methods.client.session.update, {
+    sessionId: nativeId,
+    update,
+  })
+async function tool(toolCallId: string, title: string, rawInput: object) {
+  await update({
+    sessionUpdate: 'tool_call',
+    toolCallId,
+    title,
+    rawInput,
+    status: 'in_progress',
+  })
+  await update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId,
+    status: 'completed',
+  })
+}
+async function observedMessage() {
+  const deadline = Date.now() + 3000
+  while (!existsSync(join(process.env.HOME!, 'message-observed'))) {
+    if (Date.now() > deadline)
+      throw new Error('Message was not published during prompt')
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+}
+function seedMessageChild() {
+  writeSubagent(
+    nativeId,
+    childId,
+    scenario.endsWith('killed')
+      ? 'SUBAGENT_STATE_KILLED'
+      : 'SUBAGENT_STATE_ALIVE',
+    2,
+  )
+  transcript(childId, [childInit(nativeId), done(1)])
+}
+function commands() {
+  setTimeout(
+    () =>
+      void update({
+        sessionUpdate: 'available_commands_update',
+        availableCommands: [],
+      }),
+    0,
+  )
+}
+async function invoke() {
+  const input = { Prompt: 'work', Role: 'Child' }
+  transcript(childId, [childInit(nativeId), done(1)])
+  writeSubagent(nativeId, childId, 'SUBAGENT_STATE_ALIVE', 2)
+  transcript(nativeId, [
+    user(0),
+    call(1, 'invoke_subagent', input),
+    result(
+      2,
+      `Created the following subagent:\n{"conversationId":"${childId}"}`,
+    ),
+    done(3),
+  ])
+  await tool('call_234567890', 'Run invoke_subagent', input)
+}
+connection = agent()
+  .onRequest(methods.agent.initialize, async () => ({
+    protocolVersion: 1,
+    agentCapabilities: { loadSession: true },
+  }))
+  .onRequest(methods.agent.authenticate, async () => ({}))
+  .onRequest(methods.agent.session.new, async () => {
+    // Existing ownership lets the cancel scenarios exercise send_message on an old child.
+    if (scenario === 'owned-message' || scenario === 'owned-message-killed')
+      seedMessageChild()
+    if (scenario.startsWith('kill')) {
       writeSubagent(nativeId, childId, 'SUBAGENT_STATE_ALIVE', 2)
       transcript(nativeId, [
         user(0),
-        call(1, 'invoke_subagent', input),
+        call(1, 'invoke_subagent', { Prompt: 'work' }),
         result(
           2,
           `Created the following subagent:\n{"conversationId":"${childId}"}`,
         ),
         done(3),
       ])
+    }
+    commands()
+    return { sessionId: nativeId }
+  })
+  .onRequest(methods.agent.session.load, async () => {
+    if (scenario === 'owned-message' || scenario === 'history-message') {
+      seedMessageChild()
+      if (scenario === 'history-message')
+        await tool('call_345678901', 'Run send_message', {
+          Recipient: childId,
+          Message: 'continue',
+        })
+      commands()
+      return {}
+    }
+    await update({
+      sessionUpdate: 'user_message_chunk',
+      content: { type: 'text', text: 'old question' },
+    })
+    await invoke()
+    if (scenario === 'history-kill') {
+      transcript(childId, [
+        childInit(nativeId),
+        done(1, 'Saved child reply'),
+        call(2, 'run_command', { CommandLine: 'sleep 60' }),
+      ])
+      writeSubagent(nativeId, childId, 'SUBAGENT_STATE_KILLED', 2)
+      const input = { Action: 'kill_all' }
+      transcript(
+        nativeId,
+        [
+          user(4),
+          call(5, 'manage_subagents', input),
+          result(6, 'Killed subagent'),
+          done(7),
+        ],
+        true,
+      )
+      await tool('call_345678901', 'Run manage_subagents', input)
+    }
+    commands()
+    return {}
+  })
+  .onNotification(methods.agent.session.cancel, async () => {})
+  .onRequest(methods.agent.session.close, async () => ({}))
+  .onRequest(methods.agent.session.prompt, async () => {
+    await update({
+      sessionUpdate: 'user_message_chunk',
+      content: { type: 'text', text: 'test' },
+    })
+    if (scenario === 'background' || scenario === 'parallel') {
+      const reply = 'waiting'
+      const input = { CommandLine: 'sleep 1', WaitMsBeforeAsync: 1000 }
+      const calls =
+        scenario === 'parallel'
+          ? [
+              { id: 'call_123456789', output: 'first' },
+              { id: 'call_987654321', output: 'second' },
+            ]
+          : [{ id: 'call_123456789', output: 'output' }]
+      transcript(nativeId, [
+        user(0),
+        {
+          ...call(1, 'run_command', input),
+          tool_calls: calls.map(() => ({
+            name: 'run_command',
+            args: input,
+          })),
+        },
+        ...calls.map((_, index) =>
+          result(
+            index + 2,
+            `Tool is running as a background task with task id: ${nativeId}/task-${index + 2}`,
+            'RUNNING',
+          ),
+        ),
+        done(calls.length + 2, reply),
+      ])
+      for (const { id } of calls)
+        await update({
+          sessionUpdate: 'tool_call',
+          toolCallId: id,
+          title: 'sleep 1',
+          status: 'in_progress',
+          rawInput: input,
+        })
+      await update({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: reply },
+      })
+      setTimeout(() => {
+        calls.forEach(({ id, output }, index) => {
+          const stepIdx = index + 2
+          const taskId = `${nativeId}/task-${stepIdx}`
+          writeInboxMessage(
+            nativeId,
+            `msg-task-${index}`,
+            taskId,
+            `Task id "${taskId}" finished with result:\n${output}`,
+            true,
+            { stepIndex: stepIdx, id, name: 'run_command' },
+          )
+        })
+        transcript(
+          nativeId,
+          [
+            ...calls
+              .map(({ output }, index) => {
+                const taskId = `${nativeId}/task-${index + 2}`
+                return {
+                  step_index: calls.length * 2 + 2 - index,
+                  type: 'SYSTEM_MESSAGE',
+                  content: `<SYSTEM_MESSAGE>\n[Message] timestamp=${new Date().toISOString()} sender=${taskId} priority=MESSAGE_PRIORITY_HIGH content=Task id "${taskId}" finished with result:\n${output}\n</SYSTEM_MESSAGE>`,
+                }
+              })
+              .reverse(),
+            done(calls.length * 2 + 3, 'done'),
+          ],
+          true,
+        )
+      }, 100)
+    } else if (scenario === 'spawn-kill') {
+      const input = { Prompt: 'work', Role: 'Child' }
+      writeSubagent(nativeId, childId, 'SUBAGENT_STATE_KILLED', 2)
+      transcript(childId, [
+        childInit(nativeId),
+        done(1, 'Saved before kill'),
+        call(2, 'run_command', { CommandLine: 'work' }),
+      ])
+      transcript(nativeId, [
+        user(0),
+        call(1, 'invoke_subagent', input),
+        result(2, JSON.stringify({ conversationId: childId })),
+        call(3, 'manage_subagents', { Action: 'kill_all' }),
+        result(4, 'Killed'),
+        done(5),
+      ])
       await tool('call_234567890', 'Run invoke_subagent', input)
+    } else if (scenario.includes('message')) {
+      if (scenario === 'owned-message-late') seedMessageChild()
+      const input = {
+        Recipient:
+          scenario === 'root-message'
+            ? nativeId
+            : scenario === 'unknown-message'
+              ? '44444444-4444-4444-8444-444444444444'
+              : childId,
+        Message: 'continue',
+      }
+      transcript(nativeId, [
+        user(0),
+        call(1, 'send_message', input),
+        result(2, 'Message sent'),
+        done(3),
+      ])
+      await tool('call_345678901', 'Run send_message', input)
+      await observedMessage()
+    } else if (scenario === 'child') {
+      await invoke()
+    } else {
+      const input = { Recipient: childId, Message: 'continue' }
+      const action =
+        scenario === 'kill-all'
+          ? { Action: 'kill_all' }
+          : { Action: 'kill', ConversationIds: [childId] }
+      transcript(childId, [
+        childInit(nativeId),
+        call(1, 'run_command', { CommandLine: 'work' }),
+      ])
+      transcript(
+        nativeId,
+        [
+          user(4),
+          call(5, 'send_message', input),
+          result(6, 'Message sent'),
+          call(7, 'manage_subagents', action),
+          result(8, 'Killed subagents'),
+          done(9),
+        ],
+        true,
+      )
+      await tool('call_345678901', 'Run send_message', input)
+      await observedMessage()
+      writeSubagent(nativeId, childId, 'SUBAGENT_STATE_KILLED', 2)
+      await tool('call_456789012', 'Run manage_subagents', action)
     }
-    return {
-      async initialize() {
-        return { protocolVersion: 1, agentCapabilities: { loadSession: true } }
-      },
-      async authenticate() {
-        return {}
-      },
-      async newSession() {
-        // Existing ownership lets the cancel scenarios exercise send_message on an old child.
-        if (scenario === 'owned-message' || scenario === 'owned-message-killed')
-          seedMessageChild()
-        if (scenario.startsWith('kill')) {
-          writeSubagent(nativeId, childId, 'SUBAGENT_STATE_ALIVE', 2)
-          transcript(nativeId, [
-            user(0),
-            call(1, 'invoke_subagent', { Prompt: 'work' }),
-            result(
-              2,
-              `Created the following subagent:\n{"conversationId":"${childId}"}`,
-            ),
-            done(3),
-          ])
-        }
-        commands()
-        return { sessionId: nativeId }
-      },
-      async loadSession() {
-        if (scenario === 'owned-message' || scenario === 'history-message') {
-          seedMessageChild()
-          if (scenario === 'history-message')
-            await tool('call_345678901', 'Run send_message', {
-              Recipient: childId,
-              Message: 'continue',
-            })
-          commands()
-          return {}
-        }
-        await update({
-          sessionUpdate: 'user_message_chunk',
-          content: { type: 'text', text: 'old question' },
-        })
-        await invoke()
-        if (scenario === 'history-kill') {
-          transcript(childId, [
-            childInit(nativeId),
-            done(1, 'Saved child reply'),
-            call(2, 'run_command', { CommandLine: 'sleep 60' }),
-          ])
-          writeSubagent(nativeId, childId, 'SUBAGENT_STATE_KILLED', 2)
-          const input = { Action: 'kill_all' }
-          transcript(
-            nativeId,
-            [
-              user(4),
-              call(5, 'manage_subagents', input),
-              result(6, 'Killed subagent'),
-              done(7),
-            ],
-            true,
-          )
-          await tool('call_345678901', 'Run manage_subagents', input)
-        }
-        commands()
-        return {}
-      },
-      async cancel() {},
-      async closeSession() {
-        return {}
-      },
-      async prompt() {
-        await update({
-          sessionUpdate: 'user_message_chunk',
-          content: { type: 'text', text: 'test' },
-        })
-        if (scenario === 'background' || scenario === 'parallel') {
-          const reply = 'waiting'
-          const input = { CommandLine: 'sleep 1', WaitMsBeforeAsync: 1000 }
-          const calls =
-            scenario === 'parallel'
-              ? [
-                  { id: 'call_123456789', output: 'first' },
-                  { id: 'call_987654321', output: 'second' },
-                ]
-              : [{ id: 'call_123456789', output: 'output' }]
-          transcript(nativeId, [
-            user(0),
-            {
-              ...call(1, 'run_command', input),
-              tool_calls: calls.map(() => ({
-                name: 'run_command',
-                args: input,
-              })),
-            },
-            ...calls.map((_, index) =>
-              result(
-                index + 2,
-                `Tool is running as a background task with task id: ${nativeId}/task-${index + 2}`,
-                'RUNNING',
-              ),
-            ),
-            done(calls.length + 2, reply),
-          ])
-          for (const { id } of calls)
-            await update({
-              sessionUpdate: 'tool_call',
-              toolCallId: id,
-              title: 'sleep 1',
-              status: 'in_progress',
-              rawInput: input,
-            })
-          await update({
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: reply },
-          })
-          setTimeout(() => {
-            calls.forEach(({ id, output }, index) => {
-              const stepIdx = index + 2
-              const taskId = `${nativeId}/task-${stepIdx}`
-              writeInboxMessage(
-                nativeId,
-                `msg-task-${index}`,
-                taskId,
-                `Task id "${taskId}" finished with result:\n${output}`,
-                true,
-                { stepIndex: stepIdx, id, name: 'run_command' },
-              )
-            })
-            transcript(
-              nativeId,
-              [
-                ...calls
-                  .map(({ output }, index) => {
-                    const taskId = `${nativeId}/task-${index + 2}`
-                    return {
-                      step_index: calls.length * 2 + 2 - index,
-                      type: 'SYSTEM_MESSAGE',
-                      content: `<SYSTEM_MESSAGE>\n[Message] timestamp=${new Date().toISOString()} sender=${taskId} priority=MESSAGE_PRIORITY_HIGH content=Task id "${taskId}" finished with result:\n${output}\n</SYSTEM_MESSAGE>`,
-                    }
-                  })
-                  .reverse(),
-                done(calls.length * 2 + 3, 'done'),
-              ],
-              true,
-            )
-          }, 100)
-        } else if (scenario === 'spawn-kill') {
-          const input = { Prompt: 'work', Role: 'Child' }
-          writeSubagent(nativeId, childId, 'SUBAGENT_STATE_KILLED', 2)
-          transcript(childId, [
-            childInit(nativeId),
-            done(1, 'Saved before kill'),
-            call(2, 'run_command', { CommandLine: 'work' }),
-          ])
-          transcript(nativeId, [
-            user(0),
-            call(1, 'invoke_subagent', input),
-            result(2, JSON.stringify({ conversationId: childId })),
-            call(3, 'manage_subagents', { Action: 'kill_all' }),
-            result(4, 'Killed'),
-            done(5),
-          ])
-          await tool('call_234567890', 'Run invoke_subagent', input)
-        } else if (scenario.includes('message')) {
-          if (scenario === 'owned-message-late') seedMessageChild()
-          const input = {
-            Recipient:
-              scenario === 'root-message'
-                ? nativeId
-                : scenario === 'unknown-message'
-                  ? '44444444-4444-4444-8444-444444444444'
-                  : childId,
-            Message: 'continue',
-          }
-          transcript(nativeId, [
-            user(0),
-            call(1, 'send_message', input),
-            result(2, 'Message sent'),
-            done(3),
-          ])
-          await tool('call_345678901', 'Run send_message', input)
-          await observedMessage()
-        } else if (scenario === 'child') {
-          await invoke()
-        } else {
-          const input = { Recipient: childId, Message: 'continue' }
-          const action =
-            scenario === 'kill-all'
-              ? { Action: 'kill_all' }
-              : { Action: 'kill', ConversationIds: [childId] }
-          transcript(childId, [
-            childInit(nativeId),
-            call(1, 'run_command', { CommandLine: 'work' }),
-          ])
-          transcript(
-            nativeId,
-            [
-              user(4),
-              call(5, 'send_message', input),
-              result(6, 'Message sent'),
-              call(7, 'manage_subagents', action),
-              result(8, 'Killed subagents'),
-              done(9),
-            ],
-            true,
-          )
-          await tool('call_345678901', 'Run send_message', input)
-          await observedMessage()
-          writeSubagent(nativeId, childId, 'SUBAGENT_STATE_KILLED', 2)
-          await tool('call_456789012', 'Run manage_subagents', action)
-        }
-        return { stopReason: 'end_turn' }
-      },
-    }
-  },
-  ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin)),
-)
+    return { stopReason: 'end_turn' }
+  })
+  .connect(
+    ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin)),
+  )

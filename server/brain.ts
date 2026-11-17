@@ -25,10 +25,14 @@ import {
   StepDedupe,
   countRowMessages,
   extractRowMessageSenders,
+  extractCheckpointPreTokens,
+  extractRowMessageSignatures,
   extractStepUsage,
   isMissing,
   isRestartNotice,
   isRetryWarning,
+  isWakeupMessage,
+  readConversationCompactionWindow,
   readInboxState,
   readLastStepIndex,
   readSubagents,
@@ -36,6 +40,7 @@ import {
   RETRY_IDLE_TIMEOUT_MS,
   type InboxState,
   type SubagentRecord,
+  type TranscriptReader,
 } from './brain-io.ts'
 import {
   BrainNode,
@@ -49,6 +54,8 @@ export {
   BrainNode,
   BrainTranscriptProjector,
   countRowMessages,
+  extractCheckpointPreTokens,
+  readConversationCompactionWindow,
   readInboxState,
   readLastStepIndex,
   readSubagents,
@@ -68,6 +75,7 @@ type BackgroundWalk = {
   /** Standing IsDaemon schedules are excluded unless the caller asks whether an idle runtime can stop. */
   includeDaemons?: boolean
   retryTimeoutMs?: number
+  runtimeEpoch?: RuntimeEpoch
   /** Sessions already on the walk, so a child cycle cannot recurse forever. */
   visiting?: Set<string>
   /** A subagent's first read decides its own turn phase instead of the parent's. */
@@ -80,7 +88,133 @@ type BackgroundWalk = {
   }
 }
 
-/** Determine whether the session has running background tasks or active subagents. */
+export type RuntimeEpoch = {
+  afterStepIndex: number
+  preEpochReadIds: ReadonlySet<string>
+  ignoredMessages: ReadonlyMap<string, string>
+  ignoredSubagentIds: ReadonlySet<string>
+}
+
+export function adjustInboxForEpoch(
+  inbox: InboxState,
+  epoch?: RuntimeEpoch,
+  postEpochSignatures?: ReadonlyMap<string, number>,
+): InboxState {
+  if (!epoch) return inbox
+  const unconsumedHighPriority =
+    epoch.ignoredMessages.size > 0 || epoch.preEpochReadIds.size > 0
+      ? inbox.unconsumedHighPriority.filter(
+          (m) =>
+            !epoch.ignoredMessages.has(m.id) &&
+            !epoch.preEpochReadIds.has(m.id),
+        )
+      : inbox.unconsumedHighPriority
+  let freshCount = 0
+  const freshBySig = new Map<string, number>()
+  const ignoredBySig = new Map<string, number>()
+  for (const m of inbox.messages) {
+    if (!inbox.readIds.has(m.id) || !isWakeupMessage(m)) continue
+    if (epoch.preEpochReadIds.has(m.id)) continue
+    const ignoredSig = epoch.ignoredMessages.get(m.id)
+    if (ignoredSig !== undefined) {
+      ignoredBySig.set(ignoredSig, (ignoredBySig.get(ignoredSig) ?? 0) + 1)
+    } else {
+      freshCount++
+      freshBySig.set(m.signature, (freshBySig.get(m.signature) ?? 0) + 1)
+    }
+  }
+  let consumedNonUserCount = freshCount
+  for (const [sig, ignoredCount] of ignoredBySig) {
+    const logged = postEpochSignatures?.get(sig) ?? 0
+    const fresh = freshBySig.get(sig) ?? 0
+    consumedNonUserCount += Math.min(ignoredCount, Math.max(0, logged - fresh))
+  }
+  if (
+    unconsumedHighPriority.length === inbox.unconsumedHighPriority.length &&
+    consumedNonUserCount === inbox.consumedNonUserCount
+  )
+    return inbox
+  return {
+    ...inbox,
+    unconsumedHighPriority,
+    consumedNonUserCount,
+  }
+}
+
+/** Snapshot pre-restart Brain artifacts so a restarted/reopened runtime only tracks work created after this boundary. */
+export function computeRuntimeEpoch(
+  rows: readonly Record<string, unknown>[],
+  inbox: InboxState,
+  subagents: readonly SubagentRecord[],
+  minAfterStep = -1,
+  previous?: RuntimeEpoch,
+): RuntimeEpoch | undefined {
+  let afterStepIndex = Math.max(minAfterStep, previous?.afterStepIndex ?? -1)
+  for (const row of rows) {
+    const step = Number(row.step_index)
+    if (Number.isInteger(step) && step > afterStepIndex) afterStepIndex = step
+  }
+  const preEpochReadIds = new Set(previous?.preEpochReadIds)
+  for (const m of inbox.messages) {
+    if (inbox.readIds.has(m.id) && isWakeupMessage(m)) preEpochReadIds.add(m.id)
+  }
+  const ignoredMessages = new Map<string, string>()
+  if (previous) {
+    for (const [id, sig] of previous.ignoredMessages) {
+      if (!preEpochReadIds.has(id)) ignoredMessages.set(id, sig)
+    }
+  }
+  for (const m of inbox.unconsumedHighPriority) {
+    if (!preEpochReadIds.has(m.id)) ignoredMessages.set(m.id, m.signature)
+  }
+  const ignoredSubagentIds = new Set(previous?.ignoredSubagentIds)
+  for (const s of subagents) {
+    if (s.state === 'SUBAGENT_STATE_ALIVE')
+      ignoredSubagentIds.add(s.conversationId)
+  }
+  if (
+    afterStepIndex < 0 &&
+    preEpochReadIds.size === 0 &&
+    ignoredMessages.size === 0 &&
+    ignoredSubagentIds.size === 0
+  )
+    return undefined
+  return {
+    afterStepIndex,
+    preEpochReadIds,
+    ignoredMessages,
+    ignoredSubagentIds,
+  }
+}
+
+/** Read and snapshot pre-restart Brain artifacts for a restarted or reopened runtime. */
+export async function captureRuntimeEpoch(
+  root: string,
+  nativeId: string,
+  options?: {
+    minAfterStep?: number
+    previous?: RuntimeEpoch
+    readSubagents?: typeof readSubagents
+  },
+): Promise<RuntimeEpoch | undefined> {
+  if (!sessionIdPattern.test(nativeId)) return undefined
+  const readSubs = options?.readSubagents ?? readSubagents
+  const [rows, inbox, subagents, tailStep] = await Promise.all([
+    readTranscriptRows(root, nativeId),
+    readInboxState(root, nativeId),
+    readSubs(root, nativeId),
+    readLastStepIndex(root, nativeId).catch(() => -1),
+  ])
+  return computeRuntimeEpoch(
+    rows,
+    inbox,
+    subagents,
+    Math.max(options?.minAfterStep ?? -1, tailStep),
+    options?.previous,
+  )
+}
+
+/** Determine whether the session has running background tasks or active subagents. Standing IsDaemon schedules are excluded by default so foreground interrupts do not kill them, and included when checking whether an idle runtime can stop. */
 export async function hasActiveBackgroundWork(
   root: string,
   nativeId: string,
@@ -95,17 +229,46 @@ export async function hasActiveBackgroundWork(
     const node = new BrainNode(nativeId, nativeId, {
       allowInitialSpawnPrompt: isChild,
     })
-    const [{ inbox, subagents }, { rows, mtimeMs }] = await Promise.all([
-      node.pollMetadata(root),
-      node.reader.read(root, nativeId).catch((error) => {
-        if (isMissing(error))
-          return { rows: [], reset: false, mtimeMs: undefined }
-        throw error
-      }),
-    ])
+    const [{ inbox: rawInbox, subagents }, { rows, mtimeMs }] =
+      await Promise.all([
+        node.pollMetadata(root),
+        node.reader.read(root, nativeId).catch((error) => {
+          if (isMissing(error))
+            return { rows: [], reset: false, mtimeMs: undefined }
+          throw error
+        }),
+      ])
     if (isChild && rows.length === 0) return true
-    node.projector.observeRows(rows)
-    for (const row of rows) {
+    const restartAfterStep = isChild
+      ? undefined
+      : options.runtimeEpoch?.afterStepIndex
+    let eligibleRows = rows
+    let postEpochSignatures: Map<string, number> | undefined
+    if (restartAfterStep !== undefined && restartAfterStep >= 0) {
+      node.turnStartStep = restartAfterStep
+      node.promptPhase = 'foreground_idle'
+      eligibleRows = rows.filter(
+        (row) => Number(row.step_index) > restartAfterStep,
+      )
+      postEpochSignatures = new Map<string, number>()
+      for (const row of eligibleRows) {
+        for (const sig of extractRowMessageSignatures(row)) {
+          postEpochSignatures.set(sig, (postEpochSignatures.get(sig) ?? 0) + 1)
+        }
+      }
+    } else if (!isChild && options.runtimeEpoch) {
+      postEpochSignatures = new Map<string, number>()
+      for (const row of rows) {
+        for (const sig of extractRowMessageSignatures(row)) {
+          postEpochSignatures.set(sig, (postEpochSignatures.get(sig) ?? 0) + 1)
+        }
+      }
+    }
+    const inbox = isChild
+      ? rawInbox
+      : adjustInboxForEpoch(rawInbox, options.runtimeEpoch, postEpochSignatures)
+    node.projector.observeRows(eligibleRows)
+    for (const row of eligibleRows) {
       // The restarted runtime left no woken turn running.
       if (isRestartNotice(row)) node.resetPhase()
       node.ingest(row, mtimeMs)
@@ -141,7 +304,7 @@ export async function hasActiveBackgroundWork(
             !node.isSettled(inbox, nodeMinStep)
           : (node.foregroundIdleReached &&
               node.hasUnprocessedMessages(inbox)) ||
-            node.isWokenWorking()
+            node.isWokenActive()
       )
         return true
     }
@@ -149,12 +312,16 @@ export async function hasActiveBackgroundWork(
       subagents,
       node.projector,
       nodeMinStep,
+      isChild ? undefined : options.runtimeEpoch?.ignoredSubagentIds,
     )
+    const childOptions = options.runtimeEpoch
+      ? { ...options, runtimeEpoch: undefined }
+      : options
     for (const childId of activeChildIds) {
       const subRecord = subagents.find((s) => s.conversationId === childId)
       if (
         await hasActiveBackgroundWork(root, childId, {
-          ...options,
+          ...childOptions,
           visiting,
           child: true,
           parent: { node, minStepIndex: nodeMinStep, subRecord },
@@ -522,12 +689,11 @@ export async function settleBrainTurn(
     onQuestionSettled,
     onSubagents,
     observation,
-    onUsage,
     onWakeupState,
     isRpcActive,
+    runtimeEpoch,
   }: {
     observation?: BrainTurnObservation
-    onUsage?: (usage: StepUsage, wokeUp: boolean) => void
     onWakeupState?: (state: {
       wokeUp: boolean
       wakeupUsage?: StepUsage
@@ -535,6 +701,7 @@ export async function settleBrainTurn(
       pendingReplay?: boolean
     }) => void
     isRpcActive?: () => boolean
+    runtimeEpoch?: RuntimeEpoch
     onSubagents?: (subagents: readonly SubagentRecord[]) => void
     signal?: AbortSignal
     minStepIndex?: number
@@ -579,6 +746,10 @@ export async function settleBrainTurn(
   carriedWakeupUsage?: StepUsage
 }> {
   if (!sessionIdPattern.test(nativeId)) return { status: 'completed' }
+  const effectiveMinStepIndex = Math.max(
+    minStepIndex,
+    runtimeEpoch?.afterStepIndex ?? -1,
+  )
   const fgReconciler = new ForegroundReconciler(foregroundAcp, emitForeground)
   const settledQuestions = new Map<
     string,
@@ -602,14 +773,15 @@ export async function settleBrainTurn(
       root,
       nativeId,
       sessionId,
-      minStepIndex,
+      effectiveMinStepIndex,
       {
         isCurrent: () => !signal?.aborted,
-        onUsage: (usage) => onUsage?.(usage, fgReconciler.postRpc),
+        onUsage: () => {},
         onItem,
       },
       pollIntervalMs,
       node.reader,
+      runtimeEpoch?.afterStepIndex ?? -1,
     )
   stream.phase = 'settling'
   const startedAt = Date.now()
@@ -736,10 +908,14 @@ export async function settleBrainTurn(
     if (!stream.acceptsRows() || signal?.aborted) return
     const metadata = await node.pollMetadata(root)
     if (!stream.acceptsRows() || signal?.aborted) return
-    inbox = metadata.inbox
+    inbox = adjustInboxForEpoch(
+      metadata.inbox,
+      runtimeEpoch,
+      stream.postEpochSignatures,
+    )
     subagents = metadata.subagents
     onSubagents?.(subagents)
-    const nextFingerprint = `${inbox.messages.length}:${inbox.readIds.size}:${subagents
+    const nextFingerprint = `${metadata.inbox.messages.length}:${metadata.inbox.readIds.size}:${subagents
       .map((s) => `${s.conversationId}=${s.state}`)
       .join(',')}`
     if (nextFingerprint !== fingerprint) {
@@ -785,7 +961,7 @@ export async function settleBrainTurn(
       for (let i = 0; i < preamble.length; i++) {
         if (
           preamble[i].type === 'USER_INPUT' &&
-          Number(preamble[i].step_index) > minStepIndex
+          Number(preamble[i].step_index) > effectiveMinStepIndex
         ) {
           start = i
           break
@@ -1019,6 +1195,7 @@ export async function settleBrainTurn(
         subagents,
         node.projector,
         childMinStep,
+        runtimeEpoch?.ignoredSubagentIds,
       )
       const childStatus = await settleChildren({
         root,
@@ -1037,8 +1214,12 @@ export async function settleBrainTurn(
         }
       if (childStatus.settled && node.isSettled(inbox)) {
         if (activeChildIds.length > 0) {
-          if (node.hasUnprocessedMessages(await readInboxState(root, nativeId)))
-            continue
+          const latestInbox = adjustInboxForEpoch(
+            await readInboxState(root, nativeId),
+            runtimeEpoch,
+            stream.postEpochSignatures,
+          )
+          if (node.hasUnprocessedMessages(latestInbox)) continue
         }
         if (checkedVersion !== foldVersion) continue
         return finish('completed')
@@ -1068,6 +1249,8 @@ export type BrainWatchHandle = (() => void) & {
   cancel: () => Promise<void>
   /** Poll once immediately so terminal child states are observed before sibling cleanup. */
   flush: () => Promise<void>
+  /** Immediately mark the child turn canceled and stop polling without awaiting drain. */
+  forceCancel: () => void
   isRunning: () => boolean
   /** Stopped or canceled: no further rows are read. */
   isStopped: () => boolean
@@ -1091,12 +1274,14 @@ export function watchBrain(
   resume?: { afterStep: number; turnSeq: number },
   onSubagents?: (subagents: readonly SubagentRecord[]) => void,
   retryTimeoutMs = RETRY_IDLE_TIMEOUT_MS,
+  reader?: TranscriptReader,
 ): BrainWatchHandle {
   if (!sessionIdPattern.test(nativeId))
     throw new Error('Invalid Brain session ID')
   const timeline = new Timeline(sessionId)
   const node = new BrainNode(nativeId, sessionId, {
     turnFloor: resume?.afterStep ?? -1,
+    reader,
   })
   let stopped = false
   let inflight: Promise<void> | undefined
@@ -1394,6 +1579,12 @@ export function watchBrain(
           stopped = true
         })()
         return cancelling
+      },
+      forceCancel() {
+        if (stopped) return
+        clearInterval(timer)
+        finishTurn('canceled')
+        stopped = true
       },
     },
   )

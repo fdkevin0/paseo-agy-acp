@@ -78,6 +78,7 @@ export function dataDirectory(
   launch?: ProviderLaunch,
   env: Readonly<Record<string, string>> = {},
   cwd = process.cwd(),
+  fallbackHome = homedir(),
 ): string {
   const args = launch?.args ?? []
   function flag(names: string[], fallback: string): string {
@@ -94,7 +95,7 @@ export function dataDirectory(
     }
     return value
   }
-  const home = env.HOME ?? launch?.env?.HOME ?? homedir()
+  const home = env.HOME ?? launch?.env?.HOME ?? fallbackHome
   const gemini = flag(['--gemini-dir', '--gemini_dir'], join(home, '.gemini'))
   const app = flag(['--app-data-dir', '--app_data_dir'], 'antigravity-cli')
   if (isAbsolute(gemini)) {

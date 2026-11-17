@@ -44,12 +44,14 @@ test('resolveChildTurnState correlates mixed untagged Turn 1 and tagged Turn 2 w
             id: 'u1',
             sender: parent,
             priority: 'MESSAGE_PRIORITY_HIGH',
+            signature: 'sig-u1',
             tool: { conversationId: parent, stepIndex: undefined },
           },
           {
             id: 't2',
             sender: parent,
             priority: 'MESSAGE_PRIORITY_HIGH',
+            signature: 'sig-t2',
             tool: {
               conversationId: parent,
               stepIndex: 7,

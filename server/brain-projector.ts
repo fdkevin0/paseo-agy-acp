@@ -14,6 +14,7 @@ import {
 import {
   SUBAGENT_ALIVE,
   TranscriptReader,
+  extractCheckpointPreTokens,
   extractRowMessageSenders,
   isCompletePlannerResponse,
   isPlanExecuteNotice,
@@ -98,7 +99,7 @@ function terminalToolStatus(
 }
 
 /** A checkpoint takes a step index between a response and its GENERIC rows; shift expected rows past it. */
-export function shiftPendingPastCheckpoint(
+function shiftPendingPastCheckpoint(
   pending: readonly { stepIndex: number }[],
   checkpointStep: number,
 ) {
@@ -106,7 +107,7 @@ export function shiftPendingPastCheckpoint(
 }
 
 /** Match by stepIndex first so an unlogged WAITING ask_question never steals a sibling tool's GENERIC row. */
-export function takePendingForGeneric<
+function takePendingForGeneric<
   T extends { stepIndex: number; isQuestion?: boolean },
 >(pending: T[], genericStep: number): T | undefined {
   let matchIndex = pending.findIndex((p) => p.stepIndex === genericStep)
@@ -621,7 +622,14 @@ export class BrainTranscriptProjector {
         this.retired = []
         this.lastErrorCallId = undefined
         if (!isContinuation) this.subagentTouches.length = 0
-        return text ? [{ type: 'user_message', id, text }] : []
+        const mediaCount = Array.isArray(row.media) ? row.media.length : 0
+        const combined = [
+          text,
+          ...Array.from({ length: mediaCount }, () => '[image]'),
+        ]
+          .filter(Boolean)
+          .join('\n')
+        return combined ? [{ type: 'user_message', id, text: combined }] : []
       }
       case 'SYSTEM_MESSAGE': {
         this.lastErrorCallId = undefined
@@ -702,17 +710,19 @@ export class BrainTranscriptProjector {
         }
         return []
       }
-      case 'CHECKPOINT':
+      case 'CHECKPOINT': {
         shiftPendingPastCheckpoint(this.pending, stepIndex)
-        return row.status === 'DONE'
-          ? [
-              {
-                type: 'compaction',
-                id: `${id}:compaction`,
-                status: 'completed',
-              },
-            ]
-          : []
+        if (row.status !== 'DONE') return []
+        const preTokens = extractCheckpointPreTokens(row)
+        return [
+          {
+            type: 'compaction',
+            id: `${id}:compaction`,
+            status: 'completed',
+            ...(preTokens !== undefined ? { preTokens } : {}),
+          },
+        ]
+      }
       case 'ERROR_MESSAGE':
         if (isRetryWarning(row)) return []
         this.retired = []
@@ -833,6 +843,7 @@ export function activeChildIdsForTurn(
   subagents: readonly SubagentRecord[],
   projector: BrainTranscriptProjector,
   minStepIndex: number,
+  ignoredSubagentIds?: ReadonlySet<string>,
 ): string[] {
   const touched = projector.touchedSubagentIds(minStepIndex)
   const woken = projector.wokenSubagentIds(minStepIndex)
@@ -840,7 +851,8 @@ export function activeChildIdsForTurn(
   for (const sub of subagents) {
     if (
       sub.state === SUBAGENT_ALIVE &&
-      (sub.spawnStepIndex > minStepIndex ||
+      ((sub.spawnStepIndex > minStepIndex &&
+        !ignoredSubagentIds?.has(sub.conversationId)) ||
         touched.has(sub.conversationId) ||
         woken.has(sub.conversationId))
     ) {
@@ -979,7 +991,7 @@ export class BrainNode {
       if (!stepIndices.has(step)) this.retryObservedAt.delete(step)
   }
 
-  /** Forget the wakeup phase: a new USER_INPUT, a transcript rewrite or (for hasActiveBackgroundWork) a runtime restart. */
+  /** Forget the wakeup phase on a new USER_INPUT or transcript rewrite. */
   resetPhase() {
     this.retrySince = undefined
     this.retryError = undefined
@@ -1205,6 +1217,16 @@ export class BrainNode {
         (this.lastStep?.type === 'GENERIC' &&
           this.lastStep.status !== 'CANCELED' &&
           this.lastStep.status !== 'INTERRUPTED'))
+    )
+  }
+
+  isWokenActive(): boolean {
+    return (
+      this.isWokenWorking() ||
+      (this.wokeUp &&
+        !this.abortedByDenial &&
+        this.lastStep?.type === 'PLANNER_RESPONSE' &&
+        runningStepStatuses.has(String(this.lastStep.status)))
     )
   }
 

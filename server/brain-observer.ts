@@ -3,6 +3,8 @@ import {
   TranscriptReader,
   StepDedupe,
   countRowMessages,
+  extractCheckpointPreTokens,
+  extractRowMessageSignatures,
   extractStepUsage,
   isMissing,
   stepErrorMessage,
@@ -82,6 +84,7 @@ export class BrainTurnObservation {
   missing = false
   private readError?: unknown
   private failure?: unknown
+  private readonly epochAfterStepIndex: number
   get error(): unknown {
     return this.failure ?? this.readError
   }
@@ -91,6 +94,7 @@ export class BrainTurnObservation {
   historicalWakeups(): ReadonlyMap<number, string> {
     return this.historicalWakeupSteps
   }
+  postEpochSignatures = new Map<string, number>()
   revision = 0
   private waiters = new Set<() => void>()
   private notify() {
@@ -155,12 +159,14 @@ export class BrainTurnObservation {
     callbacks: BrainTurnObservation['callbacks'],
     pollIntervalMs = 200,
     reader = new TranscriptReader(),
+    epochAfterStepIndex = -1,
   ) {
     this.reader = reader
     this.root = root
     this.nativeId = nativeId
     this.sessionId = sessionId
     this.minStepIndex = minStepIndex
+    this.epochAfterStepIndex = epochAfterStepIndex
     this.callbacks = callbacks
     this.pollIntervalMs = pollIntervalMs
     this.usage = new ModelUsageObserver(minStepIndex, (usage) =>
@@ -218,15 +224,25 @@ export class BrainTurnObservation {
       this.lastStepIndex = -1
       this.historicalMessages = 0
       this.historicalWakeupSteps.clear()
+      this.postEpochSignatures.clear()
     }
     const historicalRows: Row[] = []
     for (const row of read.rows) {
       const index = Number(row.step_index)
-      if (Number.isInteger(index))
+      if (Number.isInteger(index)) {
         this.lastStepIndex = Math.max(this.lastStepIndex, index)
-      if (index <= this.minStepIndex) {
-        this.historicalMessages += countRowMessages(row, false)
-        historicalRows.push(row)
+        if (index > this.epochAfterStepIndex) {
+          if (index <= this.minStepIndex) {
+            this.historicalMessages += countRowMessages(row, false)
+            historicalRows.push(row)
+          }
+          for (const sig of extractRowMessageSignatures(row)) {
+            this.postEpochSignatures.set(
+              sig,
+              (this.postEpochSignatures.get(sig) ?? 0) + 1,
+            )
+          }
+        }
       }
     }
     if (historicalRows.length > 0)
@@ -295,15 +311,18 @@ export class BrainTurnObservation {
         row.type === 'CHECKPOINT' &&
         row.status === 'DONE' &&
         this.checkpoints.fresh(row)
-      )
+      ) {
+        const preTokens = extractCheckpointPreTokens(row)
         this.callbacks.onItem(
           {
             type: 'compaction',
             id: `${this.sessionId}:step:${row.step_index}:compaction`,
             status: 'completed',
+            ...(preTokens !== undefined ? { preTokens } : {}),
           },
           typeof row.created_at === 'string' ? row.created_at : undefined,
         )
+      }
   }
   async attach(consumer: (read: BrainRead) => Promise<void>) {
     await this.inflight
