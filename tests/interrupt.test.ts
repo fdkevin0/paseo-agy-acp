@@ -26,8 +26,11 @@ async function createReloadGate(dir: string) {
   })
   let released = false
   let conn: Socket | undefined
+  const sockets = new Set<Socket>()
   const server = createServer((socket) => {
     conn = socket
+    sockets.add(socket)
+    socket.on('close', () => sockets.delete(socket))
     let buf = ''
     socket.on('data', (chunk) => {
       buf += chunk.toString('utf8')
@@ -46,7 +49,7 @@ async function createReloadGate(dir: string) {
       if (conn && !conn.destroyed) conn.end('go\n')
     },
     async close() {
-      conn?.destroy()
+      for (const socket of sockets) socket.destroy()
       await new Promise<void>((resolve) => server.close(() => resolve()))
     },
   }
@@ -506,20 +509,19 @@ function assertNoFailures(events: readonly ProviderEvent[]) {
   )
 }
 
-async function tempHome(t: TestContext, prefix: string) {
-  const home = await mkdtemp(join(tmpdir(), prefix))
-  t.after(() => rm(home, { recursive: true, force: true }))
-  return home
+async function tempHome(prefix: string) {
+  return mkdtemp(join(tmpdir(), prefix))
 }
 
 test('interrupt returns while reload is gated, serializes queued configure and prompt, fences stale artifacts, and uses in-place cancel afterwards', async (t) => {
-  const home = await tempHome(t, 'agy-interrupt-gate-')
+  const home = await tempHome('agy-interrupt-gate-')
   const gate = await createReloadGate(home)
   const conn = await connect(home, 5000, { AGY_RELOAD_GATE: gate.socketPath })
   t.after(async () => {
     gate.release()
     await gate.close()
     await conn.provider.close()
+    await rm(home, { recursive: true, force: true })
   })
   await conn.provider.send(
     openReq('s', home, {
@@ -598,16 +600,21 @@ test('interrupt returns while reload is gated, serializes queued configure and p
 })
 
 test('interrupt prefers session/resume, cancels queued prompt before reload finishes, and reopen fences stale Brain state', async (t) => {
-  const home = await tempHome(t, 'agy-interrupt-resume-')
+  const home = await tempHome('agy-interrupt-resume-')
   const gate = await createReloadGate(home)
   const first = await connect(home, 5000, {
     AGY_RESUME_CAP: '1',
     AGY_RELOAD_GATE: gate.socketPath,
   })
+  let second: Awaited<ReturnType<typeof connect>> | undefined
+  let third: Awaited<ReturnType<typeof connect>> | undefined
   t.after(async () => {
     gate.release()
     await gate.close()
     await first.provider.close()
+    await second?.provider.close()
+    await third?.provider.close()
+    await rm(home, { recursive: true, force: true })
   })
   await first.provider.send(openReq('s1', home, { requestId: 'open-1' }))
   await first.until((event) => event.type === 'session.ready')
@@ -657,8 +664,7 @@ test('interrupt prefers session/resume, cancels queued prompt before reload fini
   )
 
   await first.provider.close()
-  const second = await connect(home, 5000, { AGY_RESUME_CAP: '1' })
-  t.after(() => second.provider.close())
+  second = await connect(home, 5000, { AGY_RESUME_CAP: '1' })
   await second.provider.send(
     openReq('s2', home, {
       requestId: 'open-2',
@@ -671,8 +677,7 @@ test('interrupt prefers session/resume, cancels queued prompt before reload fini
   await second.until(turnEvent('s2', 'completed'))
   await second.provider.close()
 
-  const third = await connect(home, 5000)
-  t.after(() => third.provider.close())
+  third = await connect(home, 5000)
   await third.provider.send(
     openReq('s3', home, {
       requestId: 'open-3',
@@ -721,13 +726,15 @@ test('interrupt prefers session/resume, cancels queued prompt before reload fini
 })
 
 test('ignore-cancel fast-path timeout falls back to retire and reload, and non-reloadable ignore-cancel fails cleanly', async (t) => {
-  const homeA = await tempHome(t, 'agy-ignore-cancel-reload-')
-  const homeB = await tempHome(t, 'agy-ignore-cancel-no-reload-')
+  const homeA = await tempHome('agy-ignore-cancel-reload-')
+  const homeB = await tempHome('agy-ignore-cancel-no-reload-')
   const reloadable = await connect(homeA, 5000)
   const nonReloadable = await connect(homeB, 5000, { AGY_NO_RELOAD: '1' })
   t.after(async () => {
     await reloadable.provider.close()
     await nonReloadable.provider.close()
+    await rm(homeA, { recursive: true, force: true })
+    await rm(homeB, { recursive: true, force: true })
   })
 
   await reloadable.provider.send(
@@ -775,7 +782,7 @@ test('ignore-cancel fast-path timeout falls back to retire and reload, and non-r
 })
 
 test('reload failure fails queued configure and prompt with root-cause diagnostic once', async (t) => {
-  const home = await tempHome(t, 'agy-reload-fail-')
+  const home = await tempHome('agy-reload-fail-')
   const gate = await createReloadGate(home)
   const conn = await connect(home, 5000, {
     AGY_RELOAD_GATE: gate.socketPath,
@@ -785,6 +792,7 @@ test('reload failure fails queued configure and prompt with root-cause diagnosti
     gate.release()
     await gate.close()
     await conn.provider.close()
+    await rm(home, { recursive: true, force: true })
   })
   await conn.provider.send(openReq('s-fail', home, { requestId: 'open-fail' }))
   await conn.until((event) => event.type === 'session.ready')
@@ -833,9 +841,12 @@ test('reload failure fails queued configure and prompt with root-cause diagnosti
 })
 
 test('retireAndRecover after native plan switch does not resurrect full-access skipPermissions', async (t) => {
-  const home = await tempHome(t, 'agy-native-plan-')
+  const home = await tempHome('agy-native-plan-')
   const conn = await connect(home, 5000)
-  t.after(() => conn.provider.close())
+  t.after(async () => {
+    await conn.provider.close()
+    await rm(home, { recursive: true, force: true })
+  })
   await conn.provider.send(
     openReq('s-plan', home, { requestId: 'open-plan', mode: 'full-access' }),
   )
