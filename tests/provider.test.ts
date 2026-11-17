@@ -1837,6 +1837,7 @@ test('canceling a woken ask_question cancels the native turn without relaunching
       response: { behavior: 'deny' },
     })
     await q.turn('canceled')
+    await q.h.provider.close()
     assert.equal(
       (await readFile(q.log, 'utf8')).slice(before.length),
       'cancel\n',
@@ -1870,6 +1871,7 @@ test('interrupting a woken ask_question cancels without relaunching', async () =
       (e) => e.type === 'request.completed' && e.requestId === 'interrupt',
     )
     await q.turn('canceled')
+    await q.h.provider.close()
     assert.equal(
       (await readFile(q.log, 'utf8')).slice(before.length),
       'cancel\n',
