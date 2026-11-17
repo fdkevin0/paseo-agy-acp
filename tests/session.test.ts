@@ -1182,6 +1182,12 @@ test(
       )
       assert.ok(failed?.type === 'session.turn' && failed.state === 'failed')
       assert.match(failed.error?.message ?? '', /attempt 8.*synthetic timeout/)
+      await m.handle({
+        type: 'session.configure',
+        requestId: 'sync-reload',
+        sessionId: 's',
+        changes: {},
+      })
       await m.close()
       const log = (await readFile(join(home, 'runtime.jsonl'), 'utf8'))
         .trim()
