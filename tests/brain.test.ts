@@ -4475,7 +4475,7 @@ test('re-waking a child across turns isolates prior failed grandchildren while r
   }
 })
 
-test('re-waking a child after Turn-1 retry timeout succeeds without Turn-1 retry carry-over and waits on untagged inbox read-skew', async () => {
+test('re-waking a child after Turn-1 retry timeout succeeds without Turn-1 retry carry-over and waits on inbox read-skew', async () => {
   const f = await fixture()
   const abort = new AbortController()
   let handle: BrainWatchHandle | undefined
@@ -4487,18 +4487,20 @@ test('re-waking a child after Turn-1 retry timeout succeeds without Turn-1 retry
       callId: 'invoke',
       name: 'invoke_subagent',
     })
-    // Turn 1: parent spawns child and sends untagged wakeup #1; child ingests it and expires on a retry warning.
-    const parentTurn1: Row[] = [
-      ...invoke(child),
-      ...report(child, 'untagged wake 1', 5),
-    ]
+    // Turn 1: parent spawns child and sends wakeup #1; child ingests it and expires on a retry warning.
+    const parentTurn1: Row[] = [...invoke(child), ...report(child, 'wake 1', 5)]
     await f.put(parent, parentTurn1)
     await f.subagent(parent, child, 'SUBAGENT_STATE_ALIVE', 3, 'invoke')
-    await f.deliver(child, parent, 'untagged wake 1', true, 'u1')
+    await f.deliver(child, parent, 'wake 1', true, 'u1', {
+      conversationId: parent,
+      stepIndex: 6,
+      callId: 'send-1',
+      name: 'send_message',
+    })
     const childTurn1: Row[] = [
       message(0, parent, 'initial task'),
       done(1, 'ready'),
-      message(2, parent, 'untagged wake 1'),
+      message(2, parent, 'wake 1'),
       interrupted(3, '2020-01-01T00:00:00Z'),
     ]
     await f.put(child, childTurn1)
@@ -4533,11 +4535,11 @@ test('re-waking a child after Turn-1 retry timeout succeeds without Turn-1 retry
     assert.equal(turn1.status, 'failed')
     assert.equal(turn1.stalled, true)
 
-    // Turn 2: parent logs completed untagged send_message BEFORE u2.json appears in child inbox (read-skew).
+    // Turn 2: parent logs completed send_message BEFORE u2.json appears in child inbox (read-skew).
     const parentTurn2: Row[] = [
       ...parentTurn1,
       { step_index: 8, type: 'USER_INPUT', content: 'retry in turn 2' },
-      ...report(child, 'untagged wake 2', 9),
+      ...report(child, 'wake 2', 9),
     ]
     await f.put(parent, parentTurn2)
 
@@ -4552,15 +4554,25 @@ test('re-waking a child after Turn-1 retry timeout succeeds without Turn-1 retry
       return res
     })
     // Deliver u2 and complete child + parent in Turn 2 without clearing retryStep=3 except via childMinStep scoping.
-    await f.deliver(child, parent, 'untagged wake 2', true, 'u2')
+    await f.deliver(child, parent, 'wake 2', true, 'u2', {
+      conversationId: parent,
+      stepIndex: 10,
+      callId: 'send-2',
+      name: 'send_message',
+    })
     await appendFile(
       f.path(child),
       encode([
-        message(4, parent, 'untagged wake 2'),
+        message(4, parent, 'wake 2'),
         ...report(parent, 'recovered in turn 2', 5),
       ]),
     )
-    await f.deliver(parent, child, 'recovered in turn 2', true, 'c-done')
+    await f.deliver(parent, child, 'recovered in turn 2', true, 'c-done', {
+      conversationId: child,
+      stepIndex: 6,
+      callId: 'send-done',
+      name: 'send_message',
+    })
     await appendFile(
       f.path(parent),
       encode([message(12, child, 'recovered in turn 2'), done(13, 'all done')]),
@@ -5099,62 +5111,6 @@ test('terminal ERROR_MESSAGE in parent does not hide live subagents re-woken ear
   } finally {
     await f.close()
   }
-})
-
-test('recordPreambleWakeups deduplicates completed wakeups by stepIndex when preamble straddles minStepIndex', () => {
-  const node = new BrainNode(parent, 'p', { allowInitialSpawnPrompt: false })
-  const rows = [
-    { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-    {
-      step_index: 1,
-      type: 'PLANNER_RESPONSE',
-      status: 'DONE',
-      tool_calls: [
-        { id: 'w1', name: 'send_message', args: { Recipient: child } },
-      ],
-    },
-    {
-      step_index: 2,
-      type: 'GENERIC',
-      status: 'DONE',
-      content: 'Sent',
-    },
-    {
-      step_index: 3,
-      type: 'PLANNER_RESPONSE',
-      status: 'DONE',
-      tool_calls: [
-        { id: 'w2', name: 'send_message', args: { Recipient: child } },
-      ],
-    },
-    {
-      step_index: 4,
-      type: 'GENERIC',
-      status: 'DONE',
-      content: 'Sent 2',
-    },
-  ]
-  // Simulate BrainTurnObservation having already recorded step 2 (<= minStepIndex 2),
-  // while preambleSlice straddles minStepIndex and includes steps 0..4.
-  const priorWakeups = new Map<number, string>([[2, child]])
-  node.recordPreambleWakeups(
-    rows,
-    {
-      messages: [],
-      readIds: new Set(),
-      unconsumedHighPriority: [],
-      consumedNonUserCount: 0,
-      stepCallIds: new Map(),
-    },
-    [],
-    priorWakeups,
-  )
-  assert.equal(
-    node.countPriorWakeups(child, 4),
-    2,
-    'overlapping step 2 in priorWakeups and preambleSlice must not be double-counted',
-  )
-  assert.equal(node.countPriorWakeups(child, 2), 1)
 })
 
 test('watchBrain does not advance turnFloor past child ERROR_MESSAGE on grandchild report in the same turn', async () => {

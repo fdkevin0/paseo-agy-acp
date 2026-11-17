@@ -821,24 +821,6 @@ export class BrainTranscriptProjector {
   }
 }
 
-/**
- * Harvest completed `send_message` wakeups (`GENERIC` step → child session) from rows a live projector
- * has not consumed: a turn's pre-turn history, or a transcript replayed after resume. Projection is
- * per-batch and discarded, so callers never carry a second projection state.
- */
-export function completedWakeupsFromRows(
-  sessionId: string,
-  rows: readonly Record<string, unknown>[],
-  metadata?: { inbox: InboxState; subagents: readonly SubagentRecord[] },
-): ReadonlyMap<number, string> {
-  if (rows.length === 0) return new Map()
-  const projector = new BrainTranscriptProjector(sessionId, undefined, false)
-  if (metadata) projector.syncMetadata(metadata.inbox, metadata.subagents)
-  projector.observeRows(rows)
-  for (const row of rows) projector.project(row)
-  return projector.completedWakeupsByStep()
-}
-
 export function activeChildIdsForTurn(
   subagents: readonly SubagentRecord[],
   projector: BrainTranscriptProjector,
@@ -963,22 +945,6 @@ export class BrainNode {
 
   get wokeUpSinceLastPrompt(): boolean {
     return this.promptPhase === 'woken'
-  }
-
-  recordPreambleWakeups(
-    rows: readonly Record<string, unknown>[],
-    inbox: InboxState,
-    subagents: readonly SubagentRecord[],
-    priorWakeups?: ReadonlyMap<number, string>,
-  ) {
-    this.projector.seedCompletedWakeups(priorWakeups)
-    this.projector.seedCompletedWakeups(
-      completedWakeupsFromRows(this.sessionId, rows, { inbox, subagents }),
-    )
-  }
-
-  countPriorWakeups(recipient: string, maxStepIndex: number): number {
-    return this.projector.countPriorWakeups(recipient, maxStepIndex)
   }
 
   wakeupStepsFrom(sender: string): readonly number[] {

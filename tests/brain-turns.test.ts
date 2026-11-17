@@ -17,7 +17,7 @@ import {
   report,
 } from './brain-fixtures.ts'
 
-test('resolveChildTurnState correlates mixed untagged Turn 1 and tagged Turn 2 wakeups', () => {
+test('resolveChildTurnState correlates tagged Turn 1 and Turn 2 wakeups', () => {
   const parentNode = new BrainNode(parent, parent, {
     allowInitialSpawnPrompt: false,
   })
@@ -25,7 +25,7 @@ test('resolveChildTurnState correlates mixed untagged Turn 1 and tagged Turn 2 w
     allowInitialSpawnPrompt: true,
   })
   childNode.ingest(message(0, parent, 'init'))
-  childNode.ingest(message(3, parent, 'untagged turn 1'))
+  childNode.ingest(message(3, parent, 'tagged turn 1'))
   childNode.ingest(message(6, parent, 'tagged turn 2'))
 
   assert.deepEqual(
@@ -41,11 +41,15 @@ test('resolveChildTurnState correlates mixed untagged Turn 1 and tagged Turn 2 w
       {
         messages: [
           {
-            id: 'u1',
+            id: 't1',
             sender: parent,
             priority: 'MESSAGE_PRIORITY_HIGH',
-            signature: 'sig-u1',
-            tool: { conversationId: parent, stepIndex: undefined },
+            signature: 'sig-t1',
+            tool: {
+              conversationId: parent,
+              stepIndex: 4,
+              name: 'send_message',
+            },
           },
           {
             id: 't2',
@@ -59,7 +63,7 @@ test('resolveChildTurnState correlates mixed untagged Turn 1 and tagged Turn 2 w
             },
           },
         ],
-        readIds: new Set(['u1', 't2']),
+        readIds: new Set(['t1', 't2']),
         unconsumedHighPriority: [],
         consumedNonUserCount: 2,
         stepCallIds: new Map(),
@@ -159,115 +163,45 @@ test('readTurnBoundaryBefore re-reads when a message file completes in place', a
   }
 })
 
-test('readTurnBoundaryBefore places untagged wakeups by walking ancestor turns', async () => {
+test('readTurnBoundaryBefore resolves re-woken child boundary against tagged ancestor turns', async () => {
   const f = await fixture()
-  const mixedParent = '44444444-4444-4444-8444-444444444444'
-  const mixedChild = '55555555-5555-4555-8555-555555555555'
-  const orderedParent = '66666666-6666-4666-8666-666666666666'
-  const orderedChild = '77777777-7777-4777-8777-777777777777'
-  const untaggedParent = '88888888-8888-4888-8888-888888888888'
-  const untaggedChild = '99999999-9999-4999-8999-999999999999'
+  const rootParent = '44444444-4444-4444-8444-444444444444'
+  const reWokenChild = '55555555-5555-4555-8555-555555555555'
   try {
     const cache: TurnBoundaryCache = new Map()
-
-    // Untagged Turn 1 wakeup followed by a tagged Turn 2 wakeup: the boundary sits at the untagged one.
-    await f.put(mixedParent, [
+    await f.put(rootParent, [
       { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
       done(1, 't1'),
       { step_index: 2, type: 'USER_INPUT', content: 'turn 2' },
-      ...report(mixedChild, 'tagged wake t2', 3),
+      ...report(reWokenChild, 'tagged wake t2', 3),
       done(6, 't2'),
     ])
-    await f.deliver(mixedChild, mixedParent, 'init child', true, 'init-c', {
-      conversationId: mixedParent,
+    await f.deliver(reWokenChild, rootParent, 'init child', true, 'init-c', {
+      conversationId: rootParent,
       stepIndex: 0,
       callId: 'spawn-c',
       name: 'invoke_subagent',
     })
-    await f.deliver(mixedChild, mixedParent, 'untagged wake', true, 'u1-c')
-    await f.deliver(mixedChild, mixedParent, 'tagged wake t2', true, 't2-c', {
-      conversationId: mixedParent,
-      stepIndex: 4,
-      callId: 'send-c',
-      name: 'send_message',
-    })
-    await f.put(mixedChild, [
-      message(0, mixedParent, 'init'),
-      message(1, mixedParent, 'untagged wake'),
-      message(2, mixedParent, 'tagged wake t2'),
-      done(3, 'child done'),
-    ])
-    assert.deepEqual(
-      await readTurnBoundaryBefore(f.root, mixedChild, 3, cache),
-      { boundary: 2, ready: true },
-    )
-
-    // A tagged Turn 2 wakeup that lands before its untagged twin anchors the turn at its own step.
-    await f.put(orderedParent, [
-      { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-      done(1, 't1'),
-      { step_index: 2, type: 'USER_INPUT', content: 'turn 2' },
-      ...report(orderedChild, 'tagged t2', 3),
-      ...report(orderedChild, 'untagged t2', 6),
-      done(9, 't2'),
-    ])
-    await f.deliver(orderedChild, orderedParent, 'init child', true, 'init-c', {
-      conversationId: orderedParent,
-      stepIndex: 0,
-      callId: 'spawn-c',
-      name: 'invoke_subagent',
-    })
-    await f.deliver(orderedChild, orderedParent, 'tagged t2', true, 't2-1', {
-      conversationId: orderedParent,
-      stepIndex: 4,
+    await f.deliver(reWokenChild, rootParent, 'tagged wake t1', true, 't1-c', {
+      conversationId: rootParent,
+      stepIndex: 1,
       callId: 'send-1',
       name: 'send_message',
     })
-    await f.deliver(orderedChild, orderedParent, 'untagged t2', true, 'u2-2')
-    await f.put(orderedChild, [
-      message(0, orderedParent, 'init'),
-      message(1, orderedParent, 'tagged t2'),
-      done(2, 'work in t2'),
-      message(3, orderedParent, 'untagged t2'),
-      done(4, 'child done'),
-    ])
-    assert.deepEqual(
-      await readTurnBoundaryBefore(f.root, orderedChild, 4, cache),
-      { boundary: 1, ready: true },
-    )
-
-    // Every wakeup untagged on both turns.
-    await f.put(untaggedParent, [
-      { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-      ...report(untaggedChild, 'untagged t1', 1),
-      done(4, 't1'),
-      { step_index: 5, type: 'USER_INPUT', content: 'turn 2' },
-      ...report(untaggedChild, 'untagged t2', 6),
-      done(9, 't2'),
-    ])
-    await f.deliver(
-      untaggedChild,
-      untaggedParent,
-      'init child',
-      true,
-      'init-c',
-      {
-        conversationId: untaggedParent,
-        stepIndex: 0,
-        callId: 'spawn-c',
-        name: 'invoke_subagent',
-      },
-    )
-    await f.deliver(untaggedChild, untaggedParent, 'untagged t1', true, 'u1')
-    await f.deliver(untaggedChild, untaggedParent, 'untagged t2', true, 'u2')
-    await f.put(untaggedChild, [
-      message(0, untaggedParent, 'init'),
-      message(1, untaggedParent, 'untagged t1'),
-      message(2, untaggedParent, 'untagged t2'),
+    await f.deliver(reWokenChild, rootParent, 'tagged wake t2', true, 't2-c', {
+      conversationId: rootParent,
+      stepIndex: 4,
+      callId: 'send-2',
+      name: 'send_message',
+    })
+    await f.put(reWokenChild, [
+      message(0, rootParent, 'init'),
+      message(1, rootParent, 'tagged wake t1'),
+      message(2, rootParent, 'tagged wake t2'),
       done(3, 'child done'),
     ])
     assert.deepEqual(
-      await readTurnBoundaryBefore(f.root, untaggedChild, 3, cache),
+      await readTurnBoundaryBefore(f.root, reWokenChild, 3, cache),
       { boundary: 2, ready: true },
     )
   } finally {

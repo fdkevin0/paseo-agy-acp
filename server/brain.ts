@@ -24,7 +24,6 @@ import type { NormalizedQuestion } from './questions.ts'
 import {
   StepDedupe,
   countRowMessages,
-  extractRowMessageSenders,
   extractCheckpointPreTokens,
   extractRowMessageSignatures,
   extractStepUsage,
@@ -971,12 +970,6 @@ export async function settleBrainTurn(
       initial = false
       anchored = true
       const preambleSlice = preamble.slice(0, start)
-      node.recordPreambleWakeups(
-        preambleSlice,
-        inbox,
-        subagents,
-        stream.historicalWakeups(),
-      )
       for (const row of preambleSlice)
         node.consumedMessages += countRowMessages(row, false)
       slice = preamble.slice(start)
@@ -1365,11 +1358,7 @@ export function watchBrain(
         isNativeToolName(m.tool?.name ?? '', 'invoke_subagent'),
       )
       const parentId = init?.tool?.conversationId
-      const {
-        messages: parentWakeupMsgs,
-        tagged,
-        allTagged,
-      } = selectParentWakeups(inbox, parentId)
+      const tagged = selectParentWakeups(inbox, parentId)
       node.projector.observeRows(rows)
       for (const row of rows) {
         if (stopped) return
@@ -1380,28 +1369,6 @@ export function watchBrain(
           (resume !== undefined && stepIndex <= resume.afterStep)
         if (Number.isInteger(stepIndex) && stepIndex > lastStepIndex)
           lastStepIndex = stepIndex
-        // Tagged wakeups use the canonical parent-turn boundary below; a second send in
-        // the same turn must never move the floor past that turn's terminal error.
-        if (
-          !allTagged &&
-          node.failure(retryTimeoutMs) !== undefined &&
-          row.type === 'SYSTEM_MESSAGE' &&
-          !isRestartNotice(row) &&
-          Number.isInteger(stepIndex)
-        ) {
-          // Only a wakeup from the spawning parent (or, without a spawn record, from any sender that
-          // is not a known descendant) may close the failed turn: a descendant's report must never
-          // clear its ancestor's own terminal failure.
-          const senders = extractRowMessageSenders(row)
-          const isParentWakeup = parentId
-            ? senders.includes(parentId)
-            : senders.some(
-                (s) =>
-                  sessionIdPattern.test(s) &&
-                  !subagents.some((sub) => sub.conversationId === s),
-              )
-          if (isParentWakeup) node.advanceTurnFloor(stepIndex - 1)
-        }
         const items = node.ingest(row, observedAt)
         if (replayed) continue
         if (
@@ -1443,40 +1410,31 @@ export function watchBrain(
       if (
         parentId &&
         init?.tool?.stepIndex !== undefined &&
-        parentWakeupMsgs.length > 0
+        tagged.length > 0
       ) {
-        if (allTagged) {
-          const latestWakeParentStep = tagged[tagged.length - 1].tool.stepIndex
-          const resolved = await readTurnBoundaryBefore(
-            root,
-            parentId,
-            latestWakeParentStep,
-            boundaryCache,
+        const latestWakeParentStep = tagged[tagged.length - 1].tool.stepIndex
+        const resolved = await readTurnBoundaryBefore(
+          root,
+          parentId,
+          latestWakeParentStep,
+          boundaryCache,
+        )
+        if (!resolved.ready) {
+          awaitingCrossTurnEntry = parentTurnActive
+        } else {
+          const turn = resolveReWokenTurn(
+            tagged,
+            wakeupSteps,
+            resolved.boundary,
+            init.tool.stepIndex,
           )
-          if (!resolved.ready) {
-            awaitingCrossTurnEntry = parentTurnActive
-          } else {
-            const turn = resolveReWokenTurn(
-              tagged,
-              wakeupSteps,
-              resolved.boundary,
-              init.tool.stepIndex,
-            )
-            if (turn.status === 're-woken')
-              node.advanceTurnFloor(turn.startStep - 1)
-            else
-              awaitingCrossTurnEntry =
-                turn.status === 'awaiting-row' &&
-                parentTurnActive &&
-                parentWakeupMsgs.length > wakeupSteps.length
-          }
-        } else if (
-          parentWakeupMsgs.length > wakeupSteps.length &&
-          parentTurnActive &&
-          node.turnFloor < 0 &&
-          !node.retryPending()
-        ) {
-          awaitingCrossTurnEntry = true
+          if (turn.status === 're-woken')
+            node.advanceTurnFloor(turn.startStep - 1)
+          else
+            awaitingCrossTurnEntry =
+              turn.status === 'awaiting-row' &&
+              parentTurnActive &&
+              tagged.length > wakeupSteps.length
         }
       }
       if (awaitingCrossTurnEntry) return
@@ -1497,8 +1455,7 @@ export function watchBrain(
       })
       if (childStatus.error) finishTurn('failed', childStatus.error)
       const hasPendingParentWakeup =
-        parentWakeupMsgs.length > wakeupSteps.length &&
-        isParentTurnActive?.() !== false
+        tagged.length > wakeupSteps.length && isParentTurnActive?.() !== false
       if (
         running &&
         (node.retryPending() ||
