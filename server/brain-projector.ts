@@ -359,33 +359,6 @@ export class BrainTranscriptProjector {
     return ids
   }
 
-  countCompletedWakeups(recipient: string, minStepIndex = -1): number {
-    let count = 0
-    for (const [stepIndex, childId] of this.completedWakeups) {
-      if (childId === recipient && stepIndex > minStepIndex) count++
-    }
-    return count
-  }
-
-  countPriorWakeups(recipient: string, maxStepIndex: number): number {
-    let count = 0
-    for (const [stepIndex, childId] of this.completedWakeups) {
-      if (childId === recipient && stepIndex <= maxStepIndex) count++
-    }
-    return count
-  }
-
-  completedWakeupsByStep(): ReadonlyMap<number, string> {
-    return this.completedWakeups
-  }
-
-  seedCompletedWakeups(prior?: ReadonlyMap<number, string>) {
-    if (!prior) return
-    for (const [stepIndex, childId] of prior) {
-      this.completedWakeups.set(stepIndex, childId)
-    }
-  }
-
   consumeRowMessageSenders(row: Record<string, unknown>): string[] {
     return [...this.evaluateRowSenders(row).senders]
   }
@@ -421,19 +394,6 @@ export class BrainTranscriptProjector {
     const result = { row, senders, isInitialPrompt }
     this.lastRowSenders = result
     return result
-  }
-
-  countPendingWakeups(recipient: string, minStepIndex = -1): number {
-    let count = 0
-    for (const p of this.pending) {
-      if (
-        p.stepIndex > minStepIndex &&
-        isNativeToolName(p.name, 'send_message') &&
-        p.args.Recipient === recipient
-      )
-        count++
-    }
-    return count
   }
 
   private finishTool(
