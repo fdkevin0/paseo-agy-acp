@@ -100,7 +100,7 @@ Inspect `npm pack --dry-run --ignore-scripts` for the manifest, icon, both overv
 
 ### CI and tag validation
 
-`ci.yml` checks pull requests, pushes to `main` and manual runs on Node 24. It installs the locked dependencies, checks formatting and types, runs the offline suite and verifies package contents.
+`ci.yml` checks pull requests, pushes to `main` and manual runs on Node 26. It installs the locked dependencies, checks formatting and types, runs the offline suite and verifies package contents.
 
 `release.yml` runs for version-tag pushes or manual dispatch on an existing tag. It rejects branch dispatches, mismatched tags and non-stable versions before contacting npm. The tag must equal `v` plus `package.json`'s stable `X.Y.Z` version. Only a registry HTTP 404 means the version is absent; HTTP 200 marks it as already published. Authentication failures, server errors and timeouts stop the workflow.
 

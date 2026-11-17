@@ -23,6 +23,7 @@ import {
 } from '../server/brain-observer.ts'
 import { settleBrainTurn } from '../server/brain.ts'
 import { BrainTranscriptProjector } from '../server/brain-projector.ts'
+import { createEventCollector } from './helpers.ts'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -67,7 +68,8 @@ const checkpoint = (step_index: number, content = 'summary'): Row => ({
 
 async function harness(t: TestContext) {
   const home = await mkdtemp(join(tmpdir(), 'agy-pr8-repro-'))
-  const events: ProviderEvent[] = []
+  const collector = createEventCollector()
+  const events = collector.events
   const manager = new SessionManager({
     launch: {
       command: process.execPath,
@@ -76,9 +78,7 @@ async function harness(t: TestContext) {
     },
     usage: new AgyUsageSource(),
     capabilities: ['prompt.message', 'permission'],
-    emit: (event) => {
-      events.push(structuredClone(event))
-    },
+    emit: collector.emit,
   })
   const start = manager.start.bind(manager)
   let session!: Awaited<ReturnType<typeof manager.start>>
@@ -88,7 +88,7 @@ async function harness(t: TestContext) {
     async (...args: Parameters<typeof start>) =>
       (session = await start(...args)),
   )
-  await manager.open({
+  await manager.handle({
     type: 'session.open',
     requestId: 'open',
     sessionId: 's',
@@ -106,6 +106,28 @@ async function harness(t: TestContext) {
     await manager.close()
     await rm(home, { recursive: true, force: true })
   })
+  const holdLive = async (clientMessageId: string) => {
+    const target =
+      events.filter((event) => event.type === 'session.commands').length + 1
+    const running = manager.handle({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId,
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'hold:cancel' }],
+        },
+      },
+    })
+    await collector.wait(
+      () =>
+        events.filter((event) => event.type === 'session.commands').length >=
+        target,
+    )
+    return { running, observation: session.state.observation! }
+  }
   return {
     home,
     path,
@@ -114,6 +136,7 @@ async function harness(t: TestContext) {
     session,
     write: (rows: Row[]) => writeFile(path, encode(rows)),
     append: (rows: Row[]) => appendFile(path, encode(rows)),
+    holdLive,
   }
 }
 
@@ -562,27 +585,8 @@ test('historical message deltas delivered after attach do not stall a completed 
 
 test('appended foreground checkpoint is not pruned by an older staged snapshot on cancel', async (t) => {
   const h = await harness(t)
-  const held = deferred<Result>()
-  const started = deferred<void>()
-  t.mock.method(h.session.transport.rpc, 'prompt', () => {
-    started.resolve()
-    return held.promise
-  })
-
-  const turnPromise = h.manager.handle({
-    type: 'session.prompt',
-    sessionId: 's',
-    prompt: {
-      clientMessageId: 'm-dup',
-      delivery: 'auto',
-      input: {
-        type: 'message',
-        content: [{ type: 'text', text: 'compact then cancel' }],
-      },
-    },
-  })
-  await started.promise
-  const obs = h.session.state.observation!
+  const held = await h.holdLive('m-dup')
+  const obs = held.observation
 
   await h.write([user(1), model(2, 100)])
   await obs.poll()
@@ -590,11 +594,12 @@ test('appended foreground checkpoint is not pruned by an older staged snapshot o
   await h.append([checkpoint(3)])
   await obs.poll()
 
-  h.session.state.turnAbort!.abort(
-    Object.assign(new Error('canceled'), { name: 'AbortError' }),
-  )
-  held.resolve({ stopReason: 'cancelled' })
-  await turnPromise
+  await h.manager.handle({
+    type: 'session.interrupt',
+    requestId: 'interrupt',
+    sessionId: 's',
+  })
+  await held.running
 
   const compactions = h.events.filter(
     (e) => e.type === 'timeline.item' && e.item.type === 'compaction',
@@ -846,33 +851,21 @@ test(
 )
 
 test('confirmed usage deletion invalidates the source cache without fabricating a new user context or bill', async (t) => {
-  const h = await harness(t),
-    entered = deferred<void>(),
-    done = deferred<Result>()
+  const h = await harness(t)
   h.session.publishUsage({ inputTokens: 1000, outputTokens: 100 })
-  t.mock.method(h.session.transport.rpc, 'prompt', () => {
-    entered.resolve()
-    return done.promise
-  })
-  const running = h.manager.handle({
-    type: 'session.prompt',
-    sessionId: 's',
-    prompt: {
-      clientMessageId: 'deletion',
-      delivery: 'auto',
-      input: { type: 'message', content: [{ type: 'text', text: 'work' }] },
-    },
-  })
-  await entered.promise
-  const obs = h.session.state.observation!
+  const held = await h.holdLive('deletion')
+  const obs = held.observation
   await h.write([user(1), model(2, 70)])
   await obs.poll()
   await h.write([user(1)])
   await obs.poll()
   assert.equal(obs.usage.latest, undefined)
-  h.session.state.turnAbort!.abort()
-  done.resolve({ stopReason: 'cancelled' })
-  await running
+  await h.manager.handle({
+    type: 'session.interrupt',
+    requestId: 'interrupt',
+    sessionId: 's',
+  })
+  await held.running
   const usage = h.events.findLast((e) => e.type === 'session.usage')
   assert.ok(usage?.type === 'session.usage')
   assert.equal(

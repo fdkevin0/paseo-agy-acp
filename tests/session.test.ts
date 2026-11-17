@@ -1,5 +1,6 @@
 import { test, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import {
   mkdtemp,
   readFile,
@@ -15,51 +16,88 @@ import { fileURLToPath } from 'node:url'
 import {
   PROVIDER_CAPABILITIES,
   type ProviderEvent,
+  type ProviderTimelineItem,
 } from '@getpaseo/plugin/server/provider'
 import { readSubagents } from '../server/brain.ts'
 import { createProvider } from '../server/provider.ts'
 import { SessionManager } from '../server/session.ts'
+import { SubagentRegistry } from '../server/subagents.ts'
 import { AgyUsageSource } from '../server/usage.ts'
-import { collectProviderEvents, writeBrainTranscript } from './helpers.ts'
-
-function manager(extraArgs: string[] = []) {
-  return new SessionManager({
-    launch: {
-      command: process.execPath,
-      args: [
-        fileURLToPath(new URL('./mock-acp.ts', import.meta.url)),
-        ...extraArgs,
-      ],
-      env: { PATH: process.env.PATH ?? '' },
-    },
-    usage: new AgyUsageSource(),
-    capabilities: [],
-    emit() {},
-  })
-}
+import {
+  collectProviderEvents,
+  createEventCollector,
+  writeBrainTranscript,
+} from './helpers.ts'
 
 test(
   'protocol disconnection kills an active child and shutdown waits for it',
   { timeout: 5000 },
   async () => {
-    const m = manager()
+    const home = await mkdtemp(join(tmpdir(), 'agy-disconnect-'))
+    const pidFile = join(home, 'child.pid')
+    const collector = createEventCollector()
+    const m = new SessionManager({
+      launch: {
+        command: process.execPath,
+        args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+        env: {
+          HOME: home,
+          PATH: process.env.PATH ?? '',
+          AGY_TEST_PID_FILE: pidFile,
+        },
+      },
+      usage: new AgyUsageSource(),
+      capabilities: ['prompt.message'],
+      emit: collector.emit,
+    })
     try {
-      const session = await m.start('broken', process.cwd())
-      let exited = false
-      void session.transport.exited.then(() => {
-        exited = true
+      await m.handle({
+        type: 'session.open',
+        requestId: 'open',
+        sessionId: 's',
+        history: 'skip',
+        config: {
+          cwd: home,
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: true,
+        },
       })
-      const prompt = session.transport.rpc.prompt({
-        sessionId: 'disconnect-test',
-        prompt: [{ type: 'text', text: 'disconnect' }],
+      const pid = Number((await readFile(pidFile, 'utf8')).trim())
+      assert.ok(Number.isInteger(pid) && pid > 0)
+      await m.handle({
+        type: 'session.prompt',
+        sessionId: 's',
+        prompt: {
+          clientMessageId: 'disconnect',
+          delivery: 'auto',
+          input: {
+            type: 'message',
+            content: [{ type: 'text', text: 'disconnect' }],
+          },
+        },
       })
-      await assert.rejects(prompt)
-      assert.equal(session.transport.closed, true)
-      assert.equal(session.state.failed, true)
+      assert.equal(
+        collector.events.some(
+          (e) => e.type === 'session.runtime_failed' && e.sessionId === 's',
+        ),
+        true,
+      )
+      assert.equal(
+        collector.events.some(
+          (e) =>
+            e.type === 'session.turn' &&
+            e.sessionId === 's' &&
+            e.state === 'failed',
+        ),
+        true,
+      )
       await m.close()
-      assert.equal(exited, true)
+      assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' })
     } finally {
       await m.close()
+      await rm(home, { recursive: true, force: true })
     }
   },
 )
@@ -69,7 +107,8 @@ test(
   { timeout: 5000 },
   async () => {
     const home = await mkdtemp(join(tmpdir(), 'agy-session-stall-'))
-    const events: ProviderEvent[] = []
+    const collector = createEventCollector()
+    const events = collector.events
     const m = new SessionManager({
       launch: {
         command: process.execPath,
@@ -78,20 +117,14 @@ test(
       },
       usage: new AgyUsageSource(),
       capabilities: ['prompt.message', 'permission', 'session.configure'],
-      emit(event) {
-        events.push(event)
-      },
+      emit: collector.emit,
       stallTimeoutMs: 30,
     })
-    const waitTurn = async (state: 'completed' | 'failed' | 'canceled') => {
-      const deadline = Date.now() + 2000
-      while (
-        !events.some((e) => e.type === 'session.turn' && e.state === state)
-      ) {
-        assert.ok(Date.now() < deadline, JSON.stringify(events))
-        await delay(5)
-      }
-    }
+    const waitTurn = (state: 'completed' | 'failed' | 'canceled') =>
+      collector.wait(
+        (e) => e.type === 'session.turn' && e.state === state,
+        2000,
+      )
     const readRuntimeLog = async () =>
       (await readFile(join(home, 'runtime.jsonl'), 'utf8'))
         .trim()
@@ -172,266 +205,519 @@ test(
   },
 )
 
-for (const blocked of ['closing', 'failed', 'capability'] as const) {
-  test(`subagent items clear native IDs when linking is blocked by ${blocked}`, async () => {
-    const home = await mkdtemp(join(tmpdir(), 'agy-blocked-link-'))
-    const events: ProviderEvent[] = []
-    const m = new SessionManager({
+async function assertBlockedSubagentLink(opts: {
+  capabilities: readonly string[]
+  unavailable: boolean
+}) {
+  const home = await mkdtemp(join(tmpdir(), 'agy-blocked-link-'))
+  const brainRoot = join(home, '.gemini/antigravity-cli/brain')
+  const events: ProviderEvent[] = []
+  const registry = new SubagentRegistry({
+    sessionId: 's',
+    cwd: home,
+    brainRoot,
+    capabilities: opts.capabilities,
+    emit: (e) => events.push(structuredClone(e)),
+    getNativeId: () => '11111111-1111-4111-8111-111111111111',
+    isParentTurnActive: () => false,
+    isLoading: () => false,
+    isUnavailable: () => opts.unavailable,
+  })
+  try {
+    const item: ProviderTimelineItem = {
+      type: 'tool_call',
+      id: 'tool',
+      callId: 'tool',
+      name: 'invoke_subagent',
+      status: 'completed',
+      error: null,
+      detail: {
+        type: 'sub_agent',
+        log: '',
+        childSessionId: '22222222-2222-4222-8222-222222222222',
+      },
+    }
+    registry.linkSubsession('s', '11111111-1111-4111-8111-111111111111', item)
+    assert.equal(events.length, 0)
+    assert.ok(item.type === 'tool_call' && item.detail.type === 'sub_agent')
+    assert.equal(item.detail.childSessionId, undefined)
+  } finally {
+    registry.closeAll()
+    await rm(home, { recursive: true, force: true })
+  }
+}
+
+test('subagent items clear native IDs when linking is blocked by unavailable session', async () => {
+  await assertBlockedSubagentLink({
+    capabilities: ['session.subsession'],
+    unavailable: true,
+  })
+})
+
+test('subagent items clear native IDs when linking is blocked by capability', async () => {
+  await assertBlockedSubagentLink({
+    capabilities: [],
+    unavailable: false,
+  })
+})
+
+async function assertRefreshBoundaryStripsNativeId(
+  terminalStatus: 'canceled' | 'failed',
+  triggerUnavailable: (ctx: {
+    m: SessionManager
+    pidFile: string
+    collector: ReturnType<typeof createEventCollector>
+  }) => Promise<void>,
+) {
+  const home = await mkdtemp(join(tmpdir(), 'agy-refresh-boundary-'))
+  const pidFile = join(home, 'child.pid')
+  const collector = createEventCollector()
+  let markRefreshEntered!: () => void
+  const refreshEntered = new Promise<void>((resolve) => {
+    markRefreshEntered = resolve
+  })
+  let releaseRefresh!: () => void
+  const refreshGate = new Promise<void>((resolve) => {
+    releaseRefresh = resolve
+  })
+  const reads = [
+    async () => [],
+    async () => {
+      markRefreshEntered()
+      await refreshGate
+      return []
+    },
+  ]
+  const m = new SessionManager({
+    launch: {
+      command: process.execPath,
+      args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+      env: {
+        HOME: home,
+        PATH: process.env.PATH ?? '',
+        AGY_TEST_PID_FILE: pidFile,
+      },
+    },
+    usage: new AgyUsageSource(),
+    capabilities: ['prompt.message', 'session.subsession'],
+    emit: collector.emit,
+    readSubagents: () => reads.shift()!(),
+  })
+  try {
+    await m.handle({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'skip',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    const running = m.handle({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'refresh-boundary',
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'message-refresh-boundary' }],
+        },
+      },
+    })
+    await refreshEntered
+    await triggerUnavailable({ m, pidFile, collector })
+    releaseRefresh()
+    await running
+    assert.equal(
+      collector.events.some(
+        (e) => e.type === 'session.opened' && e.parentSessionId !== undefined,
+      ),
+      false,
+    )
+    const toolEvents = collector.events.filter(
+      (e) =>
+        e.type === 'timeline.item' &&
+        e.item.type === 'tool_call' &&
+        e.item.callId === 'message-refresh',
+    )
+    assert.equal(toolEvents.length, 1)
+    const emitted = toolEvents[0]
+    assert.ok(
+      emitted?.type === 'timeline.item' &&
+        emitted.item.type === 'tool_call' &&
+        emitted.item.detail.type === 'sub_agent',
+    )
+    assert.equal(emitted.item.detail.childSessionId, undefined)
+    assert.equal(emitted.item.status, terminalStatus)
+  } finally {
+    releaseRefresh()
+    await m.close()
+    await rm(home, { recursive: true, force: true })
+  }
+}
+
+test(
+  'terminalizing during ownership refresh never exposes native IDs: closing',
+  { timeout: 5000 },
+  async () => {
+    await assertRefreshBoundaryStripsNativeId('canceled', async ({ m }) => {
+      await m.handle({
+        type: 'session.close',
+        requestId: 'close',
+        sessionId: 's',
+      })
+    })
+  },
+)
+
+test(
+  'terminalizing during ownership refresh never exposes native IDs: failed',
+  { timeout: 5000 },
+  async () => {
+    await assertRefreshBoundaryStripsNativeId(
+      'failed',
+      async ({ pidFile, collector }) => {
+        const pid = Number((await readFile(pidFile, 'utf8')).trim())
+        assert.ok(Number.isInteger(pid) && pid > 0)
+        process.kill(pid, 'SIGKILL')
+        await collector.wait(
+          (e) => e.type === 'session.runtime_failed' && e.sessionId === 's',
+          2000,
+        )
+      },
+    )
+  },
+)
+
+test(
+  'turn teardown rejects re-entrant prompt on permission_resolved and allows immediate prompt on terminal session.turn',
+  { timeout: 5000 },
+  async () => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-teardown-reentry-'))
+    let m!: SessionManager
+    let reentrantOnPermission: Promise<unknown> | undefined
+    let followUpOnTurnEnd: Promise<unknown> | undefined
+    const promptNext = (clientMessageId: string) =>
+      m
+        .handle({
+          type: 'session.prompt',
+          sessionId: 's',
+          prompt: {
+            clientMessageId,
+            delivery: 'auto',
+            input: {
+              type: 'message',
+              content: [{ type: 'text', text: 'cancel-only' }],
+            },
+          },
+        })
+        .then(
+          () => 'ok',
+          (err: unknown) => err,
+        )
+    const bus = new EventEmitter()
+    const turnActions = [
+      () => {},
+      () => {
+        followUpOnTurnEnd = promptNext('followup-turn')
+      },
+      () => {},
+      () => {},
+    ]
+    bus.once('session.permission_resolved', () => {
+      reentrantOnPermission = promptNext('reentrant-perm')
+    })
+    bus.on('session.turn', () => {
+      turnActions.shift()!()
+    })
+    const collector = createEventCollector((event) => {
+      bus.emit(event.type, event)
+    })
+    m = new SessionManager({
       launch: {
         command: process.execPath,
         args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
         env: { HOME: home, PATH: process.env.PATH ?? '' },
       },
       usage: new AgyUsageSource(),
-      capabilities: blocked === 'capability' ? [] : ['session.subsession'],
-      emit: (e) => events.push(structuredClone(e)),
+      capabilities: ['prompt.message', 'permission'],
+      emit: collector.emit,
     })
-    const session = await m.start('s', home)
     try {
-      session.state.nativeId = '11111111-1111-4111-8111-111111111111'
-      session.state.persisted = true
-      if (blocked !== 'capability') session.state[blocked] = true
-      session.emitItem({
-        type: 'tool_call',
-        id: 'tool',
-        callId: 'tool',
-        name: 'invoke_subagent',
-        status: 'completed',
-        error: null,
-        detail: {
-          type: 'sub_agent',
-          log: '',
-          childSessionId: '22222222-2222-4222-8222-222222222222',
+      await m.handle({
+        type: 'session.open',
+        requestId: 'open',
+        sessionId: 's',
+        history: 'skip',
+        config: {
+          cwd: home,
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: true,
         },
       })
-      assert.equal(events.filter((e) => e.type === 'session.opened').length, 0)
-      const item = events.find((e) => e.type === 'timeline.item')
-      assert.ok(
-        item?.type === 'timeline.item' &&
-          item.item.type === 'tool_call' &&
-          item.item.detail.type === 'sub_agent',
+      await m.handle({
+        type: 'session.prompt',
+        sessionId: 's',
+        prompt: {
+          clientMessageId: 'dangling-turn',
+          delivery: 'auto',
+          input: {
+            type: 'message',
+            content: [{ type: 'text', text: 'dangling-permission' }],
+          },
+        },
+      })
+      assert.ok(reentrantOnPermission)
+      const reentrantError = await reentrantOnPermission
+      assert.ok(reentrantError instanceof Error)
+      assert.match(reentrantError.message, /Session already has an active turn/)
+      assert.ok(followUpOnTurnEnd)
+      assert.equal(await followUpOnTurnEnd, 'ok')
+      assert.deepEqual(
+        collector.events
+          .filter(
+            (e): e is Extract<ProviderEvent, { type: 'session.turn' }> =>
+              e.type === 'session.turn',
+          )
+          .map((e) => e.state),
+        ['started', 'completed', 'started', 'canceled'],
       )
-      assert.equal(item.item.detail.childSessionId, undefined)
     } finally {
-      await session.close()
       await m.close()
       await rm(home, { recursive: true, force: true })
     }
-  })
-}
+  },
+)
 
-for (const failure of ['closing', 'failed'] as const) {
-  test(`terminalizing during ownership refresh never exposes native IDs: ${failure}`, async (t) => {
-    const home = await mkdtemp(join(tmpdir(), 'agy-refresh-boundary-'))
-    const events: ProviderEvent[] = []
-    const m = new SessionManager({
+test(
+  'synchronous session.close during terminalize timeline.item still emits terminal session.turn',
+  { timeout: 5000 },
+  async () => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-close-in-terminalize-'))
+    let m!: SessionManager
+    let closing: Promise<void> | undefined
+    const bus = new EventEmitter()
+    const timelineActions = [
+      () => {},
+      () => {},
+      () => {
+        closing = m.handle({
+          type: 'session.close',
+          requestId: 'close',
+          sessionId: 's',
+        })
+      },
+    ]
+    bus.on('timeline.item', () => {
+      timelineActions.shift()!()
+    })
+    const collector = createEventCollector((event) => {
+      bus.emit(event.type, event)
+    })
+    m = new SessionManager({
       launch: {
         command: process.execPath,
         args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
         env: { HOME: home, PATH: process.env.PATH ?? '' },
       },
       usage: new AgyUsageSource(),
-      capabilities: ['session.subsession'],
-      emit: (e) => events.push(structuredClone(e)),
+      capabilities: ['prompt.message'],
+      emit: collector.emit,
     })
-    const session = await m.start('s', home)
     try {
-      session.state.nativeId = '11111111-1111-4111-8111-111111111111'
-      session.state.persisted = true
-      session.state.loading = false
-      await session.flush()
-      const update = session.timeline.update.bind(session.timeline)
-      let interrupted = false
-      t.mock.method(
-        session.timeline,
-        'update',
-        (...args: Parameters<typeof update>) => {
-          const item = update(...args)
-          if (item?.type === 'tool_call' && item.name === 'send_message')
-            queueMicrotask(() => {
-              interrupted = true
-              session.state[failure] = true
-              session.terminalize(failure === 'failed' ? 'failed' : 'canceled')
-            })
-          return item
+      await m.handle({
+        type: 'session.open',
+        requestId: 'open',
+        sessionId: 's',
+        history: 'skip',
+        config: {
+          cwd: home,
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: true,
         },
-      )
-      await session.transport.rpc.prompt({
-        sessionId: session.state.nativeId,
-        prompt: [{ type: 'text', text: 'message-refresh-boundary' }],
       })
-      await session.drain()
-      assert.equal(interrupted, true)
-      const tools = events.filter(
-        (e) => e.type === 'timeline.item' && e.item.type === 'tool_call',
+      await m.handle({
+        type: 'session.prompt',
+        sessionId: 's',
+        prompt: {
+          clientMessageId: 'dangling-tool-turn',
+          delivery: 'auto',
+          input: {
+            type: 'message',
+            content: [{ type: 'text', text: 'dangling-tool' }],
+          },
+        },
+      })
+      assert.ok(closing)
+      await closing
+      const turnStates = collector.events
+        .filter(
+          (e): e is Extract<ProviderEvent, { type: 'session.turn' }> =>
+            e.type === 'session.turn',
+        )
+        .map((e) => e.state)
+      assert.deepEqual(turnStates, ['started', 'completed'])
+      const completedIdx = collector.events.findIndex(
+        (e) => e.type === 'session.turn' && e.state === 'completed',
       )
-      assert.equal(tools.length, 1)
-      for (const event of tools) {
-        assert.ok(
-          event.type === 'timeline.item' &&
-            event.item.type === 'tool_call' &&
-            event.item.detail.type === 'sub_agent',
-        )
-        assert.equal(event.item.detail.childSessionId, undefined)
-        assert.equal(
-          event.item.status,
-          failure === 'failed' ? 'failed' : 'canceled',
-        )
-      }
+      const closedIdx = collector.events.findIndex(
+        (e) => e.type === 'session.closed',
+      )
+      assert.ok(completedIdx >= 0 && closedIdx > completedIdx)
     } finally {
-      await session.close()
       await m.close()
       await rm(home, { recursive: true, force: true })
     }
-  })
-}
+  },
+)
 
-for (const killedAtSpawn of [false, true]) {
-  test(`syncKilledChildren waits for grandchild history and cancellation (killed at spawn: ${killedAtSpawn})`, async () => {
-    const home = await mkdtemp(join(tmpdir(), 'agy-grandchild-cancel-'))
-    const events: ProviderEvent[] = []
-    const root = '11111111-1111-4111-8111-111111111111'
-    const child = '22222222-2222-4222-8222-222222222222'
-    const grand = '33333333-3333-4333-8333-333333333333'
-    const logs = join(
-      home,
-      '.gemini/antigravity-cli/brain',
-      child,
-      '.system_generated/logs',
-    )
-    await mkdir(logs, { recursive: true })
-    await writeFile(
-      join(logs, 'transcript_full.jsonl'),
-      [
-        {
-          step_index: 0,
-          type: 'PLANNER_RESPONSE',
-          tool_calls: [
-            {
-              id: 'spawn-grand',
-              name: 'invoke_subagent',
-              args: { Prompt: 'work' },
-            },
-          ],
-        },
-        {
-          step_index: 1,
-          type: 'GENERIC',
-          status: 'DONE',
-          content: JSON.stringify({ conversationId: grand }),
-        },
-      ]
-        .map((row) => JSON.stringify(row) + '\n')
-        .join(''),
-    )
-    if (killedAtSpawn) {
-      const descriptors = join(
-        home,
-        '.gemini/antigravity-cli/brain',
-        child,
-        '.system_generated/subagents',
-      )
-      await mkdir(descriptors, { recursive: true })
-      await writeFile(
-        join(descriptors, `${grand}.json`),
-        JSON.stringify({
-          conversationId: grand,
-          state: 'SUBAGENT_STATE_KILLED',
-        }),
-      )
-    }
-    const grandLogs = join(
-      home,
-      '.gemini/antigravity-cli/brain',
-      grand,
-      '.system_generated/logs',
-    )
-    await mkdir(grandLogs, { recursive: true })
-    await writeFile(
-      join(grandLogs, 'transcript_full.jsonl'),
-      [
-        {
-          step_index: 0,
-          type: 'PLANNER_RESPONSE',
-          status: 'DONE',
-          content: 'Grandchild before kill',
-        },
-        {
-          step_index: 1,
-          type: 'PLANNER_RESPONSE',
-          tool_calls: [
-            {
-              id: 'pending',
-              name: 'run_command',
-              args: { CommandLine: 'work' },
-            },
-          ],
-        },
-      ]
-        .map((row) => JSON.stringify(row) + '\n')
-        .join(''),
-    )
-    const m = new SessionManager({
-      launch: {
-        command: process.execPath,
-        args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-        env: { HOME: home, PATH: process.env.PATH ?? '' },
-      },
-      usage: new AgyUsageSource(),
-      capabilities: ['session.subsession'],
-      emit: (e) => events.push(structuredClone(e)),
-    })
-    const session = await m.start('s', home)
-    try {
-      session.state.nativeId = root
-      session.state.persisted = true
-      session.state.loading = false
-      session.emitItem({
-        type: 'tool_call',
-        id: 'spawn-child',
-        callId: 'spawn-child',
-        name: 'invoke_subagent',
-        status: 'completed',
-        error: null,
-        detail: { type: 'sub_agent', log: '', childSessionId: child },
-      })
-      const deadline = Date.now() + 2000
-      while (!session.hasChild(grand)) {
-        assert.ok(Date.now() < deadline, 'grandchild not opened')
-        await delay(5)
-      }
-      session.rememberSubagents(
-        [
+async function verifyGrandchildSyncKilled(
+  setupExtra: (
+    brainRoot: string,
+    child: string,
+    grand: string,
+  ) => Promise<void>,
+) {
+  const home = await mkdtemp(join(tmpdir(), 'agy-grandchild-cancel-'))
+  const brainRoot = join(home, '.gemini/antigravity-cli/brain')
+  const events: ProviderEvent[] = []
+  const root = '11111111-1111-4111-8111-111111111111'
+  const child = '22222222-2222-4222-8222-222222222222'
+  const grand = '33333333-3333-4333-8333-333333333333'
+  const logs = join(brainRoot, child, '.system_generated/logs')
+  await mkdir(logs, { recursive: true })
+  await writeFile(
+    join(logs, 'transcript_full.jsonl'),
+    [
+      {
+        step_index: 0,
+        type: 'PLANNER_RESPONSE',
+        tool_calls: [
           {
-            conversationId: grand,
-            state: 'SUBAGENT_STATE_KILLED',
-            spawnStepIndex: 1,
+            id: 'spawn-grand',
+            name: 'invoke_subagent',
+            args: { Prompt: 'work' },
           },
         ],
-        child,
-      )
-      await session.syncKilledChildren([])
-      const saved = events.findIndex(
-        (e) =>
-          e.type === 'timeline.item' &&
-          e.sessionId === `s:child:${grand}` &&
-          e.item.type === 'assistant_message' &&
-          e.item.text === 'Grandchild before kill',
-      )
-      const canceled = events.findIndex(
-        (e) =>
-          e.type === 'session.turn' &&
-          e.sessionId === `s:child:${grand}` &&
-          e.state === 'canceled',
-      )
-      assert.ok(saved >= 0 && canceled > saved)
-    } finally {
-      await session.close()
-      await m.close()
-      await rm(home, { recursive: true, force: true })
-    }
+      },
+      {
+        step_index: 1,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: JSON.stringify({ conversationId: grand }),
+      },
+    ]
+      .map((row) => JSON.stringify(row) + '\n')
+      .join(''),
+  )
+  await setupExtra(brainRoot, child, grand)
+  const grandLogs = join(brainRoot, grand, '.system_generated/logs')
+  await mkdir(grandLogs, { recursive: true })
+  await writeFile(
+    join(grandLogs, 'transcript_full.jsonl'),
+    [
+      {
+        step_index: 0,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'Grandchild before kill',
+      },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        tool_calls: [
+          {
+            id: 'pending',
+            name: 'run_command',
+            args: { CommandLine: 'work' },
+          },
+        ],
+      },
+    ]
+      .map((row) => JSON.stringify(row) + '\n')
+      .join(''),
+  )
+  const registry = new SubagentRegistry({
+    sessionId: 's',
+    cwd: home,
+    brainRoot,
+    capabilities: ['session.subsession'],
+    emit: (e) => events.push(structuredClone(e)),
+    getNativeId: () => root,
+    isParentTurnActive: () => false,
+    isLoading: () => false,
+    isUnavailable: () => false,
   })
+  try {
+    registry.linkSubsession('s', root, {
+      type: 'tool_call',
+      id: 'spawn-child',
+      callId: 'spawn-child',
+      name: 'invoke_subagent',
+      status: 'completed',
+      error: null,
+      detail: { type: 'sub_agent', log: '', childSessionId: child },
+    })
+    await registry.waitNestedReady()
+    assert.equal(registry.hasChild(grand), true)
+    registry.rememberSubagents(
+      [
+        {
+          conversationId: grand,
+          state: 'SUBAGENT_STATE_KILLED',
+          spawnStepIndex: 1,
+        },
+      ],
+      child,
+    )
+    await registry.syncKilledChildren([])
+    const saved = events.findIndex(
+      (e) =>
+        e.type === 'timeline.item' &&
+        e.sessionId === `s:child:${grand}` &&
+        e.item.type === 'assistant_message' &&
+        e.item.text === 'Grandchild before kill',
+    )
+    const canceled = events.findIndex(
+      (e) =>
+        e.type === 'session.turn' &&
+        e.sessionId === `s:child:${grand}` &&
+        e.state === 'canceled',
+    )
+    assert.ok(saved >= 0 && canceled > saved)
+    assert.equal(registry.isChildResumable(grand), false)
+  } finally {
+    registry.closeAll()
+    await rm(home, { recursive: true, force: true })
+  }
 }
+
+test('syncKilledChildren waits for grandchild history and cancellation (killed at spawn: false)', async () => {
+  await verifyGrandchildSyncKilled(async () => {})
+})
+
+test('syncKilledChildren waits for grandchild history and cancellation (killed at spawn: true)', async () => {
+  await verifyGrandchildSyncKilled(async (brainRoot, child, grand) => {
+    const descriptors = join(brainRoot, child, '.system_generated/subagents')
+    await mkdir(descriptors, { recursive: true })
+    await writeFile(
+      join(descriptors, `${grand}.json`),
+      JSON.stringify({
+        conversationId: grand,
+        state: 'SUBAGENT_STATE_KILLED',
+      }),
+    )
+  })
+})
 
 test('ownership read failures do not poison subsequent ACP notifications', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-ownership-read-error-'))
@@ -459,16 +745,22 @@ test('ownership read failures do not poison subsequent ACP notifications', async
       env: { HOME: home, PATH: process.env.PATH ?? '' },
     },
     usage: new AgyUsageSource(),
-    capabilities: ['session.subsession'],
+    capabilities: ['prompt.message', 'session.subsession'],
     emit: (e) => events.push(structuredClone(e)),
   })
-  const session = await m.start('s', home)
-  async function message() {
-    await session.transport.rpc.prompt({
-      sessionId: root,
-      prompt: [{ type: 'text', text: 'message-refresh-boundary' }],
+  async function message(clientMessageId: string) {
+    await m.handle({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId,
+        delivery: 'auto',
+        input: {
+          type: 'message',
+          content: [{ type: 'text', text: 'message-refresh-boundary' }],
+        },
+      },
     })
-    await session.drain()
     const event = events.findLast(
       (e) => e.type === 'timeline.item' && e.item.type === 'tool_call',
     )
@@ -480,39 +772,53 @@ test('ownership read failures do not poison subsequent ACP notifications', async
     return event.item.detail.childSessionId
   }
   try {
-    session.state.nativeId = root
-    session.state.persisted = true
-    session.state.loading = false
-    await session.flush()
-    assert.equal(await message(), undefined)
-    assert.equal(
-      events.some((e) => e.type === 'session.opened'),
-      false,
-    )
+    await m.handle({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'skip',
+      persistence: { version: 1, data: { sessionId: root } },
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    assert.equal(await message('msg-1'), undefined)
+    assert.equal(events.filter((e) => e.type === 'session.opened').length, 1)
     await rm(join(system, 'subagents'))
     await mkdir(join(system, 'subagents'))
     await writeFile(
       join(system, 'subagents', `${child}.json`),
       JSON.stringify({ conversationId: child }),
     )
-    assert.equal(await message(), `s:child:${child}`)
+    assert.equal(await message('msg-2'), `s:child:${child}`)
     assert.equal(
       events.filter(
-        (e) => e.type === 'timeline.item' && e.item.type === 'tool_call',
+        (e) =>
+          e.type === 'timeline.item' &&
+          e.item.type === 'tool_call' &&
+          e.item.status === 'running',
       ).length,
       2,
     )
-    assert.equal(events.filter((e) => e.type === 'session.opened').length, 1)
+    assert.equal(
+      events.filter(
+        (e) =>
+          e.type === 'session.opened' && e.sessionId === `s:child:${child}`,
+      ).length,
+      1,
+    )
   } finally {
-    await session.close()
     await m.close()
     await rm(home, { recursive: true, force: true })
   }
 })
 
-test('history:skip coalesces restored context usage before ready and configure validates options before full-access relaunch', async () => {
+test('history:skip coalesces restored context usage before ready', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-skip-usage-config-'))
-  const log = join(home, 'calls.log')
   const events: ProviderEvent[] = []
   const m = new SessionManager({
     launch: {
@@ -522,16 +828,14 @@ test('history:skip coalesces restored context usage before ready and configure v
         HOME: home,
         PATH: process.env.PATH ?? '',
         AGY_TEST_LOAD_USAGE: '1',
-        AGY_TEST_LOG_LOAD: '1',
-        AGY_TEST_LOG: log,
       },
     },
     usage: new AgyUsageSource(),
-    capabilities: ['session.configure'],
+    capabilities: [],
     emit: (e) => events.push(structuredClone(e)),
   })
   try {
-    await m.open({
+    await m.handle({
       type: 'session.open',
       requestId: 'open-skip',
       sessionId: 's',
@@ -558,29 +862,6 @@ test('history:skip coalesces restored context usage before ready and configure v
         events.findIndex((e) => e.type === 'session.usage') <
           events.findIndex((e) => e.type === 'session.ready'),
     )
-
-    // thought_level is omitted from advertised options, so { mode: 'full-access', thinkingOption: 'high' } fails pre-validation without relaunching.
-    const loadsBefore = (await readFile(log, 'utf8'))
-      .trim()
-      .split('\n')
-      .filter((l) => l === 'load').length
-    await assert.rejects(
-      m.handle({
-        type: 'session.configure',
-        requestId: 'cfg-bad',
-        sessionId: 's',
-        changes: { mode: 'full-access', thinkingOption: 'high' },
-      }),
-      /does not advertise thought_level/,
-    )
-    const loadsAfter = (await readFile(log, 'utf8'))
-      .trim()
-      .split('\n')
-      .filter((l) => l === 'load').length
-    assert.equal(loadsAfter, loadsBefore)
-    const latestConfig = events.findLast((e) => e.type === 'session.config')
-    assert.ok(latestConfig?.type === 'session.config')
-    assert.notEqual(latestConfig.config.mode, 'full-access')
   } finally {
     await m.close()
     await rm(home, { recursive: true, force: true })
@@ -591,41 +872,42 @@ test('interrupt rejects after runtime_failed without reviving or spawning a repl
   const home = await mkdtemp(join(tmpdir(), 'agy-interrupt-failed-'))
   const log = join(home, 'starts.log')
   const fixture = join(home, 'fixture-crash.mjs')
-  const sdkUrl = import.meta.resolve('@agentclientprotocol/sdk')
+  const sdkUrl = import.meta.resolve('@agentclientprotocol/sdk/unstable')
   await writeFile(
     fixture,
     `
-import { AgentSideConnection, ndJsonStream } from ${JSON.stringify(sdkUrl)}
+import { agent, methods, ndJsonStream } from ${JSON.stringify(sdkUrl)}
 import { appendFileSync } from 'node:fs'
 import { Readable, Writable } from 'node:stream'
 
 appendFileSync(process.env.AGY_TEST_LOG, 'start\\n')
 const nativeId = '11111111-1111-4111-8111-111111111111'
 const stream = ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin))
-new AgentSideConnection((client) => ({
-  async initialize() {
-    return { protocolVersion: 1, agentCapabilities: { loadSession: true } }
-  },
-  async authenticate() { return {} },
-  async newSession() {
+agent()
+  .onRequest(methods.agent.initialize, async () => ({
+    protocolVersion: 1,
+    agentCapabilities: { loadSession: true },
+  }))
+  .onRequest(methods.agent.authenticate, async () => ({}))
+  .onRequest(methods.agent.session.new, async ({ client }) => {
     setImmediate(() => {
-      void client.sessionUpdate({
+      void client.notify(methods.client.session.update, {
         sessionId: nativeId,
         update: { sessionUpdate: 'available_commands_update', availableCommands: [] },
       })
     })
     return { sessionId: nativeId, configOptions: [] }
-  },
-  async loadSession() {
+  })
+  .onRequest(methods.agent.session.load, async () => {
     appendFileSync(process.env.AGY_TEST_LOG, 'load\\n')
     return { configOptions: [] }
-  },
-  async cancel() {},
-  async prompt() {
+  })
+  .onNotification(methods.agent.session.cancel, async () => {})
+  .onRequest(methods.agent.session.prompt, async () => {
     process.stderr.write('fatal runtime crash\\n')
     process.exit(3)
-  },
-}), stream)
+  })
+  .connect(stream)
 `,
   )
   const events: ProviderEvent[] = []
@@ -644,7 +926,7 @@ new AgentSideConnection((client) => ({
     emit: (e) => events.push(structuredClone(e)),
   })
   try {
-    await m.open({
+    await m.handle({
       type: 'session.open',
       requestId: 'open-crash',
       sessionId: 's',
@@ -658,19 +940,24 @@ new AgentSideConnection((client) => ({
       },
     })
     // Seed an unconsumed high-priority inbox message so hasActiveBackgroundWork would be true if reached.
-    const inboxDir = join(
+    const msgDir = join(
       home,
       '.gemini',
       'antigravity-cli',
       'brain',
       '11111111-1111-4111-8111-111111111111',
       '.system_generated',
-      'inbox',
+      'messages',
     )
-    await mkdir(inboxDir, { recursive: true })
+    await mkdir(msgDir, { recursive: true })
     await writeFile(
-      join(inboxDir, 'msg-1.json'),
-      JSON.stringify({ priority: 'MESSAGE_PRIORITY_HIGH', consumed: false }),
+      join(msgDir, 'msg-1.json'),
+      JSON.stringify({
+        id: 'msg-1',
+        sender: '22222222-2222-4222-8222-222222222222',
+        priority: 'MESSAGE_PRIORITY_HIGH',
+        content: 'wake',
+      }),
     )
 
     await m.handle({
@@ -722,11 +1009,11 @@ test('relaunch surfaces replacement runtime crash during drain and emits runtime
   const home = await mkdtemp(join(tmpdir(), 'agy-relaunch-drain-crash-'))
   const log = join(home, 'relaunch.log')
   const fixture = join(home, 'fixture-relaunch-crash.mjs')
-  const sdkUrl = import.meta.resolve('@agentclientprotocol/sdk')
+  const sdkUrl = import.meta.resolve('@agentclientprotocol/sdk/unstable')
   await writeFile(
     fixture,
     `
-import { AgentSideConnection, ndJsonStream } from ${JSON.stringify(sdkUrl)}
+import { agent, methods, ndJsonStream } from ${JSON.stringify(sdkUrl)}
 import { appendFileSync, readFileSync } from 'node:fs'
 import { Readable, Writable } from 'node:stream'
 
@@ -747,21 +1034,22 @@ const configOptions = [
   },
 ]
 const stream = ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin))
-new AgentSideConnection((client) => ({
-  async initialize() {
-    return { protocolVersion: 1, agentCapabilities: { loadSession: true } }
-  },
-  async authenticate() { return {} },
-  async newSession() {
+agent()
+  .onRequest(methods.agent.initialize, async () => ({
+    protocolVersion: 1,
+    agentCapabilities: { loadSession: true },
+  }))
+  .onRequest(methods.agent.authenticate, async () => ({}))
+  .onRequest(methods.agent.session.new, async ({ client }) => {
     setImmediate(() => {
-      void client.sessionUpdate({
+      void client.notify(methods.client.session.update, {
         sessionId: nativeId,
         update: { sessionUpdate: 'available_commands_update', availableCommands: [] },
       })
     })
     return { sessionId: nativeId, configOptions }
-  },
-  async loadSession() {
+  })
+  .onRequest(methods.agent.session.load, async () => {
     appendFileSync(process.env.AGY_TEST_LOG, 'load\\n')
     if (starts >= 2) {
       setImmediate(() => {
@@ -770,17 +1058,15 @@ new AgentSideConnection((client) => ({
       })
     }
     return { configOptions }
-  },
-  async setSessionConfigOption({ configId, value }) {
-    return {
-      configOptions: configOptions.map((o) =>
-        o.id === configId ? { ...o, currentValue: String(value) } : o,
-      ),
-    }
-  },
-  async cancel() {},
-  async prompt() { return { stopReason: 'end_turn' } },
-}), stream)
+  })
+  .onRequest(methods.agent.session.setConfigOption, async ({ params: { configId, value } }) => ({
+    configOptions: configOptions.map((o) =>
+      o.id === configId ? { ...o, currentValue: String(value) } : o,
+    ),
+  }))
+  .onNotification(methods.agent.session.cancel, async () => {})
+  .onRequest(methods.agent.session.prompt, async () => ({ stopReason: 'end_turn' }))
+  .connect(stream)
 `,
   )
   const events: ProviderEvent[] = []
@@ -799,7 +1085,7 @@ new AgentSideConnection((client) => ({
     emit: (e) => events.push(structuredClone(e)),
   })
   try {
-    await m.open({
+    await m.handle({
       type: 'session.open',
       requestId: 'open-relaunch',
       sessionId: 's',
@@ -866,7 +1152,7 @@ test(
       retryTimeoutMs: 50,
     })
     try {
-      await m.open({
+      await m.handle({
         type: 'session.open',
         requestId: 'open',
         sessionId: 's',
@@ -896,16 +1182,18 @@ test(
       )
       assert.ok(failed?.type === 'session.turn' && failed.state === 'failed')
       assert.match(failed.error?.message ?? '', /attempt 8.*synthetic timeout/)
-      await delay(750)
+      await m.close()
       const log = (await readFile(join(home, 'runtime.jsonl'), 'utf8'))
         .trim()
         .split('\n')
         .map((line) => JSON.parse(line))
+      const starts = log.filter((row) => row.event === 'start')
       assert.equal(
-        log.filter((row) => row.event === 'start').length,
+        starts.length,
         2,
         'active background work requires stopping and relaunching its native owner',
       )
+      assert.throws(() => process.kill(starts[0].pid, 0), { code: 'ESRCH' })
       assert.ok(log.some((row) => row.event === 'cancel'))
       assert.equal(
         log.some((row) => row.event === 'leaked-background'),
@@ -937,7 +1225,7 @@ test(
       retryTimeoutMs: 20,
     })
     try {
-      await m.open({
+      await m.handle({
         type: 'session.open',
         requestId: 'open',
         sessionId: 's',
@@ -1005,7 +1293,7 @@ test('context uses latest turn snapshot on cancel/error/restore and preserves na
     persist: true,
   }
   try {
-    await m.open({
+    await m.handle({
       type: 'session.open',
       requestId: 'open',
       sessionId: 's',
@@ -1062,7 +1350,7 @@ test('context uses latest turn snapshot on cancel/error/restore and preserves na
       sessionId: 's',
     })
     events.length = 0
-    await m.open({
+    await m.handle({
       type: 'session.open',
       requestId: 'restore',
       sessionId: 'restored',
@@ -1084,6 +1372,39 @@ test(
   { timeout: 5000 },
   async () => {
     const home = await mkdtemp(join(tmpdir(), 'agy-tool-prefix-'))
+    const native = '11111111-1111-4111-8111-111111111111'
+    const dir = join(
+      home,
+      '.gemini/antigravity-cli/brain',
+      native,
+      '.system_generated/logs',
+    )
+    await mkdir(dir, { recursive: true })
+    const rows = [
+      {
+        step_index: 0,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          {
+            id: 'historical-tool',
+            name: 'run_command',
+            args: { CommandLine: 'echo retained' },
+          },
+        ],
+      },
+      {
+        step_index: 1,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'retained output',
+      },
+    ]
+    const transcriptPath = join(dir, 'transcript_full.jsonl')
+    await writeFile(
+      transcriptPath,
+      rows.map((r) => JSON.stringify(r) + '\n').join('') + '{"step_index":2',
+    )
     const events: ProviderEvent[] = []
     const m = new SessionManager({
       launch: {
@@ -1092,73 +1413,80 @@ test(
         env: { HOME: home, PATH: process.env.PATH ?? '' },
       },
       usage: new AgyUsageSource(),
-      capabilities: [],
-      emit: (e) => events.push(e),
+      capabilities: ['prompt.message'],
+      emit: (e) => events.push(structuredClone(e)),
     })
-    const session = await m.start('s', home)
     try {
-      const native = '11111111-1111-4111-8111-111111111111'
-      const dir = join(session.brainRoot, native, '.system_generated/logs')
-      await mkdir(dir, { recursive: true })
-      const rows = [
-        {
-          step_index: 0,
-          type: 'PLANNER_RESPONSE',
-          status: 'DONE',
-          tool_calls: [
-            {
-              id: 'historical-tool',
-              name: 'run_command',
-              args: { CommandLine: 'echo retained' },
-            },
-          ],
+      await m.handle({
+        type: 'session.open',
+        requestId: 'open',
+        sessionId: 's',
+        history: 'replay',
+        persistence: { version: 1, data: { sessionId: native } },
+        config: {
+          cwd: home,
+          env: { AGY_TEST_CHECKPOINT_HISTORY: '1' },
+          mcpServers: {},
+          settings: {},
+          persist: true,
         },
-        {
-          step_index: 1,
-          type: 'GENERIC',
-          status: 'DONE',
-          content: 'retained output',
-        },
-      ]
-      await writeFile(
-        join(dir, 'transcript_full.jsonl'),
-        rows.map((r) => JSON.stringify(r) + '\n').join('') + '{"step_index":2',
+      })
+      const toolEvents = events.filter(
+        (e) => e.type === 'timeline.item' && e.item.type === 'tool_call',
       )
-      session.state.nativeId = native
-      session.state.persisted = true
-      session.state.opening = false
-      session.state.opened = true
-      session.state.loading = false
-      session.state.replay = true
-      await session.replayTools()
+      assert.equal(toolEvents.length, 1)
+      const toolEvent = toolEvents[0]
+      assert.ok(
+        toolEvent?.type === 'timeline.item' &&
+          toolEvent.item.type === 'tool_call',
+      )
       assert.deepEqual(
-        events.flatMap((e) =>
-          e.type === 'timeline.item' && e.item.type === 'tool_call'
-            ? [
-                {
-                  callId: e.item.callId,
-                  status: e.item.status,
-                  detail: e.item.detail,
-                },
-              ]
-            : [],
-        ),
-        [
-          {
-            callId: 'historical-tool',
-            status: 'completed',
-            detail: {
-              type: 'shell',
-              command: 'echo retained',
-              cwd: undefined,
-              output: 'retained output',
-            },
+        {
+          callId: toolEvent.item.callId,
+          status: toolEvent.item.status,
+          detail: toolEvent.item.detail,
+        },
+        {
+          callId: 'historical-tool',
+          status: 'completed',
+          detail: {
+            type: 'shell',
+            command: 'echo retained',
+            cwd: undefined,
+            output: 'retained output',
           },
-        ],
+        },
       )
-      assert.equal(session.state.lastKnownStepIndex, 1)
+      await writeFile(
+        transcriptPath,
+        [
+          rows[0],
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'old',
+            input_tokens: 999,
+            output_tokens: 1,
+          },
+        ]
+          .map((r) => JSON.stringify(r) + '\n')
+          .join(''),
+      )
+      await m.handle({
+        type: 'session.prompt',
+        sessionId: 's',
+        prompt: {
+          clientMessageId: 'after-open',
+          delivery: 'auto',
+          input: {
+            type: 'message',
+            content: [{ type: 'text', text: 'cancel-only' }],
+          },
+        },
+      })
+      assert.equal(events.filter((e) => e.type === 'session.usage').length, 0)
     } finally {
-      await session.close()
       await m.close()
       await rm(home, { recursive: true, force: true })
     }
@@ -1196,7 +1524,7 @@ test('native compaction has stable live/history identity, command-only visibilit
         : [],
     )
   try {
-    await m.open({
+    await m.handle({
       type: 'session.open',
       requestId: 'open',
       sessionId: 's',
@@ -1244,7 +1572,7 @@ test('native compaction has stable live/history identity, command-only visibilit
     })
     for (const history of ['replay', 'skip', 'replay'] as const) {
       events.length = 0
-      await m.open({
+      await m.handle({
         type: 'session.open',
         requestId: `open:${history}`,
         sessionId: 's',
@@ -1263,6 +1591,7 @@ test('native compaction has stable live/history identity, command-only visibilit
           type: 'compaction',
           id: event.item.id,
           status: 'completed',
+          preTokens: 268_740,
         })
       }
       const usage = events.findLast((event) => event.type === 'session.usage')
@@ -1287,11 +1616,11 @@ test(
     const home = await mkdtemp(join(tmpdir(), 'agy-orchestrator-session-'))
     const logPath = join(home, 'rpc.log')
     const fixturePath = join(home, 'orchestrator-acp.mjs')
-    const sdkUrl = import.meta.resolve('@agentclientprotocol/sdk')
+    const sdkUrl = import.meta.resolve('@agentclientprotocol/sdk/unstable')
     await writeFile(
       fixturePath,
       `
-import { AgentSideConnection, ndJsonStream } from ${JSON.stringify(sdkUrl)}
+import { agent, methods, ndJsonStream } from ${JSON.stringify(sdkUrl)}
 import { appendFileSync } from 'node:fs'
 import { WritableStream } from 'node:stream/web'
 import { Readable, Writable } from 'node:stream'
@@ -1407,37 +1736,34 @@ stream.writable = new WritableStream({
   },
 })
 
-new AgentSideConnection((client) => ({
-  async initialize() {
-    return { protocolVersion: 1, agentCapabilities: { loadSession: true } }
-  },
-  async authenticate() {
-    return {}
-  },
-  async newSession() {
+agent()
+  .onRequest(methods.agent.initialize, async () => ({
+    protocolVersion: 1,
+    agentCapabilities: { loadSession: true },
+  }))
+  .onRequest(methods.agent.authenticate, async () => ({}))
+  .onRequest(methods.agent.session.new, async ({ client }) => {
     const sessionId = '11111111-1111-4111-8111-111111111111'
     setTimeout(() => {
-      void client.sessionUpdate({
+      void client.notify(methods.client.session.update, {
         sessionId,
         update: { sessionUpdate: 'available_commands_update', availableCommands: [] },
       })
     }, 0)
     return { sessionId, configOptions: buildConfigOptions() }
-  },
-  async loadSession({ sessionId }) {
+  })
+  .onRequest(methods.agent.session.load, async ({ params: { sessionId }, client }) => {
     omitModelsNext = true
     setTimeout(() => {
-      void client.sessionUpdate({
+      void client.notify(methods.client.session.update, {
         sessionId,
         update: { sessionUpdate: 'available_commands_update', availableCommands: [] },
       })
     }, 0)
     return { configOptions: buildConfigOptions() }
-  },
-  async closeSession() {
-    return {}
-  },
-  async setSessionConfigOption({ configId, value }) {
+  })
+  .onRequest(methods.agent.session.close, async () => ({}))
+  .onRequest(methods.agent.session.setConfigOption, async ({ params: { configId, value } }) => {
     log('set:' + configId + '=' + value)
     const opts = buildConfigOptions()
     const target = opts.find((o) => o.id === configId)
@@ -1449,12 +1775,10 @@ new AgentSideConnection((client) => ({
     else if (configId === 'thought_level') currentThought = String(value)
     else if (configId === 'mode') currentMode = String(value)
     return { configOptions: buildConfigOptions() }
-  },
-  async prompt() {
-    return { stopReason: 'end_turn' }
-  },
-  async cancel() {},
-}), stream)
+  })
+  .onRequest(methods.agent.session.prompt, async () => ({ stopReason: 'end_turn' }))
+  .onNotification(methods.agent.session.cancel, async () => {})
+  .connect(stream)
 `,
     )
     const provider = await createProvider(new AgyUsageSource()).connect({
@@ -1729,6 +2053,643 @@ new AgentSideConnection((client) => ({
   },
 )
 
+type ChildSession = {
+  interrupt: (mode: 'cancel' | 'relaunch') => Promise<void>
+  waitForRuntimeReady: (signal: AbortSignal) => Promise<void>
+  transport: { rpc: { prompt: (...args: unknown[]) => Promise<unknown> } }
+}
+
+/** An opened session whose child subagents live in a synthetic `brain` tree. */
+async function childSession(retryTimeoutMs?: number) {
+  const home = await mkdtemp(join(tmpdir(), 'agy-child-session-'))
+  const logPath = join(home, 'agy.log')
+  const events: ProviderEvent[] = []
+  const m = new SessionManager({
+    launch: {
+      command: process.execPath,
+      args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+      env: {
+        HOME: home,
+        PATH: process.env.PATH ?? '',
+        AGY_TEST_LOG: logPath,
+        AGY_TEST_LOG_LOAD: '1',
+      },
+    },
+    usage: new AgyUsageSource(),
+    capabilities: ['prompt.message', 'session.subsession'],
+    retryTimeoutMs,
+    emit: (event) => events.push(structuredClone(event)),
+  })
+  await m.handle({
+    type: 'session.open',
+    requestId: 'open',
+    sessionId: 's',
+    history: 'skip',
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+  const opened = events.find(
+    (e) => e.type === 'session.opened' && e.sessionId === 's',
+  )
+  assert.ok(opened?.type === 'session.opened')
+  const nativeId = (opened.persistence!.data as { sessionId: string }).sessionId
+  const brainRoot = join(home, '.gemini/antigravity-cli/brain')
+  const writeJsonl = async (id: string, rows: unknown[]) => {
+    const dir = join(brainRoot, id, '.system_generated/logs')
+    await mkdir(dir, { recursive: true })
+    await writeFile(
+      join(dir, 'transcript_full.jsonl'),
+      rows.map((r) => JSON.stringify(r) + '\n').join(''),
+    )
+  }
+  const writeSubagent = async (
+    id: string,
+    spawnStepIndex: number,
+    callId: string,
+    content = 'work',
+  ) => {
+    const subDir = join(brainRoot, nativeId, '.system_generated/subagents')
+    await mkdir(subDir, { recursive: true })
+    await writeFile(
+      join(subDir, `${id}.json`),
+      JSON.stringify({
+        conversationId: id,
+        spawnStepIndex,
+        state: 'SUBAGENT_STATE_ALIVE',
+      }),
+    )
+    const msgDir = join(brainRoot, id, '.system_generated/messages')
+    await mkdir(msgDir, { recursive: true })
+    await writeFile(
+      join(msgDir, 'init.json'),
+      JSON.stringify({
+        id: 'init',
+        sender: nativeId,
+        recipient: id,
+        priority: 'MESSAGE_PRIORITY_HIGH',
+        content,
+        sourceMetadata: {
+          tool: {
+            conversationId: nativeId,
+            stepIndex: spawnStepIndex,
+            toolCall: {
+              id: callId,
+              name: 'invoke_subagent',
+              argumentsJson: '{}',
+            },
+          },
+        },
+      }),
+    )
+    await writeFile(join(msgDir, 'read.json'), JSON.stringify({ init: true }))
+  }
+  const session = (
+    m as unknown as { sessions: Map<string, ChildSession> }
+  ).sessions.get('s')!
+  const prompt = (clientMessageId: string, text: string) =>
+    m.handle({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId,
+        delivery: 'auto',
+        input: { type: 'message', content: [{ type: 'text', text }] },
+      },
+    })
+  return {
+    logPath,
+    prompt,
+    events,
+    nativeId,
+    brainRoot,
+    writeJsonl,
+    writeSubagent,
+    session,
+    close: async () => {
+      await m.close()
+      await rm(home, { recursive: true, force: true })
+    },
+  }
+}
+
+test(
+  'parallel child crash flushes failed child state, cancels running sibling watcher, and relaunches runtime',
+  { timeout: 10_000 },
+  async (t) => {
+    const {
+      logPath,
+      events,
+      nativeId,
+      prompt,
+      writeJsonl,
+      writeSubagent,
+      session,
+      close,
+    } = await childSession(40)
+    const childA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const childB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    try {
+      t.mock.method(session.transport.rpc, 'prompt', async () => {
+        await writeSubagent(childA, 2, 'spawn-a')
+        await writeSubagent(childB, 3, 'spawn-b')
+        // Start childB running and childA initially running, then childA crashes after 40ms
+        // (well before childA's 1000ms watcher interval, exercising flushRunningChildren).
+        await writeJsonl(childA, [
+          {
+            step_index: 0,
+            type: 'SYSTEM_MESSAGE',
+            content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=work A\n</SYSTEM_MESSAGE>`,
+          },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'RUNNING',
+            thinking: 'working',
+          },
+        ])
+        await writeJsonl(childB, [
+          {
+            step_index: 0,
+            type: 'SYSTEM_MESSAGE',
+            content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=work B\n</SYSTEM_MESSAGE>`,
+          },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            tool_calls: [
+              {
+                id: 'long-cmd',
+                name: 'run_command',
+                args: { CommandLine: 'sleep 60' },
+              },
+            ],
+          },
+        ])
+        await writeJsonl(nativeId, [
+          { step_index: 0, type: 'USER_INPUT', content: 'parallel work' },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            tool_calls: [
+              { id: 'spawn-a', name: 'invoke_subagent', args: { Role: 'A' } },
+              { id: 'spawn-b', name: 'invoke_subagent', args: { Role: 'B' } },
+            ],
+          },
+          {
+            step_index: 2,
+            type: 'GENERIC',
+            status: 'DONE',
+            content: JSON.stringify({ conversationId: childA }),
+          },
+          {
+            step_index: 3,
+            type: 'GENERIC',
+            status: 'DONE',
+            content: JSON.stringify({ conversationId: childB }),
+          },
+          {
+            step_index: 4,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Waiting for both subagents.',
+          },
+        ])
+        setTimeout(() => {
+          void writeJsonl(childA, [
+            {
+              step_index: 0,
+              type: 'SYSTEM_MESSAGE',
+              content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=work A\n</SYSTEM_MESSAGE>`,
+            },
+            {
+              step_index: 1,
+              type: 'ERROR_MESSAGE',
+              content: 'Child A crashed fatally',
+            },
+          ])
+        }, 40)
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 120, outputTokens: 12, totalTokens: 132 },
+        }
+      })
+
+      await prompt('p1', 'parallel work')
+
+      const rootFailed = events.find(
+        (e) =>
+          e.type === 'session.turn' &&
+          e.sessionId === 's' &&
+          e.state === 'failed',
+      )
+      assert.ok(rootFailed?.type === 'session.turn')
+      assert.match(rootFailed.error?.message ?? '', /Child A crashed fatally/)
+
+      const childATerminal = events.find(
+        (e) =>
+          e.type === 'session.turn' &&
+          e.sessionId === `s:child:${childA}` &&
+          e.state !== 'started',
+      )
+      assert.ok(childATerminal?.type === 'session.turn')
+      assert.equal(
+        childATerminal.state,
+        'failed',
+        'flushRunningChildren must observe childA failure before sibling cancellation runs',
+      )
+
+      const childBTerminal = events.find(
+        (e) =>
+          e.type === 'session.turn' &&
+          e.sessionId === `s:child:${childB}` &&
+          e.state !== 'started',
+      )
+      assert.ok(childBTerminal?.type === 'session.turn')
+      assert.equal(
+        childBTerminal.state,
+        'canceled',
+        'active sibling childB must be canceled when the root turn fails',
+      )
+
+      await session.waitForRuntimeReady(new AbortController().signal)
+      const logLines = (await readFile(logPath, 'utf8')).trim().split('\n')
+      assert.ok(logLines.includes('cancel'))
+      assert.ok(
+        logLines.includes('load'),
+        'runtime must relaunch to terminate leaked sibling subagent work',
+      )
+    } finally {
+      await close()
+    }
+  },
+)
+
+test(
+  're-woken idle child crash and child retry-timeout stall both flush child watcher to failed instead of canceled',
+  { timeout: 10_000 },
+  async (t) => {
+    const {
+      brainRoot,
+      events,
+      nativeId,
+      prompt,
+      writeJsonl,
+      writeSubagent,
+      session,
+      close,
+    } = await childSession(40)
+    const childA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const childB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    try {
+      // Turn 1: spawn childA, which completes cleanly (so childA watcher becomes !isRunning()).
+      let turn = 0
+      t.mock.method(session.transport.rpc, 'prompt', async () => {
+        turn++
+        if (turn === 1) {
+          await writeSubagent(childA, 2, 'spawn-a')
+          await writeJsonl(childA, [
+            {
+              step_index: 0,
+              type: 'SYSTEM_MESSAGE',
+              content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=work A\n</SYSTEM_MESSAGE>`,
+            },
+            {
+              step_index: 1,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'Child A turn 1 done',
+            },
+          ])
+          await writeJsonl(nativeId, [
+            { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
+            {
+              step_index: 1,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              tool_calls: [
+                { id: 'spawn-a', name: 'invoke_subagent', args: { Role: 'A' } },
+              ],
+            },
+            {
+              step_index: 2,
+              type: 'GENERIC',
+              status: 'DONE',
+              content: JSON.stringify({ conversationId: childA }),
+            },
+            {
+              step_index: 3,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'Turn 1 complete.',
+            },
+          ])
+          return {
+            stopReason: 'end_turn' as const,
+            usage: { inputTokens: 50, outputTokens: 5, totalTokens: 55 },
+          }
+        }
+        // Turn 2: re-wake idle childA (crashes in < 1000ms) AND spawn childB (stalls on retry warning -> settled.stalled = true).
+        const msgDirA = join(brainRoot, childA, '.system_generated/messages')
+        await writeFile(
+          join(msgDirA, 'wake2.json'),
+          JSON.stringify({
+            id: 'wake2',
+            sender: nativeId,
+            recipient: childA,
+            priority: 'MESSAGE_PRIORITY_HIGH',
+            content: 'wake A',
+            sourceMetadata: {
+              tool: {
+                conversationId: nativeId,
+                stepIndex: 6,
+                toolCall: {
+                  id: 'wake-a',
+                  name: 'send_message',
+                  argumentsJson: '{}',
+                },
+              },
+            },
+          }),
+        )
+        await writeFile(
+          join(msgDirA, 'read.json'),
+          JSON.stringify({ init: true, wake2: true }),
+        )
+        await writeJsonl(childA, [
+          {
+            step_index: 0,
+            type: 'SYSTEM_MESSAGE',
+            content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=work A\n</SYSTEM_MESSAGE>`,
+          },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Child A turn 1 done',
+          },
+          {
+            step_index: 2,
+            type: 'SYSTEM_MESSAGE',
+            content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=wake A\n</SYSTEM_MESSAGE>`,
+          },
+          {
+            step_index: 3,
+            type: 'ERROR_MESSAGE',
+            content: 'Re-woken childA crashed immediately',
+          },
+        ])
+        await writeJsonl(nativeId, [
+          { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            tool_calls: [
+              { id: 'spawn-a', name: 'invoke_subagent', args: { Role: 'A' } },
+            ],
+          },
+          {
+            step_index: 2,
+            type: 'GENERIC',
+            status: 'DONE',
+            content: JSON.stringify({ conversationId: childA }),
+          },
+          {
+            step_index: 3,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Turn 1 complete.',
+          },
+          { step_index: 4, type: 'USER_INPUT', content: 'turn 2' },
+          {
+            step_index: 5,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            tool_calls: [
+              {
+                id: 'wake-a',
+                name: 'send_message',
+                args: { Recipient: childA, Message: 'wake A' },
+              },
+            ],
+          },
+          {
+            step_index: 6,
+            type: 'GENERIC',
+            status: 'DONE',
+            content: 'Message sent',
+          },
+          {
+            step_index: 7,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Waiting on woken childA.',
+          },
+        ])
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
+        }
+      })
+
+      await prompt('p1', 'turn 1')
+      await prompt('p2', 'turn 2')
+
+      const childATurns = events.flatMap((e) =>
+        e.type === 'session.turn' && e.sessionId === `s:child:${childA}`
+          ? [`${e.turnId}:${e.state}`]
+          : [],
+      )
+      assert.deepEqual(childATurns, [
+        `s:child:${childA}:turn:1:started`,
+        `s:child:${childA}:turn:1:completed`,
+        `s:child:${childA}:turn:2:started`,
+        `s:child:${childA}:turn:2:failed`,
+      ])
+
+      // Turn 3: spawn childB which expires on retry warning (settled.stalled === true); flushActiveChildren must mark childB failed before interrupt relaunches.
+      t.mock.method(session.transport.rpc, 'prompt', async () => {
+        await writeSubagent(childB, 10, 'spawn-b')
+        await writeJsonl(childB, [
+          {
+            step_index: 0,
+            type: 'SYSTEM_MESSAGE',
+            content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=work B\n</SYSTEM_MESSAGE>`,
+          },
+          {
+            step_index: 1,
+            type: 'ERROR_MESSAGE',
+            status: 'DONE',
+            content:
+              'Error: The stream was interrupted. Please continue the task you were working on.',
+          },
+        ])
+        await writeJsonl(nativeId, [
+          { step_index: 8, type: 'USER_INPUT', content: 'turn 3' },
+          {
+            step_index: 9,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            tool_calls: [
+              { id: 'spawn-b', name: 'invoke_subagent', args: { Role: 'B' } },
+            ],
+          },
+          {
+            step_index: 10,
+            type: 'GENERIC',
+            status: 'DONE',
+            content: JSON.stringify({ conversationId: childB }),
+          },
+          {
+            step_index: 11,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Waiting on childB.',
+          },
+        ])
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 150, outputTokens: 15, totalTokens: 165 },
+        }
+      })
+
+      await prompt('p3', 'turn 3')
+
+      const childBTurns = events.flatMap((e) =>
+        e.type === 'session.turn' && e.sessionId === `s:child:${childB}`
+          ? [`${e.turnId}:${e.state}`]
+          : [],
+      )
+      assert.deepEqual(childBTurns, [
+        `s:child:${childB}:turn:1:started`,
+        `s:child:${childB}:turn:1:failed`,
+      ])
+    } finally {
+      await close()
+    }
+  },
+)
+
+test(
+  'parent turn failure after child already completed flushes child without interrupting or relaunching runtime',
+  { timeout: 10_000 },
+  async (t) => {
+    const { brainRoot, events, nativeId, prompt, writeJsonl, session, close } =
+      await childSession(40)
+    const childDone = 'eeeeeeee-1111-4111-8111-111111111111'
+    try {
+      const interruptMock = t.mock.method(session, 'interrupt')
+
+      t.mock.method(session.transport.rpc, 'prompt', async () => {
+        const subDir = join(brainRoot, nativeId, '.system_generated/subagents')
+        await mkdir(subDir, { recursive: true })
+        await writeFile(
+          join(subDir, `${childDone}.json`),
+          JSON.stringify({
+            conversationId: childDone,
+            spawnStepIndex: 2,
+            state: 'SUBAGENT_STATE_ALIVE',
+          }),
+        )
+        const msgDir = join(brainRoot, childDone, '.system_generated/messages')
+        await mkdir(msgDir, { recursive: true })
+        await writeFile(
+          join(msgDir, 'init.json'),
+          JSON.stringify({
+            id: 'init',
+            sender: nativeId,
+            recipient: childDone,
+            priority: 'MESSAGE_PRIORITY_HIGH',
+            content: 'finish quickly',
+            sourceMetadata: {
+              tool: {
+                conversationId: nativeId,
+                stepIndex: 2,
+                toolCall: {
+                  id: 'c-done',
+                  name: 'invoke_subagent',
+                  argumentsJson: '{}',
+                },
+              },
+            },
+          }),
+        )
+        await writeFile(
+          join(msgDir, 'read.json'),
+          JSON.stringify({ init: true }),
+        )
+        await writeJsonl(childDone, [
+          {
+            step_index: 0,
+            type: 'SYSTEM_MESSAGE',
+            content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} priority=MESSAGE_PRIORITY_HIGH content=finish quickly\n</SYSTEM_MESSAGE>`,
+          },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Done.',
+          },
+        ])
+        await writeJsonl(nativeId, [
+          { step_index: 0, type: 'USER_INPUT', content: 'go' },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            tool_calls: [
+              { id: 'c-done', name: 'invoke_subagent', args: { Role: 'Done' } },
+            ],
+          },
+          {
+            step_index: 2,
+            type: 'GENERIC',
+            status: 'DONE',
+            content: JSON.stringify({ conversationId: childDone }),
+          },
+          {
+            step_index: 3,
+            type: 'ERROR_MESSAGE',
+            status: 'ERROR',
+            source: 'MODEL',
+            error: 'Parent fatal model error after child finished',
+          },
+        ])
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 80, outputTokens: 10, totalTokens: 90 },
+        }
+      })
+
+      await prompt('p1', 'go')
+
+      const childTurns = events.flatMap((e) =>
+        e.type === 'session.turn' && e.sessionId === `s:child:${childDone}`
+          ? [`${e.turnId}:${e.state}`]
+          : [],
+      )
+      assert.deepEqual(childTurns, [
+        `s:child:${childDone}:turn:1:started`,
+        `s:child:${childDone}:turn:1:completed`,
+      ])
+      assert.equal(
+        interruptMock.mock.callCount(),
+        0,
+        'failed turn with only an already-completed child must not interrupt or relaunch the runtime',
+      )
+    } finally {
+      await close()
+    }
+  },
+)
+
 async function usageHarness(t: TestContext) {
   const home = await mkdtemp(join(tmpdir(), 'agy-session-usage-'))
   const events: ProviderEvent[] = []
@@ -1754,7 +2715,7 @@ async function usageHarness(t: TestContext) {
     async (...args: Parameters<typeof start>) =>
       (session = await start(...args)),
   )
-  await m.open({
+  await m.handle({
     type: 'session.open',
     requestId: 'open',
     sessionId: 's',
@@ -2167,30 +3128,83 @@ test('underflowing positive usage skips carriedUsage deduction and clears stale 
   )
 })
 
-test('post-waitPrompt settle failure still publishes positive result.usage and clears consumed carriedUsage', async (t) => {
-  const h = await usageHarness(t)
-  h.session.state.wakeup.carriedUsage = {
-    inputTokens: 40,
-    outputTokens: 4,
-    cachedReadTokens: 0,
-  }
-  t.mock.method(h.session.transport.rpc, 'prompt', async () => {
-    await h.write([{ step_index: 0, type: 'USER_INPUT', content: 'turn 1' }])
-    // Force observation/settle to fail after waitPrompt returns positive usage.
-    h.session.state.turnAbort?.abort(new Error('Post-prompt settle aborted'))
-    return {
-      stopReason: 'end_turn' as const,
-      usage: { inputTokens: 120, outputTokens: 12, totalTokens: 132 },
-    }
+test('post-waitPrompt settle failure still publishes positive result.usage and clears consumed carriedUsage', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-post-wait-settle-error-'))
+  const events: ProviderEvent[] = []
+  const m = new SessionManager({
+    launch: {
+      command: process.execPath,
+      args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+      env: { HOME: home, PATH: process.env.PATH ?? '' },
+    },
+    usage: new AgyUsageSource(),
+    capabilities: ['prompt.message'],
+    emit: (e) => events.push(structuredClone(e)),
   })
-  await h.prompt('post-prompt-error')
-  assert.equal(h.latest().inputTokens, 80)
-  assert.equal(h.latest().outputTokens, 8)
-  assert.equal(
-    h.session.state.wakeup.carriedUsage,
-    undefined,
-    'consumed carriedUsage must be cleared even when post-waitPrompt settling throws',
-  )
+  const prompt = (clientMessageId: string, text: string) =>
+    m.handle({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId,
+        delivery: 'auto',
+        input: { type: 'message', content: [{ type: 'text', text }] },
+      },
+    })
+  const latestUsage = () => {
+    const event = events.findLast((e) => e.type === 'session.usage')
+    assert.ok(event?.type === 'session.usage')
+    return event.usage
+  }
+  const latestTurn = () => {
+    const event = events.findLast((e) => e.type === 'session.turn')
+    assert.ok(event?.type === 'session.turn')
+    return event
+  }
+  try {
+    await m.handle({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'skip',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    const opened = events.find((e) => e.type === 'session.opened')
+    assert.ok(opened?.type === 'session.opened' && opened.persistence)
+    const nativeId = (opened.persistence.data as { sessionId: string })
+      .sessionId
+    await prompt('p1', 'seed-woken-carry')
+    assert.equal(latestUsage().inputTokens, 140)
+    assert.equal(latestUsage().outputTokens, 14)
+
+    await prompt('p2', 'corrupt-transcript-positive-usage')
+    assert.equal(latestTurn().state, 'failed')
+    assert.equal(latestUsage().inputTokens, 80)
+    assert.equal(latestUsage().outputTokens, 8)
+
+    await writeFile(
+      join(
+        home,
+        '.gemini/antigravity-cli/brain',
+        nativeId,
+        '.system_generated/logs/transcript_full.jsonl',
+      ),
+      '',
+    )
+    await prompt('p3', 'clean-positive-usage')
+    assert.equal(latestTurn().state, 'completed')
+    assert.equal(latestUsage().inputTokens, 50)
+    assert.equal(latestUsage().outputTokens, 5)
+  } finally {
+    await m.close()
+    await rm(home, { recursive: true, force: true })
+  }
 })
 
 for (const postEcho of [false, true])
@@ -2219,7 +3233,7 @@ for (const postEcho of [false, true])
       async (...args: Parameters<typeof start>) =>
         (session = await start(...args)),
     )
-    await m.open({
+    await m.handle({
       type: 'session.open',
       requestId: 'open',
       sessionId: 's',
@@ -2373,7 +3387,7 @@ test(
       async (...args: Parameters<typeof start>) =>
         (session = await start(...args)),
     )
-    await m.open({
+    await m.handle({
       type: 'session.open',
       requestId: 'open',
       sessionId: 's',
@@ -2567,7 +3581,7 @@ for (const postEcho of [false, true]) {
         async (...args: Parameters<typeof start>) =>
           (session = await start(...args)),
       )
-      await m.open({
+      await m.handle({
         type: 'session.open',
         requestId: 'open',
         sessionId: 's',

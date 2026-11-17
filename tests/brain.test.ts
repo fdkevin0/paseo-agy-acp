@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { EventEmitter, once } from 'node:events'
 import { test } from 'node:test'
 import {
-  mkdtemp,
   mkdir,
   open,
   readFile,
@@ -12,13 +12,13 @@ import {
   rm,
   symlink,
 } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
   advanceForegroundCursor,
   BrainNode,
   BrainTranscriptProjector,
+  captureRuntimeEpoch,
   countRowMessages,
   hasActiveBackgroundWork,
   readInboxState,
@@ -28,182 +28,27 @@ import {
   watchBrain,
   type BrainWatchHandle,
 } from '../server/brain.ts'
-import { waitUntil } from './helpers.ts'
+import { createEventCollector, waitUntil } from './helpers.ts'
+import { TranscriptReader } from '../server/brain-io.ts'
+import { BrainTurnObservation } from '../server/brain-observer.ts'
+import {
+  child,
+  done,
+  encode,
+  fixture,
+  grandchild,
+  invoke,
+  message,
+  parent,
+  report,
+  type Row,
+} from './brain-fixtures.ts'
 import { SubagentRegistry } from '../server/subagents.ts'
 import type {
   ProviderEvent,
   ProviderTimelineItem,
 } from '@getpaseo/plugin/server/provider'
 
-const parent = '11111111-1111-4111-8111-111111111111'
-const child = '22222222-2222-4222-8222-222222222222'
-const grandchild = '33333333-3333-4333-8333-333333333333'
-type Row = Record<string, unknown>
-const done = (step_index: number, content = 'finished'): Row => ({
-  step_index,
-  type: 'PLANNER_RESPONSE',
-  status: 'DONE',
-  content,
-})
-const message = (step_index: number, sender: string, content: string): Row => ({
-  step_index,
-  type: 'SYSTEM_MESSAGE',
-  content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-08T17:00:00Z sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=${content}\n</SYSTEM_MESSAGE>`,
-})
-const invoke = (id: string): Row[] => [
-  { step_index: 1, type: 'USER_INPUT', content: 'work' },
-  {
-    step_index: 2,
-    type: 'PLANNER_RESPONSE',
-    status: 'DONE',
-    tool_calls: [{ id: 'invoke', name: 'invoke_subagent', args: {} }],
-  },
-  {
-    step_index: 3,
-    type: 'GENERIC',
-    status: 'DONE',
-    content: JSON.stringify({ conversationId: id }),
-  },
-  done(4, 'waiting'),
-]
-const report = (recipient: string, text: string, start = 1): Row[] => [
-  {
-    step_index: start,
-    type: 'PLANNER_RESPONSE',
-    status: 'DONE',
-    tool_calls: [
-      {
-        id: `report-${start}`,
-        name: 'send_message',
-        args: {
-          Recipient: recipient,
-          Message: text,
-        },
-      },
-    ],
-  },
-  {
-    step_index: start + 1,
-    type: 'GENERIC',
-    status: 'DONE',
-    content: 'Message sent',
-  },
-  done(start + 2, 'I sent the report.'),
-]
-const encode = (rows: Row[]) =>
-  rows.map((row) => JSON.stringify(row)).join('\n') + '\n'
-async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), 'agy-brain-test-'))
-  const path = (id: string) =>
-    join(root, id, '.system_generated/logs/transcript_full.jsonl')
-  async function put(id: string, rows: Row[]) {
-    await mkdir(join(root, id, '.system_generated/logs'), { recursive: true })
-    await writeFile(path(id), encode(rows))
-  }
-  /** Rewrite like agy's WriteFullTranscript: O_TRUNC on the same inode, optionally pausing while empty. */
-  async function rewrite(
-    id: string,
-    rows: Row[],
-    whileEmpty?: () => Promise<void>,
-  ) {
-    const file = await open(path(id), 'r+')
-    try {
-      await file.truncate(0)
-      await whileEmpty?.()
-      await file.write(encode(rows), 0)
-    } finally {
-      await file.close()
-    }
-  }
-  async function subagent(
-    parentId: string,
-    childId: string,
-    state = 'SUBAGENT_STATE_ALIVE',
-    spawnStepIndex = 3,
-    spawnCallId = 'invoke',
-  ) {
-    const dir = join(root, parentId, '.system_generated/subagents')
-    await mkdir(dir, { recursive: true })
-    await writeFile(
-      join(dir, `${childId}.json`),
-      JSON.stringify({
-        conversationId: childId,
-        subagentDescriptor: {
-          typeName: 'research',
-          role: 'Researcher',
-        },
-        spawnStepIndex,
-        state,
-      }),
-    )
-    await deliver(childId, parentId, 'work', true, 'init', {
-      conversationId: parentId,
-      stepIndex: spawnStepIndex,
-      callId: spawnCallId,
-      name: 'invoke_subagent',
-    })
-  }
-  async function deliver(
-    recipientId: string,
-    sender: string,
-    content: string,
-    read = true,
-    msgId: string = randomUUID(),
-    tool?: {
-      conversationId: string
-      stepIndex: number
-      callId: string
-      name: string
-    },
-  ) {
-    const dir = join(root, recipientId, '.system_generated/messages')
-    await mkdir(dir, { recursive: true })
-    await writeFile(
-      join(dir, `${msgId}.json`),
-      JSON.stringify({
-        id: msgId,
-        sender,
-        recipient: recipientId,
-        priority: 'MESSAGE_PRIORITY_HIGH',
-        content,
-        timestamp: new Date().toISOString(),
-        ...(tool
-          ? {
-              sourceMetadata: {
-                tool: {
-                  conversationId: tool.conversationId,
-                  stepIndex: tool.stepIndex,
-                  toolCall: {
-                    id: tool.callId,
-                    name: tool.name,
-                    argumentsJson: '{}',
-                  },
-                },
-              },
-            }
-          : {}),
-      }),
-    )
-    const readPath = join(dir, 'read.json')
-    const current = await readFile(readPath, 'utf8').then(
-      (raw) => JSON.parse(raw) as Record<string, boolean>,
-      () => ({}) as Record<string, boolean>,
-    )
-    if (read) current[msgId] = true
-    else delete current[msgId]
-    await writeFile(readPath, JSON.stringify(current))
-    return msgId
-  }
-  return {
-    root,
-    path,
-    put,
-    rewrite,
-    subagent,
-    deliver,
-    close: () => rm(root, { recursive: true, force: true }),
-  }
-}
 /** settleBrainTurn's poll timer is unref'd; hold the event loop open while awaiting it. */
 function alive<T>(promise: Promise<T>): Promise<T> {
   const keepAlive = setInterval(() => {}, 1000)
@@ -2932,10 +2777,11 @@ test('stream retries preserve tool correlation and do not project historical err
   )
 })
 
-test('API/stream retries recover after 4s and multiple interruptions; unfinished response stays pending', async () => {
+test('API/stream retries recover after 4s and multiple interruptions; unfinished response stays pending', async (t) => {
   const f = await fixture()
   const items: ProviderTimelineItem[] = []
   try {
+    t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
     await f.put(parent, [
       { step_index: 1, type: 'USER_INPUT', content: 'work' },
       {
@@ -2946,17 +2792,38 @@ test('API/stream retries recover after 4s and multiple interruptions; unfinished
         error: 'API error (attempt 1): request failed: synthetic timeout',
       },
     ])
+    const stepEvents = new EventEmitter()
+    const onStep = (step: number) => {
+      stepEvents.emit(String(step))
+    }
+    const step2Seen = once(stepEvents, '2')
+    const step4Seen = once(stepEvents, '4')
+    const obs = new BrainTurnObservation(
+      f.root,
+      parent,
+      'p',
+      -1,
+      {
+        isCurrent: () => true,
+        onUsage: () => {},
+        onItem: (item) => items.push(item),
+      },
+      60_000,
+    )
     let finished = false
     const pending = alive(
       settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
-        pollIntervalMs: 5,
-        stallTimeoutMs: 10_000,
+        observation: obs,
+        stallTimeoutMs: 50,
+        onStep,
       }),
     ).then((result) => {
       finished = true
       return result
     })
-    await delay(4000)
+    await step2Seen
+    t.mock.timers.tick(4_000)
+    await obs.poll()
     await appendFile(
       f.path(parent),
       encode([
@@ -2969,9 +2836,11 @@ test('API/stream retries recover after 4s and multiple interruptions; unfinished
         },
       ]),
     )
-    await delay(25)
+    await obs.poll()
+    await step4Seen
     assert.equal(finished, false)
     await appendFile(f.path(parent), encode([done(5)]))
+    await obs.poll()
     assert.equal((await pending).status, 'completed')
     assert.equal(
       items.some((item) => item.type === 'error'),
@@ -3493,6 +3362,97 @@ test('child registry forwards the shared retry policy to its watcher', async () 
   }
 })
 
+test('SubagentRegistry resumeChild racing cancelRunning and cancelAll does not resurrect stopped watchers', async (t) => {
+  const f = await fixture()
+  const events: ProviderEvent[] = []
+  const registry = new SubagentRegistry({
+    sessionId: 'p',
+    cwd: f.root,
+    brainRoot: f.root,
+    capabilities: ['session.subsession'],
+    emit: (event) => events.push(event),
+    getNativeId: () => parent,
+    isParentTurnActive: () => true,
+    isLoading: () => false,
+    isUnavailable: () => false,
+  })
+  t.after(async () => {
+    registry.closeAll()
+    await f.close()
+  })
+  await f.put(child, [
+    message(0, parent, 'work'),
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+  ])
+  registry.linkSubsession('p', parent, {
+    type: 'tool_call',
+    id: 'spawn',
+    callId: 'spawn',
+    name: 'invoke_subagent',
+    status: 'completed',
+    error: null,
+    detail: { type: 'sub_agent', childSessionId: child, log: '' },
+  })
+  await until(() =>
+    events.some(
+      (event) =>
+        event.type === 'session.turn' &&
+        event.sessionId === `p:child:${child}` &&
+        event.state === 'started',
+    ),
+  )
+
+  await Promise.all(registry.cancelRunning())
+  assert.equal(registry.hasRunningChildren(), false)
+  assert.equal(registry.isChildResumable(child), true)
+
+  registry.linkSubsession('p', parent, {
+    type: 'tool_call',
+    id: 'msg-1',
+    callId: 'msg-1',
+    name: 'send_message',
+    status: 'completed',
+    error: null,
+    detail: { type: 'sub_agent', childSessionId: child, log: '' },
+  })
+  assert.equal(registry.hasRunningChildren(), true)
+  await Promise.all(registry.cancelRunning())
+  assert.equal(registry.hasRunningChildren(), false)
+  assert.equal(registry.isChildResumable(child), true)
+
+  registry.linkSubsession('p', parent, {
+    type: 'tool_call',
+    id: 'msg-2',
+    callId: 'msg-2',
+    name: 'send_message',
+    status: 'completed',
+    error: null,
+    detail: { type: 'sub_agent', childSessionId: child, log: '' },
+  })
+  await registry.cancelAll()
+  assert.equal(registry.hasRunningChildren(), false)
+
+  await appendFile(f.path(child), encode([done(2, 'child finished')]))
+  registry.linkSubsession('p', parent, {
+    type: 'tool_call',
+    id: 'msg-3',
+    callId: 'msg-3',
+    name: 'send_message',
+    status: 'completed',
+    error: null,
+    detail: { type: 'sub_agent', childSessionId: child, log: '' },
+  })
+  await until(() =>
+    events.some(
+      (event) =>
+        event.type === 'session.turn' &&
+        event.sessionId === `p:child:${child}` &&
+        event.state === 'completed',
+    ),
+  )
+  assert.equal(registry.hasRunningChildren(), false)
+})
+
 test('cancel wins after multiple exhausted warnings are ingested', async () => {
   const f = await fixture()
   const controller = new AbortController()
@@ -3527,7 +3487,7 @@ async function checkpointFixture(): Promise<Row> {
   )
 }
 
-test('completed checkpoint uses native compaction without guessing trigger or token counts and keeps tool offsets', async () => {
+test('completed checkpoint projects preTokens without guessing trigger or post-compaction usage and keeps tool offsets', async () => {
   const checkpoint = await checkpointFixture()
   const projector = new BrainTranscriptProjector('p')
   projector.project({
@@ -3539,8 +3499,25 @@ test('completed checkpoint uses native compaction without guessing trigger or to
     ],
   })
   assert.deepEqual(projector.project(checkpoint), [
-    { type: 'compaction', id: 'p:step:93:compaction', status: 'completed' },
+    {
+      type: 'compaction',
+      id: 'p:step:93:compaction',
+      status: 'completed',
+      preTokens: 268_740,
+    },
   ])
+  assert.deepEqual(
+    new BrainTranscriptProjector('p').project({
+      step_index: 99,
+      type: 'CHECKPOINT',
+      status: 'DONE',
+      input_tokens: 0,
+      cache_read_tokens: 0,
+      output_tokens: 4_200,
+      content: 'summary',
+    }),
+    [{ type: 'compaction', id: 'p:step:99:compaction', status: 'completed' }],
+  )
   const a = projector.project({
     step_index: 94,
     type: 'GENERIC',
@@ -3593,6 +3570,7 @@ test('foreground and wakeup project checkpoints without using checkpoint tokens 
             type: 'compaction',
             id: 'p:step:4:compaction',
             status: 'completed',
+            preTokens: 268_740,
           },
         ],
       )
@@ -3619,7 +3597,12 @@ test('a command-only checkpoint is visible without inventing a model response or
     assert.equal(result.status, 'completed')
     assert.equal(result.lastStepUsage, undefined)
     assert.deepEqual(items, [
-      { type: 'compaction', id: 'p:step:93:compaction', status: 'completed' },
+      {
+        type: 'compaction',
+        id: 'p:step:93:compaction',
+        status: 'completed',
+        preTokens: 268_740,
+      },
     ])
     const old: ProviderTimelineItem[] = []
     await alive(
@@ -3687,6 +3670,7 @@ test('child compaction stays on child timeline, survives cancellation drain, and
       type: 'compaction',
       id: 'child:step:2:compaction',
       status: 'completed',
+      preTokens: 268_740,
     })
   } finally {
     handle?.()
@@ -4319,6 +4303,1142 @@ test('advanceForegroundCursor handles partial offsets, allowSkip boundaries, and
   )
 })
 
+test('re-waking a child across turns isolates prior failed grandchildren while retaining current-turn grandchildren across multi-wakeups', async () => {
+  const f = await fixture()
+  const grandchild2 = '55555555-5555-4555-8555-555555555555'
+  const abort = new AbortController()
+  let handle: BrainWatchHandle | undefined
+  let running: Promise<unknown> | undefined
+  try {
+    // Turn 1: parent -> child -> grandchild (fails with ERROR_MESSAGE).
+    const parentTurn1 = invoke(child)
+    const childTurn1: Row[] = [
+      message(0, parent, 'work'),
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ id: 'gc1', name: 'invoke_subagent', args: {} }],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: JSON.stringify({ conversationId: grandchild }),
+      },
+      done(3, 'waiting on gc1'),
+    ]
+    await f.put(parent, parentTurn1)
+    await f.subagent(parent, child, 'SUBAGENT_STATE_ALIVE', 3, 'invoke')
+    await f.put(child, childTurn1)
+    await f.subagent(child, grandchild, 'SUBAGENT_STATE_ALIVE', 2, 'gc1')
+    await f.put(grandchild, [
+      message(0, child, 'sub-task'),
+      { step_index: 1, type: 'ERROR_MESSAGE', content: 'Grandchild 1 crashed' },
+    ])
+
+    const childEvents: ProviderEvent[] = []
+    handle = watchBrain(f.root, child, 'child', (e) => childEvents.push(e), 5)
+    await handle.ready
+    assert.ok(
+      childEvents.some(
+        (e) =>
+          e.type === 'session.turn' &&
+          e.state === 'failed' &&
+          /Grandchild 1 crashed/.test(e.error?.message ?? ''),
+      ),
+    )
+
+    const turn1 = await settleBrainTurn(f.root, parent, 'p', () => {}, {
+      minStepIndex: -1,
+      pollIntervalMs: 5,
+    })
+    assert.equal(turn1.status, 'failed')
+    assert.match(turn1.error ?? '', /Grandchild 1 crashed/)
+
+    // Turn 2: parent re-wakes child via send_message; child spawns grandchild2 during wakeup #1,
+    // then receives intra-turn wakeup #2 without touching grandchild1 or re-touching grandchild2.
+    const parentTurn2: Row[] = [
+      ...parentTurn1,
+      { step_index: 5, type: 'USER_INPUT', content: 'continue without gc1' },
+      ...report(child, 'wakeup 1', 6),
+    ]
+    await f.put(parent, parentTurn2)
+    await f.deliver(child, parent, 'wakeup 1', true, 'w1', {
+      conversationId: parent,
+      stepIndex: 7,
+      callId: 'report-6',
+      name: 'send_message',
+    })
+    const childTurn2Wake1: Row[] = [
+      ...childTurn1,
+      message(4, parent, 'wakeup 1'),
+      {
+        step_index: 5,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ id: 'gc2', name: 'invoke_subagent', args: {} }],
+      },
+      {
+        step_index: 6,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: JSON.stringify({ conversationId: grandchild2 }),
+      },
+      ...report(parent, 'started gc2', 7),
+    ]
+    await f.subagent(child, grandchild2, 'SUBAGENT_STATE_ALIVE', 6, 'gc2')
+    await f.put(grandchild2, [
+      message(0, child, 'second sub-task'),
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          { id: 'cmd', name: 'run_command', args: { CommandLine: 'sleep 1' } },
+        ],
+      },
+    ])
+    await f.rewrite(child, childTurn2Wake1)
+    await f.deliver(parent, child, 'started gc2', true, 'c-w1')
+
+    // Intra-turn wakeup #2 from parent while grandchild2 is still running.
+    await appendFile(
+      f.path(parent),
+      encode([
+        message(9, child, 'started gc2'),
+        ...report(child, 'wakeup 2', 10),
+      ]),
+    )
+    await f.deliver(child, parent, 'wakeup 2', true, 'w2', {
+      conversationId: parent,
+      stepIndex: 11,
+      callId: 'report-10',
+      name: 'send_message',
+    })
+    await appendFile(
+      f.path(child),
+      encode([message(10, parent, 'wakeup 2'), done(11, 'ack wakeup 2')]),
+    )
+
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), true)
+
+    let turn2Settled = false
+    running = settleBrainTurn(f.root, parent, 'p', () => {}, {
+      signal: abort.signal,
+      minStepIndex: 4,
+      pollIntervalMs: 5,
+    }).then((res) => {
+      turn2Settled = true
+      return res
+    })
+    // Finish grandchild2 -> child -> parent.
+    await appendFile(
+      f.path(grandchild2),
+      encode([
+        { step_index: 2, type: 'GENERIC', status: 'DONE', content: 'ok' },
+        ...report(child, 'gc2 finished', 3),
+      ]),
+    )
+    await f.deliver(child, grandchild2, 'gc2 finished', true, 'gc2-done')
+    await appendFile(
+      f.path(child),
+      encode([
+        message(12, grandchild2, 'gc2 finished'),
+        ...report(parent, 'turn 2 complete', 13),
+      ]),
+    )
+    await f.deliver(parent, child, 'turn 2 complete', true, 'c-w2')
+    await appendFile(
+      f.path(parent),
+      encode([message(13, child, 'turn 2 complete'), done(14, 'done turn 2')]),
+    )
+
+    await waitUntil(() => turn2Settled)
+    assert.equal(((await running) as { status: string }).status, 'completed')
+    await waitUntil(() => !handle!.isRunning())
+    const childTurns = childEvents.flatMap((e) =>
+      e.type === 'session.turn' ? [`${e.turnId}:${e.state}`] : [],
+    )
+    assert.deepEqual(childTurns, [
+      'child:turn:1:started',
+      'child:turn:1:failed',
+      'child:turn:2:started',
+      'child:turn:2:completed',
+    ])
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
+  } finally {
+    abort.abort()
+    await running
+    handle?.()
+    await f.close()
+  }
+})
+
+test('re-waking a child after Turn-1 retry timeout succeeds without Turn-1 retry carry-over and waits on inbox read-skew', async () => {
+  const f = await fixture()
+  const abort = new AbortController()
+  let handle: BrainWatchHandle | undefined
+  let running: Promise<unknown> | undefined
+  try {
+    await f.deliver(child, parent, 'initial task', true, 'init', {
+      conversationId: parent,
+      stepIndex: 3,
+      callId: 'invoke',
+      name: 'invoke_subagent',
+    })
+    // Turn 1: parent spawns child and sends wakeup #1; child ingests it and expires on a retry warning.
+    const parentTurn1: Row[] = [...invoke(child), ...report(child, 'wake 1', 5)]
+    await f.put(parent, parentTurn1)
+    await f.subagent(parent, child, 'SUBAGENT_STATE_ALIVE', 3, 'invoke')
+    await f.deliver(child, parent, 'wake 1', true, 'u1', {
+      conversationId: parent,
+      stepIndex: 6,
+      callId: 'send-1',
+      name: 'send_message',
+    })
+    const childTurn1: Row[] = [
+      message(0, parent, 'initial task'),
+      done(1, 'ready'),
+      message(2, parent, 'wake 1'),
+      interrupted(3, '2020-01-01T00:00:00Z'),
+    ]
+    await f.put(child, childTurn1)
+
+    const childEvents: ProviderEvent[] = []
+    handle = watchBrain(
+      f.root,
+      child,
+      'child',
+      (e) => childEvents.push(e),
+      5,
+      undefined,
+      undefined,
+      undefined,
+      40,
+    )
+    await handle.ready
+    assert.ok(
+      childEvents.some(
+        (e) =>
+          e.type === 'session.turn' &&
+          e.turnId === 'child:turn:1' &&
+          e.state === 'failed',
+      ),
+    )
+
+    const turn1 = await settleBrainTurn(f.root, parent, 'p', () => {}, {
+      minStepIndex: -1,
+      pollIntervalMs: 5,
+      retryTimeoutMs: 40,
+    })
+    assert.equal(turn1.status, 'failed')
+    assert.equal(turn1.stalled, true)
+
+    // Turn 2: parent logs completed send_message BEFORE u2.json appears in child inbox (read-skew).
+    const parentTurn2: Row[] = [
+      ...parentTurn1,
+      { step_index: 8, type: 'USER_INPUT', content: 'retry in turn 2' },
+      ...report(child, 'wake 2', 9),
+    ]
+    await f.put(parent, parentTurn2)
+
+    let turn2Result: { status: string; error?: string } | undefined
+    running = settleBrainTurn(f.root, parent, 'p', () => {}, {
+      signal: abort.signal,
+      minStepIndex: 7,
+      pollIntervalMs: 5,
+      retryTimeoutMs: 40,
+    }).then((res) => {
+      turn2Result = res
+      return res
+    })
+    // Deliver u2 and complete child + parent in Turn 2 without clearing retryStep=3 except via childMinStep scoping.
+    await f.deliver(child, parent, 'wake 2', true, 'u2', {
+      conversationId: parent,
+      stepIndex: 10,
+      callId: 'send-2',
+      name: 'send_message',
+    })
+    await appendFile(
+      f.path(child),
+      encode([
+        message(4, parent, 'wake 2'),
+        ...report(parent, 'recovered in turn 2', 5),
+      ]),
+    )
+    await f.deliver(parent, child, 'recovered in turn 2', true, 'c-done', {
+      conversationId: child,
+      stepIndex: 6,
+      callId: 'send-done',
+      name: 'send_message',
+    })
+    await appendFile(
+      f.path(parent),
+      encode([message(12, child, 'recovered in turn 2'), done(13, 'all done')]),
+    )
+
+    await waitUntil(() => turn2Result !== undefined)
+    assert.equal(((await running) as { status: string }).status, 'completed')
+    await waitUntil(() => !handle!.isRunning())
+    const childTurns = childEvents.flatMap((e) =>
+      e.type === 'session.turn' ? [`${e.turnId}:${e.state}`] : [],
+    )
+    assert.deepEqual(childTurns, [
+      'child:turn:1:started',
+      'child:turn:1:failed',
+      'child:turn:2:started',
+      'child:turn:2:completed',
+    ])
+    assert.equal(
+      await hasActiveBackgroundWork(f.root, parent, { retryTimeoutMs: 40 }),
+      false,
+    )
+  } finally {
+    abort.abort()
+    await running
+    handle?.()
+    await f.close()
+  }
+})
+
+test('watchBrain fresh replay on nested Turn-2 re-wakeup isolates Turn-1 failed great-grandchild and allows peer-woken children to settle', async () => {
+  const f = await fixture()
+  const greatGrand1 = randomUUID()
+  const greatGrand2 = randomUUID()
+  const peerChild = randomUUID()
+  const handles: BrainWatchHandle[] = []
+  try {
+    // Turn 1: parent -> child -> grandchild -> greatGrand1 (failed), plus parent -> peerChild (completed).
+    await f.deliver(child, parent, 'init child', true, 'init-c', {
+      conversationId: parent,
+      stepIndex: 2,
+      callId: 'spawn-c',
+      name: 'invoke_subagent',
+    })
+    await f.deliver(peerChild, parent, 'init peer', true, 'init-p', {
+      conversationId: parent,
+      stepIndex: 3,
+      callId: 'spawn-p',
+      name: 'invoke_subagent',
+    })
+    await f.deliver(grandchild, child, 'init gc', true, 'init-gc', {
+      conversationId: child,
+      stepIndex: 2,
+      callId: 'spawn-gc',
+      name: 'invoke_subagent',
+    })
+    await f.deliver(greatGrand1, grandchild, 'init gg1', true, 'init-gg1', {
+      conversationId: grandchild,
+      stepIndex: 2,
+      callId: 'spawn-gg1',
+      name: 'invoke_subagent',
+    })
+
+    // Turn 2: parent (USER_INPUT step 5) wakes child (step 7), child wakes grandchild (step 5) and peerChild (peer wakeup!).
+    await f.put(parent, [
+      { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          { id: 'spawn-c', name: 'invoke_subagent', args: {} },
+          { id: 'spawn-p', name: 'invoke_subagent', args: {} },
+        ],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: JSON.stringify({ conversationId: child }),
+      },
+      {
+        step_index: 3,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: JSON.stringify({ conversationId: peerChild }),
+      },
+      done(4, 'turn 1 end'),
+      { step_index: 5, type: 'USER_INPUT', content: 'turn 2' },
+      ...report(child, 'wake child turn 2', 6),
+    ])
+    await f.subagent(parent, child, 'SUBAGENT_STATE_ALIVE', 2, 'spawn-c')
+    await f.subagent(parent, peerChild, 'SUBAGENT_STATE_ALIVE', 3, 'spawn-p')
+
+    await f.deliver(child, parent, 'wake child turn 2', true, 'w-c2', {
+      conversationId: parent,
+      stepIndex: 7,
+      callId: 'report-6',
+      name: 'send_message',
+    })
+    await f.put(child, [
+      message(0, parent, 'init child'),
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ id: 'spawn-gc', name: 'invoke_subagent', args: {} }],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: JSON.stringify({ conversationId: grandchild }),
+      },
+      done(3, 'waiting turn 1'),
+      message(4, parent, 'wake child turn 2'),
+      ...report(grandchild, 'wake gc turn 2', 5),
+    ])
+    await f.subagent(child, grandchild, 'SUBAGENT_STATE_ALIVE', 2, 'spawn-gc')
+
+    await f.deliver(grandchild, child, 'wake gc turn 2', true, 'w-gc2', {
+      conversationId: child,
+      stepIndex: 6,
+      callId: 'report-5',
+      name: 'send_message',
+    })
+    await f.deliver(greatGrand2, grandchild, 'init gg2', true, 'init-gg2', {
+      conversationId: grandchild,
+      stepIndex: 6,
+      callId: 'spawn-gg2',
+      name: 'invoke_subagent',
+    })
+    await f.put(grandchild, [
+      message(0, child, 'init gc'),
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ id: 'spawn-gg1', name: 'invoke_subagent', args: {} }],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: JSON.stringify({ conversationId: greatGrand1 }),
+      },
+      done(3, 'gc turn 1'),
+      message(4, child, 'wake gc turn 2'),
+      {
+        step_index: 5,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ id: 'spawn-gg2', name: 'invoke_subagent', args: {} }],
+      },
+      {
+        step_index: 6,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: JSON.stringify({ conversationId: greatGrand2 }),
+      },
+      done(7, 'gc turn 2 done'),
+    ])
+    await f.subagent(
+      grandchild,
+      greatGrand1,
+      'SUBAGENT_STATE_ALIVE',
+      2,
+      'spawn-gg1',
+    )
+    await f.subagent(
+      grandchild,
+      greatGrand2,
+      'SUBAGENT_STATE_ALIVE',
+      6,
+      'spawn-gg2',
+    )
+    await f.put(greatGrand1, [
+      message(0, grandchild, 'init gg1'),
+      { step_index: 1, type: 'ERROR_MESSAGE', content: 'gg1 failed in turn 1' },
+    ])
+    await f.put(greatGrand2, [
+      message(0, grandchild, 'init gg2'),
+      done(1, 'gg2 succeeded in turn 2'),
+    ])
+
+    // Fresh watcher on grandchild (simulating session/load replay without any active parent turn).
+    const gcEvents: ProviderEvent[] = []
+    const gcHandle = watchBrain(
+      f.root,
+      grandchild,
+      'gc',
+      (e) => gcEvents.push(e),
+      5,
+    )
+    handles.push(gcHandle)
+    await gcHandle.ready
+    assert.deepEqual(
+      gcEvents.flatMap((e) => (e.type === 'session.turn' ? [e.state] : [])),
+      ['started', 'completed'],
+    )
+
+    // Peer-woken child: woken by sibling `child` rather than `parent`, must settle cleanly without hanging.
+    await f.put(peerChild, [
+      message(0, parent, 'init peer'),
+      done(1, 'peer turn 1 done'),
+    ])
+    const peerEvents: ProviderEvent[] = []
+    const peerHandle = watchBrain(
+      f.root,
+      peerChild,
+      'peer',
+      (e) => peerEvents.push(e),
+      5,
+    )
+    handles.push(peerHandle)
+    await peerHandle.ready
+    await f.deliver(peerChild, child, 'peer ping', true, 'peer-msg', {
+      conversationId: child,
+      stepIndex: 8,
+      callId: 'peer-call',
+      name: 'send_message',
+    })
+    await appendFile(
+      f.path(peerChild),
+      encode([message(2, child, 'peer ping'), done(3, 'peer turn 2 done')]),
+    )
+    await waitUntil(() =>
+      peerEvents.some(
+        (e) =>
+          e.type === 'session.turn' &&
+          e.turnId === 'peer:turn:2' &&
+          e.state === 'completed',
+      ),
+    )
+  } finally {
+    handles.forEach((close) => close())
+    await f.close()
+  }
+})
+
+test('follow-up send_message to a child stalled in retryPending never deadlocks settleBrainTurn or masks watchBrain failures', async () => {
+  const f = await fixture()
+  const handles: BrainWatchHandle[] = []
+  const sibling = '99999999-9999-4999-8999-999999999999'
+  const spawnPair = (target: string, start: number, callId: string): Row[] => [
+    {
+      step_index: start,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ id: callId, name: 'invoke_subagent', args: {} }],
+    },
+    {
+      step_index: start + 1,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: JSON.stringify({ conversationId: target }),
+    },
+  ]
+  const sendPair = (
+    target: string,
+    text: string,
+    start: number,
+    callId: string,
+  ): Row[] => [
+    {
+      step_index: start,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          id: callId,
+          name: 'send_message',
+          args: { Recipient: target, Message: text },
+        },
+      ],
+    },
+    {
+      step_index: start + 1,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: 'Message sent',
+    },
+  ]
+  try {
+    // Turn 1: parent spawns child (step 2) and sibling (step 4); both complete Turn 1.
+    await f.subagent(parent, child, 'SUBAGENT_STATE_ALIVE', 2)
+    await f.subagent(parent, sibling, 'SUBAGENT_STATE_ALIVE', 4)
+    await f.deliver(child, parent, 'init child', true, 'init-c', {
+      conversationId: parent,
+      stepIndex: 2,
+      callId: 'spawn-c',
+      name: 'invoke_subagent',
+    })
+    await f.deliver(sibling, parent, 'init sibling', true, 'init-s', {
+      conversationId: parent,
+      stepIndex: 4,
+      callId: 'spawn-s',
+      name: 'invoke_subagent',
+    })
+    const parentTurn1: Row[] = [
+      { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
+      ...spawnPair(child, 1, 'spawn-c'),
+      ...spawnPair(sibling, 3, 'spawn-s'),
+      done(5, 'turn 1 done'),
+    ]
+    await f.put(parent, parentTurn1)
+    await f.put(child, [message(0, parent, 'init child'), done(1, 'c1 done')])
+    await f.put(sibling, [
+      message(0, parent, 'init sibling'),
+      done(1, 's1 done'),
+    ])
+
+    const childEvents: ProviderEvent[] = []
+    const childWatch = watchBrain(
+      f.root,
+      child,
+      'child',
+      (e) => childEvents.push(e),
+      5,
+      () => true,
+      undefined,
+      undefined,
+      40,
+    )
+    handles.push(childWatch)
+    await childWatch.ready
+
+    // Turn 2: parent wakes child (w1 at step 8) and sibling (step 10).
+    // Child ingests w1 (step 2), hits retryPending at step 3, and then parent sends a 2nd wakeup w2 (step 14).
+    await f.deliver(child, parent, 'wake 1', true, 'w1', {
+      conversationId: parent,
+      stepIndex: 8,
+      callId: 'w1-call',
+      name: 'send_message',
+    })
+    await f.deliver(sibling, parent, 'wake s', true, 'ws', {
+      conversationId: parent,
+      stepIndex: 10,
+      callId: 'ws-call',
+      name: 'send_message',
+    })
+    await appendFile(
+      f.path(child),
+      encode([
+        message(2, parent, 'wake 1'),
+        interrupted(3, '2020-01-01T00:00:00Z'),
+      ]),
+    )
+    await appendFile(
+      f.path(sibling),
+      encode([message(2, parent, 'wake s'), done(3, 's2 done')]),
+    )
+    await f.deliver(parent, sibling, 's2 report', true, 's2-rep')
+    await f.deliver(child, parent, 'wake 2', false, 'w2', {
+      conversationId: parent,
+      stepIndex: 14,
+      callId: 'w2-call',
+      name: 'send_message',
+    })
+    await f.put(parent, [
+      ...parentTurn1,
+      { step_index: 6, type: 'USER_INPUT', content: 'turn 2' },
+      ...sendPair(child, 'wake 1', 7, 'w1-call'),
+      ...sendPair(sibling, 'wake s', 9, 'ws-call'),
+      done(11, 'waiting'),
+      message(12, sibling, 's2 report'),
+      ...sendPair(child, 'wake 2', 13, 'w2-call'),
+      done(15, 'waiting on child'),
+    ])
+
+    const settled = await settleBrainTurn(f.root, parent, 'p', () => {}, {
+      minStepIndex: 5,
+      pollIntervalMs: 5,
+      retryTimeoutMs: 40,
+      stallTimeoutMs: 200,
+    })
+    assert.equal(settled.status, 'failed')
+    assert.equal(settled.stalled, true)
+    assert.match(settled.error ?? '', /No retry recovery was observed/)
+
+    await childWatch.flush()
+    assert.deepEqual(
+      childEvents.flatMap((e) =>
+        e.type === 'session.turn' ? [`${e.turnId}:${e.state}`] : [],
+      ),
+      [
+        'child:turn:1:started',
+        'child:turn:1:completed',
+        'child:turn:2:started',
+        'child:turn:2:failed',
+      ],
+    )
+
+    // Same-turn spawn + follow-up send_message while child has expired retryPending or replay mode (isParentTurnActive=false).
+    const sameTurnChild = 'aaaaaaaa-1111-4111-8111-111111111111'
+    await f.subagent(parent, sameTurnChild, 'SUBAGENT_STATE_ALIVE', 17)
+    await f.deliver(sameTurnChild, parent, 'init st', true, 'init-st', {
+      conversationId: parent,
+      stepIndex: 17,
+      callId: 'spawn-st',
+      name: 'invoke_subagent',
+    })
+    await f.deliver(sameTurnChild, parent, 'followup st', false, 'fu-st', {
+      conversationId: parent,
+      stepIndex: 19,
+      callId: 'fu-st-call',
+      name: 'send_message',
+    })
+    await f.put(sameTurnChild, [
+      message(0, parent, 'init st'),
+      interrupted(1, '2020-01-01T00:00:00Z'),
+    ])
+    await appendFile(
+      f.path(parent),
+      encode([
+        ...spawnPair(sameTurnChild, 16, 'spawn-st'),
+        ...sendPair(sameTurnChild, 'followup st', 18, 'fu-st-call'),
+      ]),
+    )
+    const stEvents: ProviderEvent[] = []
+    const stWatch = watchBrain(
+      f.root,
+      sameTurnChild,
+      'st',
+      (e) => stEvents.push(e),
+      5,
+      () => false,
+      undefined,
+      undefined,
+      40,
+    )
+    handles.push(stWatch)
+    await stWatch.ready
+    assert.deepEqual(
+      stEvents.flatMap((e) => (e.type === 'session.turn' ? [e.state] : [])),
+      ['started', 'failed'],
+    )
+  } finally {
+    handles.forEach((close) => close())
+    await f.close()
+  }
+})
+
+test('terminal ERROR_MESSAGE in parent does not hide live subagents re-woken earlier in the same turn', async () => {
+  const f = await fixture()
+  try {
+    // Turn 1: parent spawns child (step 3), both finish Turn 1.
+    await f.subagent(parent, child, 'SUBAGENT_STATE_ALIVE', 3)
+    await f.deliver(child, parent, 'init', true, 'init-msg', {
+      conversationId: parent,
+      stepIndex: 3,
+      callId: 'invoke',
+      name: 'invoke_subagent',
+    })
+    const turn1 = invoke(child)
+    await f.put(parent, turn1)
+    await f.put(child, [message(0, parent, 'init'), done(1, 'c1 done')])
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
+
+    // Turn 2: parent re-wakes child (step 7), child starts running, then parent crashes with ERROR_MESSAGE (step 9).
+    await f.deliver(child, parent, 'turn 2 work', true, 'w2-msg', {
+      conversationId: parent,
+      stepIndex: 7,
+      callId: 'report-6',
+      name: 'send_message',
+    })
+    await appendFile(
+      f.path(child),
+      encode([
+        message(2, parent, 'turn 2 work'),
+        { step_index: 3, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+      ]),
+    )
+    await f.put(parent, [
+      ...turn1,
+      { step_index: 5, type: 'USER_INPUT', content: 'turn 2' },
+      ...report(child, 'turn 2 work', 6),
+      { step_index: 9, type: 'ERROR_MESSAGE', content: 'Parent step crashed' },
+    ])
+    assert.equal(
+      await hasActiveBackgroundWork(f.root, parent),
+      true,
+      'live re-woken child must remain visible to hasActiveBackgroundWork after parent ERROR_MESSAGE',
+    )
+
+    // Child finishes foreground turn after starting a standing IsDaemon schedule.
+    await appendFile(
+      f.path(child),
+      encode([
+        {
+          step_index: 4,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [
+            {
+              id: 'daemon-1',
+              name: 'schedule',
+              args: {
+                CronExpression: '*/5 * * * *',
+                Prompt: 'tick',
+                IsDaemon: true,
+              },
+            },
+          ],
+        },
+        {
+          step_index: 5,
+          type: 'GENERIC',
+          status: 'RUNNING',
+          content: `Tool is running as a background task with task id: ${child}/task-5\n`,
+        },
+        done(6, 'daemon armed'),
+      ]),
+    )
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
+    assert.equal(
+      await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
+      true,
+      'idle reaping check must still see standing daemon in re-woken child after parent ERROR_MESSAGE',
+    )
+
+    // A server restart notice stops all subagents and daemons, clearing active work.
+    await appendFile(
+      f.path(parent),
+      encode([
+        message(
+          10,
+          'system',
+          '[Notice] All your subagents and background tasks have been stopped due to server restart.',
+        ),
+      ]),
+    )
+    assert.equal(
+      await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
+      false,
+    )
+  } finally {
+    await f.close()
+  }
+})
+
+test('watchBrain does not advance turnFloor past child ERROR_MESSAGE on grandchild report in the same turn', async () => {
+  const f = await fixture()
+  let handle: BrainWatchHandle | undefined
+  try {
+    const events: ProviderEvent[] = []
+    await f.deliver(child, parent, 'init child', true, 'init-c', {
+      conversationId: parent,
+      stepIndex: 2,
+      callId: 'spawn-c',
+      name: 'invoke_subagent',
+    })
+    await f.subagent(child, grandchild, 'SUBAGENT_STATE_ALIVE', 2, 'spawn-gc')
+    await f.put(child, [
+      message(0, parent, 'work'),
+      {
+        step_index: 1,
+        type: 'ERROR_MESSAGE',
+        status: 'DONE',
+        content:
+          'The stream was interrupted. Please continue the task you were working on.',
+      },
+    ])
+    handle = watchBrain(
+      f.root,
+      child,
+      'child',
+      (e) => events.push(e),
+      50,
+      undefined,
+      undefined,
+      undefined,
+      200,
+    )
+    await handle.ready
+    // The retry warning arms its deadline on its own read pass, before the report lands.
+    await waitUntil(() => (handle?.resumePoint().afterStep ?? -1) >= 1)
+    await f.put(child, [
+      message(0, parent, 'work'),
+      {
+        step_index: 1,
+        type: 'ERROR_MESSAGE',
+        status: 'DONE',
+        content:
+          'The stream was interrupted. Please continue the task you were working on.',
+      },
+      message(2, grandchild, 'late grandchild report'),
+    ])
+    await waitUntil(() => handle?.isRunning() === false)
+    assert.equal(handle.isRunning(), false)
+    assert.ok(
+      events.some((e) => e.type === 'session.turn' && e.state === 'failed'),
+      'grandchild report must not erase child retry-timeout failure',
+    )
+  } finally {
+    handle?.()
+    await f.close()
+  }
+})
+
+test('SubagentRegistry.flushActive flushes newly discovered nested grandchild watchers', async () => {
+  const f = await fixture()
+  const events: ProviderEvent[] = []
+  const registry = new SubagentRegistry({
+    sessionId: 's',
+    cwd: f.root,
+    brainRoot: f.root,
+    capabilities: ['session.subsession'],
+    emit: (event) => events.push(event),
+    getNativeId: () => parent,
+    isParentTurnActive: () => true,
+    isLoading: () => false,
+    isUnavailable: () => false,
+  })
+  try {
+    await f.put(child, [message(0, parent, 'work')])
+    await f.put(grandchild, [
+      message(0, child, 'gc work'),
+      { step_index: 1, type: 'ERROR_MESSAGE', content: 'gc failed' },
+    ])
+    registry.linkSubsession('s', parent, {
+      type: 'tool_call',
+      id: 'spawn',
+      callId: 'spawn',
+      name: 'invoke_subagent',
+      detail: { type: 'sub_agent', childSessionId: child, log: '' },
+      status: 'completed',
+      error: null,
+    })
+    await registry.waitNestedReady()
+    // Write grandchild subagent metadata and spawn tool call after initial ready so flushActive discovers and flushes it.
+    await f.subagent(child, grandchild, 'SUBAGENT_STATE_ALIVE', 1, 'gc-call')
+    await f.put(child, [
+      message(0, parent, 'work'),
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ id: 'gc-call', name: 'invoke_subagent', args: {} }],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: JSON.stringify({ conversationId: grandchild }),
+      },
+      done(3, 'child done'),
+    ])
+    await registry.flushActive()
+
+    assert.ok(
+      events.some(
+        (e) =>
+          e.type === 'session.turn' &&
+          e.sessionId === `s:child:${grandchild}` &&
+          e.state === 'failed',
+      ),
+      'flushActive must discover and flush nested grandchild watchers',
+    )
+  } finally {
+    await registry.cancelAll()
+    await f.close()
+  }
+})
+
+test('watchBrain preserves fatal ERROR_MESSAGE when grandchild report follows in the same read', async () => {
+  const f = await fixture()
+  let handle: BrainWatchHandle | undefined
+  try {
+    const events: ProviderEvent[] = []
+    await f.deliver(child, parent, 'init child', true, 'init-c', {
+      conversationId: parent,
+      stepIndex: 2,
+      callId: 'spawn-c',
+      name: 'invoke_subagent',
+    })
+    await f.subagent(child, grandchild, 'SUBAGENT_STATE_ALIVE', 2, 'spawn-gc')
+    await f.put(child, [
+      message(0, parent, 'work'),
+      {
+        step_index: 1,
+        type: 'ERROR_MESSAGE',
+        content: 'Fatal child error before grandchild report',
+      },
+      message(2, grandchild, 'late grandchild report'),
+    ])
+    handle = watchBrain(f.root, child, 'child', (e) => events.push(e), 50)
+    await handle.ready
+    assert.equal(handle.isRunning(), false)
+    assert.ok(
+      events.some(
+        (e) =>
+          e.type === 'session.turn' &&
+          e.state === 'failed' &&
+          e.error?.message === 'Fatal child error before grandchild report',
+      ),
+      'fatal ERROR_MESSAGE must not be erased by trailing grandchild SYSTEM_MESSAGE',
+    )
+  } finally {
+    handle?.()
+    await f.close()
+  }
+})
+
+test('watchBrain excludes a Turn-1 failed sibling when later root turns leave the grandchild unwoken', async () => {
+  const f = await fixture()
+  let handle: BrainWatchHandle | undefined
+  try {
+    const oldGc = '44444444-4444-4444-8444-444444444444'
+    await f.put(parent, [
+      ...invoke(child),
+      { step_index: 5, type: 'USER_INPUT', content: 'turn 2' },
+      ...report(child, 'tagged t2', 6),
+      ...report(child, 'untagged t2', 9),
+      done(12, 't2'),
+      { step_index: 13, type: 'USER_INPUT', content: 'unrelated turn 3' },
+      done(14, 't3'),
+    ])
+    await f.deliver(child, parent, 'init child', true, 'init-c', {
+      conversationId: parent,
+      stepIndex: 2,
+      callId: 'invoke',
+      name: 'invoke_subagent',
+    })
+    await f.deliver(child, parent, 'tagged t2', true, 't2-c', {
+      conversationId: parent,
+      stepIndex: 7,
+      callId: 'send-c-1',
+      name: 'send_message',
+    })
+    await f.deliver(child, parent, 'untagged t2', true, 'u2-c')
+    await f.put(child, [
+      message(0, parent, 'init'),
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ id: 'invoke', name: 'invoke_subagent', args: {} }],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: JSON.stringify({ conversationId: grandchild }),
+      },
+      done(4, 'child t1'),
+      message(5, parent, 'tagged t2'),
+      message(6, parent, 'untagged t2'),
+      ...report(grandchild, 'gc t2', 7),
+      done(10, 'child t2'),
+    ])
+    await f.subagent(child, grandchild, 'SUBAGENT_STATE_ALIVE', 2, 'invoke')
+    await f.deliver(grandchild, child, 'init gc', true, 'init-gc', {
+      conversationId: child,
+      stepIndex: 2,
+      callId: 'invoke',
+      name: 'invoke_subagent',
+    })
+    await f.deliver(grandchild, child, 'gc t2', true, 'wake-gc', {
+      conversationId: child,
+      stepIndex: 8,
+      callId: 'send-gc',
+      name: 'send_message',
+    })
+    await f.subagent(
+      grandchild,
+      oldGc,
+      'SUBAGENT_STATE_ALIVE',
+      2,
+      'invoke-old-gc',
+    )
+    await f.deliver(oldGc, grandchild, 'init old gc', true, 'init-old-gc', {
+      conversationId: grandchild,
+      stepIndex: 2,
+      callId: 'invoke-old-gc',
+      name: 'invoke_subagent',
+    })
+    await f.put(oldGc, [
+      message(0, grandchild, 'old gc work'),
+      {
+        step_index: 1,
+        type: 'ERROR_MESSAGE',
+        content: 'old descendant failure',
+      },
+    ])
+    await f.put(grandchild, [
+      message(0, child, 'init gc'),
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          { id: 'invoke-old-gc', name: 'invoke_subagent', args: {} },
+        ],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: JSON.stringify({ conversationId: oldGc }),
+      },
+      done(4, 'gc t1'),
+      message(5, child, 'gc t2'),
+      done(6, 'gc ok'),
+    ])
+
+    const unrelated: ProviderEvent[] = []
+    handle = watchBrain(f.root, grandchild, 'gc', (e) => unrelated.push(e), 50)
+    await handle.ready
+    assert.ok(
+      unrelated.some(
+        (e) => e.type === 'session.turn' && e.state === 'completed',
+      ),
+      'fresh descendant watcher must complete without inheriting Turn-1 failed sibling',
+    )
+    assert.equal(
+      unrelated.some((e) => e.type === 'session.turn' && e.state === 'failed'),
+      false,
+      'unrelated later root Turn-3 USER_INPUT must not leak old Turn-1 failure',
+    )
+    handle()
+    handle = undefined
+
+    // Root Turn 3 now wakes child B while grandchild C stays unwoken.
+    await appendFile(
+      f.path(parent),
+      encode([...report(child, 'wake b in t3', 15), done(18, 't3')]),
+    )
+    await f.deliver(child, parent, 'wake b in t3', true, 't3-c', {
+      conversationId: parent,
+      stepIndex: 16,
+      callId: 'send-c-3',
+      name: 'send_message',
+    })
+    await appendFile(
+      f.path(child),
+      encode([
+        message(11, parent, 'wake b in t3'),
+        done(12, 'child t3 without waking gc'),
+      ]),
+    )
+
+    const woken: ProviderEvent[] = []
+    handle = watchBrain(
+      f.root,
+      grandchild,
+      'gc-woken',
+      (e) => woken.push(e),
+      50,
+      () => true,
+    )
+    await handle.ready
+    assert.ok(
+      woken.some((e) => e.type === 'session.turn' && e.state === 'completed'),
+      'fresh descendant watcher must complete even after Root Turn 3 wakes child B',
+    )
+    assert.equal(
+      woken.some((e) => e.type === 'session.turn' && e.state === 'failed'),
+      false,
+      'Root Turn 3 waking child B must not resurrect Turn-1 failure on grandchild C',
+    )
+  } finally {
+    handle?.()
+    await f.close()
+  }
+})
+
 test('child initial spawn prompt after step-0 system reminder projects user_message without inflating consumedMessages', async () => {
   const f = await fixture()
   const abort = new AbortController()
@@ -4389,6 +5509,11 @@ test('child initial spawn prompt after step-0 system reminder projects user_mess
       'step-1 spawn prompt must not count as a consumed wakeup message',
     )
 
+    assert.equal(
+      await hasActiveBackgroundWork(f.root, parent),
+      true,
+      'a child still running its wakeup turn blocks parent settlement',
+    )
     let parentSettled = false
     running = settleBrainTurn(f.root, parent, 'p', () => {}, {
       signal: abort.signal,
@@ -4398,8 +5523,6 @@ test('child initial spawn prompt after step-0 system reminder projects user_mess
       parentSettled = true
       return res
     })
-    await delay(30)
-    assert.equal(parentSettled, false)
 
     await appendFile(
       f.path(child),
@@ -4575,3 +5698,555 @@ test('initial spawn prompt quoting task results or batched with a followup messa
   // Root countRowMessages(row, false) counts step-0 UUID wakeup without subtracting 1.
   assert.equal(countRowMessages(message(0, child, 'root wakeup'), false), 1)
 })
+
+test('same-turn second parent wakeup preserves the child terminal failure', async () => {
+  const f = await fixture()
+  let handle: BrainWatchHandle | undefined
+  try {
+    await f.put(parent, [
+      { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
+      done(1),
+      { step_index: 2, type: 'USER_INPUT', content: 'turn 2' },
+      ...report(child, 'first wake', 3),
+      ...report(child, 'second wake', 6),
+    ])
+    await f.deliver(child, parent, 'init', true, 'init', {
+      conversationId: parent,
+      stepIndex: 0,
+      name: 'invoke_subagent',
+      callId: 'spawn',
+    })
+    await f.deliver(child, parent, 'first', true, 'first', {
+      conversationId: parent,
+      stepIndex: 4,
+      name: 'send_message',
+      callId: 'first',
+    })
+    await f.deliver(child, parent, 'second', true, 'second', {
+      conversationId: parent,
+      stepIndex: 7,
+      name: 'send_message',
+      callId: 'second',
+    })
+    await f.put(child, [
+      message(0, parent, 'init'),
+      done(1),
+      message(2, parent, 'first'),
+      { step_index: 3, type: 'ERROR_MESSAGE', content: 'same-turn fatal' },
+      message(4, parent, 'second'),
+    ])
+    const events: ProviderEvent[] = []
+    handle = watchBrain(f.root, child, 'child', (e) => events.push(e), 50)
+    await handle.ready
+    assert.ok(
+      events.some(
+        (e) =>
+          e.type === 'session.turn' &&
+          e.state === 'failed' &&
+          e.error?.message === 'same-turn fatal',
+      ),
+    )
+  } finally {
+    handle?.()
+    await f.close()
+  }
+})
+
+test('isWokenActive and captureRuntimeEpoch fence pre-restart artifacts while detecting post-epoch work', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+  const staleParent = '44444444-4444-4444-8444-444444444444'
+  const wokenRows: Row[] = [
+    { step_index: 0, type: 'USER_INPUT', content: 'start' },
+    done(1, 'fg'),
+    message(2, child, 'wakeup'),
+    { step_index: 3, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+  ]
+  const wokenNode = new BrainNode(parent, 'p')
+  wokenRows.forEach((row) => wokenNode.ingest(row))
+  assert.equal(wokenNode.isWokenWorking(), false)
+  assert.equal(wokenNode.isWokenActive(), true)
+  await f.put(parent, wokenRows)
+  await f.deliver(parent, child, 'wakeup', true, 'm-woken')
+  assert.equal(await hasActiveBackgroundWork(f.root, parent), true)
+
+  await f.put(child, [
+    message(0, staleParent, 'work'),
+    { step_index: 1, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+  ])
+  await f.subagent(staleParent, child, 'SUBAGENT_STATE_ALIVE', 1, 'inv-1')
+  const racedChild = '77777777-7777-4777-8777-777777777777'
+  await f.subagent(
+    staleParent,
+    racedChild,
+    'SUBAGENT_STATE_ALIVE',
+    99,
+    'inv-raced',
+  )
+  await f.deliver(staleParent, child, 'unread', false, 'msg-unread')
+  await f.deliver(staleParent, child, 'deficit', true, 'msg-deficit')
+  await f.put(staleParent, [
+    { step_index: 0, type: 'USER_INPUT', content: 'old' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          id: 'bg-1',
+          name: 'run_command',
+          args: { CommandLine: 'sleep 30' },
+        },
+        {
+          id: 'cron-1',
+          name: 'schedule',
+          args: {
+            CronExpression: '0 * * * *',
+            IsDaemon: true,
+            Prompt: 'tick',
+          },
+        },
+        {
+          id: 'inv-1',
+          name: 'invoke_subagent',
+          args: { Role: 'Researcher' },
+        },
+      ],
+    },
+    {
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: `Tool is running as a background task with task id: ${staleParent}/task-1\n`,
+    },
+    {
+      step_index: 3,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: `Tool is running as a background task with task id: ${staleParent}/task-2\n`,
+    },
+    {
+      step_index: 4,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: `Launched subagent ${child}`,
+    },
+    done(5, 'old done'),
+  ])
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, staleParent, {
+      includeDaemons: true,
+    }),
+    true,
+  )
+
+  const epoch = await captureRuntimeEpoch(f.root, staleParent)
+  assert.ok(epoch)
+  assert.equal(epoch.afterStepIndex, 5)
+  assert.equal(epoch.preEpochReadIds.has('msg-deficit'), true)
+  assert.equal(epoch.ignoredMessages.has('msg-unread'), true)
+  assert.equal(epoch.ignoredSubagentIds.has(child), true)
+  assert.equal(epoch.ignoredSubagentIds.has(racedChild), true)
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, staleParent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    false,
+  )
+
+  await f.deliver(staleParent, child, 'unread', true, 'msg-unread')
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, staleParent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    false,
+  )
+  const clearedReadSettled = await alive(
+    settleBrainTurn(f.root, staleParent, 'sp-read', () => {}, {
+      pollIntervalMs: 5,
+      stallTimeoutMs: 50,
+      runtimeEpoch: epoch,
+    }),
+  )
+  assert.equal(clearedReadSettled.status, 'completed')
+
+  await f.deliver(staleParent, child, 'fresh', true, 'msg-fresh')
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, staleParent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    true,
+  )
+
+  await appendFile(
+    f.path(staleParent),
+    encode([
+      message(6, child, 'fresh'),
+      done(7, 'woken done'),
+      { step_index: 8, type: 'USER_INPUT', content: 'turn 2' },
+      done(9, 'turn 2 done'),
+    ]),
+  )
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, staleParent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    false,
+  )
+  const settled = await alive(
+    settleBrainTurn(f.root, staleParent, 'sp', () => {}, {
+      pollIntervalMs: 5,
+      stallTimeoutMs: 50,
+      runtimeEpoch: epoch,
+    }),
+  )
+  assert.equal(settled.status, 'completed')
+
+  await appendFile(
+    f.path(staleParent),
+    encode([
+      {
+        step_index: 10,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          {
+            id: 'cron-new',
+            name: 'schedule',
+            args: {
+              CronExpression: '*/5 * * * *',
+              Prompt: 'fresh',
+              IsDaemon: true,
+            },
+          },
+        ],
+      },
+      {
+        step_index: 11,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: `Tool is running as a background task with task id: ${staleParent}/task-3\n`,
+      },
+      done(12, 'cron scheduled'),
+    ]),
+  )
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, staleParent, {
+      includeDaemons: false,
+      runtimeEpoch: epoch,
+    }),
+    false,
+  )
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, staleParent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    true,
+  )
+})
+
+test('drained pre-epoch ignored wakeup that logs post-epoch cannot offset a later unflushed fresh wakeup', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+  await f.deliver(parent, child, 'already-read', true, 'msg-old')
+  await f.deliver(parent, child, 'unread', false, 'msg-unread')
+  await f.put(parent, [
+    { step_index: 1, type: 'USER_INPUT', content: 'old' },
+    done(2, 'old done'),
+  ])
+
+  const epoch = await captureRuntimeEpoch(f.root, parent)
+  assert.ok(epoch)
+  assert.equal(epoch.afterStepIndex, 2)
+  assert.equal(epoch.preEpochReadIds.has('msg-old'), true)
+  assert.equal(epoch.ignoredMessages.has('msg-unread'), true)
+
+  // Post-epoch turn drains the pre-epoch unread wakeup AND writes its SYSTEM_MESSAGE row.
+  await f.deliver(parent, child, 'unread', true, 'msg-unread')
+  await appendFile(
+    f.path(parent),
+    encode([
+      { step_index: 3, type: 'USER_INPUT', content: 'turn 1' },
+      message(4, child, 'unread'),
+      done(5, 'unread handled'),
+    ]),
+  )
+
+  // A later fresh wakeup is marked read before its SYSTEM_MESSAGE flushes; it must stay unprocessed.
+  await f.deliver(parent, child, 'fresh', true, 'msg-fresh')
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, parent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    true,
+  )
+
+  await appendFile(
+    f.path(parent),
+    encode([message(6, child, 'fresh'), done(7, 'fresh done')]),
+  )
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, parent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    false,
+  )
+  const settled = await alive(
+    settleBrainTurn(f.root, parent, 'p-drained', () => {}, {
+      pollIntervalMs: 5,
+      stallTimeoutMs: 50,
+      runtimeEpoch: epoch,
+    }),
+  )
+  assert.equal(settled.status, 'completed')
+})
+
+test('monotonic captureRuntimeEpoch preserves epoch fence across an O_TRUNC 0-byte rewrite window', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+  await f.subagent(parent, child, 'SUBAGENT_STATE_ALIVE', 1, 'inv-1')
+  await f.deliver(parent, child, 'old', true, 'msg-read')
+  await f.deliver(parent, child, 'unread', false, 'msg-unread')
+  const rows: Row[] = [
+    { step_index: 1, type: 'USER_INPUT', content: 'old' },
+    message(2, child, 'old'),
+    done(3, 'done'),
+  ]
+  await f.put(parent, rows)
+
+  const epoch1 = await captureRuntimeEpoch(f.root, parent)
+  assert.ok(epoch1)
+  assert.equal(epoch1.afterStepIndex, 3)
+
+  await f.rewrite(parent, rows, async () => {
+    const duringTruncate = await captureRuntimeEpoch(f.root, parent, {
+      minAfterStep: epoch1.afterStepIndex,
+      previous: epoch1,
+    })
+    assert.ok(duringTruncate)
+    assert.equal(duringTruncate.afterStepIndex, 3)
+    assert.equal(duringTruncate.preEpochReadIds.has('msg-read'), true)
+    assert.equal(duringTruncate.ignoredMessages.has('msg-unread'), true)
+    assert.equal(duringTruncate.ignoredSubagentIds.has(child), true)
+  })
+})
+
+test('no-LF pre-epoch SYSTEM_MESSAGE completed later stays fenced and does not skew post-epoch wakeups', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+  await f.deliver(parent, child, 'late', true, 'msg-late')
+  await f.put(parent, [
+    { step_index: 1, type: 'USER_INPUT', content: 'old' },
+    done(2, 'old'),
+  ])
+  await appendFile(f.path(parent), JSON.stringify(message(3, child, 'late')))
+
+  const epoch = await captureRuntimeEpoch(f.root, parent)
+  assert.ok(epoch)
+  assert.equal(epoch.afterStepIndex, 3)
+  assert.equal(epoch.preEpochReadIds.has('msg-late'), true)
+
+  await appendFile(
+    f.path(parent),
+    '\n' +
+      encode([
+        { step_index: 4, type: 'USER_INPUT', content: 'next' },
+        done(5, 'next done'),
+      ]),
+  )
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, parent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    false,
+  )
+  const settled = await alive(
+    settleBrainTurn(f.root, parent, 'p-nolf', () => {}, {
+      pollIntervalMs: 5,
+      stallTimeoutMs: 50,
+      runtimeEpoch: epoch,
+    }),
+  )
+  assert.equal(settled.status, 'completed')
+
+  await f.deliver(parent, child, 'after', true, 'msg-after')
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, parent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    true,
+  )
+  await appendFile(
+    f.path(parent),
+    encode([message(6, child, 'after'), done(7, 'after done')]),
+  )
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, parent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    false,
+  )
+})
+
+class GatedChildReader extends TranscriptReader {
+  private readonly shouldGate: (nativeId: string) => boolean
+  private readonly onEnter: () => void
+  private readonly gate: Promise<void>
+
+  constructor(
+    shouldGate: (nativeId: string) => boolean,
+    onEnter: () => void,
+    gate: Promise<void>,
+  ) {
+    super()
+    this.shouldGate = shouldGate
+    this.onEnter = onEnter
+    this.gate = gate
+  }
+
+  override async read(root: string, nativeId: string) {
+    if (this.shouldGate(nativeId)) {
+      this.onEnter()
+      await this.gate
+    }
+    return super.read(root, nativeId)
+  }
+}
+
+function createGatedChildReader(targetId: string) {
+  let armed = false
+  let resolveEntered!: () => void
+  const entered = new Promise<void>((resolve) => {
+    resolveEntered = resolve
+  })
+  let releaseGate!: () => void
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve
+  })
+  return {
+    arm() {
+      armed = true
+    },
+    entered,
+    release() {
+      releaseGate()
+    },
+    createTranscriptReader(): TranscriptReader {
+      return new GatedChildReader(
+        (id) => {
+          if (!armed || id !== targetId) return false
+          armed = false
+          return true
+        },
+        resolveEntered,
+        gate,
+      )
+    },
+  }
+}
+
+test(
+  'forceStopAll after slow child cancel unblocks SubagentRegistry and isolates later child turns from the stale cancelAll loop',
+  { timeout: 5000 },
+  async (t) => {
+    const f = await fixture()
+    const collector = createEventCollector()
+    const readerGate = createGatedChildReader(child)
+    const child2 = '44444444-4444-4444-8444-444444444444'
+    const registry = new SubagentRegistry({
+      sessionId: 'p',
+      cwd: f.root,
+      brainRoot: f.root,
+      capabilities: ['session.subsession'],
+      emit: collector.emit,
+      getNativeId: () => parent,
+      isParentTurnActive: () => true,
+      isLoading: () => false,
+      isUnavailable: () => false,
+      createTranscriptReader: readerGate.createTranscriptReader,
+    })
+    t.after(async () => {
+      readerGate.release()
+      registry.closeAll()
+      await f.close()
+    })
+
+    await f.put(child, [
+      message(0, parent, 'work'),
+      { step_index: 1, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+    ])
+    registry.linkSubsession('p', parent, {
+      type: 'tool_call',
+      id: 'spawn-1',
+      callId: 'spawn-1',
+      name: 'invoke_subagent',
+      status: 'completed',
+      error: null,
+      detail: { type: 'sub_agent', childSessionId: child, log: '' },
+    })
+    await registry.waitCurrentReady()
+    assert.equal(registry.hasRunningChildren(), true)
+
+    readerGate.arm()
+    const staleCancel = registry.cancelAll()
+    await readerGate.entered
+    registry.forceStopAll()
+
+    const msgItem: ProviderTimelineItem = {
+      type: 'tool_call',
+      id: 'msg-child2',
+      callId: 'msg-child2',
+      name: 'send_message',
+      status: 'completed',
+      error: null,
+      detail: { type: 'sub_agent', childSessionId: child2, log: '' },
+    }
+    await f.subagent(parent, child2)
+    assert.equal(await registry.prepareMessageItem(msgItem), true)
+    assert.deepEqual(msgItem.detail, {
+      type: 'sub_agent',
+      childSessionId: child2,
+      log: '',
+    })
+
+    await f.put(child2, [
+      message(0, parent, 'work 2'),
+      { step_index: 1, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+    ])
+    registry.linkSubsession('p', parent, msgItem)
+    await registry.waitCurrentReady()
+    assert.equal(registry.hasChild(child2), true)
+    assert.equal(registry.hasRunningChildren(), true)
+
+    readerGate.release()
+    await staleCancel
+    assert.equal(registry.hasRunningChildren(), true)
+
+    await appendFile(f.path(child2), encode([done(2, 'child2 finished')]))
+    await collector.wait(
+      (event) =>
+        event.type === 'session.turn' &&
+        event.sessionId === `p:child:${child2}` &&
+        event.state === 'completed',
+    )
+    assert.equal(
+      collector.events.some(
+        (event) =>
+          event.type === 'session.turn' &&
+          event.sessionId === `p:child:${child2}` &&
+          event.state === 'canceled',
+      ),
+      false,
+    )
+  },
+)

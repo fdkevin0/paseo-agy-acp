@@ -6,7 +6,7 @@ import {
 } from './brain-projector.ts'
 import { record } from './common.ts'
 import { toolDetail } from './mapping.ts'
-import type { ToolCall } from '@agentclientprotocol/sdk'
+import type { ToolCall } from '@agentclientprotocol/sdk/unstable'
 import type { ProviderTimelineItem } from '@getpaseo/plugin/server/provider'
 
 export interface HistoryEntry {
@@ -18,10 +18,12 @@ export interface HistoryEntry {
 }
 
 const userRequestPattern =
-  /<USER_REQUEST>\r?\n([\s\S]*)\r?\n<\/USER_REQUEST>(?:\r?\n<ADDITIONAL_METADATA>[\s\S]*<\/ADDITIONAL_METADATA>)?\s*$/
+  /<USER_REQUEST>\r?\n([\s\S]*)\r?\n<\/USER_REQUEST>(?:\r?\n<ADDITIONAL_METADATA>[\s\S]*<\/ADDITIONAL_METADATA>)?((?:\n\[image\])*)\s*$/
 
 function normalizeUserText(text: string): string {
-  return text.match(userRequestPattern)?.[1] ?? text
+  const match = text.match(userRequestPattern)
+  if (!match) return text
+  return [match[1], match[2].replace(/^\n/, '')].filter(Boolean).join('\n')
 }
 
 function stableJson(value: unknown): string {

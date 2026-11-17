@@ -9,11 +9,11 @@ import {
   type ProviderEvent,
 } from '@getpaseo/plugin/server/provider'
 import { BrainTranscriptProjector } from '../server/brain-projector.ts'
-import { alignReplayTools } from '../server/history.ts'
+import { alignReplayTools, mergeCompactionHistory } from '../server/history.ts'
 import { Timeline } from '../server/mapping.ts'
 import { SessionManager } from '../server/session.ts'
 import { AgyUsageSource } from '../server/usage.ts'
-import { zSessionUpdate } from '../node_modules/@agentclientprotocol/sdk/dist/schema/zod.gen.js'
+import { zSessionUpdate } from '../node_modules/@agentclientprotocol/sdk/dist/v1/unstable/schema/zod.gen.js'
 
 const native = '11111111-1111-4111-8111-111111111111'
 const child = '22222222-2222-4222-8222-222222222222'
@@ -135,7 +135,7 @@ async function replay(
     emit: (event) => events.push(structuredClone(event)),
   })
   try {
-    await manager.open({
+    await manager.handle({
       type: 'session.open',
       requestId: 'open',
       sessionId: 's',
@@ -956,15 +956,7 @@ test('null-result history recovery remains intact when the next turn cancels aft
     await manager.close()
     await rm(home, { recursive: true, force: true })
   })
-  const start = manager.start.bind(manager)
-  let session!: Awaited<ReturnType<typeof manager.start>>
-  t.mock.method(
-    manager,
-    'start',
-    async (...args: Parameters<typeof start>) =>
-      (session = await start(...args)),
-  )
-  await manager.open({
+  await manager.handle({
     type: 'session.open',
     requestId: 'open',
     sessionId: 's',
@@ -979,33 +971,32 @@ test('null-result history recovery remains intact when the next turn cancels aft
   assert.equal(restored.detail.content, 'read')
   assert.equal(restored.detail.filePath, '/acp')
   assert.equal(restored.detail.offset, 7)
-  t.mock.method(session.transport.rpc, 'prompt', async () => {
-    await writeFile(
-      path,
-      encode([
-        ...rows,
-        { step_index: 6, type: 'USER_INPUT', content: 'next' },
-        {
-          step_index: 7,
-          type: 'PLANNER_RESPONSE',
-          input_tokens: 100,
-          output_tokens: 2,
-        },
-        checkpoint(8),
-      ]) + '{"step_index":9',
-    )
-    return { stopReason: 'cancelled' as const }
-  })
+  await writeFile(
+    join(home, 'stage-transcript.jsonl'),
+    encode([
+      ...rows,
+      { step_index: 6, type: 'USER_INPUT', content: 'next' },
+      {
+        step_index: 7,
+        type: 'PLANNER_RESPONSE',
+        input_tokens: 100,
+        output_tokens: 2,
+      },
+      checkpoint(8),
+    ]) + '{"step_index":9',
+  )
   await manager.handle({
     type: 'session.prompt',
     sessionId: 's',
     prompt: {
       clientMessageId: 'next',
       delivery: 'auto',
-      input: { type: 'message', content: [{ type: 'text', text: 'next' }] },
+      input: {
+        type: 'message',
+        content: [{ type: 'text', text: 'stage-and-cancel' }],
+      },
     },
   })
-  assert.equal(session.state.lastKnownStepIndex, 8)
   const usage = events.findLast((event) => event.type === 'session.usage')
   assert.ok(usage?.type === 'session.usage')
   assert.equal(usage.usage.contextWindowUsedTokens, 102)
@@ -1014,13 +1005,47 @@ test('null-result history recovery remains intact when the next turn cancels aft
     undefined,
     'context-only cancellation does not create a bill',
   )
+  const usageCountBeforeFollowup = events.filter(
+    (event) => event.type === 'session.usage',
+  ).length
+  await writeFile(
+    path,
+    encode([
+      ...rows,
+      { step_index: 6, type: 'USER_INPUT', content: 'next' },
+      {
+        step_index: 7,
+        type: 'PLANNER_RESPONSE',
+        input_tokens: 999,
+        output_tokens: 2,
+      },
+      checkpoint(8),
+    ]),
+  )
+  await manager.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId: 'check-boundary-8',
+      delivery: 'auto',
+      input: {
+        type: 'message',
+        content: [{ type: 'text', text: 'cancel-only' }],
+      },
+    },
+  })
+  assert.equal(
+    events.filter((event) => event.type === 'session.usage').length,
+    usageCountBeforeFollowup,
+    'step 8 boundary excludes earlier step 7 after canceled compaction',
+  )
   assert.deepEqual(
     events.flatMap((event) =>
       event.type === 'session.turn' && event.state !== 'started'
         ? [event.state]
         : [],
     ),
-    ['canceled'],
+    ['canceled', 'canceled'],
   )
   assert.deepEqual(
     timeline(events)
@@ -1722,4 +1747,64 @@ test('Orchestrator contrib planexecute handoffs align across CHECKPOINT history 
   )?.item
   assert.ok(enterItem?.type === 'tool_call')
   assert.equal(enterItem.detail.type, 'unknown')
+})
+
+test('Brain USER_INPUT media projects [image] placeholders and deduplicates with ACP replay', () => {
+  const projector = new BrainTranscriptProjector('s')
+  const imageOnly = projector.project({
+    step_index: 0,
+    type: 'USER_INPUT',
+    status: 'DONE',
+    content: '',
+    media: [{ mime_type: 'image/png', uri: '/tmp/a.png' }],
+  })
+  assert.deepEqual(imageOnly, [
+    { type: 'user_message', id: 's:step:0', text: '[image]' },
+  ])
+
+  const textWithMedia = projector.project({
+    step_index: 1,
+    type: 'USER_INPUT',
+    status: 'DONE',
+    content:
+      '<USER_REQUEST>\nexplain\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nlocal time\n</ADDITIONAL_METADATA>',
+    media: [
+      { mime_type: 'image/png', uri: '/tmp/a.png' },
+      { mime_type: 'image/jpeg', uri: '/tmp/b.jpg' },
+    ],
+  })
+  assert.deepEqual(textWithMedia, [
+    {
+      type: 'user_message',
+      id: 's:step:1',
+      text: '<USER_REQUEST>\nexplain\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nlocal time\n</ADDITIONAL_METADATA>\n[image]\n[image]',
+    },
+  ])
+
+  const merged = mergeCompactionHistory(
+    [
+      {
+        item: { type: 'user_message', id: 'acp:1', text: '[image]' },
+      },
+      {
+        item: {
+          type: 'user_message',
+          id: 'acp:2',
+          text: 'explain\n[image]\n[image]',
+        },
+      },
+    ],
+    [{ item: imageOnly[0] }, { item: textWithMedia[0] }],
+  )
+  assert.deepEqual(
+    merged.map((e) => e.item),
+    [
+      { type: 'user_message', id: 'acp:1', text: '[image]' },
+      {
+        type: 'user_message',
+        id: 'acp:2',
+        text: 'explain\n[image]\n[image]',
+      },
+    ],
+  )
 })

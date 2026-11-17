@@ -4,8 +4,19 @@ writeFileSync(
   process.env.AGY_USAGE_ARGS!,
   JSON.stringify(process.argv.slice(2)),
 )
-if (process.env.AGY_USAGE_FAIL) {
+if (process.env.AGY_USAGE_PID_FILE) {
+  writeFileSync(process.env.AGY_USAGE_PID_FILE, String(process.pid))
+}
+if (process.env.AGY_USAGE_AUTH_HANG) {
+  process.stderr.write(
+    'Authentication required. Please visit the URL to log in:\n' +
+      '  https://accounts.google.com/o/oauth2/auth?code_challenge=secret-pkce\n' +
+      'Waiting for authentication (timeout 60s)...\n',
+  )
+  setTimeout(() => {}, 30_000)
+} else if (process.env.AGY_USAGE_FAIL) {
   process.stderr.write('Authentication required')
   process.exit(1)
+} else {
+  process.stdout.write(readFileSync(process.env.AGY_USAGE_FIXTURE!, 'utf8'))
 }
-process.stdout.write(readFileSync(process.env.AGY_USAGE_FIXTURE!, 'utf8'))

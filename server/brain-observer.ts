@@ -3,13 +3,18 @@ import {
   TranscriptReader,
   StepDedupe,
   countRowMessages,
+  extractCheckpointPreTokens,
+  extractRowMessageSignatures,
   extractStepUsage,
   isMissing,
+  stepErrorMessage,
 } from './brain-io.ts'
 import type { StepUsage } from './mapping.ts'
 
 type Row = Record<string, unknown>
-export type BrainRead = Awaited<ReturnType<TranscriptReader['read']>>
+export type BrainRead = Awaited<ReturnType<TranscriptReader['read']>> & {
+  observedAtByStep?: ReadonlyMap<number, number>
+}
 
 /** Numeric observations are independent of text/tool dedupe and never accumulate consumption. */
 export class ModelUsageObserver {
@@ -78,11 +83,13 @@ export class BrainTurnObservation {
   missing = false
   private readError?: unknown
   private failure?: unknown
+  private readonly epochAfterStepIndex: number
   get error(): unknown {
     return this.failure ?? this.readError
   }
   lastStepIndex = -1
   historicalMessages = 0
+  postEpochSignatures = new Map<string, number>()
   revision = 0
   private waiters = new Set<() => void>()
   private notify() {
@@ -109,6 +116,10 @@ export class BrainTurnObservation {
   private buffered = new Map<number, Row>()
   private bufferReset = false
   private bufferSnapshot?: Set<number>
+  private bufferObservedAt = new Map<
+    number,
+    { error: string | undefined; observedAt: number }
+  >()
   private checkpoints = new StepDedupe()
   private drainingRead = false
   private mayPublish() {
@@ -143,12 +154,14 @@ export class BrainTurnObservation {
     callbacks: BrainTurnObservation['callbacks'],
     pollIntervalMs = 200,
     reader = new TranscriptReader(),
+    epochAfterStepIndex = -1,
   ) {
     this.reader = reader
     this.root = root
     this.nativeId = nativeId
     this.sessionId = sessionId
     this.minStepIndex = minStepIndex
+    this.epochAfterStepIndex = epochAfterStepIndex
     this.callbacks = callbacks
     this.pollIntervalMs = pollIntervalMs
     this.usage = new ModelUsageObserver(minStepIndex, (usage) =>
@@ -205,13 +218,23 @@ export class BrainTurnObservation {
       this.bufferSnapshot = undefined
       this.lastStepIndex = -1
       this.historicalMessages = 0
+      this.postEpochSignatures.clear()
     }
     for (const row of read.rows) {
       const index = Number(row.step_index)
-      if (Number.isInteger(index))
+      if (Number.isInteger(index)) {
         this.lastStepIndex = Math.max(this.lastStepIndex, index)
-      if (index <= this.minStepIndex)
-        this.historicalMessages += countRowMessages(row, false)
+        if (index > this.epochAfterStepIndex) {
+          if (index <= this.minStepIndex)
+            this.historicalMessages += countRowMessages(row, false)
+          for (const sig of extractRowMessageSignatures(row)) {
+            this.postEpochSignatures.set(
+              sig,
+              (this.postEpochSignatures.get(sig) ?? 0) + 1,
+            )
+          }
+        }
+      }
     }
     if (this.mayPublish())
       this.callbacks.onBoundary?.(
@@ -225,7 +248,23 @@ export class BrainTurnObservation {
     if (this.consumer && this.acceptsRows() && this.callbacks.isCurrent())
       await this.consumer(next)
     else {
-      for (const row of eligible) this.buffered.set(Number(row.step_index), row)
+      if (read.snapshotStepIndices && read.snapshotStepIndices.size > 0) {
+        for (const step of this.bufferObservedAt.keys()) {
+          if (!read.snapshotStepIndices.has(step))
+            this.bufferObservedAt.delete(step)
+        }
+      }
+      for (const row of eligible) {
+        const step = Number(row.step_index)
+        this.buffered.set(step, row)
+        if (read.mtimeMs !== undefined) {
+          const error = stepErrorMessage(row)
+          const existing = this.bufferObservedAt.get(step)
+          if (!existing || existing.error !== error) {
+            this.bufferObservedAt.set(step, { error, observedAt: read.mtimeMs })
+          }
+        }
+      }
       if (read.snapshotStepIndices)
         this.bufferSnapshot = new Set(read.snapshotStepIndices)
       if (this.bufferSnapshot)
@@ -257,15 +296,18 @@ export class BrainTurnObservation {
         row.type === 'CHECKPOINT' &&
         row.status === 'DONE' &&
         this.checkpoints.fresh(row)
-      )
+      ) {
+        const preTokens = extractCheckpointPreTokens(row)
         this.callbacks.onItem(
           {
             type: 'compaction',
             id: `${this.sessionId}:step:${row.step_index}:compaction`,
             status: 'completed',
+            ...(preTokens !== undefined ? { preTokens } : {}),
           },
           typeof row.created_at === 'string' ? row.created_at : undefined,
         )
+      }
   }
   async attach(consumer: (read: BrainRead) => Promise<void>) {
     await this.inflight
@@ -275,10 +317,21 @@ export class BrainTurnObservation {
         (a, b) => Number(a.step_index) - Number(b.step_index),
       )
       this.buffered.clear()
+      const observedAtByStep =
+        this.bufferObservedAt.size > 0
+          ? new Map(
+              [...this.bufferObservedAt].map(([step, entry]) => [
+                step,
+                entry.observedAt,
+              ]),
+            )
+          : undefined
+      this.bufferObservedAt.clear()
       await consumer({
         rows,
         reset: this.bufferReset,
         snapshotStepIndices: this.bufferSnapshot,
+        observedAtByStep,
       })
       this.bufferReset = false
       this.bufferSnapshot = undefined

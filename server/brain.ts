@@ -5,7 +5,11 @@ import {
 } from './brain-observer.ts'
 import { stat } from 'node:fs/promises'
 import { join } from 'node:path'
-import { formatErrorMessage, sessionIdPattern } from './common.ts'
+import {
+  formatErrorMessage,
+  isNativeToolName,
+  sessionIdPattern,
+} from './common.ts'
 import {
   Timeline,
   addStepUsage,
@@ -20,10 +24,14 @@ import type { NormalizedQuestion } from './questions.ts'
 import {
   StepDedupe,
   countRowMessages,
+  extractCheckpointPreTokens,
+  extractRowMessageSignatures,
   extractStepUsage,
   isMissing,
   isRestartNotice,
   isRetryWarning,
+  isWakeupMessage,
+  readConversationCompactionWindow,
   readInboxState,
   readLastStepIndex,
   readSubagents,
@@ -31,6 +39,7 @@ import {
   RETRY_IDLE_TIMEOUT_MS,
   type InboxState,
   type SubagentRecord,
+  type TranscriptReader,
 } from './brain-io.ts'
 import {
   BrainNode,
@@ -44,43 +53,224 @@ export {
   BrainNode,
   BrainTranscriptProjector,
   countRowMessages,
+  extractCheckpointPreTokens,
+  readConversationCompactionWindow,
   readInboxState,
   readLastStepIndex,
   readSubagents,
   readTranscriptRows,
   type SubagentRecord,
 }
+import {
+  readTurnBoundaryBefore,
+  resolveChildTurnState,
+  resolveReWokenTurn,
+  selectParentWakeups,
+  type ChildTurnState,
+  type TurnBoundaryCache,
+} from './brain-turns.ts'
+
+type BackgroundWalk = {
+  /** Standing IsDaemon schedules are excluded unless the caller asks whether an idle runtime can stop. */
+  includeDaemons?: boolean
+  retryTimeoutMs?: number
+  runtimeEpoch?: RuntimeEpoch
+  /** Sessions already on the walk, so a child cycle cannot recurse forever. */
+  visiting?: Set<string>
+  /** A subagent's first read decides its own turn phase instead of the parent's. */
+  child?: boolean
+  /** The parent turn that spawned or woke this child. */
+  parent?: {
+    node: BrainNode
+    minStepIndex: number
+    subRecord?: SubagentRecord
+  }
+}
+
+export type RuntimeEpoch = {
+  afterStepIndex: number
+  preEpochReadIds: ReadonlySet<string>
+  ignoredMessages: ReadonlyMap<string, string>
+  ignoredSubagentIds: ReadonlySet<string>
+}
+
+export function adjustInboxForEpoch(
+  inbox: InboxState,
+  epoch?: RuntimeEpoch,
+  postEpochSignatures?: ReadonlyMap<string, number>,
+): InboxState {
+  if (!epoch) return inbox
+  const unconsumedHighPriority =
+    epoch.ignoredMessages.size > 0 || epoch.preEpochReadIds.size > 0
+      ? inbox.unconsumedHighPriority.filter(
+          (m) =>
+            !epoch.ignoredMessages.has(m.id) &&
+            !epoch.preEpochReadIds.has(m.id),
+        )
+      : inbox.unconsumedHighPriority
+  let freshCount = 0
+  const freshBySig = new Map<string, number>()
+  const ignoredBySig = new Map<string, number>()
+  for (const m of inbox.messages) {
+    if (!inbox.readIds.has(m.id) || !isWakeupMessage(m)) continue
+    if (epoch.preEpochReadIds.has(m.id)) continue
+    const ignoredSig = epoch.ignoredMessages.get(m.id)
+    if (ignoredSig !== undefined) {
+      ignoredBySig.set(ignoredSig, (ignoredBySig.get(ignoredSig) ?? 0) + 1)
+    } else {
+      freshCount++
+      freshBySig.set(m.signature, (freshBySig.get(m.signature) ?? 0) + 1)
+    }
+  }
+  let consumedNonUserCount = freshCount
+  for (const [sig, ignoredCount] of ignoredBySig) {
+    const logged = postEpochSignatures?.get(sig) ?? 0
+    const fresh = freshBySig.get(sig) ?? 0
+    consumedNonUserCount += Math.min(ignoredCount, Math.max(0, logged - fresh))
+  }
+  if (
+    unconsumedHighPriority.length === inbox.unconsumedHighPriority.length &&
+    consumedNonUserCount === inbox.consumedNonUserCount
+  )
+    return inbox
+  return {
+    ...inbox,
+    unconsumedHighPriority,
+    consumedNonUserCount,
+  }
+}
+
+/** Snapshot pre-restart Brain artifacts so a restarted/reopened runtime only tracks work created after this boundary. */
+export function computeRuntimeEpoch(
+  rows: readonly Record<string, unknown>[],
+  inbox: InboxState,
+  subagents: readonly SubagentRecord[],
+  minAfterStep = -1,
+  previous?: RuntimeEpoch,
+): RuntimeEpoch | undefined {
+  let afterStepIndex = Math.max(minAfterStep, previous?.afterStepIndex ?? -1)
+  for (const row of rows) {
+    const step = Number(row.step_index)
+    if (Number.isInteger(step) && step > afterStepIndex) afterStepIndex = step
+  }
+  const preEpochReadIds = new Set(previous?.preEpochReadIds)
+  for (const m of inbox.messages) {
+    if (inbox.readIds.has(m.id) && isWakeupMessage(m)) preEpochReadIds.add(m.id)
+  }
+  const ignoredMessages = new Map<string, string>()
+  if (previous) {
+    for (const [id, sig] of previous.ignoredMessages) {
+      if (!preEpochReadIds.has(id)) ignoredMessages.set(id, sig)
+    }
+  }
+  for (const m of inbox.unconsumedHighPriority) {
+    if (!preEpochReadIds.has(m.id)) ignoredMessages.set(m.id, m.signature)
+  }
+  const ignoredSubagentIds = new Set(previous?.ignoredSubagentIds)
+  for (const s of subagents) {
+    if (s.state === 'SUBAGENT_STATE_ALIVE')
+      ignoredSubagentIds.add(s.conversationId)
+  }
+  if (
+    afterStepIndex < 0 &&
+    preEpochReadIds.size === 0 &&
+    ignoredMessages.size === 0 &&
+    ignoredSubagentIds.size === 0
+  )
+    return undefined
+  return {
+    afterStepIndex,
+    preEpochReadIds,
+    ignoredMessages,
+    ignoredSubagentIds,
+  }
+}
+
+/** Read and snapshot pre-restart Brain artifacts for a restarted or reopened runtime. */
+export async function captureRuntimeEpoch(
+  root: string,
+  nativeId: string,
+  options?: {
+    minAfterStep?: number
+    previous?: RuntimeEpoch
+    readSubagents?: typeof readSubagents
+  },
+): Promise<RuntimeEpoch | undefined> {
+  if (!sessionIdPattern.test(nativeId)) return undefined
+  const readSubs = options?.readSubagents ?? readSubagents
+  const [rows, inbox, subagents, tailStep] = await Promise.all([
+    readTranscriptRows(root, nativeId),
+    readInboxState(root, nativeId),
+    readSubs(root, nativeId),
+    readLastStepIndex(root, nativeId).catch(() => -1),
+  ])
+  return computeRuntimeEpoch(
+    rows,
+    inbox,
+    subagents,
+    Math.max(options?.minAfterStep ?? -1, tailStep),
+    options?.previous,
+  )
+}
 
 /** Determine whether the session has running background tasks or active subagents. Standing IsDaemon schedules are excluded by default so foreground interrupts do not kill them, and included when checking whether an idle runtime can stop. */
 export async function hasActiveBackgroundWork(
   root: string,
   nativeId: string,
-  options: { includeDaemons?: boolean; retryTimeoutMs?: number } = {},
-  visiting = new Set<string>(),
-  isChild = false,
+  options: BackgroundWalk = {},
 ): Promise<boolean> {
+  const visiting = options.visiting ?? new Set<string>()
+  const isChild = options.child === true
+  const parentContext = options.parent
   if (!sessionIdPattern.test(nativeId) || visiting.has(nativeId)) return false
   visiting.add(nativeId)
   try {
     const node = new BrainNode(nativeId, nativeId, {
       allowInitialSpawnPrompt: isChild,
     })
-    const [{ inbox, subagents }, rows] = await Promise.all([
-      node.pollMetadata(root),
-      readTranscriptRows(root, nativeId),
-    ])
+    const [{ inbox: rawInbox, subagents }, { rows, mtimeMs }] =
+      await Promise.all([
+        node.pollMetadata(root),
+        node.reader.read(root, nativeId).catch((error) => {
+          if (isMissing(error))
+            return { rows: [], reset: false, mtimeMs: undefined }
+          throw error
+        }),
+      ])
     if (isChild && rows.length === 0) return true
-    const observedAt = await stat(
-      join(root, nativeId, '.system_generated/logs/transcript_full.jsonl'),
-    ).then(
-      (info) => info.mtimeMs,
-      () => Date.now(),
-    )
-    node.projector.observeRows(rows)
-    for (const row of rows) {
+    const restartAfterStep = isChild
+      ? undefined
+      : options.runtimeEpoch?.afterStepIndex
+    let eligibleRows = rows
+    let postEpochSignatures: Map<string, number> | undefined
+    if (restartAfterStep !== undefined && restartAfterStep >= 0) {
+      node.turnStartStep = restartAfterStep
+      node.promptPhase = 'foreground_idle'
+      eligibleRows = rows.filter(
+        (row) => Number(row.step_index) > restartAfterStep,
+      )
+      postEpochSignatures = new Map<string, number>()
+      for (const row of eligibleRows) {
+        for (const sig of extractRowMessageSignatures(row)) {
+          postEpochSignatures.set(sig, (postEpochSignatures.get(sig) ?? 0) + 1)
+        }
+      }
+    } else if (!isChild && options.runtimeEpoch) {
+      postEpochSignatures = new Map<string, number>()
+      for (const row of rows) {
+        for (const sig of extractRowMessageSignatures(row)) {
+          postEpochSignatures.set(sig, (postEpochSignatures.get(sig) ?? 0) + 1)
+        }
+      }
+    }
+    const inbox = isChild
+      ? rawInbox
+      : adjustInboxForEpoch(rawInbox, options.runtimeEpoch, postEpochSignatures)
+    node.projector.observeRows(eligibleRows)
+    for (const row of eligibleRows) {
       // The restarted runtime left no woken turn running.
       if (isRestartNotice(row)) node.resetPhase()
-      node.ingest(row, observedAt)
+      node.ingest(row, mtimeMs)
     }
     if (inbox.unconsumedHighPriority.length > 0) return true
     if (
@@ -88,25 +278,54 @@ export async function hasActiveBackgroundWork(
       (options.includeDaemons && node.projector.hasDaemons())
     )
       return true
+    const childTurn: ChildTurnState = parentContext
+      ? resolveChildTurnState(
+          parentContext.node,
+          parentContext.minStepIndex,
+          parentContext.subRecord,
+          node,
+          inbox,
+        )
+      : {
+          status: 'active',
+          minStepIndex: node.currentTurnFloor(),
+          awaitingTurnWakeup: false,
+        }
+    if (childTurn.status === 'pending') return true
+    const nodeMinStep = childTurn.minStepIndex
     // A timed-out model retry does not stop tracked processes or descendants.
-    if (!node.failure(options.retryTimeoutMs)) {
-      if (node.retryPending()) return true
+    if (!node.failure(options.retryTimeoutMs, nodeMinStep)) {
+      if (node.retryPending(nodeMinStep)) return true
       if (
         isChild
-          ? node.hasUnprocessedMessages(inbox) || !node.isSettled(inbox)
+          ? childTurn.awaitingTurnWakeup ||
+            node.hasUnprocessedMessages(inbox) ||
+            !node.isSettled(inbox, nodeMinStep)
           : (node.foregroundIdleReached &&
               node.hasUnprocessedMessages(inbox)) ||
-            node.isWokenWorking()
+            node.isWokenActive()
       )
         return true
     }
     const activeChildIds = activeChildIdsForTurn(
       subagents,
       node.projector,
-      isChild ? -1 : node.turnStartStep,
+      nodeMinStep,
+      isChild ? undefined : options.runtimeEpoch?.ignoredSubagentIds,
     )
+    const childOptions = options.runtimeEpoch
+      ? { ...options, runtimeEpoch: undefined }
+      : options
     for (const childId of activeChildIds) {
-      if (await hasActiveBackgroundWork(root, childId, options, visiting, true))
+      const subRecord = subagents.find((s) => s.conversationId === childId)
+      if (
+        await hasActiveBackgroundWork(root, childId, {
+          ...childOptions,
+          visiting,
+          child: true,
+          parent: { node, minStepIndex: nodeMinStep, subRecord },
+        })
+      )
         return true
     }
     return false
@@ -115,19 +334,45 @@ export async function hasActiveBackgroundWork(
   }
 }
 
-async function settleChildren(
-  root: string,
+/** Resolve a child's turn phase against the parent turn that spawned or woke it. */
+function childTurnOf(
   parentNode: BrainNode,
-  parentInbox: InboxState,
-  activeChildIds: readonly string[],
-  visiting = new Set<string>(),
-  retryTimeoutMs = RETRY_IDLE_TIMEOUT_MS,
-): Promise<{ settled: boolean; error?: string; stalled?: boolean }> {
+  parentMinStepIndex: number,
+  parentSubagents: readonly SubagentRecord[],
+  childId: string,
+  child: BrainNode,
+  childInbox: InboxState,
+): ChildTurnState {
+  return resolveChildTurnState(
+    parentNode,
+    parentMinStepIndex,
+    parentSubagents.find((s) => s.conversationId === childId),
+    child,
+    childInbox,
+  )
+}
+
+type ChildSettlement = { settled: boolean; error?: string; stalled?: boolean }
+
+async function settleChildren(options: {
+  root: string
+  parentNode: BrainNode
+  parentInbox: InboxState
+  activeChildIds: readonly string[]
+  parentSubagents: readonly SubagentRecord[]
+  parentMinStepIndex: number
+  visiting?: Set<string>
+  retryTimeoutMs?: number
+}): Promise<ChildSettlement> {
+  const { root, parentNode, parentInbox, parentSubagents, parentMinStepIndex } =
+    options
+  const visiting = options.visiting ?? new Set<string>()
+  const retryTimeoutMs = options.retryTimeoutMs ?? RETRY_IDLE_TIMEOUT_MS
   if (visiting.has(parentNode.nativeId)) return { settled: true }
   visiting.add(parentNode.nativeId)
   try {
     let settled = true
-    for (const childId of activeChildIds) {
+    for (const childId of options.activeChildIds) {
       if (!sessionIdPattern.test(childId) || visiting.has(childId)) continue
       let child = parentNode.children.get(childId)
       if (!child) {
@@ -137,49 +382,87 @@ async function settleChildren(
       const { inbox: childInbox, subagents: childSubagents } =
         await child.pollMetadata(root)
       try {
-        const { rows, reset } = await child.reader.read(root, childId)
+        const { rows, reset, snapshotStepIndices, mtimeMs } =
+          await child.reader.read(root, childId)
+        const observedAt = child.initialReadDone ? undefined : mtimeMs
+        if (rows.length > 0) child.initialReadDone = true
+        if (snapshotStepIndices) child.pruneRetrySteps(snapshotStepIndices)
         if (reset) child.reset(childInbox, childSubagents)
         child.projector.observeRows(rows)
-        for (const row of rows) child.ingest(row)
+        for (const row of rows) child.ingest(row, observedAt)
       } catch (error) {
         if (isMissing(error)) {
-          const failure = child.failure(retryTimeoutMs)
-          if (failure)
-            return {
-              settled: false,
-              error: `Subagent ${childId} failed: ${failure}`,
-              stalled: child.retryPending(),
-            }
+          const childTurn = childTurnOf(
+            parentNode,
+            parentMinStepIndex,
+            parentSubagents,
+            childId,
+            child,
+            childInbox,
+          )
+          if (childTurn.status === 'active') {
+            const failure = child.failure(
+              retryTimeoutMs,
+              childTurn.minStepIndex,
+            )
+            if (failure)
+              return {
+                settled: false,
+                error: `Subagent ${childId} failed: ${failure}`,
+                stalled: child.retryPending(childTurn.minStepIndex),
+              }
+          }
           settled = false
           continue
         }
         throw error
       }
-      if (!child.retryPending() && child.hasUnprocessedMessages(childInbox)) {
+      const childTurn = childTurnOf(
+        parentNode,
+        parentMinStepIndex,
+        parentSubagents,
+        childId,
+        child,
+        childInbox,
+      )
+      if (childTurn.status === 'pending') {
         settled = false
         continue
       }
-      const failure = child.failure(retryTimeoutMs)
-      if (failure)
-        return {
-          settled: false,
-          error: `Subagent ${childId} failed: ${failure}`,
-          stalled: child.retryPending(),
-        }
-      if (!child.isSettled(childInbox)) settled = false
+      const childMinStep = childTurn.minStepIndex
+      const waitingForWakeup =
+        !child.retryPending(childMinStep) &&
+        (childTurn.awaitingTurnWakeup ||
+          child.hasUnprocessedMessages(childInbox))
+      if (!waitingForWakeup) {
+        const failure = child.failure(retryTimeoutMs, childMinStep)
+        if (failure)
+          return {
+            settled: false,
+            error: `Subagent ${childId} failed: ${failure}`,
+            stalled: child.retryPending(childMinStep),
+          }
+      }
+      if (
+        waitingForWakeup ||
+        childTurn.awaitingTurnWakeup ||
+        !child.isSettled(childInbox, childMinStep)
+      )
+        settled = false
       const grandchildIds = activeChildIdsForTurn(
         childSubagents,
         child.projector,
-        -1,
+        childMinStep,
       )
-      const nested = await settleChildren(
-        root,
-        child,
-        childInbox,
-        grandchildIds,
+      const nested = await settleChildren({
+        ...options,
         visiting,
-        retryTimeoutMs,
-      )
+        parentNode: child,
+        parentInbox: childInbox,
+        activeChildIds: grandchildIds,
+        parentSubagents: childSubagents,
+        parentMinStepIndex: childMinStep,
+      })
       if (nested.error) return nested
       if (!nested.settled) settled = false
       // This child's report must reach the parent's transcript before the child counts as settled.
@@ -405,14 +688,13 @@ export async function settleBrainTurn(
     onQuestionSettled,
     onSubagents,
     observation,
-    onUsage,
     onWakeupState,
     isRpcActive,
     mcpServerNames,
+    runtimeEpoch,
   }: {
     mcpServerNames?: readonly string[]
     observation?: BrainTurnObservation
-    onUsage?: (usage: StepUsage, wokeUp: boolean) => void
     onWakeupState?: (state: {
       wokeUp: boolean
       wakeupUsage?: StepUsage
@@ -420,6 +702,7 @@ export async function settleBrainTurn(
       pendingReplay?: boolean
     }) => void
     isRpcActive?: () => boolean
+    runtimeEpoch?: RuntimeEpoch
     onSubagents?: (subagents: readonly SubagentRecord[]) => void
     signal?: AbortSignal
     minStepIndex?: number
@@ -464,6 +747,10 @@ export async function settleBrainTurn(
   carriedWakeupUsage?: StepUsage
 }> {
   if (!sessionIdPattern.test(nativeId)) return { status: 'completed' }
+  const effectiveMinStepIndex = Math.max(
+    minStepIndex,
+    runtimeEpoch?.afterStepIndex ?? -1,
+  )
   const fgReconciler = new ForegroundReconciler(foregroundAcp, emitForeground)
   const settledQuestions = new Map<
     string,
@@ -479,6 +766,7 @@ export async function settleBrainTurn(
     reader: observation?.reader,
     allowInitialSpawnPrompt: false,
     mcpServerNames,
+    turnFloor: minStepIndex,
   })
   const ownsObservation = !observation
   const stream =
@@ -487,14 +775,15 @@ export async function settleBrainTurn(
       root,
       nativeId,
       sessionId,
-      minStepIndex,
+      effectiveMinStepIndex,
       {
         isCurrent: () => !signal?.aborted,
-        onUsage: (usage) => onUsage?.(usage, fgReconciler.postRpc),
+        onUsage: () => {},
         onItem,
       },
       pollIntervalMs,
       node.reader,
+      runtimeEpoch?.afterStepIndex ?? -1,
     )
   stream.phase = 'settling'
   const startedAt = Date.now()
@@ -621,10 +910,14 @@ export async function settleBrainTurn(
     if (!stream.acceptsRows() || signal?.aborted) return
     const metadata = await node.pollMetadata(root)
     if (!stream.acceptsRows() || signal?.aborted) return
-    inbox = metadata.inbox
+    inbox = adjustInboxForEpoch(
+      metadata.inbox,
+      runtimeEpoch,
+      stream.postEpochSignatures,
+    )
     subagents = metadata.subagents
     onSubagents?.(subagents)
-    const nextFingerprint = `${inbox.messages.length}:${inbox.readIds.size}:${subagents
+    const nextFingerprint = `${metadata.inbox.messages.length}:${metadata.inbox.readIds.size}:${subagents
       .map((s) => `${s.conversationId}=${s.state}`)
       .join(',')}`
     if (nextFingerprint !== fingerprint) {
@@ -633,8 +926,10 @@ export async function settleBrainTurn(
       lastActivity = Date.now()
     }
     const rows = read.rows
+    const observedAt = node.initialReadDone ? undefined : read.mtimeMs
     if (read.snapshotStepIndices) {
       dedupe.prune(read.snapshotStepIndices)
+      node.pruneRetrySteps(read.snapshotStepIndices)
       for (const step of wakeupSteps.keys())
         if (!read.snapshotStepIndices.has(step)) wakeupSteps.delete(step)
       emitWakeupState()
@@ -668,7 +963,7 @@ export async function settleBrainTurn(
       for (let i = 0; i < preamble.length; i++) {
         if (
           preamble[i].type === 'USER_INPUT' &&
-          Number(preamble[i].step_index) > minStepIndex
+          Number(preamble[i].step_index) > effectiveMinStepIndex
         ) {
           start = i
           break
@@ -677,7 +972,8 @@ export async function settleBrainTurn(
       if (start < 0) return
       initial = false
       anchored = true
-      for (const row of preamble.slice(0, start))
+      const preambleSlice = preamble.slice(0, start)
+      for (const row of preambleSlice)
         node.consumedMessages += countRowMessages(row, false)
       slice = preamble.slice(start)
       preamble = []
@@ -685,6 +981,7 @@ export async function settleBrainTurn(
       node.projector.bindToolCallIds(acpToolCallIds)
       node.projector.resolveToolIdentities(isRpcActive?.() === true)
     }
+    if (slice.length > 0) node.initialReadDone = true
     for (const row of slice) {
       const stepIndex = Number(row.step_index)
       if (row.type === 'USER_INPUT') {
@@ -707,7 +1004,10 @@ export async function settleBrainTurn(
         }
       }
       fgReconciler.observeRowMeta(row)
-      const items = node.ingest(row)
+      const items = node.ingest(
+        row,
+        read.observedAtByStep?.get(stepIndex) ?? observedAt,
+      )
       const usage = extractStepUsage(row)
       const postRpcStep = fgReconciler.reconcile(row, items, node.wokeUp)
       stream.wokeUp ||= fgReconciler.postRpc
@@ -797,7 +1097,6 @@ export async function settleBrainTurn(
         await stream.wait(revision, signal)
         continue
       }
-      if (signal?.aborted) continue
       const failure = node.failure(retryTimeoutMs)
       if (failure)
         return {
@@ -887,19 +1186,22 @@ export async function settleBrainTurn(
       }
       if (continuedQuestion) continue
       const checkedVersion = foldVersion
+      const childMinStep = node.currentTurnFloor()
       const activeChildIds = activeChildIdsForTurn(
         subagents,
         node.projector,
-        minStepIndex,
+        childMinStep,
+        runtimeEpoch?.ignoredSubagentIds,
       )
-      const childStatus = await settleChildren(
+      const childStatus = await settleChildren({
         root,
-        node,
-        inbox,
+        parentNode: node,
+        parentInbox: inbox,
         activeChildIds,
-        new Set(),
+        parentSubagents: subagents,
+        parentMinStepIndex: childMinStep,
         retryTimeoutMs,
-      )
+      })
       if (signal?.aborted || checkedVersion !== foldVersion) continue
       if (childStatus.error)
         return {
@@ -908,8 +1210,12 @@ export async function settleBrainTurn(
         }
       if (childStatus.settled && node.isSettled(inbox)) {
         if (activeChildIds.length > 0) {
-          if (node.hasUnprocessedMessages(await readInboxState(root, nativeId)))
-            continue
+          const latestInbox = adjustInboxForEpoch(
+            await readInboxState(root, nativeId),
+            runtimeEpoch,
+            stream.postEpochSignatures,
+          )
+          if (node.hasUnprocessedMessages(latestInbox)) continue
         }
         if (checkedVersion !== foldVersion) continue
         return finish('completed')
@@ -937,6 +1243,10 @@ export async function settleBrainTurn(
 export type BrainWatchHandle = (() => void) & {
   /** Drain rows written so far, then end the active child turn as canceled. */
   cancel: () => Promise<void>
+  /** Poll once immediately so terminal child states are observed before sibling cleanup. */
+  flush: () => Promise<void>
+  /** Immediately mark the child turn canceled and stop polling without awaiting drain. */
+  forceCancel: () => void
   isRunning: () => boolean
   /** Stopped or canceled: no further rows are read. */
   isStopped: () => boolean
@@ -961,11 +1271,16 @@ export function watchBrain(
   onSubagents?: (subagents: readonly SubagentRecord[]) => void,
   retryTimeoutMs = RETRY_IDLE_TIMEOUT_MS,
   mcpServerNames: readonly string[] = [],
+  reader?: TranscriptReader,
 ): BrainWatchHandle {
   if (!sessionIdPattern.test(nativeId))
     throw new Error('Invalid Brain session ID')
   const timeline = new Timeline(sessionId, mcpServerNames)
-  const node = new BrainNode(nativeId, sessionId, { mcpServerNames })
+  const node = new BrainNode(nativeId, sessionId, {
+    mcpServerNames,
+    turnFloor: resume?.afterStep ?? -1,
+    reader,
+  })
   let stopped = false
   let inflight: Promise<void> | undefined
   let cancelling: Promise<void> | undefined
@@ -975,6 +1290,7 @@ export function watchBrain(
   let turnSeq = resume?.turnSeq ?? 1
   let turnId = `${sessionId}:turn:${turnSeq}`
   let lastStepIndex = resume?.afterStep ?? -1
+  const boundaryCache: TurnBoundaryCache = new Map()
   const dedupe = new StepDedupe()
   const childUsage = new ModelUsageObserver(
     resume?.afterStep ?? -1,
@@ -1029,14 +1345,25 @@ export function watchBrain(
     try {
       const { inbox, subagents } = await node.pollMetadata(root)
       onSubagents?.(subagents)
-      const { rows, reset, snapshotStepIndices } = await node.reader.read(
-        root,
-        nativeId,
-      )
-      if (snapshotStepIndices) dedupe.prune(snapshotStepIndices)
+      const { rows, reset, snapshotStepIndices, mtimeMs } =
+        await node.reader.read(root, nativeId)
+      const observedAt = node.initialReadDone ? undefined : mtimeMs
+      if (rows.length > 0) node.initialReadDone = true
+      if (snapshotStepIndices) {
+        dedupe.prune(snapshotStepIndices)
+        node.pruneRetrySteps(snapshotStepIndices)
+      }
       if (reset) {
         node.reset(inbox, subagents)
+        boundaryCache.clear()
       }
+      // The initial spawn message names the conversation that owns this session's turns; every
+      // correlation below keys off it so the inbox filter and the transcript-row sender check agree.
+      const init = inbox.messages.find((m) =>
+        isNativeToolName(m.tool?.name ?? '', 'invoke_subagent'),
+      )
+      const parentId = init?.tool?.conversationId
+      const tagged = selectParentWakeups(inbox, parentId)
       node.projector.observeRows(rows)
       for (const row of rows) {
         if (stopped) return
@@ -1047,7 +1374,7 @@ export function watchBrain(
           (resume !== undefined && stepIndex <= resume.afterStep)
         if (Number.isInteger(stepIndex) && stepIndex > lastStepIndex)
           lastStepIndex = stepIndex
-        const items = node.ingest(row)
+        const items = node.ingest(row, observedAt)
         if (replayed) continue
         if (
           !running &&
@@ -1056,6 +1383,7 @@ export function watchBrain(
             row.type === 'SYSTEM_MESSAGE' ||
             row.type === 'PLANNER_RESPONSE')
         ) {
+          if (Number.isInteger(stepIndex)) node.advanceTurnFloor(stepIndex - 1)
           running = true
           turnId = `${sessionId}:turn:${++turnSeq}`
           turnStartedEmitted = true
@@ -1081,23 +1409,62 @@ export function watchBrain(
         }
       }
       childUsage.observe({ rows, reset, snapshotStepIndices })
+      const wakeupSteps = parentId ? node.wakeupStepsFrom(parentId) : []
+      const parentTurnActive = isParentTurnActive?.() !== false
+      let awaitingCrossTurnEntry = false
+      if (
+        parentId &&
+        init?.tool?.stepIndex !== undefined &&
+        tagged.length > 0
+      ) {
+        const latestWakeParentStep = tagged[tagged.length - 1].tool.stepIndex
+        const resolved = await readTurnBoundaryBefore(
+          root,
+          parentId,
+          latestWakeParentStep,
+          boundaryCache,
+        )
+        if (!resolved.ready) {
+          awaitingCrossTurnEntry = parentTurnActive
+        } else {
+          const turn = resolveReWokenTurn(
+            tagged,
+            wakeupSteps,
+            resolved.boundary,
+            init.tool.stepIndex,
+          )
+          if (turn.status === 're-woken')
+            node.advanceTurnFloor(turn.startStep - 1)
+          else
+            awaitingCrossTurnEntry =
+              turn.status === 'awaiting-row' &&
+              parentTurnActive &&
+              tagged.length > wakeupSteps.length
+        }
+      }
+      if (awaitingCrossTurnEntry) return
+      const childMinStep = node.currentTurnFloor()
       const activeChildIds = activeChildIdsForTurn(
         subagents,
         node.projector,
-        -1,
+        childMinStep,
       )
-      const childStatus = await settleChildren(
+      const childStatus = await settleChildren({
         root,
-        node,
-        inbox,
+        parentNode: node,
+        parentInbox: inbox,
         activeChildIds,
-        new Set(),
+        parentSubagents: subagents,
+        parentMinStepIndex: childMinStep,
         retryTimeoutMs,
-      )
+      })
       if (childStatus.error) finishTurn('failed', childStatus.error)
+      const hasPendingParentWakeup =
+        tagged.length > wakeupSteps.length && isParentTurnActive?.() !== false
       if (
         running &&
-        (node.retryPending() || !node.hasUnprocessedMessages(inbox))
+        (node.retryPending() ||
+          (!hasPendingParentWakeup && !node.hasUnprocessedMessages(inbox)))
       ) {
         const failure = node.failure(retryTimeoutMs)
         if (failure) {
@@ -1157,6 +1524,12 @@ export function watchBrain(
       resumePoint() {
         return { afterStep: lastStepIndex, turnSeq }
       },
+      async flush() {
+        if (stopped || cancelling) return
+        await inflight?.catch(() => undefined)
+        if (stopped || cancelling) return
+        await poll().catch(() => undefined)
+      },
       cancel() {
         if (stopped) return Promise.resolve()
         clearInterval(timer)
@@ -1168,6 +1541,12 @@ export function watchBrain(
           stopped = true
         })()
         return cancelling
+      },
+      forceCancel() {
+        if (stopped) return
+        clearInterval(timer)
+        finishTurn('canceled')
+        stopped = true
       },
     },
   )

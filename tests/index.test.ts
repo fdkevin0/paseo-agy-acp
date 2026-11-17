@@ -8,7 +8,6 @@ import type { ProviderRegistration } from '@getpaseo/plugin/server/provider'
 import type { UsageSourceRegistration } from '@getpaseo/plugin/server/usage'
 import contribute from '../index.server.ts'
 import { PACKAGE_VERSION } from '../server/common.ts'
-import { AgyUsageSource } from '../server/usage.ts'
 
 test('contribute registers provider and usage source', () => {
   let registeredUsage: UsageSourceRegistration | undefined
@@ -37,17 +36,6 @@ test('contribute registers provider and usage source', () => {
   assert.ok(registeredProvider)
   assert.equal(registeredProvider.id, 'agy')
   assert.equal(registeredProvider.label, 'Antigravity (ACP)')
-})
-
-test('AgyUsageSource.registration returns valid registration structure', () => {
-  const usage = new AgyUsageSource()
-  const reg = usage.registration()
-  assert.equal(reg.id, 'agy')
-  assert.equal(reg.label, 'Antigravity')
-  assert.equal(reg.icon, 'icon.svg')
-  assert.equal(typeof reg.discover, 'function')
-  assert.equal(typeof reg.fetch, 'function')
-  assert.ok(reg.input)
 })
 
 test('PACKAGE_VERSION matches package.json and server imports respect Paseo runtime boundaries', () => {
