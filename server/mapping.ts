@@ -814,7 +814,14 @@ export class Timeline {
       update.sessionUpdate === 'agent_message_chunk' ||
       update.sessionUpdate === 'agent_thought_chunk'
     ) {
-      if (update.content.type !== 'text') return
+      const chunk =
+        update.content.type === 'text'
+          ? update.content.text
+          : update.sessionUpdate === 'user_message_chunk' &&
+              update.content.type === 'image'
+            ? '[image]'
+            : undefined
+      if (chunk === undefined) return
       const type =
         update.sessionUpdate === 'user_message_chunk'
           ? 'user_message'
@@ -827,9 +834,18 @@ export class Timeline {
           type,
           text: '',
         }
+      const prev = this.message!.text
+      const sep =
+        type === 'user_message' &&
+        prev.length > 0 &&
+        !prev.endsWith('\n') &&
+        !chunk.startsWith('\n') &&
+        (update.content.type === 'image' || prev.endsWith('[image]'))
+          ? '\n'
+          : ''
       this.message = {
         ...this.message!,
-        text: this.message!.text + update.content.text,
+        text: prev + sep + chunk,
       }
       return this.message
     }

@@ -1181,3 +1181,52 @@ test('hasPositivePromptUsage and appliesCarriedWakeup reject zero placeholders a
     true,
   )
 })
+
+test('Timeline projects image blocks in user_message_chunk as [image] placeholders', () => {
+  const imageOnly = new Timeline('s1')
+  const imgItem = imageOnly.update({
+    sessionUpdate: 'user_message_chunk',
+    content: { type: 'image', data: 'AQID', mimeType: 'image/png' },
+  })
+  assert.deepEqual(imgItem, {
+    id: 's1:message:1',
+    type: 'user_message',
+    text: '[image]',
+  })
+
+  const textThenImg = new Timeline('s2')
+  textThenImg.update({
+    sessionUpdate: 'user_message_chunk',
+    content: { type: 'text', text: 'check this' },
+  })
+  const combined1 = textThenImg.update({
+    sessionUpdate: 'user_message_chunk',
+    content: { type: 'image', data: 'AQID', mimeType: 'image/png' },
+  })
+  assert.equal(
+    combined1?.type === 'user_message' ? combined1.text : undefined,
+    'check this\n[image]',
+  )
+
+  const imgThenText = new Timeline('s3')
+  imgThenText.update({
+    sessionUpdate: 'user_message_chunk',
+    content: { type: 'image', data: 'AQID', mimeType: 'image/png' },
+  })
+  const combined2 = imgThenText.update({
+    sessionUpdate: 'user_message_chunk',
+    content: { type: 'text', text: 'describe' },
+  })
+  assert.equal(
+    combined2?.type === 'user_message' ? combined2.text : undefined,
+    '[image]\ndescribe',
+  )
+
+  assert.equal(
+    imgThenText.update({
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'image', data: 'AQID', mimeType: 'image/png' },
+    }),
+    undefined,
+  )
+})

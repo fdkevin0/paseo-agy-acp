@@ -9,7 +9,7 @@ import {
   type ProviderEvent,
 } from '@getpaseo/plugin/server/provider'
 import { BrainTranscriptProjector } from '../server/brain-projector.ts'
-import { alignReplayTools } from '../server/history.ts'
+import { alignReplayTools, mergeCompactionHistory } from '../server/history.ts'
 import { Timeline } from '../server/mapping.ts'
 import { SessionManager } from '../server/session.ts'
 import { AgyUsageSource } from '../server/usage.ts'
@@ -1747,4 +1747,64 @@ test('Orchestrator contrib planexecute handoffs align across CHECKPOINT history 
   )?.item
   assert.ok(enterItem?.type === 'tool_call')
   assert.equal(enterItem.detail.type, 'unknown')
+})
+
+test('Brain USER_INPUT media projects [image] placeholders and deduplicates with ACP replay', () => {
+  const projector = new BrainTranscriptProjector('s')
+  const imageOnly = projector.project({
+    step_index: 0,
+    type: 'USER_INPUT',
+    status: 'DONE',
+    content: '',
+    media: [{ mime_type: 'image/png', uri: '/tmp/a.png' }],
+  })
+  assert.deepEqual(imageOnly, [
+    { type: 'user_message', id: 's:step:0', text: '[image]' },
+  ])
+
+  const textWithMedia = projector.project({
+    step_index: 1,
+    type: 'USER_INPUT',
+    status: 'DONE',
+    content:
+      '<USER_REQUEST>\nexplain\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nlocal time\n</ADDITIONAL_METADATA>',
+    media: [
+      { mime_type: 'image/png', uri: '/tmp/a.png' },
+      { mime_type: 'image/jpeg', uri: '/tmp/b.jpg' },
+    ],
+  })
+  assert.deepEqual(textWithMedia, [
+    {
+      type: 'user_message',
+      id: 's:step:1',
+      text: '<USER_REQUEST>\nexplain\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nlocal time\n</ADDITIONAL_METADATA>\n[image]\n[image]',
+    },
+  ])
+
+  const merged = mergeCompactionHistory(
+    [
+      {
+        item: { type: 'user_message', id: 'acp:1', text: '[image]' },
+      },
+      {
+        item: {
+          type: 'user_message',
+          id: 'acp:2',
+          text: 'explain\n[image]\n[image]',
+        },
+      },
+    ],
+    [{ item: imageOnly[0] }, { item: textWithMedia[0] }],
+  )
+  assert.deepEqual(
+    merged.map((e) => e.item),
+    [
+      { type: 'user_message', id: 'acp:1', text: '[image]' },
+      {
+        type: 'user_message',
+        id: 'acp:2',
+        text: 'explain\n[image]\n[image]',
+      },
+    ],
+  )
 })
