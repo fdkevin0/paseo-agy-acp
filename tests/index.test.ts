@@ -9,40 +9,37 @@ import type { UsageSourceRegistration } from '@getpaseo/plugin/server/usage'
 import contribute from '../index.server.ts'
 import { PACKAGE_VERSION } from '../server/common.ts'
 
-test('contribute registers provider and usage source', () => {
-  let registeredUsage: UsageSourceRegistration | undefined
-  let registeredProvider: ProviderRegistration | undefined
-
-  const mockServer = {
-    registerUsageSource(source: UsageSourceRegistration) {
-      registeredUsage = source
+function createRecordingServerContext() {
+  let usage: UsageSourceRegistration | undefined
+  let provider: ProviderRegistration | undefined
+  const unexpected = (method: string) => () => {
+    throw new Error(`Unexpected PluginServerContext.${method} call`)
+  }
+  const server: PluginServerContext = {
+    registerSettings: unexpected('registerSettings'),
+    handle: unexpected('handle'),
+    addHook: unexpected('addHook'),
+    on: unexpected('on'),
+    before: unexpected('before'),
+    registerUsageSource(source) {
+      usage = source
     },
-    registerProvider(provider: ProviderRegistration) {
-      registeredProvider = provider
+    registerProvider(registration) {
+      provider = registration
     },
-  } as unknown as PluginServerContext
+  }
+  return {
+    server,
+    get usage() {
+      return usage
+    },
+    get provider() {
+      return provider
+    },
+  }
+}
 
-  const cleanup = contribute(mockServer)
-  assert.equal(typeof cleanup, 'function')
-  cleanup()
-
-  assert.ok(registeredUsage)
-  assert.equal(registeredUsage.id, 'agy')
-  assert.equal(registeredUsage.label, 'Antigravity')
-  assert.equal(registeredUsage.icon, 'icon.svg')
-  assert.equal(typeof registeredUsage.discover, 'function')
-  assert.equal(typeof registeredUsage.fetch, 'function')
-
-  assert.ok(registeredProvider)
-  assert.equal(registeredProvider.id, 'agy')
-  assert.equal(registeredProvider.label, 'Antigravity (ACP)')
-})
-
-test('PACKAGE_VERSION matches package.json and server imports respect Paseo runtime boundaries', () => {
-  const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-  const pkg = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'))
-  assert.equal(PACKAGE_VERSION, pkg.version)
-
+function findEscapingRuntimeImports(root: string): string[] {
   const allowedRoots = ['server', 'client', 'shared'].map((dir) =>
     resolve(root, dir),
   )
@@ -54,6 +51,7 @@ test('PACKAGE_VERSION matches package.json and server imports respect Paseo runt
   ]
   const specifierPattern =
     /\b(?:import|export)\s+(?:[^'"]*?\s+from\s+)?['"](\.[^'"]+)['"]/g
+  const violations: string[] = []
   for (const file of files) {
     const source = readFileSync(file, 'utf8')
     for (const match of source.matchAll(specifierPattern)) {
@@ -61,10 +59,35 @@ test('PACKAGE_VERSION matches package.json and server imports respect Paseo runt
       const insideAllowed = allowedRoots.some(
         (allowed) => target === allowed || target.startsWith(allowed + sep),
       )
-      assert.ok(
-        insideAllowed,
-        `Runtime import ${match[1]} in ${relative(root, file)} escapes client/, server/, or shared/`,
-      )
+      if (!insideAllowed) {
+        violations.push(`${relative(root, file)} -> ${match[1]}`)
+      }
     }
   }
+  return violations
+}
+
+test('contribute registers provider and usage source', () => {
+  const recorder = createRecordingServerContext()
+  const cleanup = contribute(recorder.server)
+  assert.equal(typeof cleanup, 'function')
+  cleanup()
+
+  assert.ok(recorder.usage)
+  assert.equal(recorder.usage.id, 'agy')
+  assert.equal(recorder.usage.label, 'Antigravity')
+  assert.equal(recorder.usage.icon, 'icon.svg')
+  assert.equal(typeof recorder.usage.discover, 'function')
+  assert.equal(typeof recorder.usage.fetch, 'function')
+
+  assert.ok(recorder.provider)
+  assert.equal(recorder.provider.id, 'agy')
+  assert.equal(recorder.provider.label, 'Antigravity (ACP)')
+})
+
+test('PACKAGE_VERSION matches package.json and server imports respect Paseo runtime boundaries', () => {
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+  const pkg = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'))
+  assert.equal(PACKAGE_VERSION, pkg.version)
+  assert.deepEqual(findEscapingRuntimeImports(root), [])
 })

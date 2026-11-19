@@ -20,7 +20,7 @@ agent()
       process.execPath,
       [
         '-e',
-        "setTimeout(() => require('node:fs').writeFileSync(process.argv[1], 'leaked'), 700)",
+        "setTimeout(() => require('node:fs').writeFileSync(process.argv[1], 'leaked'), 3000)",
         join(process.env.HOME!, 'old-result'),
       ],
       { detached: true, stdio: 'ignore' },
