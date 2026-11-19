@@ -6,6 +6,7 @@ import {
   mkdir,
   writeFile,
   readFile,
+  realpath,
   rm,
   stat,
   symlink,
@@ -352,7 +353,7 @@ test('keychain logins without a token file support cold global discovery, accoun
 })
 
 test('usage discovers account scopes and maps windows, tier and failures through the CLI', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'agy-usage-'))
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'agy-usage-')))
   const home = join(root, 'home')
   const dir = join(home, '.gemini/antigravity-cli')
   const fixture = join(root, 'quota.json')
