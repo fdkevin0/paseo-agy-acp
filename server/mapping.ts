@@ -655,22 +655,6 @@ export function hasPositivePromptUsage(usage?: Usage | null): boolean {
   )
 }
 
-export function appliesCarriedWakeup(
-  usage: Usage | null | undefined,
-  carriedWakeup: StepUsage | undefined,
-): carriedWakeup is StepUsage {
-  if (!carriedWakeup || !hasPositivePromptUsage(usage)) return false
-  const raw = record(usage)
-  return (
-    nonnegative(raw.inputTokens) &&
-    raw.inputTokens >= carriedWakeup.inputTokens &&
-    nonnegative(raw.outputTokens) &&
-    raw.outputTokens >= carriedWakeup.outputTokens &&
-    (!nonnegative(raw.cachedReadTokens) ||
-      raw.cachedReadTokens >= carriedWakeup.cachedReadTokens)
-  )
-}
-
 /** Combine ACP turn token counters with per-step context occupancy from transcript_full.jsonl when available. */
 export function promptUsage(
   usage?: Usage | null,
@@ -678,40 +662,29 @@ export function promptUsage(
     preserveContext?: boolean
     contextWindowMaxTokens?: number
     lastStep?: StepUsage
-    carriedWakeup?: StepUsage
     wakeup?: StepUsage
   },
 ): ProviderUsage {
   const effective = hasPositivePromptUsage(usage) ? usage : undefined
   if (!effective && !options?.lastStep && !options?.wakeup) return {}
   const raw = record(effective)
-  const carried = appliesCarriedWakeup(effective, options?.carriedWakeup)
-    ? options.carriedWakeup
-    : undefined
   const field = (
     rawVal: unknown,
-    sub: number | undefined,
     add: number | undefined,
     fallback: number | undefined,
-  ) =>
-    nonnegative(rawVal)
-      ? Math.max(0, rawVal - (sub ?? 0)) + (add ?? 0)
-      : ((add || fallback) ?? 0)
+  ) => (nonnegative(rawVal) ? rawVal + (add ?? 0) : ((add || fallback) ?? 0))
   const input = field(
     raw.inputTokens,
-    carried?.inputTokens,
     options?.wakeup?.inputTokens,
     options?.lastStep?.inputTokens,
   )
   const cacheRead = field(
     raw.cachedReadTokens,
-    carried?.cachedReadTokens,
     options?.wakeup?.cachedReadTokens,
     options?.lastStep?.cachedReadTokens,
   )
   const output = field(
     raw.outputTokens,
-    carried?.outputTokens,
     options?.wakeup?.outputTokens,
     options?.lastStep?.outputTokens,
   )

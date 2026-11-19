@@ -19,7 +19,7 @@ import {
 } from '@getpaseo/plugin/server/provider'
 import { readSubagents } from '../server/brain.ts'
 import { createProvider } from '../server/provider.ts'
-import { SessionManager, streamsLiveWakeups } from '../server/session.ts'
+import { SessionManager } from '../server/session.ts'
 import { SubagentRegistry } from '../server/subagents.ts'
 import { connectAcp } from '../server/transport.ts'
 import { AgyUsageSource } from '../server/usage.ts'
@@ -28,7 +28,6 @@ import {
   createEventCollector,
   isolatedEnv,
   sequenceDouble,
-  waitUntil,
   writeBrainTranscript,
 } from './helpers.ts'
 
@@ -118,17 +117,6 @@ function onceOnEvent(
     }
   }
 }
-
-test('live wakeup streaming starts at the agy 1.5.10 release', () => {
-  assert.equal(streamsLiveWakeups(undefined), false)
-  assert.equal(streamsLiveWakeups('dev'), false)
-  assert.equal(streamsLiveWakeups('1.5.9'), false)
-  assert.equal(streamsLiveWakeups('1.5.10-rc.1'), false)
-  assert.equal(streamsLiveWakeups('1.5.10'), true)
-  assert.equal(streamsLiveWakeups('v1.5.12+build.3'), true)
-  assert.equal(streamsLiveWakeups('1.10.0'), true)
-  assert.equal(streamsLiveWakeups('2.0.0'), true)
-})
 
 test(
   'protocol disconnection kills an active child and shutdown waits for it',
@@ -2936,7 +2924,6 @@ async function usageHarness(t: TestContext) {
   const home = await mkdtemp(join(tmpdir(), 'agy-session-usage-'))
   const events: ProviderEvent[] = []
   let promptHandler: PromptHandler | undefined
-  let realPrompt!: RpcPrompt
   const m = new HarnessSessionManager({
     launch: {
       command: process.execPath,
@@ -2946,12 +2933,7 @@ async function usageHarness(t: TestContext) {
     usage: new AgyUsageSource({ env: isolatedEnv(home) }),
     capabilities: ['prompt.message', 'prompt.command', 'session.configure'],
     emit: (e) => events.push(structuredClone(e)),
-    connectAcp: wrapConnectAcp(
-      () => promptHandler,
-      (fn) => {
-        realPrompt = fn
-      },
-    ),
+    connectAcp: wrapConnectAcp(() => promptHandler),
   })
   t.after(async () => {
     await m.close()
@@ -2995,7 +2977,6 @@ async function usageHarness(t: TestContext) {
     events,
     write,
     prompt,
-    nativePrompt: (params: Parameters<RpcPrompt>[0]) => realPrompt(params),
     setPromptHandler: (handler: PromptHandler | undefined) => {
       promptHandler = handler
     },
@@ -3003,14 +2984,8 @@ async function usageHarness(t: TestContext) {
   }
 }
 
-test('zero-token canceled or command turns preserve carriedUsage, pendingReplay, and prior consumption', async (t) => {
+test('zero-token canceled or command turns preserve prior consumption', async (t) => {
   const h = await usageHarness(t)
-  h.session.state.wakeup.carriedUsage = {
-    inputTokens: 0,
-    outputTokens: 0,
-    cachedReadTokens: 500,
-  }
-  h.session.state.wakeup.pendingReplay = true
   h.session.publishUsage({
     inputTokens: 200,
     outputTokens: 20,
@@ -3038,7 +3013,7 @@ test('zero-token canceled or command turns preserve carriedUsage, pendingReplay,
     ]),
   )
 
-  // 1. Zero-token slash command preserves cache-only carriedUsage, pendingReplay, and prior consumption.
+  // A zero-token slash command does not replace prior consumption.
   await h.m.handle({
     type: 'session.prompt',
     sessionId: 's',
@@ -3048,129 +3023,22 @@ test('zero-token canceled or command turns preserve carriedUsage, pendingReplay,
       input: { type: 'command', name: 'status', arguments: '' },
     },
   })
-  assert.deepEqual(h.session.state.wakeup.carriedUsage, {
-    inputTokens: 0,
-    outputTokens: 0,
-    cachedReadTokens: 500,
-  })
-  assert.equal(h.session.state.wakeup.pendingReplay, true)
   assert.equal(h.latest().inputTokens, 200)
   assert.equal(h.latest().cachedInputTokens, 500)
 
-  // 2. Zero-token canceled message turn (before user echo) also preserves carriedUsage and pendingReplay.
+  // A canceled zero-token message turn also preserves prior consumption.
   await h.prompt('cancel-zero')
-  assert.deepEqual(h.session.state.wakeup.carriedUsage, {
-    inputTokens: 0,
-    outputTokens: 0,
-    cachedReadTokens: 500,
-  })
-  assert.equal(h.session.state.wakeup.pendingReplay, true)
   assert.equal(h.latest().inputTokens, 200)
 
-  // 3. Subsequent billed turn deducts the preserved cache-only carriedUsage cleanly.
+  // The next billed turn reports independent totals.
   await h.prompt('billed-next')
   assert.equal(h.latest().inputTokens, 120)
   assert.equal(h.latest().outputTokens, 15)
-  assert.equal(h.latest().cachedInputTokens, 150)
-  assert.equal(h.session.state.wakeup.carriedUsage, undefined)
-  assert.equal(h.session.state.wakeup.pendingReplay, false)
+  assert.equal(h.latest().cachedInputTokens, 650)
 })
 
-test('pre-echo prompt RPC rejection preserves pendingReplay and carriedUsage for the next turn', async (t) => {
+test('runtime relaunch during a stalled turn retains that turn’s wakeup usage', async (t) => {
   const h = await usageHarness(t)
-  const sender = '22222222-2222-4222-8222-222222222222'
-  h.setPromptHandler(
-    sequenceDouble([
-      // Turn 1: Reactive Wakeup produces pendingReplay = true and carriedUsage = {50, 5}.
-      async () => {
-        await h.write([
-          { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-          {
-            step_index: 1,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            content: 'Foreground',
-            input_tokens: 100,
-            output_tokens: 10,
-          },
-          {
-            step_index: 2,
-            type: 'SYSTEM_MESSAGE',
-            content: `<SYSTEM_MESSAGE>\n[Message] sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=done\n</SYSTEM_MESSAGE>`,
-          },
-          {
-            step_index: 3,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            content: 'Woken reply',
-            input_tokens: 50,
-            output_tokens: 5,
-          },
-        ])
-        return {
-          stopReason: 'end_turn' as const,
-          usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
-        }
-      },
-      // Turn 2: rpc.prompt throws before echoing user_message_chunk (no relaunch).
-      async () => {
-        throw new Error('Transient RPC failure before echo')
-      },
-      // Turn 3: succeeds with cumulative usage (110 - 50 carried = 60).
-      async () => {
-        await h.write([
-          { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-          { step_index: 4, type: 'USER_INPUT', content: 'turn 3' },
-          {
-            step_index: 5,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            content: 'Turn 3 reply',
-            input_tokens: 60,
-            output_tokens: 6,
-          },
-        ])
-        return {
-          stopReason: 'end_turn' as const,
-          usage: { inputTokens: 110, outputTokens: 11, totalTokens: 121 },
-        }
-      },
-    ]),
-  )
-  await h.prompt('turn 1')
-  assert.equal(h.session.state.wakeup.pendingReplay, true)
-  assert.deepEqual(h.session.state.wakeup.carriedUsage, {
-    inputTokens: 50,
-    outputTokens: 5,
-    cachedReadTokens: 0,
-  })
-
-  await h.prompt('turn 2')
-  assert.equal(
-    h.session.state.wakeup.pendingReplay,
-    true,
-    'pendingReplay must survive pre-echo prompt RPC failure when runtime was not relaunched',
-  )
-  assert.deepEqual(h.session.state.wakeup.carriedUsage, {
-    inputTokens: 50,
-    outputTokens: 5,
-    cachedReadTokens: 0,
-  })
-
-  await h.prompt('turn 3')
-  assert.equal(h.latest().inputTokens, 60)
-  assert.equal(h.latest().outputTokens, 6)
-  assert.equal(h.session.state.wakeup.pendingReplay, false)
-  assert.equal(h.session.state.wakeup.carriedUsage, undefined)
-})
-
-test('runtime relaunch during a turn deducts pre-relaunch carriedUsage while clearing dead-runtime wakeup state', async (t) => {
-  const h = await usageHarness(t)
-  h.session.state.wakeup.carriedUsage = {
-    inputTokens: 80,
-    outputTokens: 8,
-    cachedReadTokens: 10,
-  }
   const sender = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
   h.setPromptHandler(async () => {
     await h.write([
@@ -3245,140 +3113,12 @@ test('runtime relaunch during a turn deducts pre-relaunch carriedUsage while cle
     oldTransport,
     'stalled woken turn with active background task must relaunch the runtime',
   )
-  // 180 - 80 (prevCarried) + 40 (turnWakeupUsage) = 140
-  assert.equal(h.latest().inputTokens, 140)
-  assert.equal(h.latest().outputTokens, 14)
-  assert.equal(h.latest().cachedInputTokens, 25)
-  assert.equal(
-    h.session.state.wakeup.carriedUsage,
-    undefined,
-    'fresh runtime after relaunch must not inherit dead-runtime wakeup debt',
-  )
-  assert.equal(h.session.state.wakeup.pendingReplay, false)
+  assert.equal(h.latest().inputTokens, 220)
+  assert.equal(h.latest().outputTokens, 22)
+  assert.equal(h.latest().cachedInputTokens, 35)
 })
 
-test('post-echo zero-usage cancellation clears pendingReplay while preserving carriedUsage', async (t) => {
-  const h = await usageHarness(t)
-  h.session.state.wakeup.carriedUsage = {
-    inputTokens: 50,
-    outputTokens: 5,
-    cachedReadTokens: 0,
-  }
-  h.session.state.wakeup.pendingReplay = true
-  h.setPromptHandler(async () => {
-    const pending = h.nativePrompt({
-      sessionId: h.session.state.nativeId,
-      prompt: [{ type: 'text', text: 'wait' }],
-    })
-    await waitUntil(() => !h.session.state.wakeup.suppressEcho)
-    await h.session.transport.rpc.cancel({
-      sessionId: h.session.state.nativeId,
-    })
-    await pending
-    return {
-      stopReason: 'cancelled' as const,
-      usage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        totalTokens: 0,
-      },
-    }
-  })
-  await h.prompt('post-echo-cancel')
-  assert.equal(
-    h.session.state.wakeup.pendingReplay,
-    false,
-    'user_message_chunk consumed pendingReplay even though result.usage was all zero',
-  )
-  assert.deepEqual(h.session.state.wakeup.carriedUsage, {
-    inputTokens: 50,
-    outputTokens: 5,
-    cachedReadTokens: 0,
-  })
-})
-
-test('zero-usage turn with its own wakeup accumulates carriedUsage via addStepUsage', async (t) => {
-  const h = await usageHarness(t)
-  h.session.state.wakeup.carriedUsage = {
-    inputTokens: 50,
-    outputTokens: 5,
-    cachedReadTokens: 10,
-  }
-  const sender = '33333333-3333-4333-8333-333333333333'
-  h.setPromptHandler(async () => {
-    await h.write([
-      { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-      {
-        step_index: 1,
-        type: 'PLANNER_RESPONSE',
-        status: 'DONE',
-        content: 'Foreground',
-      },
-      {
-        step_index: 2,
-        type: 'SYSTEM_MESSAGE',
-        content: `<SYSTEM_MESSAGE>\n[Message] sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=wake\n</SYSTEM_MESSAGE>`,
-      },
-      {
-        step_index: 3,
-        type: 'PLANNER_RESPONSE',
-        status: 'DONE',
-        content: 'Woken reply',
-        input_tokens: 30,
-        output_tokens: 3,
-        cache_read_tokens: 5,
-      },
-    ])
-    return {
-      stopReason: 'end_turn' as const,
-      usage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        totalTokens: 0,
-      },
-    }
-  })
-  await h.prompt('zero-rpc-with-wakeup')
-  assert.deepEqual(h.session.state.wakeup.carriedUsage, {
-    inputTokens: 80,
-    outputTokens: 8,
-    cachedReadTokens: 15,
-  })
-  assert.equal(h.latest().inputTokens, 30)
-  assert.equal(h.latest().outputTokens, 3)
-  assert.equal(h.latest().cachedInputTokens, 5)
-})
-
-test('underflowing positive usage skips carriedUsage deduction and clears stale carriedUsage', async (t) => {
-  const h = await usageHarness(t)
-  h.session.state.wakeup.carriedUsage = {
-    inputTokens: 50,
-    outputTokens: 5,
-    cachedReadTokens: 500,
-  }
-  h.setPromptHandler(async () => ({
-    stopReason: 'end_turn' as const,
-    usage: {
-      inputTokens: 80,
-      outputTokens: 8,
-      cachedReadTokens: 100,
-      totalTokens: 188,
-    },
-  }))
-  await h.prompt('underflow-turn')
-  assert.equal(h.latest().inputTokens, 80)
-  assert.equal(h.latest().outputTokens, 8)
-  assert.equal(h.latest().cachedInputTokens, 100)
-  assert.equal(
-    h.session.state.wakeup.carriedUsage,
-    undefined,
-    'positive usage turn must clear stale carriedUsage even on underflow',
-  )
-})
-
-test('post-waitPrompt settle failure still publishes positive result.usage and clears consumed carriedUsage', async () => {
+test('settlement failure still publishes positive prompt result.usage', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-post-wait-settle-error-'))
   const events: ProviderEvent[] = []
   const m = new SessionManager({
@@ -3429,14 +3169,10 @@ test('post-waitPrompt settle failure still publishes positive result.usage and c
     assert.ok(opened?.type === 'session.opened' && opened.persistence)
     const nativeId = (opened.persistence.data as { sessionId: string })
       .sessionId
-    await prompt('p1', 'seed-woken-carry')
-    assert.equal(latestUsage().inputTokens, 140)
-    assert.equal(latestUsage().outputTokens, 14)
-
     await prompt('p2', 'corrupt-transcript-positive-usage')
     assert.equal(latestTurn().state, 'failed')
-    assert.equal(latestUsage().inputTokens, 80)
-    assert.equal(latestUsage().outputTokens, 8)
+    assert.equal(latestUsage().inputTokens, 120)
+    assert.equal(latestUsage().outputTokens, 12)
 
     await writeFile(
       join(
@@ -3456,291 +3192,3 @@ test('post-waitPrompt settle failure still publishes positive result.usage and c
     await rm(home, { recursive: true, force: true })
   }
 })
-
-async function continuationHarness(t: TestContext, prefix: string) {
-  const home = await mkdtemp(join(tmpdir(), prefix))
-  const collector = createEventCollector()
-  let promptHandler: PromptHandler | undefined
-  let realPrompt!: RpcPrompt
-  const m = new HarnessSessionManager({
-    launch: {
-      command: process.execPath,
-      args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-      env: isolatedEnv(home),
-    },
-    usage: new AgyUsageSource({ env: isolatedEnv(home) }),
-    capabilities: ['prompt.message', 'permission'],
-    emit: collector.emit,
-    connectAcp: wrapConnectAcp(
-      () => promptHandler,
-      (fn) => {
-        realPrompt = fn
-      },
-    ),
-  })
-  t.after(async () => {
-    await m.close()
-    await rm(home, { recursive: true, force: true })
-  })
-  await m.handle({
-    type: 'session.open',
-    requestId: 'open',
-    sessionId: 's',
-    history: 'skip',
-    config: {
-      cwd: home,
-      env: {},
-      mcpServers: {},
-      settings: {},
-      persist: true,
-    },
-  })
-  const session = m.session
-  const sender = '44444444-4444-4444-8444-444444444444'
-  const wokenAskRows = [
-    { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-    {
-      step_index: 1,
-      type: 'PLANNER_RESPONSE',
-      status: 'DONE',
-      content: 'Foreground',
-      input_tokens: 100,
-      output_tokens: 10,
-    },
-    {
-      step_index: 2,
-      type: 'SYSTEM_MESSAGE',
-      content: `<SYSTEM_MESSAGE>\n[Message] sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=wake\n</SYSTEM_MESSAGE>`,
-    },
-    {
-      step_index: 3,
-      type: 'PLANNER_RESPONSE',
-      status: 'DONE',
-      input_tokens: 40,
-      output_tokens: 4,
-      tool_calls: [
-        {
-          id: 'ask-1',
-          name: 'ask_question',
-          args: {
-            questions: [
-              {
-                question: 'Proceed?',
-                options: [{ label: 'Yes' }, { label: 'No' }],
-              },
-            ],
-          },
-        },
-      ],
-    },
-  ]
-  const seedWokenAsk: PromptHandler = async () => {
-    await writeBrainTranscript(
-      session.brainRoot,
-      session.state.nativeId,
-      wokenAskRows,
-    )
-    return {
-      stopReason: 'end_turn' as const,
-      usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
-    }
-  }
-  const waitAndCancelEcho = async () => {
-    const pending = realPrompt({
-      sessionId: session.state.nativeId,
-      prompt: [{ type: 'text', text: 'wait' }],
-    })
-    await waitUntil(() => session.state.continuationEchoSeen)
-    await session.transport.rpc.cancel({
-      sessionId: session.state.nativeId,
-    })
-    await pending
-  }
-  const runAndAnswerQuestion = async (clientMessageId: string) => {
-    const promptPromise = m.handle({
-      type: 'session.prompt',
-      sessionId: 's',
-      prompt: {
-        clientMessageId,
-        delivery: 'auto',
-        input: { type: 'message', content: [{ type: 'text', text: 'turn 1' }] },
-      },
-    })
-    const perm = await collector.wait((e) => e.type === 'session.permission')
-    assert.ok(perm.type === 'session.permission')
-    await m.handle({
-      type: 'session.permission',
-      sessionId: 's',
-      permissionId: perm.request.id,
-      response: {
-        behavior: 'allow',
-        updatedInput: { answers: { 'Proceed?': 'Yes' } },
-      },
-    })
-    return promptPromise
-  }
-  return {
-    m,
-    session,
-    events: collector.events,
-    wokenAskRows,
-    seedWokenAsk,
-    waitAndCancelEcho,
-    runAndAnswerQuestion,
-    nativePrompt: (params: Parameters<RpcPrompt>[0]) => realPrompt(params),
-    setPromptHandler: (handler: PromptHandler | undefined) => {
-      promptHandler = handler
-    },
-  }
-}
-
-async function runCanceledContinuationTest(
-  t: TestContext,
-  beforeCancel: (
-    h: Awaited<ReturnType<typeof continuationHarness>>,
-  ) => Promise<void>,
-  expectedPendingReplay: boolean,
-) {
-  const h = await continuationHarness(t, 'agy-f2-cont-cancel-')
-  h.setPromptHandler(
-    sequenceDouble([
-      h.seedWokenAsk,
-      async () => {
-        await beforeCancel(h)
-        return {
-          stopReason: 'cancelled' as const,
-          usage: {
-            inputTokens: 0,
-            outputTokens: 0,
-            cachedReadTokens: 0,
-            totalTokens: 0,
-          },
-        }
-      },
-    ]),
-  )
-  await h.runAndAnswerQuestion('p-f2')
-  assert.deepEqual(
-    h.session.state.wakeup.carriedUsage,
-    { inputTokens: 40, outputTokens: 4, cachedReadTokens: 0 },
-    'canceled zero-usage continuation must preserve pre-continuation wakeup carriedUsage',
-  )
-  assert.equal(
-    h.session.state.wakeup.pendingReplay,
-    expectedPendingReplay,
-    'pre-echo canceled continuation must preserve pendingReplay while post-echo clears it',
-  )
-}
-
-test('canceled synthetic ask_question continuation with zero usage preserves carriedUsage (postEcho: false)', async (t) => {
-  await runCanceledContinuationTest(t, async () => {}, true)
-})
-
-test('canceled synthetic ask_question continuation with zero usage preserves carriedUsage (postEcho: true)', async (t) => {
-  await runCanceledContinuationTest(t, (h) => h.waitAndCancelEcho(), false)
-})
-
-test(
-  'continuation USER_INPUT written to transcript before zero-usage cancel preserves carriedUsage',
-  { timeout: 10000 },
-  async (t) => {
-    const h = await continuationHarness(t, 'agy-codex-cont-ui-')
-    h.setPromptHandler(
-      sequenceDouble([
-        h.seedWokenAsk,
-        async () => {
-          const pending = h.nativePrompt({
-            sessionId: h.session.state.nativeId,
-            prompt: [{ type: 'text', text: 'wait' }],
-          })
-          await waitUntil(() => h.session.state.continuationEchoSeen)
-          await writeBrainTranscript(
-            h.session.brainRoot,
-            h.session.state.nativeId,
-            [
-              ...h.wokenAskRows,
-              { step_index: 4, type: 'USER_INPUT', content: 'Proceed?: Yes' },
-            ],
-          )
-          await waitUntil(
-            () => h.session.state.lastKnownStepIndex >= 4,
-            5000,
-            () =>
-              'continuation USER_INPUT step 4 must be consumed before cancel',
-          )
-          await h.session.state.observation?.poll()
-          await h.session.transport.rpc.cancel({
-            sessionId: h.session.state.nativeId,
-          })
-          await pending
-          return {
-            stopReason: 'cancelled' as const,
-            usage: {
-              inputTokens: 0,
-              outputTokens: 0,
-              cachedReadTokens: 0,
-              totalTokens: 0,
-            },
-          }
-        },
-      ]),
-    )
-    await h.runAndAnswerQuestion('p-codex-cont-user-input')
-    assert.deepEqual(
-      h.session.state.wakeup.carriedUsage,
-      { inputTokens: 40, outputTokens: 4, cachedReadTokens: 0 },
-      'post-USER_INPUT zero-usage cancel must not overwrite preContinuationCarriedSteps',
-    )
-    assert.equal(h.session.state.wakeup.pendingReplay, false)
-  },
-)
-
-async function runRejectedContinuationTest(
-  t: TestContext,
-  beforeReject: (
-    h: Awaited<ReturnType<typeof continuationHarness>>,
-  ) => Promise<void>,
-  expectedPendingReplay: boolean,
-) {
-  const h = await continuationHarness(t, 'agy-egm-cont-reject-')
-  h.setPromptHandler(
-    sequenceDouble([
-      h.seedWokenAsk,
-      async () => {
-        await beforeReject(h)
-        throw new Error('continuation rpc failed')
-      },
-    ]),
-  )
-  await h.runAndAnswerQuestion('p-egm-cont-reject').catch(() => undefined)
-  const usageEvent = h.events.findLast((e) => e.type === 'session.usage')
-  assert.ok(usageEvent && usageEvent.type === 'session.usage')
-  assert.equal(usageEvent.usage.inputTokens, 140)
-  assert.equal(usageEvent.usage.outputTokens, 14)
-  assert.deepEqual(
-    h.session.state.wakeup.carriedUsage,
-    { inputTokens: 40, outputTokens: 4, cachedReadTokens: 0 },
-    'rejected continuation must preserve pre-continuation wakeup carriedUsage',
-  )
-  assert.equal(
-    h.session.state.wakeup.pendingReplay,
-    expectedPendingReplay,
-    'pre-echo rejected continuation must preserve pendingReplay while post-echo clears it',
-  )
-}
-
-test(
-  'rejected synthetic ask_question continuation preserves wakeup billing and replay state (postEcho: false)',
-  { timeout: 10000 },
-  async (t) => {
-    await runRejectedContinuationTest(t, async () => {}, true)
-  },
-)
-
-test(
-  'rejected synthetic ask_question continuation preserves wakeup billing and replay state (postEcho: true)',
-  { timeout: 10000 },
-  async (t) => {
-    await runRejectedContinuationTest(t, (h) => h.waitAndCancelEcho(), false)
-  },
-)

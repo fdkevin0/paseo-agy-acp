@@ -77,8 +77,7 @@ export class ModelUsageObserver {
 export class BrainTurnObservation {
   readonly reader: TranscriptReader
   readonly usage: ModelUsageObserver
-  phase: 'foreground' | 'settling' | 'continuation' | 'draining' | 'disposed' =
-    'foreground'
+  phase: 'foreground' | 'settling' | 'draining' | 'disposed' = 'foreground'
   wokeUp = false
   missing = false
   private readError?: unknown

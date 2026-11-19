@@ -211,17 +211,15 @@ function answerFor(response: QuestionResponse, header: string) {
 
 /**
  * Convert Paseo's QuestionCard response into agy's `elicitation/create` result.
- * `asked` are the questions the card showed, when a replayed schema is answered from an earlier card.
  */
 export function buildElicitationResponse(
   questions: readonly NormalizedQuestion[],
   response: QuestionResponse,
-  asked: readonly NormalizedQuestion[] = questions,
 ): { action: 'accept' | 'decline'; content?: Record<string, unknown> } {
   if (response.behavior === 'deny') return { action: 'decline' }
   const content: Record<string, unknown> = {}
-  questions.forEach((q, index) => {
-    const answer = answerFor(response, asked[index]?.header ?? q.header)
+  questions.forEach((q) => {
+    const answer = answerFor(response, q.header)
     if (!answer) return
     const byLabel = (label: string) => q.options.find((o) => o.label === label)
     if (!q.multiSelect) {
@@ -259,7 +257,7 @@ export function formatQuestionAnswersText(
     .join('\n\n')
 }
 
-/** Verify that a replayed elicitation/create schema asks the exact same questions and options. */
+/** Match native elicitation schemas with their Brain transcript tool inputs. */
 export function sameNormalizedQuestions(
   a: readonly NormalizedQuestion[],
   b: readonly NormalizedQuestion[],

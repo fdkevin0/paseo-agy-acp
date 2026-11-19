@@ -33,24 +33,18 @@ export async function providerStatus(
     if (!version)
       return {
         available: false,
-        diagnostic: 'Could not determine agy version; requires >=1.5.3.',
+        diagnostic: 'Could not determine agy version; requires >=1.5.10.',
       }
-    const major = Number(version[1])
-    const minor = Number(version[2])
-    const patch = Number(version[3])
-    const prerelease = version[4]
-    const supported =
-      major > 1 ||
-      (major === 1 &&
-        (minor > 5 ||
-          (minor === 5 && (patch > 3 || (patch === 3 && !prerelease)))))
-    if (supported) {
+    const [, major, minor, patch, prerelease] = version
+    // agy 1.5.10 streams Reactive Wakeup output over ACP after session/prompt returns.
+    const order = Number(major) - 1 || Number(minor) - 5 || Number(patch) - 10
+    if (order > 0 || (order === 0 && !prerelease)) {
       setBounded(statusCache, key, Date.now(), STATUS_CACHE_LIMIT)
       return { available: true }
     }
     return {
       available: false,
-      diagnostic: `agy ${version[0]} is too old; requires >=1.5.3. Run agy update.`,
+      diagnostic: `agy ${version[0]} is too old; requires >=1.5.10. Run agy update.`,
     }
   } catch (error) {
     const target = cmd === 'agy' ? 'agy --version' : `agy (${cmd} --version)`

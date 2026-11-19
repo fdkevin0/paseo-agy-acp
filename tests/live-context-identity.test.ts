@@ -79,9 +79,8 @@ test('raw checkpoint observation reconciles only confirmed snapshot deletion bef
 
 function assertDeferredProvenance(spec: {
   toolId?: string
-  bindIdentity: (p: BrainTranscriptProjector, ids: string[]) => void
-  holdForLateIds: boolean
-  expectedSource: 'tool_id' | 'step_metadata' | undefined
+  bindIdentity: (p: BrainTranscriptProjector) => void
+  expectedSource: 'tool_id' | 'step_metadata' | 'acp_input'
   afterCheckpoint: (
     p: BrainTranscriptProjector,
     items: ReturnType<BrainTranscriptProjector['project']>,
@@ -91,9 +90,7 @@ function assertDeferredProvenance(spec: {
   expectedNotifications: number
 }) {
   const p = new BrainTranscriptProjector('s')
-  const ids: string[] = []
-  p.bindToolCallIds(ids)
-  p.resolveToolIdentities(true)
+  p.bindLiveToolCallIds([], new Set())
   const items = p.project(planner(1, spec.toolId))
   items.push(
     ...p.project({
@@ -103,8 +100,8 @@ function assertDeferredProvenance(spec: {
       content: 'result',
     }),
   )
-  spec.bindIdentity(p, ids)
-  items.push(...p.resolveToolIdentities(spec.holdForLateIds))
+  spec.bindIdentity(p)
+  items.push(...p.resolveToolIdentities())
   const tools = items.filter((item) => item.type === 'tool_call')
   assert.deepEqual(
     tools.map((item) => item.status),
@@ -139,7 +136,6 @@ test('deferred tool_id emissions retain their provenance through compaction hist
   assertDeferredProvenance({
     toolId: 'native',
     bindIdentity: () => {},
-    holdForLateIds: true,
     expectedSource: 'tool_id',
     afterCheckpoint: () => {},
     expectedCompactions: 1,
@@ -150,7 +146,6 @@ test('deferred tool_id emissions retain their provenance through compaction hist
 test('deferred step_metadata emissions retain their provenance through compaction history', () => {
   assertDeferredProvenance({
     bindIdentity: (p) => p.syncMetadata(metadata(2, 'native'), []),
-    holdForLateIds: true,
     expectedSource: 'step_metadata',
     afterCheckpoint: () => {},
     expectedCompactions: 1,
@@ -158,46 +153,27 @@ test('deferred step_metadata emissions retain their provenance through compactio
   })
 })
 
-test('deferred acp emissions retain their provenance through compaction history', () => {
+test('deferred ACP emissions retain verified provenance through compaction history', () => {
   assertDeferredProvenance({
-    bindIdentity: (_p, ids) => ids.push('native'),
-    holdForLateIds: true,
-    expectedSource: undefined,
-    // A later genuinely native occurrence of the same literal cannot bless an earlier positional ID.
-    afterCheckpoint: (p, items, callId) =>
-      items.push(...p.project(planner(4, callId))),
-    expectedCompactions: 0,
-    expectedNotifications: 1,
-  })
-})
-
-test('deferred fallback emissions retain their provenance through compaction history', () => {
-  assertDeferredProvenance({
-    bindIdentity: () => {},
-    holdForLateIds: false,
-    expectedSource: undefined,
-    // A later genuinely native occurrence of the same literal cannot bless an earlier positional ID.
-    afterCheckpoint: (p, items, callId) =>
-      items.push(...p.project(planner(4, callId))),
-    expectedCompactions: 0,
-    expectedNotifications: 1,
+    bindIdentity: (p) => p.bindLiveToolCallIds(['native'], new Set(['native'])),
+    expectedSource: 'acp_input',
+    afterCheckpoint: () => {},
+    expectedCompactions: 1,
+    expectedNotifications: 0,
   })
 })
 
 function assertSupersededSource(spec: {
   toolId?: string
-  bindIdentity: (p: BrainTranscriptProjector, ids: string[]) => void
-  holdForLateIds: boolean
-  expectedSource: 'tool_id' | 'step_metadata' | undefined
+  bindIdentity: (p: BrainTranscriptProjector) => void
+  expectedSource: 'tool_id' | 'step_metadata' | 'acp_input'
 }) {
   const p = new BrainTranscriptProjector('s')
-  const ids: string[] = []
-  p.bindToolCallIds(ids)
-  p.resolveToolIdentities(true)
+  p.bindLiveToolCallIds([], new Set())
   const emitted = p.project(planner(1, spec.toolId))
   emitted.push(...p.project(planner(3, 'next')))
-  spec.bindIdentity(p, ids)
-  emitted.push(...p.resolveToolIdentities(spec.holdForLateIds))
+  spec.bindIdentity(p)
+  emitted.push(...p.resolveToolIdentities())
   const canceled = emitted.filter(
     (item) => item.type === 'tool_call' && item.status === 'canceled',
   )
@@ -209,31 +185,21 @@ test('superseded terminal emissions inherit each pending identity source, includ
   assertSupersededSource({
     toolId: 'native',
     bindIdentity: () => {},
-    holdForLateIds: true,
     expectedSource: 'tool_id',
   })
   assertSupersededSource({
     bindIdentity: (p) => p.syncMetadata(metadata(2, 'native'), []),
-    holdForLateIds: true,
     expectedSource: 'step_metadata',
   })
   assertSupersededSource({
-    bindIdentity: (_p, ids) => ids.push('native'),
-    holdForLateIds: true,
-    expectedSource: undefined,
-  })
-  assertSupersededSource({
-    bindIdentity: () => {},
-    holdForLateIds: false,
-    expectedSource: undefined,
+    bindIdentity: (p) => p.bindLiveToolCallIds(['native'], new Set(['native'])),
+    expectedSource: 'acp_input',
   })
 })
 
 function assertDeferredBrainJson(output: unknown) {
   const p = new BrainTranscriptProjector('s')
-  const ids: string[] = []
-  p.bindToolCallIds(ids)
-  p.resolveToolIdentities(true)
+  p.bindLiveToolCallIds([], new Set())
   assert.deepEqual(
     p.project({
       step_index: 1,
@@ -252,8 +218,8 @@ function assertDeferredBrainJson(output: unknown) {
     }),
     [],
   )
-  ids.push('late-acp-id')
-  const items = p.resolveToolIdentities(true)
+  p.bindLiveToolCallIds(['late-acp-id'], new Set(['late-acp-id']))
+  const items = p.resolveToolIdentities()
   assert.equal(items.length, 2)
   const item = items.at(-1)
   assert.ok(item?.type === 'tool_call' && item.detail.type === 'unknown')
@@ -261,8 +227,8 @@ function assertDeferredBrainJson(output: unknown) {
   assert.equal(item.status, 'completed')
   assert.deepEqual(item.detail.input, { nested: null })
   assert.deepEqual(item.detail.output, output)
-  assert.equal(p.nativeToolIdentitySource(item), undefined)
-  assert.deepEqual(p.resolveToolIdentities(false), [])
+  assert.equal(p.nativeToolIdentitySource(item), 'acp_input')
+  assert.deepEqual(p.resolveToolIdentities(), [])
 }
 
 test('deferred Brain JSON null remains data across late ACP identity', () => {

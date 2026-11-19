@@ -338,7 +338,7 @@ export function projectReplayHistory({
     acpToolSnapshots,
     slots,
   )
-  projector.bindToolCallIds(alignedIds, 0, verifiedAcpToolIds)
+  projector.bindToolCallIds(alignedIds, verifiedAcpToolIds)
   const brainHistory: HistoryEntry[] = []
   let lastKnownStepIndex = -1
   for (const row of rows) {

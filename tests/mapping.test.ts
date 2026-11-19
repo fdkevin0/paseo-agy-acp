@@ -1,7 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  appliesCarriedWakeup,
   hasPositivePromptUsage,
   Timeline,
   toolDetail,
@@ -197,26 +196,6 @@ test('usage rejects invalid context, ignores foreign currency, and computes last
     },
   )
   assert.deepEqual(promptUsage(null), {})
-  assert.deepEqual(
-    promptUsage(
-      { totalTokens: 60, inputTokens: 50, outputTokens: 10 },
-      {
-        carriedWakeup: {
-          inputTokens: 20,
-          outputTokens: 4,
-          cachedReadTokens: 99,
-        },
-        lastStep: { inputTokens: 30, cachedReadTokens: 15, outputTokens: 6 },
-      },
-    ),
-    {
-      inputTokens: 30,
-      outputTokens: 6,
-      cachedInputTokens: 15,
-      contextWindowUsedTokens: 51,
-    },
-    'missing ACP cachedReadTokens still falls back to lastStep when carriedWakeup is deducted',
-  )
   assert.deepEqual(
     promptUsage(
       { totalTokens: 60, inputTokens: 50, outputTokens: 10 },
@@ -1125,7 +1104,7 @@ test('exit_plan_mode renders as a Markdown plan card across ACP variants and par
   assert.equal(entered.detail.type, 'unknown')
 })
 
-test('hasPositivePromptUsage and appliesCarriedWakeup reject zero placeholders and underflowing cache counters', () => {
+test('hasPositivePromptUsage rejects zero placeholders but accepts cache-only and thought-token usage', () => {
   const zeroUsage = {
     inputTokens: 0,
     outputTokens: 0,
@@ -1156,65 +1135,6 @@ test('hasPositivePromptUsage and appliesCarriedWakeup reject zero placeholders a
       cachedInputTokens: 40,
       contextWindowUsedTokens: 63,
     },
-  )
-  const cacheOnlyDebt = {
-    inputTokens: 0,
-    outputTokens: 0,
-    cachedReadTokens: 500,
-  }
-  assert.equal(appliesCarriedWakeup(zeroUsage, cacheOnlyDebt), false)
-  assert.equal(
-    appliesCarriedWakeup(
-      {
-        inputTokens: 10,
-        outputTokens: 2,
-        cachedReadTokens: 100,
-        totalTokens: 112,
-      },
-      cacheOnlyDebt,
-    ),
-    false,
-  )
-  const multiFieldDebt = {
-    inputTokens: 50,
-    outputTokens: 5,
-    cachedReadTokens: 500,
-  }
-  assert.deepEqual(
-    promptUsage(
-      {
-        inputTokens: 80,
-        outputTokens: 8,
-        cachedReadTokens: 100,
-        totalTokens: 188,
-      },
-      { carriedWakeup: multiFieldDebt },
-    ),
-    {
-      inputTokens: 80,
-      outputTokens: 8,
-      cachedInputTokens: 100,
-    },
-    'underflowing cachedReadTokens atomically skips all carriedWakeup deductions',
-  )
-  assert.equal(
-    appliesCarriedWakeup(
-      {
-        inputTokens: 10,
-        outputTokens: 2,
-        cachedReadTokens: 600,
-        totalTokens: 612,
-      },
-      cacheOnlyDebt,
-    ),
-    true,
-  )
-  assert.equal(
-    appliesCarriedWakeup(
-      { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
-      cacheOnlyDebt,
-    ),
-    true,
   )
 })
 
