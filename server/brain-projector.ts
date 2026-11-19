@@ -34,7 +34,6 @@ export type NativeToolIdentitySource = 'tool_id' | 'step_metadata' | 'acp_input'
 export type ObservedToolSlot = {
   slot: number
   stepIndex: number
-  name: string
   args: unknown
   toolId?: string
   isQuestion: boolean
@@ -253,7 +252,6 @@ export class BrainTranscriptProjector {
               const slot: ObservedToolSlot = {
                 slot: this.observedSlots.length,
                 stepIndex: stepIndex + index + 1,
-                name: cleanName,
                 args: tool.args,
                 toolId:
                   typeof tool.id === 'string' && tool.id ? tool.id : undefined,
