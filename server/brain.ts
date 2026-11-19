@@ -672,6 +672,7 @@ export async function settleBrainTurn(
     foregroundAcp = [],
     drainAcp,
     toolSnapshot,
+    hasToolResult,
     deniedToolCallIds,
     shouldUpdateTool,
     onStep,
@@ -705,6 +706,7 @@ export async function settleBrainTurn(
     foregroundAcp?: readonly ForegroundAcpSegment[]
     drainAcp?: () => Promise<void>
     toolSnapshot?: (id: string) => Readonly<ToolCall> | undefined
+    hasToolResult?: (id: string) => boolean
     deniedToolCallIds?: ReadonlySet<string>
     shouldUpdateTool?: (
       item: Extract<ProviderTimelineItem, { type: 'tool_call' }>,
@@ -862,13 +864,16 @@ export async function settleBrainTurn(
       return
     }
     const snapshot = toolSnapshot?.(item.callId)
+    const acpSuppliedResult = hasToolResult
+      ? hasToolResult(item.callId)
+      : snapshot != null &&
+        (snapshot.rawOutput != null ||
+          (snapshot.content != null && snapshot.content.length > 0))
     // An unstreamed child card is only useful if it opens or resumes the child.
     if (
       backgroundCompletion ||
       shouldUpdateTool?.(item) ||
-      (snapshot
-        ? snapshot.rawOutput == null && snapshot.content == null
-        : item.detail.type !== 'sub_agent')
+      (snapshot ? !acpSuppliedResult : item.detail.type !== 'sub_agent')
     )
       onItem(item, timestamp, { rawOutput: node.projector.toolRawOutput(item) })
   }
@@ -880,21 +885,30 @@ export async function settleBrainTurn(
       const snapshot = toolSnapshot?.(id)
       if (snapshot) snapshots.set(id, snapshot)
     }
-    const align = (ids: readonly string[]) =>
-      alignReplayTools([], inbox.stepCallIds, subagents, ids, snapshots, slots)
+    const align = (ids: readonly string[], targetSlots = slots) =>
+      alignReplayTools(
+        [],
+        inbox.stepCallIds,
+        subagents,
+        ids,
+        snapshots,
+        targetSlots,
+      )
     const turn = align(acpToolCallIds)
     node.projector.bindLiveToolCallIds(turn.alignedIds, turn.verifiedAcpToolIds)
-    // ACP can send post-response calls while Brain still ends inside the RPC.
+    // ACP can send post-response calls while Brain still trails the full turn.
     // Verify the positional foreground prefix for billing only; it cannot bind tool identity.
     foregroundPrefixIds = []
-    const count = slots.filter((slot) => !slot.invalid).length
-    const prefix = foregroundToolIds.slice(0, count)
+    const validSlots = slots.filter((slot) => !slot.invalid)
+    const prefixCount = Math.min(validSlots.length, foregroundToolIds.length)
+    const prefix = foregroundToolIds.slice(0, prefixCount)
     if (
-      count < acpToolCallIds.length &&
-      prefix.length === count &&
+      validSlots.length < acpToolCallIds.length &&
+      prefixCount > 0 &&
       prefix.every((id, i) => id === acpToolCallIds[i])
     ) {
-      const foreground = align(prefix)
+      const prefixSlots = slots.slice(0, validSlots[prefixCount - 1].slot + 1)
+      const foreground = align(prefix, prefixSlots)
       foregroundPrefixIds = foreground.alignedIds.map((id) =>
         id && foreground.verifiedAcpToolIds.has(id) ? id : undefined,
       )

@@ -114,6 +114,7 @@ export class BrainTranscriptProjector {
     callId: string
     source: NativeToolIdentitySource
   }
+  private lastGenericMatched = false
   private background = new Map<string, PendingTool>()
   private daemons = new Map<string, number>()
   private subagentTouches: { childId: string; stepIndex: number }[] = []
@@ -170,6 +171,10 @@ export class BrainTranscriptProjector {
   backgroundGenericAnchor():
     { callId: string; source: NativeToolIdentitySource } | undefined {
     return this.lastBackgroundGeneric
+  }
+
+  matchedLastGeneric(): boolean {
+    return this.lastGenericMatched
   }
 
   bindToolCallIds(
@@ -594,6 +599,7 @@ export class BrainTranscriptProjector {
   }
   project(value: unknown): ProviderTimelineItem[] {
     this.lastBackgroundGeneric = undefined
+    this.lastGenericMatched = false
     const row = record(value)
     if (!Number.isInteger(row.step_index)) return []
     const stepIndex = Number(row.step_index)
@@ -726,6 +732,7 @@ export class BrainTranscriptProjector {
       case 'GENERIC': {
         const pending = takePendingForGeneric(this.pending, stepIndex)
         if (!pending || pending.questionCompleted) return []
+        this.lastGenericMatched = true
         pending.stepIndex = stepIndex
         if (!pending.callId && this.liveToolAlignment) {
           pending.genericSeen = true
@@ -1099,9 +1106,8 @@ export class BrainNode {
             if (this.projector.hasBackground())
               this.promptPhase = 'foreground_idle'
           } else if (
-            // items.length > 0 proves project() settled a tracked pending tool/question
-            // (anonymous deferred tools set hasPending() via retired and hit the branch above).
-            items.length > 0 &&
+            // Anonymous live completions defer emission into retired, so check match state directly.
+            this.projector.matchedLastGeneric() &&
             row.status !== 'CANCELED' &&
             row.status !== 'INTERRUPTED'
           ) {

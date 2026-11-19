@@ -51,6 +51,7 @@ import {
   type Row,
 } from './brain-fixtures.ts'
 import { SubagentRegistry } from '../server/subagents.ts'
+import { Timeline } from '../server/mapping.ts'
 import type {
   ProviderEvent,
   ProviderTimelineItem,
@@ -4380,6 +4381,218 @@ test(
     )
   },
 )
+
+test(
+  'an ACP-ahead turn still verifies the foreground prefix after Brain flushes past foreground tools',
+  { timeout: 5000 },
+  async (t) => {
+    const f = await fixture()
+    t.after(f.close)
+    const tracker = createStepTracker()
+    const obs = manualObs(f.root, parent)
+    const abort = new AbortController()
+    t.after(() => {
+      abort.abort()
+      return obs.dispose()
+    })
+    const fgInput = { Path: '/fixture/fg.txt' }
+    const postInput1 = { Path: '/fixture/post-1.txt' }
+    const postInput2 = { Path: '/fixture/post-2.txt' }
+    const snapshots = new Map([
+      ['fg-1', { toolCallId: 'fg-1', title: 'Read', rawInput: fgInput }],
+      ['post-1', { toolCallId: 'post-1', title: 'Read', rawInput: postInput1 }],
+      ['post-2', { toolCallId: 'post-2', title: 'Read', rawInput: postInput2 }],
+    ])
+    await f.put(parent, [
+      { step_index: 0, type: 'USER_INPUT', content: 'work' },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ name: 'read_file', args: fgInput }],
+      },
+      { step_index: 2, type: 'GENERIC', status: 'DONE', content: 'fg data' },
+      done(3, 'started'),
+      message(4, 'task-in-rpc', 'In-RPC completion'),
+      {
+        ...done(5, 'in-rpc reply'),
+        input_tokens: 40,
+        output_tokens: 1,
+      },
+      message(6, 'task-post-rpc', 'Post-RPC completion'),
+      {
+        step_index: 7,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ name: 'read_file', args: postInput1 }],
+      },
+      { step_index: 8, type: 'GENERIC', status: 'DONE', content: 'post 1' },
+    ])
+    const items: ProviderTimelineItem[] = []
+    const usage = new Map<number, number>()
+    let wakeupInput: number | undefined
+    const running = alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+        signal: abort.signal,
+        observation: obs,
+        acpToolCallIds: ['fg-1', 'post-1', 'post-2'],
+        foregroundAcp: [
+          { type: 'tool_call', callId: 'fg-1' },
+          { type: 'assistant_message', text: 'started' },
+          { type: 'assistant_message', text: 'in-rpc reply' },
+        ],
+        toolSnapshot: (id) => snapshots.get(id),
+        onStep: (step) => {
+          tracker.onStep(step)
+          usage.set(step, wakeupInput ?? 0)
+        },
+        onWakeupState: (state) => {
+          wakeupInput = state.wakeupUsage?.inputTokens
+        },
+      }),
+    )
+    await tracker.waitFor(8)
+    assert.equal(usage.get(5), 0)
+    await appendFile(
+      f.path(parent),
+      encode([
+        {
+          step_index: 9,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [{ name: 'read_file', args: postInput2 }],
+        },
+        { step_index: 10, type: 'GENERIC', status: 'DONE', content: 'post 2' },
+        { ...done(11, 'post-rpc final'), input_tokens: 99, output_tokens: 3 },
+      ]),
+    )
+    await flushObs(obs)
+    const result = await running
+    assert.equal(result.status, 'completed')
+    assert.equal(result.wakeupUsage?.inputTokens, 99)
+    assert.equal(result.wakeupUsage?.outputTokens, 3)
+    assert.deepEqual(
+      items
+        .filter(isTerminalToolCall)
+        .map(({ callId, detail }) => [
+          callId,
+          detail.type === 'read' && detail.content,
+        ]),
+      [
+        ['fg-1', 'fg data'],
+        ['post-1', 'post 1'],
+        ['post-2', 'post 2'],
+      ],
+    )
+  },
+)
+
+test('running empty ACP content followed by status-only completion still recovers Brain result', async (t) => {
+  const f = await fixture()
+  t.after(f.close)
+  const timeline = new Timeline('p')
+  const readA = { Path: '/fixture/a.txt' }
+  const readB = { Path: '/fixture/b.txt' }
+  const startA = timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'read-a',
+    title: 'read_file',
+    status: 'in_progress',
+    rawInput: readA,
+    content: [],
+  })
+  assert.ok(startA)
+  timeline.track(startA)
+  const doneA = timeline.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'read-a',
+    status: 'completed',
+  })
+  assert.ok(doneA)
+  timeline.track(doneA)
+  const startB = timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'read-b',
+    title: 'read_file',
+    status: 'in_progress',
+    rawInput: readB,
+    content: [],
+  })
+  assert.ok(startB)
+  timeline.track(startB)
+  const doneB = timeline.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'read-b',
+    status: 'completed',
+    content: [],
+  })
+  assert.ok(doneB)
+  timeline.track(doneB)
+  assert.equal(timeline.isRunning('p:tool:read-a'), false)
+  assert.equal(timeline.hasToolResult('read-a'), false)
+  assert.equal(timeline.hasToolResult('read-b'), true)
+  await f.put(parent, [
+    { step_index: 1, type: 'USER_INPUT', content: 'read both' },
+    {
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        { name: 'read_file', args: readA },
+        { name: 'read_file', args: readB },
+      ],
+    },
+    { step_index: 3, type: 'GENERIC', status: 'DONE', content: 'alpha' },
+    { step_index: 4, type: 'GENERIC', status: 'DONE', content: 'beta' },
+    done(5, 'Done.'),
+  ])
+  const items: ProviderTimelineItem[] = []
+  const result = await settleBrainTurn(
+    f.root,
+    parent,
+    'p',
+    (item) => items.push(item),
+    {
+      acpToolCallIds: ['read-a', 'read-b'],
+      toolSnapshot: (id) => timeline.toolCallSnapshot(id),
+      hasToolResult: (id) => timeline.hasToolResult(id),
+      shouldUpdateTool: (item) => timeline.isRunning(item.id),
+    },
+  )
+  assert.equal(result.status, 'completed')
+  assert.deepEqual(
+    items
+      .filter(isTerminalToolCall)
+      .map(({ callId, detail }) => [
+        callId,
+        detail.type === 'read' && detail.content,
+      ]),
+    [['read-a', 'alpha']],
+  )
+})
+
+test('anonymous live ask_question GENERIC(DONE) resumes foreground_active instead of staying foreground_idle', () => {
+  const node = new BrainNode(parent, 'p', { allowInitialSpawnPrompt: false })
+  node.projector.bindLiveToolCallIds([], new Set())
+  node.ingest({ step_index: 1, type: 'USER_INPUT', content: 'ask me' })
+  node.ingest({
+    step_index: 2,
+    type: 'PLANNER_RESPONSE',
+    status: 'DONE',
+    tool_calls: [
+      {
+        name: 'ask_question',
+        args: { questions: [{ question: 'Pick?', options: ['A', 'B'] }] },
+      },
+    ],
+  })
+  assert.equal(node.promptPhase, 'foreground_idle')
+  node.ingest({ step_index: 3, type: 'GENERIC', status: 'DONE', content: 'A' })
+  assert.equal(node.promptPhase, 'foreground_active')
+  node.ingest(message(4, 'task-bg', 'Background finished'))
+  assert.equal(node.promptPhase, 'foreground_active')
+  assert.equal(node.wokeUp, false)
+})
 
 test('declining native elicitation does not suppress a non-reader observation fault', async (t) => {
   const f = await fixture()

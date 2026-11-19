@@ -746,6 +746,9 @@ export class Timeline {
   toolCallSnapshot(callId: string): Readonly<ToolCall> | undefined {
     return this.tools.get(callId)?.acp
   }
+  hasToolResult(callId: string): boolean {
+    return this.tools.get(callId)?.hasAcpResult === true
+  }
   recoverToolResult(
     item: Extract<ProviderTimelineItem, { type: 'tool_call' }>,
     output: unknown,

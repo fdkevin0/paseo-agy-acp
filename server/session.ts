@@ -2026,6 +2026,7 @@ async function promptSession(
           acpToolCallIds: session.state.turnToolCallIds,
           drainAcp: session.drain,
           toolSnapshot: (id) => session.timeline.toolCallSnapshot(id),
+          hasToolResult: (id) => session.timeline.hasToolResult(id),
           onWakeupState: (wakeup) => {
             turnWokeUp = wakeup.wokeUp
             turnWakeupUsage = wakeup.wakeupUsage
