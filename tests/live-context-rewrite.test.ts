@@ -16,14 +16,17 @@ import type {
   ProviderTimelineItem,
 } from '@getpaseo/plugin/server/provider'
 import { SessionManager } from '../server/session.ts'
+import { connectAcp } from '../server/transport.ts'
 import { AgyUsageSource } from '../server/usage.ts'
 import {
   ModelUsageObserver,
   BrainTurnObservation,
+  type BrainRead,
 } from '../server/brain-observer.ts'
+import { TranscriptReader } from '../server/brain-io.ts'
 import { settleBrainTurn } from '../server/brain.ts'
 import { BrainTranscriptProjector } from '../server/brain-projector.ts'
-import { createEventCollector } from './helpers.ts'
+import { createEventCollector, sequenceDouble } from './helpers.ts'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -66,11 +69,95 @@ const checkpoint = (step_index: number, content = 'summary'): Row => ({
   content,
 })
 
-async function harness(t: TestContext) {
+type PromptHandler = (
+  params: Parameters<ReturnType<typeof connectAcp>['rpc']['prompt']>[0],
+  realPrompt: ReturnType<typeof connectAcp>['rpc']['prompt'],
+) => Promise<Result>
+
+class HarnessSessionManager extends SessionManager {
+  session!: Awaited<ReturnType<SessionManager['start']>>
+  override async start(...args: Parameters<SessionManager['start']>) {
+    this.session = await super.start(...args)
+    return this.session
+  }
+}
+
+class RecordingTranscriptReader extends TranscriptReader {
+  private readonly rewriteRows: Record<string, unknown>[][]
+  constructor(rewriteRows: Record<string, unknown>[][]) {
+    super()
+    this.rewriteRows = rewriteRows
+  }
+  override async read(root: string, nativeId: string) {
+    const r = await super.read(root, nativeId)
+    if (r.reset) this.rewriteRows.push(r.rows)
+    return r
+  }
+}
+
+class ScriptedTranscriptReader extends TranscriptReader {
+  private readonly next: () => Promise<BrainRead>
+  constructor(reads: readonly BrainRead[]) {
+    super()
+    this.next = sequenceDouble(reads.map((read) => async () => read))
+  }
+  override read(): ReturnType<TranscriptReader['read']> {
+    return this.next()
+  }
+}
+
+class TrackingObservation extends BrainTurnObservation {
+  readonly attached = deferred<void>()
+  override async attach(
+    consumer: Parameters<BrainTurnObservation['attach']>[0],
+  ) {
+    await super.attach(consumer)
+    this.attached.resolve()
+  }
+}
+
+function wrapConnectAcp(
+  getPromptHandler: () => PromptHandler | undefined,
+): typeof connectAcp {
+  return (...args) => {
+    const transport = connectAcp(...args)
+    const realPrompt = transport.rpc.prompt.bind(transport.rpc)
+    const wrappedRpc = new Proxy(transport.rpc, {
+      get(target, prop) {
+        if (prop === 'prompt') {
+          return (params: Parameters<typeof realPrompt>[0]) => {
+            const handler = getPromptHandler()
+            return handler ? handler(params, realPrompt) : realPrompt(params)
+          }
+        }
+        const value = Reflect.get(target, prop, target)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    return new Proxy(transport, {
+      get(target, prop) {
+        if (prop === 'rpc') return wrappedRpc
+        return Reflect.get(target, prop, target)
+      },
+    })
+  }
+}
+
+async function harness(
+  t: TestContext,
+  options?: {
+    observationPollIntervalMs?: number
+    createTranscriptReader?: () => TranscriptReader
+    createObservation?: (
+      ...args: ConstructorParameters<typeof BrainTurnObservation>
+    ) => BrainTurnObservation
+  },
+) {
   const home = await mkdtemp(join(tmpdir(), 'agy-pr8-repro-'))
   const collector = createEventCollector()
   const events = collector.events
-  const manager = new SessionManager({
+  let promptHandler: PromptHandler | undefined
+  const manager = new HarnessSessionManager({
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
@@ -79,15 +166,11 @@ async function harness(t: TestContext) {
     usage: new AgyUsageSource(),
     capabilities: ['prompt.message', 'permission'],
     emit: collector.emit,
+    observationPollIntervalMs: options?.observationPollIntervalMs,
+    connectAcp: wrapConnectAcp(() => promptHandler),
+    createTranscriptReader: options?.createTranscriptReader,
+    createObservation: options?.createObservation,
   })
-  const start = manager.start.bind(manager)
-  let session!: Awaited<ReturnType<typeof manager.start>>
-  t.mock.method(
-    manager,
-    'start',
-    async (...args: Parameters<typeof start>) =>
-      (session = await start(...args)),
-  )
   await manager.handle({
     type: 'session.open',
     requestId: 'open',
@@ -95,6 +178,7 @@ async function harness(t: TestContext) {
     history: 'skip',
     config: { cwd: home, env: {}, mcpServers: {}, settings: {}, persist: true },
   })
+  const session = manager.session
   const logsDir = join(
     session.brainRoot,
     session.state.nativeId,
@@ -134,6 +218,9 @@ async function harness(t: TestContext) {
     events,
     manager,
     session,
+    setPromptHandler: (handler: PromptHandler | undefined) => {
+      promptHandler = handler
+    },
     write: (rows: Row[]) => writeFile(path, encode(rows)),
     append: (rows: Row[]) => appendFile(path, encode(rows)),
     holdLive,
@@ -141,13 +228,32 @@ async function harness(t: TestContext) {
 }
 
 test('wakeup rewrite rebuilds the foreground phase and bills each woken step once across turns', async (t) => {
-  const h = await harness(t)
+  const rewriteRows: Record<string, unknown>[][] = []
+  let trackedObs!: TrackingObservation
+  const h = await harness(t, {
+    observationPollIntervalMs: 60_000,
+    createTranscriptReader: () => new RecordingTranscriptReader(rewriteRows),
+    createObservation: (...args) =>
+      (trackedObs = new TrackingObservation(...args)),
+  })
   const rpcDone = deferred<Result>()
   const started = deferred<void>()
-  t.mock.method(h.session.transport.rpc, 'prompt', () => {
-    started.resolve()
-    return rpcDone.promise
-  })
+  h.setPromptHandler(
+    sequenceDouble([
+      () => {
+        started.resolve()
+        return rpcDone.promise
+      },
+      async () => {
+        await h.append([user(8, 'next'), model(9, 20000, 'next reply')])
+        await trackedObs.poll()
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 150000, outputTokens: 3, totalTokens: 150003 },
+        }
+      },
+    ]),
+  )
 
   const turnPromise = h.manager.handle({
     type: 'session.prompt',
@@ -159,18 +265,7 @@ test('wakeup rewrite rebuilds the foreground phase and bills each woken step onc
     },
   })
   await started.promise
-  const obs = h.session.state.observation!
-  const rewriteRows: Record<string, unknown>[][] = []
-  const read = obs.reader.read.bind(obs.reader)
-  t.mock.method(
-    obs.reader,
-    'read',
-    async (...args: Parameters<typeof read>) => {
-      const r = await read(...args)
-      if (r.reset) rewriteRows.push(r.rows)
-      return r
-    },
-  )
+  const obs = trackedObs
   await obs.poll()
 
   const fgRows: Row[] = [
@@ -192,21 +287,11 @@ test('wakeup rewrite rebuilds the foreground phase and bills each woken step onc
   await h.write(fgRows)
   await obs.poll()
 
-  const attached = deferred<void>()
-  const origAttach = obs.attach.bind(obs)
-  t.mock.method(
-    obs,
-    'attach',
-    async (consumer: Parameters<typeof origAttach>[0]) => {
-      await origAttach(consumer)
-      attached.resolve()
-    },
-  )
   rpcDone.resolve({
     stopReason: 'end_turn',
     usage: { inputTokens: 15000, outputTokens: 1, totalTokens: 15001 },
   })
-  await attached.promise
+  await obs.attached.promise
 
   const wakeRows: Row[] = [
     {
@@ -232,6 +317,7 @@ test('wakeup rewrite rebuilds the foreground phase and bills each woken step onc
     model(7, 40000, 'wakeup final step'),
   ]
   await h.write([...fgRows, ...rewrittenWakeRows])
+  await obs.poll()
   await turnPromise
 
   const finalUsage = [...h.events]
@@ -257,10 +343,6 @@ test('wakeup rewrite rebuilds the foreground phase and bills each woken step onc
     ),
     'real changed-byte reset branch reached',
   )
-  t.mock.method(h.session.transport.rpc, 'prompt', async () => ({
-    stopReason: 'end_turn' as const,
-    usage: { inputTokens: 150000, outputTokens: 3, totalTokens: 150003 },
-  }))
   await h.manager.handle({
     type: 'session.prompt',
     sessionId: 's',
@@ -526,7 +608,7 @@ test('historical message deltas delivered after attach do not stall a completed 
     JSON.stringify({ 'msg-hist-1': true }),
   )
 
-  const obs = new BrainTurnObservation(
+  const obs = new TrackingObservation(
     root,
     nativeId,
     's',
@@ -536,26 +618,20 @@ test('historical message deltas delivered after attach do not stall a completed 
       onUsage: () => {},
       onItem: () => {},
     },
-    15,
+    60_000,
   )
-  obs.start()
 
   await writeFile(path, encode([user(1, 'turn 1')]))
   await obs.poll()
 
-  const attached = deferred<void>(),
-    attach = obs.attach.bind(obs)
-  t.mock.method(obs, 'attach', async (...args: Parameters<typeof attach>) => {
-    await attach(...args)
-    attached.resolve()
-  })
   const settlePromise = settleBrainTurn(root, nativeId, 's', () => {}, {
     observation: obs,
     minStepIndex: 3,
-    stallTimeoutMs: 60,
+    transcriptGraceMs: 2000,
+    stallTimeoutMs: 1000,
   })
 
-  await attached.promise
+  await obs.attached.promise
   await appendFile(
     path,
     encode([
@@ -581,6 +657,7 @@ test('historical message deltas delivered after attach do not stall a completed 
     'regression: completed Turn 2 must complete',
   )
   assert.equal(res.stalled, undefined)
+  assert.equal(res.lastStepUsage?.inputTokens, 200)
 })
 
 test('appended foreground checkpoint is not pruned by an older staged snapshot on cancel', async (t) => {
@@ -701,8 +778,10 @@ test('native background completion is folded while anonymous identity remains de
     'identity resolution must not replay task registration',
   )
   assert.equal(p.hasPending(), false)
-  for (const item of items)
-    assert.equal(p.nativeToolIdentitySource(item), undefined)
+  assert.deepEqual(
+    items.map((item) => p.nativeToolIdentitySource(item)),
+    [undefined, undefined],
+  )
 })
 
 test('shifted GENERIC compatibility fallback consumes each anonymous slot exactly once', () => {
@@ -877,24 +956,33 @@ test('confirmed usage deletion invalidates the source cache without fabricating 
   assert.equal(usage.usage.outputTokens, 100)
 })
 
-test('final drain retains confirmed checkpoint deletion observed while publication is stopped', async (t) => {
+test('final drain retains confirmed checkpoint deletion observed while publication is stopped', async () => {
   const items: ProviderTimelineItem[] = []
-  const obs = new BrainTurnObservation('', '', 's', -1, {
-    isCurrent: () => true,
-    onUsage: () => {},
-    onItem: (item) => items.push(item),
-  })
-  let read = {
-    rows: [checkpoint(2)],
-    reset: true,
-    snapshotStepIndices: new Set([2]) as ReadonlySet<number> | undefined,
-  }
-  t.mock.method(obs.reader, 'read', async () => read)
+  const reader = new ScriptedTranscriptReader([
+    {
+      rows: [checkpoint(2)],
+      reset: true,
+      snapshotStepIndices: new Set([2]),
+    },
+    { rows: [], reset: false, snapshotStepIndices: new Set([1]) },
+    { rows: [checkpoint(2)], reset: false, snapshotStepIndices: undefined },
+  ])
+  const obs = new BrainTurnObservation(
+    '',
+    '',
+    's',
+    -1,
+    {
+      isCurrent: () => true,
+      onUsage: () => {},
+      onItem: (item) => items.push(item),
+    },
+    200,
+    reader,
+  )
   await obs.poll()
   obs.stop()
-  read = { rows: [], reset: false, snapshotStepIndices: new Set([1]) }
   await obs.poll()
-  read = { rows: [checkpoint(2)], reset: false, snapshotStepIndices: undefined }
   await obs.drain()
   assert.equal(
     items.length,

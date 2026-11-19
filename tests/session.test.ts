@@ -11,7 +11,6 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import {
   PROVIDER_CAPABILITIES,
@@ -22,12 +21,102 @@ import { readSubagents } from '../server/brain.ts'
 import { createProvider } from '../server/provider.ts'
 import { SessionManager } from '../server/session.ts'
 import { SubagentRegistry } from '../server/subagents.ts'
+import { connectAcp } from '../server/transport.ts'
 import { AgyUsageSource } from '../server/usage.ts'
 import {
   collectProviderEvents,
   createEventCollector,
+  sequenceDouble,
+  waitUntil,
   writeBrainTranscript,
 } from './helpers.ts'
+
+type RpcPrompt = ReturnType<typeof connectAcp>['rpc']['prompt']
+type PromptHandler = (
+  params: Parameters<RpcPrompt>[0],
+  realPrompt: RpcPrompt,
+) => ReturnType<RpcPrompt>
+
+class HarnessSessionManager extends SessionManager {
+  session!: Awaited<ReturnType<SessionManager['start']>>
+  override async start(...args: Parameters<SessionManager['start']>) {
+    this.session = await super.start(...args)
+    return this.session
+  }
+}
+
+function wrapConnectAcp(
+  getPromptHandler: () => PromptHandler | undefined,
+  onRealPrompt?: (realPrompt: RpcPrompt) => void,
+): typeof connectAcp {
+  return (...args) => {
+    const transport = connectAcp(...args)
+    const realPrompt = transport.rpc.prompt.bind(transport.rpc)
+    onRealPrompt?.(realPrompt)
+    const wrappedRpc = new Proxy(transport.rpc, {
+      get(target, prop) {
+        if (prop === 'prompt') {
+          return (params: Parameters<typeof realPrompt>[0]) => {
+            const handler = getPromptHandler()
+            return handler ? handler(params, realPrompt) : realPrompt(params)
+          }
+        }
+        const value = Reflect.get(target, prop, target)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    return new Proxy(transport, {
+      get(target, prop) {
+        if (prop === 'rpc') return wrappedRpc
+        return Reflect.get(target, prop, target)
+      },
+    })
+  }
+}
+
+function completedTurnStates(events: readonly ProviderEvent[]) {
+  return events
+    .filter(
+      (
+        event,
+      ): event is Extract<ProviderEvent, { type: 'session.turn' }> & {
+        state: 'completed' | 'canceled' | 'failed'
+      } => event.type === 'session.turn' && event.state !== 'started',
+    )
+    .map((event) => event.state)
+}
+
+function compactionEvents(events: readonly ProviderEvent[]) {
+  return events.filter(
+    (
+      event,
+    ): event is Extract<ProviderEvent, { type: 'timeline.item' }> & {
+      item: Extract<ProviderTimelineItem, { type: 'compaction' }>
+    } => event.type === 'timeline.item' && event.item.type === 'compaction',
+  )
+}
+
+function childTurnKeys(events: readonly ProviderEvent[], sessionId: string) {
+  return events
+    .filter(
+      (event): event is Extract<ProviderEvent, { type: 'session.turn' }> =>
+        event.type === 'session.turn' && event.sessionId === sessionId,
+    )
+    .map((event) => `${event.turnId}:${event.state}`)
+}
+
+function onceOnEvent(
+  predicate: (event: ProviderEvent) => boolean,
+  action: () => void,
+): (event: ProviderEvent) => void {
+  let fired = false
+  return (event) => {
+    if (!fired && predicate(event)) {
+      fired = true
+      action()
+    }
+  }
+}
 
 test(
   'protocol disconnection kills an active child and shutdown waits for it',
@@ -119,6 +208,7 @@ test(
       capabilities: ['prompt.message', 'permission', 'session.configure'],
       emit: collector.emit,
       stallTimeoutMs: 30,
+      backgroundProbeTimeoutMs: 2000,
     })
     const waitTurn = (state: 'completed' | 'failed' | 'canceled') =>
       collector.wait(
@@ -1022,6 +1112,17 @@ const starts = readFileSync(process.env.AGY_TEST_LOG, 'utf8').trim().split('\\n'
 const nativeId = '11111111-1111-4111-8111-111111111111'
 const configOptions = [
   {
+    id: 'model',
+    name: 'Model',
+    category: 'model',
+    type: 'select',
+    currentValue: 'fast',
+    options: [
+      { value: 'fast', name: 'Fast' },
+      { value: 'pro', name: 'Pro' },
+    ],
+  },
+  {
     id: 'mode',
     name: 'Mode',
     category: 'mode',
@@ -1051,19 +1152,19 @@ agent()
   })
   .onRequest(methods.agent.session.load, async () => {
     appendFileSync(process.env.AGY_TEST_LOG, 'load\\n')
-    if (starts >= 2) {
-      setImmediate(() => {
-        process.stderr.write('relaunch tail crash\\n')
-        process.exit(4)
-      })
-    }
     return { configOptions }
   })
-  .onRequest(methods.agent.session.setConfigOption, async ({ params: { configId, value } }) => ({
-    configOptions: configOptions.map((o) =>
-      o.id === configId ? { ...o, currentValue: String(value) } : o,
-    ),
-  }))
+  .onRequest(methods.agent.session.setConfigOption, async ({ params: { configId, value } }) => {
+    if (starts >= 2) {
+      process.stderr.write('relaunch tail crash\\n')
+      process.exit(4)
+    }
+    return {
+      configOptions: configOptions.map((o) =>
+        o.id === configId ? { ...o, currentValue: String(value) } : o,
+      ),
+    }
+  })
   .onNotification(methods.agent.session.cancel, async () => {})
   .onRequest(methods.agent.session.prompt, async () => ({ stopReason: 'end_turn' }))
   .connect(stream)
@@ -1096,6 +1197,7 @@ agent()
         mcpServers: {},
         settings: {},
         persist: true,
+        model: 'pro',
       },
     })
     const configsBefore = events.filter(
@@ -1244,23 +1346,31 @@ test(
           persist: true,
         },
       })
-      for (const text of ['retry-foreground-active', 'normal next turn']) {
-        await m.handle({
-          type: 'session.prompt',
-          sessionId: 's',
-          prompt: {
-            clientMessageId: text,
-            delivery: 'auto',
-            input: { type: 'message', content: [{ type: 'text', text }] },
+      await m.handle({
+        type: 'session.prompt',
+        sessionId: 's',
+        prompt: {
+          clientMessageId: 'retry-foreground-active',
+          delivery: 'auto',
+          input: {
+            type: 'message',
+            content: [{ type: 'text', text: 'retry-foreground-active' }],
           },
-        })
-      }
-      const turns = events.flatMap((event) =>
-        event.type === 'session.turn' && event.state !== 'started'
-          ? [event.state]
-          : [],
-      )
-      assert.deepEqual(turns, ['completed', 'completed'])
+        },
+      })
+      await m.handle({
+        type: 'session.prompt',
+        sessionId: 's',
+        prompt: {
+          clientMessageId: 'normal next turn',
+          delivery: 'auto',
+          input: {
+            type: 'message',
+            content: [{ type: 'text', text: 'normal next turn' }],
+          },
+        },
+      })
+      assert.deepEqual(completedTurnStates(events), ['completed', 'completed'])
       const log = (await readFile(join(home, 'runtime.jsonl'), 'utf8'))
         .trim()
         .split('\n')
@@ -1277,6 +1387,46 @@ test(
     }
   },
 )
+
+async function promptAndAssertUsageSnapshot(
+  m: SessionManager,
+  events: ProviderEvent[],
+  clientMessageId: string,
+  text: string,
+  expected: {
+    contextWindowUsedTokens: number
+    contextWindowMaxTokens?: number
+    turnState: 'completed' | 'canceled' | 'failed'
+  },
+) {
+  events.length = 0
+  await m.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId,
+      delivery: 'auto',
+      input: { type: 'message', content: [{ type: 'text', text }] },
+    },
+  })
+  const usage = events.findLast((e) => e.type === 'session.usage')
+  assert.ok(usage?.type === 'session.usage')
+  assert.equal(
+    usage.usage.contextWindowUsedTokens,
+    expected.contextWindowUsedTokens,
+  )
+  assert.equal(
+    usage.usage.contextWindowMaxTokens,
+    expected.contextWindowMaxTokens,
+  )
+  assert.equal(usage.usage.inputTokens, 600000)
+  assert.equal(usage.usage.outputTokens, 4405)
+  assert.ok(
+    events.some(
+      (e) => e.type === 'session.turn' && e.state === expected.turnState,
+    ),
+  )
+}
 
 test('context uses latest turn snapshot on cancel/error/restore and preserves native updates', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-context-snapshot-'))
@@ -1309,47 +1459,58 @@ test('context uses latest turn snapshot on cancel/error/restore and preserves na
     const openedEvent = events.find((e) => e.type === 'session.opened')
     assert.ok(openedEvent?.type === 'session.opened')
     const persistence = openedEvent.persistence!
-    let promptIndex = 0
-    for (const text of [
+    await promptAndAssertUsageSnapshot(
+      m,
+      events,
+      'usage-cancel:1',
       'usage-cancel',
+      {
+        contextWindowUsedTokens: 70463,
+        turnState: 'canceled',
+      },
+    )
+    await promptAndAssertUsageSnapshot(
+      m,
+      events,
+      'usage-empty:2',
       'usage-empty',
+      {
+        contextWindowUsedTokens: 70463,
+        turnState: 'completed',
+      },
+    )
+    await promptAndAssertUsageSnapshot(
+      m,
+      events,
+      'usage-error:3',
       'usage-error',
+      {
+        contextWindowUsedTokens: 70463,
+        turnState: 'failed',
+      },
+    )
+    await promptAndAssertUsageSnapshot(
+      m,
+      events,
+      'usage-native:4',
       'usage-native',
+      {
+        contextWindowUsedTokens: 1234,
+        contextWindowMaxTokens: 128000,
+        turnState: 'completed',
+      },
+    )
+    await promptAndAssertUsageSnapshot(
+      m,
+      events,
+      'usage-empty:5',
       'usage-empty',
-    ]) {
-      events.length = 0
-      await m.handle({
-        type: 'session.prompt',
-        sessionId: 's',
-        prompt: {
-          clientMessageId: `${text}:${++promptIndex}`,
-          delivery: 'auto',
-          input: { type: 'message', content: [{ type: 'text', text }] },
-        },
-      })
-      const usage = events.findLast((e) => e.type === 'session.usage')
-      assert.ok(usage?.type === 'session.usage')
-      assert.equal(
-        usage.usage.contextWindowUsedTokens,
-        text === 'usage-native' || usage.usage.contextWindowMaxTokens === 128000
-          ? 1234
-          : 70463,
-      )
-      assert.equal(usage.usage.inputTokens, 600000)
-      assert.equal(usage.usage.outputTokens, 4405)
-      assert.ok(
-        events.some(
-          (e) =>
-            e.type === 'session.turn' &&
-            e.state ===
-              (text === 'usage-cancel'
-                ? 'canceled'
-                : text === 'usage-error'
-                  ? 'failed'
-                  : 'completed'),
-        ),
-      )
-    }
+      {
+        contextWindowUsedTokens: 1234,
+        contextWindowMaxTokens: 128000,
+        turnState: 'completed',
+      },
+    )
     await m.handle({
       type: 'session.close',
       requestId: 'close',
@@ -1499,6 +1660,90 @@ test(
   },
 )
 
+async function runCompactionPrompt(
+  m: SessionManager,
+  events: ProviderEvent[],
+  clientMessageId: string,
+  input:
+    | { type: 'command'; name: string; arguments: string }
+    | { type: 'message'; content: [{ type: 'text'; text: string }] },
+  expectedDelta: number,
+) {
+  const before = compactionEvents(events).length
+  await m.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId,
+      delivery: 'auto',
+      input,
+    },
+  })
+  assert.equal(compactionEvents(events).length - before, expectedDelta)
+  const usage = events.findLast((event) => event.type === 'session.usage')
+  assert.ok(usage?.type === 'session.usage')
+  assert.equal(usage.usage.contextWindowUsedTokens, 12)
+  assert.equal(usage.usage.inputTokens, 500)
+  assert.equal(usage.usage.outputTokens, 50)
+}
+
+async function assertReopenedCompactions(
+  m: SessionManager,
+  events: ProviderEvent[],
+  persistence: NonNullable<
+    Extract<ProviderEvent, { type: 'session.opened' }>['persistence']
+  >,
+  config: {
+    cwd: string
+    env: Record<string, string>
+    mcpServers: Record<string, never>
+    settings: Record<string, never>
+    persist: boolean
+  },
+  history: 'replay' | 'skip',
+  expectedIds: readonly string[],
+) {
+  events.length = 0
+  await m.handle({
+    type: 'session.open',
+    requestId: `open:${history}`,
+    sessionId: 's',
+    history,
+    persistence,
+    config,
+  })
+  const replayed = compactionEvents(events)
+  assert.deepEqual(
+    replayed.map((event) => event.item.id),
+    expectedIds,
+  )
+  assert.deepEqual(
+    replayed.map((event) => ({
+      sessionId: event.sessionId,
+      timestamp: event.timestamp,
+      item: event.item,
+    })),
+    expectedIds.map((id) => ({
+      sessionId: 's',
+      timestamp: '2026-01-01T00:00:00Z',
+      item: {
+        type: 'compaction',
+        id,
+        status: 'completed',
+        preTokens: 268_740,
+      },
+    })),
+  )
+  const usage = events.findLast((event) => event.type === 'session.usage')
+  assert.ok(usage?.type === 'session.usage')
+  assert.equal(usage.usage.contextWindowUsedTokens, 12)
+  await m.handle({
+    type: 'session.close',
+    requestId: `close:${history}`,
+    sessionId: 's',
+  })
+}
+
 test('native compaction has stable live/history identity, command-only visibility and no invented canceled completion or usage', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-compaction-session-'))
   const events: ProviderEvent[] = []
@@ -1523,12 +1768,6 @@ test('native compaction has stable live/history identity, command-only visibilit
     settings: {},
     persist: true,
   }
-  const compactions = () =>
-    events.flatMap((event) =>
-      event.type === 'timeline.item' && event.item.type === 'compaction'
-        ? [event]
-        : [],
-    )
   try {
     await m.handle({
       type: 'session.open',
@@ -1540,31 +1779,31 @@ test('native compaction has stable live/history identity, command-only visibilit
     const opened = events.find((event) => event.type === 'session.opened')
     assert.ok(opened?.type === 'session.opened')
     const persistence = opened.persistence!
-    for (const text of ['checkpoint-turn', '/compact', 'checkpoint-cancel']) {
-      const before = compactions().length
-      await m.handle({
-        type: 'session.prompt',
-        sessionId: 's',
-        prompt: {
-          clientMessageId: text,
-          delivery: 'auto',
-          input:
-            text === '/compact'
-              ? { type: 'command', name: 'compact', arguments: '' }
-              : { type: 'message', content: [{ type: 'text', text }] },
-        },
-      })
-      assert.equal(
-        compactions().length - before,
-        text === 'checkpoint-cancel' ? 0 : 1,
-      )
-      const usage = events.findLast((event) => event.type === 'session.usage')
-      assert.ok(usage?.type === 'session.usage')
-      assert.equal(usage.usage.contextWindowUsedTokens, 12)
-      assert.equal(usage.usage.inputTokens, 500)
-      assert.equal(usage.usage.outputTokens, 50)
-    }
-    const liveIds = compactions().map((event) => event.item.id)
+    await runCompactionPrompt(
+      m,
+      events,
+      'checkpoint-turn',
+      { type: 'message', content: [{ type: 'text', text: 'checkpoint-turn' }] },
+      1,
+    )
+    await runCompactionPrompt(
+      m,
+      events,
+      '/compact',
+      { type: 'command', name: 'compact', arguments: '' },
+      1,
+    )
+    await runCompactionPrompt(
+      m,
+      events,
+      'checkpoint-cancel',
+      {
+        type: 'message',
+        content: [{ type: 'text', text: 'checkpoint-cancel' }],
+      },
+      0,
+    )
+    const liveIds = compactionEvents(events).map((event) => event.item.id)
     assert.equal(liveIds.length, 2)
     assert.ok(
       events.some(
@@ -1576,39 +1815,23 @@ test('native compaction has stable live/history identity, command-only visibilit
       requestId: 'close',
       sessionId: 's',
     })
-    for (const history of ['replay', 'skip', 'replay'] as const) {
-      events.length = 0
-      await m.handle({
-        type: 'session.open',
-        requestId: `open:${history}`,
-        sessionId: 's',
-        history,
-        persistence,
-        config,
-      })
-      assert.deepEqual(
-        compactions().map((event) => event.item.id),
-        history === 'skip' ? [] : liveIds,
-      )
-      for (const event of compactions()) {
-        assert.equal(event.sessionId, 's')
-        assert.equal(event.timestamp, '2026-01-01T00:00:00Z')
-        assert.deepEqual(event.item, {
-          type: 'compaction',
-          id: event.item.id,
-          status: 'completed',
-          preTokens: 268_740,
-        })
-      }
-      const usage = events.findLast((event) => event.type === 'session.usage')
-      assert.ok(usage?.type === 'session.usage')
-      assert.equal(usage.usage.contextWindowUsedTokens, 12)
-      await m.handle({
-        type: 'session.close',
-        requestId: `close:${history}`,
-        sessionId: 's',
-      })
-    }
+    await assertReopenedCompactions(
+      m,
+      events,
+      persistence,
+      config,
+      'replay',
+      liveIds,
+    )
+    await assertReopenedCompactions(m, events, persistence, config, 'skip', [])
+    await assertReopenedCompactions(
+      m,
+      events,
+      persistence,
+      config,
+      'replay',
+      liveIds,
+    )
   } finally {
     await m.close()
     await rm(home, { recursive: true, force: true })
@@ -1750,22 +1973,22 @@ agent()
   .onRequest(methods.agent.authenticate, async () => ({}))
   .onRequest(methods.agent.session.new, async ({ client }) => {
     const sessionId = '11111111-1111-4111-8111-111111111111'
-    setTimeout(() => {
+    setImmediate(() => {
       void client.notify(methods.client.session.update, {
         sessionId,
         update: { sessionUpdate: 'available_commands_update', availableCommands: [] },
       })
-    }, 0)
+    })
     return { sessionId, configOptions: buildConfigOptions() }
   })
   .onRequest(methods.agent.session.load, async ({ params: { sessionId }, client }) => {
     omitModelsNext = true
-    setTimeout(() => {
+    setImmediate(() => {
       void client.notify(methods.client.session.update, {
         sessionId,
         update: { sessionUpdate: 'available_commands_update', availableCommands: [] },
       })
-    }, 0)
+    })
     return { configOptions: buildConfigOptions() }
   })
   .onRequest(methods.agent.session.close, async () => ({}))
@@ -2059,18 +2282,16 @@ agent()
   },
 )
 
-type ChildSession = {
-  interrupt: (mode: 'cancel' | 'relaunch') => Promise<void>
-  waitForRuntimeReady: (signal: AbortSignal) => Promise<void>
-  transport: { rpc: { prompt: (...args: unknown[]) => Promise<unknown> } }
-}
-
 /** An opened session whose child subagents live in a synthetic `brain` tree. */
-async function childSession(retryTimeoutMs?: number) {
+async function childSession(
+  retryTimeoutMs?: number,
+  onEvent?: (event: ProviderEvent) => void,
+) {
   const home = await mkdtemp(join(tmpdir(), 'agy-child-session-'))
   const logPath = join(home, 'agy.log')
   const events: ProviderEvent[] = []
-  const m = new SessionManager({
+  let promptHandler: PromptHandler | undefined
+  const m = new HarnessSessionManager({
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
@@ -2084,7 +2305,12 @@ async function childSession(retryTimeoutMs?: number) {
     usage: new AgyUsageSource(),
     capabilities: ['prompt.message', 'session.subsession'],
     retryTimeoutMs,
-    emit: (event) => events.push(structuredClone(event)),
+    connectAcp: wrapConnectAcp(() => promptHandler),
+    emit: (event) => {
+      const cloned = structuredClone(event)
+      events.push(cloned)
+      onEvent?.(cloned)
+    },
   })
   await m.handle({
     type: 'session.open',
@@ -2154,9 +2380,7 @@ async function childSession(retryTimeoutMs?: number) {
     )
     await writeFile(join(msgDir, 'read.json'), JSON.stringify({ init: true }))
   }
-  const session = (
-    m as unknown as { sessions: Map<string, ChildSession> }
-  ).sessions.get('s')!
+  const session = m.session
   const prompt = (clientMessageId: string, text: string) =>
     m.handle({
       type: 'session.prompt',
@@ -2176,6 +2400,9 @@ async function childSession(retryTimeoutMs?: number) {
     writeJsonl,
     writeSubagent,
     session,
+    setPromptHandler: (handler: PromptHandler | undefined) => {
+      promptHandler = handler
+    },
     close: async () => {
       await m.close()
       await rm(home, { recursive: true, force: true })
@@ -2186,7 +2413,11 @@ async function childSession(retryTimeoutMs?: number) {
 test(
   'parallel child crash flushes failed child state, cancels running sibling watcher, and relaunches runtime',
   { timeout: 10_000 },
-  async (t) => {
+  async () => {
+    const childA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const childB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    let triggerCrash: () => void = () => {}
+    let crashWrite: Promise<void> | undefined
     const {
       logPath,
       events,
@@ -2195,16 +2426,24 @@ test(
       writeJsonl,
       writeSubagent,
       session,
+      setPromptHandler,
       close,
-    } = await childSession(40)
-    const childA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-    const childB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    } = await childSession(
+      40,
+      onceOnEvent(
+        (event) =>
+          event.type === 'session.turn' &&
+          event.sessionId === `s:child:${childA}` &&
+          event.state === 'started',
+        () => triggerCrash(),
+      ),
+    )
     try {
-      t.mock.method(session.transport.rpc, 'prompt', async () => {
+      setPromptHandler(async () => {
         await writeSubagent(childA, 2, 'spawn-a')
         await writeSubagent(childB, 3, 'spawn-b')
-        // Start childB running and childA initially running, then childA crashes after 40ms
-        // (well before childA's 1000ms watcher interval, exercising flushRunningChildren).
+        // Start childB running and childA initially running; once childA's watcher emits turn started,
+        // write childA's fatal crash (well before its 1000ms watcher interval, exercising flushRunningChildren).
         await writeJsonl(childA, [
           {
             step_index: 0,
@@ -2267,8 +2506,8 @@ test(
             content: 'Waiting for both subagents.',
           },
         ])
-        setTimeout(() => {
-          void writeJsonl(childA, [
+        triggerCrash = () => {
+          crashWrite = writeJsonl(childA, [
             {
               step_index: 0,
               type: 'SYSTEM_MESSAGE',
@@ -2280,7 +2519,7 @@ test(
               content: 'Child A crashed fatally',
             },
           ])
-        }, 40)
+        }
         return {
           stopReason: 'end_turn' as const,
           usage: { inputTokens: 120, outputTokens: 12, totalTokens: 132 },
@@ -2332,6 +2571,8 @@ test(
         'runtime must relaunch to terminate leaked sibling subagent work',
       )
     } finally {
+      triggerCrash = () => {}
+      await crashWrite?.catch(() => undefined)
       await close()
     }
   },
@@ -2340,7 +2581,7 @@ test(
 test(
   're-woken idle child crash and child retry-timeout stall both flush child watcher to failed instead of canceled',
   { timeout: 10_000 },
-  async (t) => {
+  async () => {
     const {
       brainRoot,
       events,
@@ -2348,232 +2589,239 @@ test(
       prompt,
       writeJsonl,
       writeSubagent,
-      session,
+      setPromptHandler,
       close,
     } = await childSession(40)
     const childA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
     const childB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
     try {
-      // Turn 1: spawn childA, which completes cleanly (so childA watcher becomes !isRunning()).
-      let turn = 0
-      t.mock.method(session.transport.rpc, 'prompt', async () => {
-        turn++
-        if (turn === 1) {
-          await writeSubagent(childA, 2, 'spawn-a')
-          await writeJsonl(childA, [
-            {
-              step_index: 0,
-              type: 'SYSTEM_MESSAGE',
-              content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=work A\n</SYSTEM_MESSAGE>`,
-            },
-            {
-              step_index: 1,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              content: 'Child A turn 1 done',
-            },
-          ])
-          await writeJsonl(nativeId, [
-            { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-            {
-              step_index: 1,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              tool_calls: [
-                { id: 'spawn-a', name: 'invoke_subagent', args: { Role: 'A' } },
-              ],
-            },
-            {
-              step_index: 2,
-              type: 'GENERIC',
-              status: 'DONE',
-              content: JSON.stringify({ conversationId: childA }),
-            },
-            {
-              step_index: 3,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              content: 'Turn 1 complete.',
-            },
-          ])
-          return {
-            stopReason: 'end_turn' as const,
-            usage: { inputTokens: 50, outputTokens: 5, totalTokens: 55 },
-          }
-        }
-        // Turn 2: re-wake idle childA (crashes in < 1000ms) AND spawn childB (stalls on retry warning -> settled.stalled = true).
-        const msgDirA = join(brainRoot, childA, '.system_generated/messages')
-        await writeFile(
-          join(msgDirA, 'wake2.json'),
-          JSON.stringify({
-            id: 'wake2',
-            sender: nativeId,
-            recipient: childA,
-            priority: 'MESSAGE_PRIORITY_HIGH',
-            content: 'wake A',
-            sourceMetadata: {
-              tool: {
-                conversationId: nativeId,
-                stepIndex: 6,
-                toolCall: {
-                  id: 'wake-a',
-                  name: 'send_message',
-                  argumentsJson: '{}',
-                },
-              },
-            },
-          }),
-        )
-        await writeFile(
-          join(msgDirA, 'read.json'),
-          JSON.stringify({ init: true, wake2: true }),
-        )
-        await writeJsonl(childA, [
-          {
-            step_index: 0,
-            type: 'SYSTEM_MESSAGE',
-            content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=work A\n</SYSTEM_MESSAGE>`,
-          },
-          {
-            step_index: 1,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            content: 'Child A turn 1 done',
-          },
-          {
-            step_index: 2,
-            type: 'SYSTEM_MESSAGE',
-            content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=wake A\n</SYSTEM_MESSAGE>`,
-          },
-          {
-            step_index: 3,
-            type: 'ERROR_MESSAGE',
-            content: 'Re-woken childA crashed immediately',
-          },
-        ])
-        await writeJsonl(nativeId, [
-          { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-          {
-            step_index: 1,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            tool_calls: [
-              { id: 'spawn-a', name: 'invoke_subagent', args: { Role: 'A' } },
-            ],
-          },
-          {
-            step_index: 2,
-            type: 'GENERIC',
-            status: 'DONE',
-            content: JSON.stringify({ conversationId: childA }),
-          },
-          {
-            step_index: 3,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            content: 'Turn 1 complete.',
-          },
-          { step_index: 4, type: 'USER_INPUT', content: 'turn 2' },
-          {
-            step_index: 5,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            tool_calls: [
+      setPromptHandler(
+        sequenceDouble([
+          async () => {
+            // Turn 1: spawn childA, which completes cleanly (so childA watcher becomes !isRunning()).
+            await writeSubagent(childA, 2, 'spawn-a')
+            await writeJsonl(childA, [
               {
-                id: 'wake-a',
-                name: 'send_message',
-                args: { Recipient: childA, Message: 'wake A' },
+                step_index: 0,
+                type: 'SYSTEM_MESSAGE',
+                content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=work A\n</SYSTEM_MESSAGE>`,
               },
-            ],
+              {
+                step_index: 1,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                content: 'Child A turn 1 done',
+              },
+            ])
+            await writeJsonl(nativeId, [
+              { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
+              {
+                step_index: 1,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                tool_calls: [
+                  {
+                    id: 'spawn-a',
+                    name: 'invoke_subagent',
+                    args: { Role: 'A' },
+                  },
+                ],
+              },
+              {
+                step_index: 2,
+                type: 'GENERIC',
+                status: 'DONE',
+                content: JSON.stringify({ conversationId: childA }),
+              },
+              {
+                step_index: 3,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                content: 'Turn 1 complete.',
+              },
+            ])
+            return {
+              stopReason: 'end_turn' as const,
+              usage: { inputTokens: 50, outputTokens: 5, totalTokens: 55 },
+            }
           },
-          {
-            step_index: 6,
-            type: 'GENERIC',
-            status: 'DONE',
-            content: 'Message sent',
+          async () => {
+            // Turn 2: re-wake idle childA (crashes in < 1000ms).
+            const msgDirA = join(
+              brainRoot,
+              childA,
+              '.system_generated/messages',
+            )
+            await writeFile(
+              join(msgDirA, 'wake2.json'),
+              JSON.stringify({
+                id: 'wake2',
+                sender: nativeId,
+                recipient: childA,
+                priority: 'MESSAGE_PRIORITY_HIGH',
+                content: 'wake A',
+                sourceMetadata: {
+                  tool: {
+                    conversationId: nativeId,
+                    stepIndex: 6,
+                    toolCall: {
+                      id: 'wake-a',
+                      name: 'send_message',
+                      argumentsJson: '{}',
+                    },
+                  },
+                },
+              }),
+            )
+            await writeFile(
+              join(msgDirA, 'read.json'),
+              JSON.stringify({ init: true, wake2: true }),
+            )
+            await writeJsonl(childA, [
+              {
+                step_index: 0,
+                type: 'SYSTEM_MESSAGE',
+                content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=work A\n</SYSTEM_MESSAGE>`,
+              },
+              {
+                step_index: 1,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                content: 'Child A turn 1 done',
+              },
+              {
+                step_index: 2,
+                type: 'SYSTEM_MESSAGE',
+                content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=wake A\n</SYSTEM_MESSAGE>`,
+              },
+              {
+                step_index: 3,
+                type: 'ERROR_MESSAGE',
+                content: 'Re-woken childA crashed immediately',
+              },
+            ])
+            await writeJsonl(nativeId, [
+              { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
+              {
+                step_index: 1,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                tool_calls: [
+                  {
+                    id: 'spawn-a',
+                    name: 'invoke_subagent',
+                    args: { Role: 'A' },
+                  },
+                ],
+              },
+              {
+                step_index: 2,
+                type: 'GENERIC',
+                status: 'DONE',
+                content: JSON.stringify({ conversationId: childA }),
+              },
+              {
+                step_index: 3,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                content: 'Turn 1 complete.',
+              },
+              { step_index: 4, type: 'USER_INPUT', content: 'turn 2' },
+              {
+                step_index: 5,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                tool_calls: [
+                  {
+                    id: 'wake-a',
+                    name: 'send_message',
+                    args: { Recipient: childA, Message: 'wake A' },
+                  },
+                ],
+              },
+              {
+                step_index: 6,
+                type: 'GENERIC',
+                status: 'DONE',
+                content: 'Message sent',
+              },
+              {
+                step_index: 7,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                content: 'Waiting on woken childA.',
+              },
+            ])
+            return {
+              stopReason: 'end_turn' as const,
+              usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
+            }
           },
-          {
-            step_index: 7,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            content: 'Waiting on woken childA.',
+          async () => {
+            // Turn 3: spawn childB which expires on retry warning (settled.stalled === true); flushActiveChildren must mark childB failed before interrupt relaunches.
+            await writeSubagent(childB, 10, 'spawn-b')
+            await writeJsonl(childB, [
+              {
+                step_index: 0,
+                type: 'SYSTEM_MESSAGE',
+                content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=work B\n</SYSTEM_MESSAGE>`,
+              },
+              {
+                step_index: 1,
+                type: 'ERROR_MESSAGE',
+                status: 'DONE',
+                content:
+                  'Error: The stream was interrupted. Please continue the task you were working on.',
+              },
+            ])
+            await writeJsonl(nativeId, [
+              { step_index: 8, type: 'USER_INPUT', content: 'turn 3' },
+              {
+                step_index: 9,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                tool_calls: [
+                  {
+                    id: 'spawn-b',
+                    name: 'invoke_subagent',
+                    args: { Role: 'B' },
+                  },
+                ],
+              },
+              {
+                step_index: 10,
+                type: 'GENERIC',
+                status: 'DONE',
+                content: JSON.stringify({ conversationId: childB }),
+              },
+              {
+                step_index: 11,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                content: 'Waiting on childB.',
+              },
+            ])
+            return {
+              stopReason: 'end_turn' as const,
+              usage: { inputTokens: 150, outputTokens: 15, totalTokens: 165 },
+            }
           },
-        ])
-        return {
-          stopReason: 'end_turn' as const,
-          usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
-        }
-      })
+        ]),
+      )
 
       await prompt('p1', 'turn 1')
       await prompt('p2', 'turn 2')
 
-      const childATurns = events.flatMap((e) =>
-        e.type === 'session.turn' && e.sessionId === `s:child:${childA}`
-          ? [`${e.turnId}:${e.state}`]
-          : [],
-      )
-      assert.deepEqual(childATurns, [
+      assert.deepEqual(childTurnKeys(events, `s:child:${childA}`), [
         `s:child:${childA}:turn:1:started`,
         `s:child:${childA}:turn:1:completed`,
         `s:child:${childA}:turn:2:started`,
         `s:child:${childA}:turn:2:failed`,
       ])
 
-      // Turn 3: spawn childB which expires on retry warning (settled.stalled === true); flushActiveChildren must mark childB failed before interrupt relaunches.
-      t.mock.method(session.transport.rpc, 'prompt', async () => {
-        await writeSubagent(childB, 10, 'spawn-b')
-        await writeJsonl(childB, [
-          {
-            step_index: 0,
-            type: 'SYSTEM_MESSAGE',
-            content: `<SYSTEM_MESSAGE>\n[Message] sender=${nativeId} content=work B\n</SYSTEM_MESSAGE>`,
-          },
-          {
-            step_index: 1,
-            type: 'ERROR_MESSAGE',
-            status: 'DONE',
-            content:
-              'Error: The stream was interrupted. Please continue the task you were working on.',
-          },
-        ])
-        await writeJsonl(nativeId, [
-          { step_index: 8, type: 'USER_INPUT', content: 'turn 3' },
-          {
-            step_index: 9,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            tool_calls: [
-              { id: 'spawn-b', name: 'invoke_subagent', args: { Role: 'B' } },
-            ],
-          },
-          {
-            step_index: 10,
-            type: 'GENERIC',
-            status: 'DONE',
-            content: JSON.stringify({ conversationId: childB }),
-          },
-          {
-            step_index: 11,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            content: 'Waiting on childB.',
-          },
-        ])
-        return {
-          stopReason: 'end_turn' as const,
-          usage: { inputTokens: 150, outputTokens: 15, totalTokens: 165 },
-        }
-      })
-
       await prompt('p3', 'turn 3')
 
-      const childBTurns = events.flatMap((e) =>
-        e.type === 'session.turn' && e.sessionId === `s:child:${childB}`
-          ? [`${e.turnId}:${e.state}`]
-          : [],
-      )
-      assert.deepEqual(childBTurns, [
+      assert.deepEqual(childTurnKeys(events, `s:child:${childB}`), [
         `s:child:${childB}:turn:1:started`,
         `s:child:${childB}:turn:1:failed`,
       ])
@@ -2586,14 +2834,22 @@ test(
 test(
   'parent turn failure after child already completed flushes child without interrupting or relaunching runtime',
   { timeout: 10_000 },
-  async (t) => {
-    const { brainRoot, events, nativeId, prompt, writeJsonl, session, close } =
-      await childSession(40)
+  async () => {
+    const {
+      logPath,
+      brainRoot,
+      events,
+      nativeId,
+      prompt,
+      writeJsonl,
+      session,
+      setPromptHandler,
+      close,
+    } = await childSession(40)
     const childDone = 'eeeeeeee-1111-4111-8111-111111111111'
+    const initialTransport = session.transport
     try {
-      const interruptMock = t.mock.method(session, 'interrupt')
-
-      t.mock.method(session.transport.rpc, 'prompt', async () => {
+      setPromptHandler(async () => {
         const subDir = join(brainRoot, nativeId, '.system_generated/subagents')
         await mkdir(subDir, { recursive: true })
         await writeFile(
@@ -2676,20 +2932,16 @@ test(
 
       await prompt('p1', 'go')
 
-      const childTurns = events.flatMap((e) =>
-        e.type === 'session.turn' && e.sessionId === `s:child:${childDone}`
-          ? [`${e.turnId}:${e.state}`]
-          : [],
-      )
-      assert.deepEqual(childTurns, [
+      assert.deepEqual(childTurnKeys(events, `s:child:${childDone}`), [
         `s:child:${childDone}:turn:1:started`,
         `s:child:${childDone}:turn:1:completed`,
       ])
-      assert.equal(
-        interruptMock.mock.callCount(),
-        0,
-        'failed turn with only an already-completed child must not interrupt or relaunch the runtime',
+      assert.deepEqual(
+        (await readFile(logPath, 'utf8')).trim().split('\n'),
+        ['new'],
+        'failed turn with only an already-completed child must not cancel or relaunch the runtime',
       )
+      assert.equal(session.transport, initialTransport)
     } finally {
       await close()
     }
@@ -2699,7 +2951,9 @@ test(
 async function usageHarness(t: TestContext) {
   const home = await mkdtemp(join(tmpdir(), 'agy-session-usage-'))
   const events: ProviderEvent[] = []
-  const m = new SessionManager({
+  let promptHandler: PromptHandler | undefined
+  let realPrompt!: RpcPrompt
+  const m = new HarnessSessionManager({
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
@@ -2708,19 +2962,17 @@ async function usageHarness(t: TestContext) {
     usage: new AgyUsageSource(),
     capabilities: ['prompt.message', 'prompt.command', 'session.configure'],
     emit: (e) => events.push(structuredClone(e)),
+    connectAcp: wrapConnectAcp(
+      () => promptHandler,
+      (fn) => {
+        realPrompt = fn
+      },
+    ),
   })
   t.after(async () => {
     await m.close()
     await rm(home, { recursive: true, force: true })
   })
-  const start = m.start.bind(m)
-  let session!: Awaited<ReturnType<typeof m.start>>
-  t.mock.method(
-    m,
-    'start',
-    async (...args: Parameters<typeof start>) =>
-      (session = await start(...args)),
-  )
   await m.handle({
     type: 'session.open',
     requestId: 'open',
@@ -2734,9 +2986,9 @@ async function usageHarness(t: TestContext) {
       persist: true,
     },
   })
+  const session = m.session
   const write = (rows: Record<string, unknown>[]) =>
-    writeBrainTranscript(hBrainRoot(), session.state.nativeId, rows)
-  const hBrainRoot = () => session.brainRoot
+    writeBrainTranscript(session.brainRoot, session.state.nativeId, rows)
   let sequence = 0
   const prompt = (text = 'synthetic') =>
     m.handle({
@@ -2753,7 +3005,18 @@ async function usageHarness(t: TestContext) {
     assert.ok(event?.type === 'session.usage')
     return event.usage
   }
-  return { m, session, events, write, prompt, latest }
+  return {
+    m,
+    session,
+    events,
+    write,
+    prompt,
+    nativePrompt: (params: Parameters<RpcPrompt>[0]) => realPrompt(params),
+    setPromptHandler: (handler: PromptHandler | undefined) => {
+      promptHandler = handler
+    },
+    latest,
+  }
 }
 
 test('zero-token canceled or command turns preserve carriedUsage, pendingReplay, and prior consumption', async (t) => {
@@ -2775,12 +3038,23 @@ test('zero-token canceled or command turns preserve carriedUsage, pendingReplay,
     cachedReadTokens: 0,
     totalTokens: 0,
   }
+  h.setPromptHandler(
+    sequenceDouble<[], ReturnType<RpcPrompt>>([
+      async () => ({ stopReason: 'end_turn' as const, usage: zeroUsage }),
+      async () => ({ stopReason: 'cancelled' as const, usage: zeroUsage }),
+      async () => ({
+        stopReason: 'end_turn' as const,
+        usage: {
+          inputTokens: 120,
+          outputTokens: 15,
+          cachedReadTokens: 650,
+          totalTokens: 785,
+        },
+      }),
+    ]),
+  )
 
   // 1. Zero-token slash command preserves cache-only carriedUsage, pendingReplay, and prior consumption.
-  t.mock.method(h.session.transport.rpc, 'prompt', async () => ({
-    stopReason: 'end_turn' as const,
-    usage: zeroUsage,
-  }))
   await h.m.handle({
     type: 'session.prompt',
     sessionId: 's',
@@ -2800,10 +3074,6 @@ test('zero-token canceled or command turns preserve carriedUsage, pendingReplay,
   assert.equal(h.latest().cachedInputTokens, 500)
 
   // 2. Zero-token canceled message turn (before user echo) also preserves carriedUsage and pendingReplay.
-  t.mock.method(h.session.transport.rpc, 'prompt', async () => ({
-    stopReason: 'cancelled' as const,
-    usage: zeroUsage,
-  }))
   await h.prompt('cancel-zero')
   assert.deepEqual(h.session.state.wakeup.carriedUsage, {
     inputTokens: 0,
@@ -2814,15 +3084,6 @@ test('zero-token canceled or command turns preserve carriedUsage, pendingReplay,
   assert.equal(h.latest().inputTokens, 200)
 
   // 3. Subsequent billed turn deducts the preserved cache-only carriedUsage cleanly.
-  t.mock.method(h.session.transport.rpc, 'prompt', async () => ({
-    stopReason: 'end_turn' as const,
-    usage: {
-      inputTokens: 120,
-      outputTokens: 15,
-      cachedReadTokens: 650,
-      totalTokens: 785,
-    },
-  }))
   await h.prompt('billed-next')
   assert.equal(h.latest().inputTokens, 120)
   assert.equal(h.latest().outputTokens, 15)
@@ -2834,37 +3095,64 @@ test('zero-token canceled or command turns preserve carriedUsage, pendingReplay,
 test('pre-echo prompt RPC rejection preserves pendingReplay and carriedUsage for the next turn', async (t) => {
   const h = await usageHarness(t)
   const sender = '22222222-2222-4222-8222-222222222222'
-  // Turn 1: Reactive Wakeup produces pendingReplay = true and carriedUsage = {50, 5}.
-  t.mock.method(h.session.transport.rpc, 'prompt', async () => {
-    await h.write([
-      { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-      {
-        step_index: 1,
-        type: 'PLANNER_RESPONSE',
-        status: 'DONE',
-        content: 'Foreground',
-        input_tokens: 100,
-        output_tokens: 10,
+  h.setPromptHandler(
+    sequenceDouble([
+      // Turn 1: Reactive Wakeup produces pendingReplay = true and carriedUsage = {50, 5}.
+      async () => {
+        await h.write([
+          { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
+          {
+            step_index: 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Foreground',
+            input_tokens: 100,
+            output_tokens: 10,
+          },
+          {
+            step_index: 2,
+            type: 'SYSTEM_MESSAGE',
+            content: `<SYSTEM_MESSAGE>\n[Message] sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=done\n</SYSTEM_MESSAGE>`,
+          },
+          {
+            step_index: 3,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Woken reply',
+            input_tokens: 50,
+            output_tokens: 5,
+          },
+        ])
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
+        }
       },
-      {
-        step_index: 2,
-        type: 'SYSTEM_MESSAGE',
-        content: `<SYSTEM_MESSAGE>\n[Message] sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=done\n</SYSTEM_MESSAGE>`,
+      // Turn 2: rpc.prompt throws before echoing user_message_chunk (no relaunch).
+      async () => {
+        throw new Error('Transient RPC failure before echo')
       },
-      {
-        step_index: 3,
-        type: 'PLANNER_RESPONSE',
-        status: 'DONE',
-        content: 'Woken reply',
-        input_tokens: 50,
-        output_tokens: 5,
+      // Turn 3: succeeds with cumulative usage (110 - 50 carried = 60).
+      async () => {
+        await h.write([
+          { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
+          { step_index: 4, type: 'USER_INPUT', content: 'turn 3' },
+          {
+            step_index: 5,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'Turn 3 reply',
+            input_tokens: 60,
+            output_tokens: 6,
+          },
+        ])
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 110, outputTokens: 11, totalTokens: 121 },
+        }
       },
-    ])
-    return {
-      stopReason: 'end_turn' as const,
-      usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
-    }
-  })
+    ]),
+  )
   await h.prompt('turn 1')
   assert.equal(h.session.state.wakeup.pendingReplay, true)
   assert.deepEqual(h.session.state.wakeup.carriedUsage, {
@@ -2873,10 +3161,6 @@ test('pre-echo prompt RPC rejection preserves pendingReplay and carriedUsage for
     cachedReadTokens: 0,
   })
 
-  // Turn 2: rpc.prompt throws before echoing user_message_chunk (no relaunch).
-  t.mock.method(h.session.transport.rpc, 'prompt', async () => {
-    throw new Error('Transient RPC failure before echo')
-  })
   await h.prompt('turn 2')
   assert.equal(
     h.session.state.wakeup.pendingReplay,
@@ -2889,25 +3173,6 @@ test('pre-echo prompt RPC rejection preserves pendingReplay and carriedUsage for
     cachedReadTokens: 0,
   })
 
-  // Turn 3: succeeds with cumulative usage (110 - 50 carried = 60).
-  t.mock.method(h.session.transport.rpc, 'prompt', async () => {
-    await h.write([
-      { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-      { step_index: 4, type: 'USER_INPUT', content: 'turn 3' },
-      {
-        step_index: 5,
-        type: 'PLANNER_RESPONSE',
-        status: 'DONE',
-        content: 'Turn 3 reply',
-        input_tokens: 60,
-        output_tokens: 6,
-      },
-    ])
-    return {
-      stopReason: 'end_turn' as const,
-      usage: { inputTokens: 110, outputTokens: 11, totalTokens: 121 },
-    }
-  })
   await h.prompt('turn 3')
   assert.equal(h.latest().inputTokens, 60)
   assert.equal(h.latest().outputTokens, 6)
@@ -2923,7 +3188,7 @@ test('runtime relaunch during a turn deducts pre-relaunch carriedUsage while cle
     cachedReadTokens: 10,
   }
   const sender = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
-  t.mock.method(h.session.transport.rpc, 'prompt', async () => {
+  h.setPromptHandler(async () => {
     await h.write([
       { step_index: 1, type: 'USER_INPUT', content: 'run' },
       {
@@ -3016,17 +3281,12 @@ test('post-echo zero-usage cancellation clears pendingReplay while preserving ca
     cachedReadTokens: 0,
   }
   h.session.state.wakeup.pendingReplay = true
-  const nativePrompt = h.session.transport.rpc.prompt.bind(
-    h.session.transport.rpc,
-  )
-  t.mock.method(h.session.transport.rpc, 'prompt', async () => {
-    const pending = nativePrompt({
+  h.setPromptHandler(async () => {
+    const pending = h.nativePrompt({
       sessionId: h.session.state.nativeId,
       prompt: [{ type: 'text', text: 'wait' }],
     })
-    for (let i = 0; i < 100 && h.session.state.wakeup.suppressEcho; i++) {
-      await delay(10)
-    }
+    await waitUntil(() => !h.session.state.wakeup.suppressEcho)
     await h.session.transport.rpc.cancel({
       sessionId: h.session.state.nativeId,
     })
@@ -3062,7 +3322,7 @@ test('zero-usage turn with its own wakeup accumulates carriedUsage via addStepUs
     cachedReadTokens: 10,
   }
   const sender = '33333333-3333-4333-8333-333333333333'
-  t.mock.method(h.session.transport.rpc, 'prompt', async () => {
+  h.setPromptHandler(async () => {
     await h.write([
       { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
       {
@@ -3114,7 +3374,7 @@ test('underflowing positive usage skips carriedUsage deduction and clears stale 
     outputTokens: 5,
     cachedReadTokens: 500,
   }
-  t.mock.method(h.session.transport.rpc, 'prompt', async () => ({
+  h.setPromptHandler(async () => ({
     stopReason: 'end_turn' as const,
     usage: {
       inputTokens: 80,
@@ -3213,506 +3473,290 @@ test('post-waitPrompt settle failure still publishes positive result.usage and c
   }
 })
 
-for (const postEcho of [false, true])
-  test(`canceled synthetic ask_question continuation with zero usage preserves carriedUsage (postEcho: ${postEcho})`, async (t) => {
-    const home = await mkdtemp(join(tmpdir(), 'agy-f2-cont-cancel-'))
-    const events: ProviderEvent[] = []
-    const m = new SessionManager({
-      launch: {
-        command: process.execPath,
-        args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-        env: { HOME: home, PATH: process.env.PATH ?? '' },
+async function continuationHarness(t: TestContext, prefix: string) {
+  const home = await mkdtemp(join(tmpdir(), prefix))
+  const collector = createEventCollector()
+  let promptHandler: PromptHandler | undefined
+  let realPrompt!: RpcPrompt
+  const m = new HarnessSessionManager({
+    launch: {
+      command: process.execPath,
+      args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
+      env: { HOME: home, PATH: process.env.PATH ?? '' },
+    },
+    usage: new AgyUsageSource(),
+    capabilities: ['prompt.message', 'permission'],
+    emit: collector.emit,
+    connectAcp: wrapConnectAcp(
+      () => promptHandler,
+      (fn) => {
+        realPrompt = fn
       },
-      usage: new AgyUsageSource(),
-      capabilities: ['prompt.message', 'permission'],
-      emit: (e) => events.push(structuredClone(e)),
-    })
-    t.after(async () => {
-      await m.close()
-      await rm(home, { recursive: true, force: true })
-    })
-    const start = m.start.bind(m)
-    let session!: Awaited<ReturnType<typeof m.start>>
-    t.mock.method(
-      m,
-      'start',
-      async (...args: Parameters<typeof start>) =>
-        (session = await start(...args)),
-    )
-    await m.handle({
-      type: 'session.open',
-      requestId: 'open',
-      sessionId: 's',
-      history: 'skip',
-      config: {
-        cwd: home,
-        env: {},
-        mcpServers: {},
-        settings: {},
-        persist: true,
-      },
-    })
-    const sender = '44444444-4444-4444-8444-444444444444'
-    const nativePrompt = session.transport.rpc.prompt.bind(
-      session.transport.rpc,
-    )
-    let rpcCount = 0
-    t.mock.method(session.transport.rpc, 'prompt', async () => {
-      rpcCount++
-      if (rpcCount === 1) {
-        await writeBrainTranscript(session.brainRoot, session.state.nativeId, [
-          { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-          {
-            step_index: 1,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            content: 'Foreground',
-            input_tokens: 100,
-            output_tokens: 10,
-          },
-          {
-            step_index: 2,
-            type: 'SYSTEM_MESSAGE',
-            content: `<SYSTEM_MESSAGE>\n[Message] sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=wake\n</SYSTEM_MESSAGE>`,
-          },
-          {
-            step_index: 3,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            input_tokens: 40,
-            output_tokens: 4,
-            tool_calls: [
+    ),
+  })
+  t.after(async () => {
+    await m.close()
+    await rm(home, { recursive: true, force: true })
+  })
+  await m.handle({
+    type: 'session.open',
+    requestId: 'open',
+    sessionId: 's',
+    history: 'skip',
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+  const session = m.session
+  const sender = '44444444-4444-4444-8444-444444444444'
+  const wokenAskRows = [
+    { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      content: 'Foreground',
+      input_tokens: 100,
+      output_tokens: 10,
+    },
+    {
+      step_index: 2,
+      type: 'SYSTEM_MESSAGE',
+      content: `<SYSTEM_MESSAGE>\n[Message] sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=wake\n</SYSTEM_MESSAGE>`,
+    },
+    {
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      input_tokens: 40,
+      output_tokens: 4,
+      tool_calls: [
+        {
+          id: 'ask-1',
+          name: 'ask_question',
+          args: {
+            questions: [
               {
-                id: 'ask-1',
-                name: 'ask_question',
-                args: {
-                  questions: [
-                    {
-                      question: 'Proceed?',
-                      options: [{ label: 'Yes' }, { label: 'No' }],
-                    },
-                  ],
-                },
+                question: 'Proceed?',
+                options: [{ label: 'Yes' }, { label: 'No' }],
               },
             ],
           },
-        ])
-        return {
-          stopReason: 'end_turn' as const,
-          usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
-        }
-      }
-      if (postEcho) {
-        const pending = nativePrompt({
-          sessionId: session.state.nativeId,
-          prompt: [{ type: 'text', text: 'wait' }],
-        })
-        for (let i = 0; i < 100 && !session.state.continuationEchoSeen; i++) {
-          await delay(10)
-        }
-        await session.transport.rpc.cancel({
-          sessionId: session.state.nativeId,
-        })
-        await pending
-      }
-      return {
-        stopReason: 'cancelled' as const,
-        usage: {
-          inputTokens: 0,
-          outputTokens: 0,
-          cachedReadTokens: 0,
-          totalTokens: 0,
         },
-      }
+      ],
+    },
+  ]
+  const seedWokenAsk: PromptHandler = async () => {
+    await writeBrainTranscript(
+      session.brainRoot,
+      session.state.nativeId,
+      wokenAskRows,
+    )
+    return {
+      stopReason: 'end_turn' as const,
+      usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
+    }
+  }
+  const waitAndCancelEcho = async () => {
+    const pending = realPrompt({
+      sessionId: session.state.nativeId,
+      prompt: [{ type: 'text', text: 'wait' }],
     })
-
+    await waitUntil(() => session.state.continuationEchoSeen)
+    await session.transport.rpc.cancel({
+      sessionId: session.state.nativeId,
+    })
+    await pending
+  }
+  const runAndAnswerQuestion = async (clientMessageId: string) => {
     const promptPromise = m.handle({
       type: 'session.prompt',
       sessionId: 's',
       prompt: {
-        clientMessageId: 'p-f2',
+        clientMessageId,
         delivery: 'auto',
         input: { type: 'message', content: [{ type: 'text', text: 'turn 1' }] },
       },
     })
-    // Wait for the woken ask_question permission request, then answer it.
-    let permissionId: string | undefined
-    for (let i = 0; i < 100 && !permissionId; i++) {
-      const req = events.find((e) => e.type === 'session.permission')
-      if (req?.type === 'session.permission') permissionId = req.request.id
-      else await delay(10)
-    }
-    assert.ok(permissionId, 'woken ask_question must emit session.permission')
+    const perm = await collector.wait((e) => e.type === 'session.permission')
+    assert.ok(perm.type === 'session.permission')
     await m.handle({
       type: 'session.permission',
       sessionId: 's',
-      permissionId,
+      permissionId: perm.request.id,
       response: {
         behavior: 'allow',
         updatedInput: { answers: { 'Proceed?': 'Yes' } },
       },
     })
-    await promptPromise
-    assert.deepEqual(
-      session.state.wakeup.carriedUsage,
-      { inputTokens: 40, outputTokens: 4, cachedReadTokens: 0 },
-      'canceled zero-usage continuation must preserve pre-continuation wakeup carriedUsage',
-    )
-    assert.equal(
-      session.state.wakeup.pendingReplay,
-      !postEcho,
-      'pre-echo canceled continuation must preserve pendingReplay while post-echo clears it',
-    )
-  })
+    return promptPromise
+  }
+  return {
+    m,
+    session,
+    events: collector.events,
+    wokenAskRows,
+    seedWokenAsk,
+    waitAndCancelEcho,
+    runAndAnswerQuestion,
+    nativePrompt: (params: Parameters<RpcPrompt>[0]) => realPrompt(params),
+    setPromptHandler: (handler: PromptHandler | undefined) => {
+      promptHandler = handler
+    },
+  }
+}
+
+async function runCanceledContinuationTest(
+  t: TestContext,
+  beforeCancel: (
+    h: Awaited<ReturnType<typeof continuationHarness>>,
+  ) => Promise<void>,
+  expectedPendingReplay: boolean,
+) {
+  const h = await continuationHarness(t, 'agy-f2-cont-cancel-')
+  h.setPromptHandler(
+    sequenceDouble([
+      h.seedWokenAsk,
+      async () => {
+        await beforeCancel(h)
+        return {
+          stopReason: 'cancelled' as const,
+          usage: {
+            inputTokens: 0,
+            outputTokens: 0,
+            cachedReadTokens: 0,
+            totalTokens: 0,
+          },
+        }
+      },
+    ]),
+  )
+  await h.runAndAnswerQuestion('p-f2')
+  assert.deepEqual(
+    h.session.state.wakeup.carriedUsage,
+    { inputTokens: 40, outputTokens: 4, cachedReadTokens: 0 },
+    'canceled zero-usage continuation must preserve pre-continuation wakeup carriedUsage',
+  )
+  assert.equal(
+    h.session.state.wakeup.pendingReplay,
+    expectedPendingReplay,
+    'pre-echo canceled continuation must preserve pendingReplay while post-echo clears it',
+  )
+}
+
+test('canceled synthetic ask_question continuation with zero usage preserves carriedUsage (postEcho: false)', async (t) => {
+  await runCanceledContinuationTest(t, async () => {}, true)
+})
+
+test('canceled synthetic ask_question continuation with zero usage preserves carriedUsage (postEcho: true)', async (t) => {
+  await runCanceledContinuationTest(t, (h) => h.waitAndCancelEcho(), false)
+})
 
 test(
   'continuation USER_INPUT written to transcript before zero-usage cancel preserves carriedUsage',
   { timeout: 10000 },
   async (t) => {
-    const home = await mkdtemp(join(tmpdir(), 'agy-codex-cont-ui-'))
-    const events: ProviderEvent[] = []
-    const m = new SessionManager({
-      launch: {
-        command: process.execPath,
-        args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-        env: { HOME: home, PATH: process.env.PATH ?? '' },
-      },
-      usage: new AgyUsageSource(),
-      capabilities: ['prompt.message', 'permission'],
-      emit: (e) => events.push(structuredClone(e)),
-    })
-    t.after(async () => {
-      await m.close()
-      await rm(home, { recursive: true, force: true })
-    })
-    const start = m.start.bind(m)
-    let session!: Awaited<ReturnType<typeof m.start>>
-    t.mock.method(
-      m,
-      'start',
-      async (...args: Parameters<typeof start>) =>
-        (session = await start(...args)),
-    )
-    await m.handle({
-      type: 'session.open',
-      requestId: 'open',
-      sessionId: 's',
-      history: 'skip',
-      config: {
-        cwd: home,
-        env: {},
-        mcpServers: {},
-        settings: {},
-        persist: true,
-      },
-    })
-    const sender = '44444444-4444-4444-8444-444444444444'
-    const nativePrompt = session.transport.rpc.prompt.bind(
-      session.transport.rpc,
-    )
-    let rpcCount = 0
-    t.mock.method(session.transport.rpc, 'prompt', async () => {
-      rpcCount++
-      if (rpcCount === 1) {
-        await writeBrainTranscript(session.brainRoot, session.state.nativeId, [
-          { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-          {
-            step_index: 1,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            content: 'Foreground',
-            input_tokens: 100,
-            output_tokens: 10,
-          },
-          {
-            step_index: 2,
-            type: 'SYSTEM_MESSAGE',
-            content: `<SYSTEM_MESSAGE>\n[Message] sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=wake\n</SYSTEM_MESSAGE>`,
-          },
-          {
-            step_index: 3,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            input_tokens: 40,
-            output_tokens: 4,
-            tool_calls: [
-              {
-                id: 'ask-1',
-                name: 'ask_question',
-                args: {
-                  questions: [
-                    {
-                      question: 'Proceed?',
-                      options: [{ label: 'Yes' }, { label: 'No' }],
-                    },
-                  ],
-                },
-              },
+    const h = await continuationHarness(t, 'agy-codex-cont-ui-')
+    h.setPromptHandler(
+      sequenceDouble([
+        h.seedWokenAsk,
+        async () => {
+          const pending = h.nativePrompt({
+            sessionId: h.session.state.nativeId,
+            prompt: [{ type: 'text', text: 'wait' }],
+          })
+          await waitUntil(() => h.session.state.continuationEchoSeen)
+          await writeBrainTranscript(
+            h.session.brainRoot,
+            h.session.state.nativeId,
+            [
+              ...h.wokenAskRows,
+              { step_index: 4, type: 'USER_INPUT', content: 'Proceed?: Yes' },
             ],
-          },
-        ])
-        return {
-          stopReason: 'end_turn' as const,
-          usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
-        }
-      }
-      const pending = nativePrompt({
-        sessionId: session.state.nativeId,
-        prompt: [{ type: 'text', text: 'wait' }],
-      })
-      for (let i = 0; i < 100 && !session.state.continuationEchoSeen; i++) {
-        await delay(10)
-      }
-      await writeBrainTranscript(session.brainRoot, session.state.nativeId, [
-        { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-        {
-          step_index: 1,
-          type: 'PLANNER_RESPONSE',
-          status: 'DONE',
-          content: 'Foreground',
-          input_tokens: 100,
-          output_tokens: 10,
-        },
-        {
-          step_index: 2,
-          type: 'SYSTEM_MESSAGE',
-          content: `<SYSTEM_MESSAGE>\n[Message] sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=wake\n</SYSTEM_MESSAGE>`,
-        },
-        {
-          step_index: 3,
-          type: 'PLANNER_RESPONSE',
-          status: 'DONE',
-          input_tokens: 40,
-          output_tokens: 4,
-          tool_calls: [
-            {
-              id: 'ask-1',
-              name: 'ask_question',
-              args: {
-                questions: [
-                  {
-                    question: 'Proceed?',
-                    options: [{ label: 'Yes' }, { label: 'No' }],
-                  },
-                ],
-              },
+          )
+          await waitUntil(
+            () => h.session.state.lastKnownStepIndex >= 4,
+            5000,
+            () =>
+              'continuation USER_INPUT step 4 must be consumed before cancel',
+          )
+          await h.session.state.observation?.poll()
+          await h.session.transport.rpc.cancel({
+            sessionId: h.session.state.nativeId,
+          })
+          await pending
+          return {
+            stopReason: 'cancelled' as const,
+            usage: {
+              inputTokens: 0,
+              outputTokens: 0,
+              cachedReadTokens: 0,
+              totalTokens: 0,
             },
-          ],
+          }
         },
-        { step_index: 4, type: 'USER_INPUT', content: 'Proceed?: Yes' },
-      ])
-      for (let i = 0; i < 100 && session.state.lastKnownStepIndex < 4; i++) {
-        await delay(20)
-      }
-      assert.ok(
-        session.state.lastKnownStepIndex >= 4,
-        'continuation USER_INPUT step 4 must be consumed before cancel',
-      )
-      await session.transport.rpc.cancel({
-        sessionId: session.state.nativeId,
-      })
-      await pending
-      return {
-        stopReason: 'cancelled' as const,
-        usage: {
-          inputTokens: 0,
-          outputTokens: 0,
-          cachedReadTokens: 0,
-          totalTokens: 0,
-        },
-      }
-    })
-
-    const promptPromise = m.handle({
-      type: 'session.prompt',
-      sessionId: 's',
-      prompt: {
-        clientMessageId: 'p-codex-cont-user-input',
-        delivery: 'auto',
-        input: { type: 'message', content: [{ type: 'text', text: 'turn 1' }] },
-      },
-    })
-    let permissionId: string | undefined
-    for (let i = 0; i < 100 && !permissionId; i++) {
-      const req = events.find((e) => e.type === 'session.permission')
-      if (req?.type === 'session.permission') permissionId = req.request.id
-      else await delay(10)
-    }
-    assert.ok(permissionId, 'woken ask_question must emit session.permission')
-    await m.handle({
-      type: 'session.permission',
-      sessionId: 's',
-      permissionId,
-      response: {
-        behavior: 'allow',
-        updatedInput: { answers: { 'Proceed?': 'Yes' } },
-      },
-    })
-    await promptPromise
+      ]),
+    )
+    await h.runAndAnswerQuestion('p-codex-cont-user-input')
     assert.deepEqual(
-      session.state.wakeup.carriedUsage,
+      h.session.state.wakeup.carriedUsage,
       { inputTokens: 40, outputTokens: 4, cachedReadTokens: 0 },
       'post-USER_INPUT zero-usage cancel must not overwrite preContinuationCarriedSteps',
     )
-    assert.equal(session.state.wakeup.pendingReplay, false)
+    assert.equal(h.session.state.wakeup.pendingReplay, false)
   },
 )
 
-for (const postEcho of [false, true]) {
-  test(
-    `rejected synthetic ask_question continuation preserves wakeup billing and replay state (postEcho: ${postEcho})`,
-    { timeout: 10000 },
-    async (t) => {
-      const home = await mkdtemp(join(tmpdir(), 'agy-egm-cont-reject-'))
-      const events: ProviderEvent[] = []
-      const m = new SessionManager({
-        launch: {
-          command: process.execPath,
-          args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-          env: { HOME: home, PATH: process.env.PATH ?? '' },
-        },
-        usage: new AgyUsageSource(),
-        capabilities: ['prompt.message', 'permission'],
-        emit: (e) => events.push(structuredClone(e)),
-      })
-      t.after(async () => {
-        await m.close()
-        await rm(home, { recursive: true, force: true })
-      })
-      const start = m.start.bind(m)
-      let session!: Awaited<ReturnType<typeof m.start>>
-      t.mock.method(
-        m,
-        'start',
-        async (...args: Parameters<typeof start>) =>
-          (session = await start(...args)),
-      )
-      await m.handle({
-        type: 'session.open',
-        requestId: 'open',
-        sessionId: 's',
-        history: 'skip',
-        config: {
-          cwd: home,
-          env: {},
-          mcpServers: {},
-          settings: {},
-          persist: true,
-        },
-      })
-      const sender = '44444444-4444-4444-8444-444444444444'
-      const nativePrompt = session.transport.rpc.prompt.bind(
-        session.transport.rpc,
-      )
-      let rpcCount = 0
-      t.mock.method(session.transport.rpc, 'prompt', async () => {
-        rpcCount++
-        if (rpcCount === 1) {
-          await writeBrainTranscript(
-            session.brainRoot,
-            session.state.nativeId,
-            [
-              { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
-              {
-                step_index: 1,
-                type: 'PLANNER_RESPONSE',
-                status: 'DONE',
-                content: 'Foreground',
-                input_tokens: 100,
-                output_tokens: 10,
-              },
-              {
-                step_index: 2,
-                type: 'SYSTEM_MESSAGE',
-                content: `<SYSTEM_MESSAGE>\n[Message] sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=wake\n</SYSTEM_MESSAGE>`,
-              },
-              {
-                step_index: 3,
-                type: 'PLANNER_RESPONSE',
-                status: 'DONE',
-                input_tokens: 40,
-                output_tokens: 4,
-                tool_calls: [
-                  {
-                    id: 'ask-1',
-                    name: 'ask_question',
-                    args: {
-                      questions: [
-                        {
-                          question: 'Proceed?',
-                          options: [{ label: 'Yes' }, { label: 'No' }],
-                        },
-                      ],
-                    },
-                  },
-                ],
-              },
-            ],
-          )
-          return {
-            stopReason: 'end_turn' as const,
-            usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
-          }
-        }
-        if (postEcho) {
-          const pending = nativePrompt({
-            sessionId: session.state.nativeId,
-            prompt: [{ type: 'text', text: 'wait' }],
-          })
-          for (let i = 0; i < 100 && !session.state.continuationEchoSeen; i++) {
-            await delay(10)
-          }
-          await session.transport.rpc.cancel({
-            sessionId: session.state.nativeId,
-          })
-          await pending
-        }
+async function runRejectedContinuationTest(
+  t: TestContext,
+  beforeReject: (
+    h: Awaited<ReturnType<typeof continuationHarness>>,
+  ) => Promise<void>,
+  expectedPendingReplay: boolean,
+) {
+  const h = await continuationHarness(t, 'agy-egm-cont-reject-')
+  h.setPromptHandler(
+    sequenceDouble([
+      h.seedWokenAsk,
+      async () => {
+        await beforeReject(h)
         throw new Error('continuation rpc failed')
-      })
-
-      const promptPromise = m.handle({
-        type: 'session.prompt',
-        sessionId: 's',
-        prompt: {
-          clientMessageId: 'p-egm-cont-reject',
-          delivery: 'auto',
-          input: {
-            type: 'message',
-            content: [{ type: 'text', text: 'turn 1' }],
-          },
-        },
-      })
-      let permissionId: string | undefined
-      for (let i = 0; i < 100 && !permissionId; i++) {
-        const req = events.find((e) => e.type === 'session.permission')
-        if (req?.type === 'session.permission') permissionId = req.request.id
-        else await delay(10)
-      }
-      assert.ok(permissionId, 'woken ask_question must emit session.permission')
-      await m.handle({
-        type: 'session.permission',
-        sessionId: 's',
-        permissionId,
-        response: {
-          behavior: 'allow',
-          updatedInput: { answers: { 'Proceed?': 'Yes' } },
-        },
-      })
-      await promptPromise.catch(() => undefined)
-      const usageEvent = events.findLast((e) => e.type === 'session.usage')
-      assert.ok(usageEvent && usageEvent.type === 'session.usage')
-      assert.equal(usageEvent.usage.inputTokens, 140)
-      assert.equal(usageEvent.usage.outputTokens, 14)
-      assert.deepEqual(
-        session.state.wakeup.carriedUsage,
-        { inputTokens: 40, outputTokens: 4, cachedReadTokens: 0 },
-        'rejected continuation must preserve pre-continuation wakeup carriedUsage',
-      )
-      assert.equal(
-        session.state.wakeup.pendingReplay,
-        !postEcho,
-        'pre-echo rejected continuation must preserve pendingReplay while post-echo clears it',
-      )
-    },
+      },
+    ]),
+  )
+  await h.runAndAnswerQuestion('p-egm-cont-reject').catch(() => undefined)
+  const usageEvent = h.events.findLast((e) => e.type === 'session.usage')
+  assert.ok(usageEvent && usageEvent.type === 'session.usage')
+  assert.equal(usageEvent.usage.inputTokens, 140)
+  assert.equal(usageEvent.usage.outputTokens, 14)
+  assert.deepEqual(
+    h.session.state.wakeup.carriedUsage,
+    { inputTokens: 40, outputTokens: 4, cachedReadTokens: 0 },
+    'rejected continuation must preserve pre-continuation wakeup carriedUsage',
+  )
+  assert.equal(
+    h.session.state.wakeup.pendingReplay,
+    expectedPendingReplay,
+    'pre-echo rejected continuation must preserve pendingReplay while post-echo clears it',
   )
 }
+
+test(
+  'rejected synthetic ask_question continuation preserves wakeup billing and replay state (postEcho: false)',
+  { timeout: 10000 },
+  async (t) => {
+    await runRejectedContinuationTest(t, async () => {}, true)
+  },
+)
+
+test(
+  'rejected synthetic ask_question continuation preserves wakeup billing and replay state (postEcho: true)',
+  { timeout: 10000 },
+  async (t) => {
+    await runRejectedContinuationTest(t, (h) => h.waitAndCancelEcho(), false)
+  },
+)

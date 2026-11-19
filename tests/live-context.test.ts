@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { ProviderEvent } from '@getpaseo/plugin/server/provider'
 import { SessionManager } from '../server/session.ts'
+import { connectAcp } from '../server/transport.ts'
 import { AgyUsageSource } from '../server/usage.ts'
 import {
   ModelUsageObserver,
@@ -15,6 +16,7 @@ import { TranscriptReader } from '../server/brain-io.ts'
 import { watchBrain } from '../server/brain.ts'
 import { BrainTranscriptProjector } from '../server/brain-projector.ts'
 import { normalizeAskQuestionInput } from '../server/questions.ts'
+import { sequenceDouble } from './helpers.ts'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -62,10 +64,72 @@ const checkpoint = (step_index: number, content = 'summary'): Row => ({
   input_tokens: 999999,
 })
 
+type RpcPrompt = ReturnType<typeof connectAcp>['rpc']['prompt']
+type PromptHandler = (
+  params: Parameters<RpcPrompt>[0],
+  realPrompt: RpcPrompt,
+) => Promise<Result>
+
+class HarnessSessionManager extends SessionManager {
+  session!: Awaited<ReturnType<SessionManager['start']>>
+  override async start(...args: Parameters<SessionManager['start']>) {
+    this.session = await super.start(...args)
+    return this.session
+  }
+}
+
+class TrackingObservation extends BrainTurnObservation {
+  readonly attached = deferred<void>()
+  override async attach(
+    consumer: Parameters<BrainTurnObservation['attach']>[0],
+  ) {
+    await super.attach(consumer)
+    this.attached.resolve()
+  }
+}
+
 class SwappableTranscriptReader extends TranscriptReader {
   impl: TranscriptReader['read'] = (root, id) => super.read(root, id)
-  override read(root: string, nativeId: string) {
+  private nextFault?: Error
+  injectOnce(error: Error) {
+    this.nextFault = error
+  }
+  override async read(root: string, nativeId: string) {
+    if (this.nextFault) {
+      const error = this.nextFault
+      this.nextFault = undefined
+      throw error
+    }
     return this.impl(root, nativeId)
+  }
+}
+
+function wrapConnectAcp(
+  getPromptHandler: () => PromptHandler | undefined,
+  onRealPrompt: (realPrompt: RpcPrompt) => void,
+): typeof connectAcp {
+  return (...args) => {
+    const transport = connectAcp(...args)
+    const realPrompt = transport.rpc.prompt.bind(transport.rpc)
+    onRealPrompt(realPrompt)
+    const wrappedRpc = new Proxy(transport.rpc, {
+      get(target, prop) {
+        if (prop === 'prompt') {
+          return (params: Parameters<typeof realPrompt>[0]) => {
+            const handler = getPromptHandler()
+            return handler ? handler(params, realPrompt) : realPrompt(params)
+          }
+        }
+        const value = Reflect.get(target, prop, target)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    return new Proxy(transport, {
+      get(target, prop) {
+        if (prop === 'rpc') return wrappedRpc
+        return Reflect.get(target, prop, target)
+      },
+    })
   }
 }
 
@@ -76,13 +140,18 @@ async function harness(
       typeof SessionManager
     >[0]['hasActiveBackgroundWork']
     cancelConvergenceTimeoutMs?: number
+    backgroundProbeTimeoutMs?: number
+    observationPollIntervalMs?: number
     createTranscriptReader?: () => TranscriptReader
   },
 ) {
   const home = await mkdtemp(join(tmpdir(), 'agy-live-context-'))
   const events: ProviderEvent[] = []
   const listeners = new Set<() => void>()
-  const manager = new SessionManager({
+  let promptHandler: PromptHandler | undefined
+  let realPrompt!: RpcPrompt
+  let lastObservation!: TrackingObservation
+  const manager = new HarnessSessionManager({
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
@@ -96,16 +165,18 @@ async function harness(
     },
     hasActiveBackgroundWork: options?.hasActiveBackgroundWork,
     cancelConvergenceTimeoutMs: options?.cancelConvergenceTimeoutMs,
+    backgroundProbeTimeoutMs: options?.backgroundProbeTimeoutMs,
+    observationPollIntervalMs: options?.observationPollIntervalMs,
     createTranscriptReader: options?.createTranscriptReader,
+    createObservation: (...args) =>
+      (lastObservation = new TrackingObservation(...args)),
+    connectAcp: wrapConnectAcp(
+      () => promptHandler,
+      (fn) => {
+        realPrompt = fn
+      },
+    ),
   })
-  const start = manager.start.bind(manager)
-  let session!: Awaited<ReturnType<typeof manager.start>>
-  t.mock.method(
-    manager,
-    'start',
-    async (...args: Parameters<typeof start>) =>
-      (session = await start(...args)),
-  )
   await manager.handle({
     type: 'session.open',
     requestId: 'open',
@@ -113,6 +184,7 @@ async function harness(
     history: 'skip',
     config: { cwd: home, env: {}, mcpServers: {}, settings: {}, persist: true },
   })
+  const session = manager.session
   const dir = join(
     session.brainRoot,
     session.state.nativeId,
@@ -155,6 +227,16 @@ async function harness(
         ? [event]
         : [],
     )
+  const toolCalls = () =>
+    events.flatMap((event) =>
+      event.type === 'timeline.item' && event.item.type === 'tool_call'
+        ? [event.item]
+        : [],
+    )
+  const permissions = () =>
+    events.flatMap((event) =>
+      event.type === 'session.permission' ? [event] : [],
+    )
   const wait = async (predicate: () => boolean) => {
     if (predicate()) return
     await new Promise<void>((resolve) => {
@@ -177,13 +259,14 @@ async function harness(
   const hold = async () => {
     const entered = deferred<void>(),
       done = deferred<Result>()
-    t.mock.method(session.transport.rpc, 'prompt', async () => {
+    promptHandler = async () => {
+      promptHandler = undefined
       entered.resolve()
       return done.promise
-    })
+    }
     const running = prompt()
     await entered.promise
-    return { running, done, observation: session.state.observation! }
+    return { running, done, observation: lastObservation }
   }
   const holdLive = async (
     mode: 'hold:cancel' | 'hold:cancel-throw' | 'hold:never' = 'hold:cancel',
@@ -196,7 +279,7 @@ async function harness(
         events.filter((event) => event.type === 'session.commands').length >=
         target,
     )
-    return { running, observation: session.state.observation! }
+    return { running, observation: lastObservation }
   }
   return {
     home,
@@ -207,9 +290,15 @@ async function harness(
     write,
     append,
     prompt,
+    nativePrompt: (params: Parameters<RpcPrompt>[0]) => realPrompt(params),
+    setPromptHandler: (handler: PromptHandler | undefined) => {
+      promptHandler = handler
+    },
     latest,
     turns,
     compactions,
+    toolCalls,
+    permissions,
     wait,
     read,
     hold,
@@ -309,20 +398,21 @@ test(
       false,
     )
     h.session.state.turnToolCallIds.push('native-command', 'native-question')
-    for (const toolCallId of h.session.state.turnToolCallIds)
-      h.session.timeline.update({
-        sessionUpdate: 'tool_call',
-        toolCallId,
-        title: 'tool',
-        status: 'in_progress',
-      })
+    h.session.timeline.update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'native-command',
+      title: 'tool',
+      status: 'in_progress',
+    })
+    h.session.timeline.update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'native-question',
+      title: 'tool',
+      status: 'in_progress',
+    })
     held.done.resolve({ stopReason: 'end_turn' })
     await held.running
-    const tools = h.events.flatMap((event) =>
-      event.type === 'timeline.item' && event.item.type === 'tool_call'
-        ? [event.item]
-        : [],
-    )
+    const tools = h.toolCalls()
     assert.deepEqual(
       new Set(tools.map((item) => item.callId)),
       new Set(['native-command', 'native-question']),
@@ -347,30 +437,33 @@ test(
       continuation = deferred<Result>(),
       entered = deferred<void>()
     const args = { questions: [{ question: 'Choose', options: ['A', 'B'] }] }
-    let calls = 0
-    t.mock.method(h.session.transport.rpc, 'prompt', async () => {
-      if (++calls === 1) {
-        await h.write([
-          user(1),
-          model(2, 10, 'waiting'),
-          {
-            step_index: 3,
-            type: 'SYSTEM_MESSAGE',
-            content:
-              '[Message] sender=system priority=MESSAGE_PRIORITY_HIGH content=continue',
-          },
-          {
-            step_index: 4,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            tool_calls: [{ id: 'ask', name: 'ask_question', args }],
-          },
-        ])
-        return { stopReason: 'end_turn' as const }
-      }
-      entered.resolve()
-      return continuation.promise
-    })
+    h.setPromptHandler(
+      sequenceDouble<[], Promise<Result>>([
+        async () => {
+          await h.write([
+            user(1),
+            model(2, 10, 'waiting'),
+            {
+              step_index: 3,
+              type: 'SYSTEM_MESSAGE',
+              content:
+                '[Message] sender=system priority=MESSAGE_PRIORITY_HIGH content=continue',
+            },
+            {
+              step_index: 4,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              tool_calls: [{ id: 'ask', name: 'ask_question', args }],
+            },
+          ])
+          return { stopReason: 'end_turn' as const }
+        },
+        async () => {
+          entered.resolve()
+          return continuation.promise
+        },
+      ]),
+    )
     const running = h.prompt()
     await h.wait(() =>
       h.events.some((event) => event.type === 'session.permission'),
@@ -425,28 +518,25 @@ test(
           event.item.text === 'live continuation',
       ),
     )
-    const tools = () =>
-      h.events.flatMap((event) =>
-        event.type === 'timeline.item' && event.item.type === 'tool_call'
-          ? [event.item]
-          : [],
-      )
     assert.ok(
-      tools().some(
-        (item) => item.callId === 'known' && item.status === 'completed',
-      ),
+      h
+        .toolCalls()
+        .some((item) => item.callId === 'known' && item.status === 'completed'),
     )
     assert.equal(
-      tools().some((item) => item.callId.startsWith('tool-')),
+      h.toolCalls().some((item) => item.callId.startsWith('tool-')),
       false,
     )
     assert.deepEqual(h.turns(), [])
     h.session.state.turnToolCallIds.push('native-late')
     await h.read()
     assert.ok(
-      tools().some(
-        (item) => item.callId === 'native-late' && item.status === 'completed',
-      ),
+      h
+        .toolCalls()
+        .some(
+          (item) =>
+            item.callId === 'native-late' && item.status === 'completed',
+        ),
     )
     await h.append([model(10, 40, 'final')])
     await h.read()
@@ -464,6 +554,7 @@ async function runFinalPrefixPassTest(
   const local = deferred<void>()
   const cancelEntered = deferred<void>()
   const h = await harness(t, {
+      backgroundProbeTimeoutMs: 2000,
       hasActiveBackgroundWork: async () => {
         cancelEntered.resolve()
         await local.promise
@@ -617,12 +708,9 @@ test(
   async (t) => {
     const h = await harness(t)
     await h.prompt('usage-native')
-    const nativePrompt = h.session.transport.rpc.prompt.bind(
-      h.session.transport.rpc,
-    )
     const held = await h.hold()
     // The mock native runtime emits a real ACP usage_update into the held logical foreground turn.
-    await nativePrompt({
+    await h.nativePrompt({
       sessionId: h.session.state.nativeId,
       prompt: [{ type: 'text', text: 'usage-native' }],
     })
@@ -652,18 +740,8 @@ test(
       1234,
       'same foreground native snapshot remains authoritative',
     )
-    const attached = deferred<void>(),
-      attach = held.observation.attach.bind(held.observation)
-    t.mock.method(
-      held.observation,
-      'attach',
-      async (consumer: Parameters<typeof attach>[0]) => {
-        await attach(consumer)
-        attached.resolve()
-      },
-    )
     held.done.resolve({ stopReason: 'end_turn' })
-    await attached.promise
+    await held.observation.attached.promise
     const wake = [
       {
         step_index: 25,
@@ -764,40 +842,39 @@ test(
       continued = deferred<Result>(),
       entered = deferred<void>()
     const args = { questions: [{ question: 'Choose', options: ['A', 'B'] }] }
-    let calls = 0
-    t.mock.method(h.session.transport.rpc, 'prompt', async () => {
-      if (++calls === 1) {
-        await h.write([
-          user(1),
-          model(2, 10, 'waiting'),
-          {
-            step_index: 3,
-            type: 'SYSTEM_MESSAGE',
-            content:
-              '[Message] sender=system priority=MESSAGE_PRIORITY_HIGH content=wake',
-          },
-          {
-            step_index: 4,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            tool_calls: [{ id: 'first-ask', name: 'ask_question', args }],
-          },
-        ])
-        return { stopReason: 'end_turn' as const }
-      }
-      entered.resolve()
-      return continued.promise
-    })
+    h.setPromptHandler(
+      sequenceDouble<[], Promise<Result>>([
+        async () => {
+          await h.write([
+            user(1),
+            model(2, 10, 'waiting'),
+            {
+              step_index: 3,
+              type: 'SYSTEM_MESSAGE',
+              content:
+                '[Message] sender=system priority=MESSAGE_PRIORITY_HIGH content=wake',
+            },
+            {
+              step_index: 4,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              tool_calls: [{ id: 'first-ask', name: 'ask_question', args }],
+            },
+          ])
+          return { stopReason: 'end_turn' as const }
+        },
+        async () => {
+          entered.resolve()
+          return continued.promise
+        },
+      ]),
+    )
     const running = h.prompt()
-    const questions = () =>
-      h.events.flatMap((event) =>
-        event.type === 'session.permission' ? [event] : [],
-      )
-    await h.wait(() => questions().length === 1)
+    await h.wait(() => h.permissions().length === 1)
     await h.manager.handle({
       type: 'session.permission',
       sessionId: 's',
-      permissionId: questions()[0].request.id,
+      permissionId: h.permissions()[0].request.id,
       response: {
         behavior: 'allow',
         updatedInput: { answers: { Choose: 'A' } },
@@ -815,13 +892,16 @@ test(
     ])
     await h.read()
     assert.equal(
-      questions().length,
+      h.permissions().length,
       1,
       'no recursive question action while continuation is in flight',
     )
     continued.resolve({ stopReason: 'end_turn' })
-    await h.wait(() => questions().length === 2)
-    assert.notEqual(questions()[0].request.id, questions()[1].request.id)
+    await h.wait(() => h.permissions().length === 2)
+    assert.notEqual(
+      h.permissions()[0].request.id,
+      h.permissions()[1].request.id,
+    )
     await h.manager.close()
     await running
     assert.deepEqual(h.turns(), ['canceled'])
@@ -863,9 +943,9 @@ test(
       assert.deepEqual(usage.usage, { contextWindowUsedTokens: 201 })
       assert.equal(usage.sessionId, 'child')
       assert.deepEqual(
-        events.flatMap((event) =>
-          event.type === 'session.turn' ? [event.state] : [],
-        ),
+        events
+          .filter((event) => event.type === 'session.turn')
+          .map((event) => event.state),
         ['started', 'completed'],
       )
       assert.ok(
@@ -906,7 +986,7 @@ test(
     assert.equal(h.session.state.lastKnownStepIndex, 13)
     held.done.resolve({ stopReason: 'end_turn' })
     await held.running
-    t.mock.method(h.session.transport.rpc, 'prompt', async () => {
+    h.setPromptHandler(async () => {
       await h.write([user(14), model(15, 23)])
       return { stopReason: 'end_turn' as const }
     })
@@ -966,6 +1046,7 @@ test(
     const reader = new SwappableTranscriptReader()
     const h = await harness(t, {
         createTranscriptReader: () => reader,
+        observationPollIntervalMs: 60_000,
         hasActiveBackgroundWork: async () => true,
       }),
       held = await h.holdLive('hold:cancel')
@@ -1163,11 +1244,8 @@ test(
   { timeout: 5000 },
   async (t) => {
     const h = await harness(t)
-    const nativePrompt = h.session.transport.rpc.prompt.bind(
-      h.session.transport.rpc,
-    )
     const held = await h.hold()
-    await nativePrompt({
+    await h.nativePrompt({
       sessionId: h.session.state.nativeId,
       prompt: [{ type: 'text', text: 'usage-native' }],
     })
@@ -1195,37 +1273,62 @@ test(
   },
 )
 
-for (const tail of ['older', 'missing', 'higher-nonusage'] as const)
-  test(
-    `final ${tail} tail preserves observed context while reconciling only complete boundaries`,
-    { timeout: 5000 },
-    async (t) => {
-      const h = await harness(t),
-        held = await h.hold()
-      await h.write([user(1), model(4, 80)])
-      await h.read()
-      if (tail === 'missing') await rm(h.path)
-      else if (tail === 'older')
-        await writeFile(h.path, JSON.stringify(model(2, 10)))
-      else
-        await appendFile(
-          h.path,
+async function runFinalTailTest(
+  t: TestContext,
+  mutateTail: (path: string) => Promise<void>,
+  expectedLastStepIndex: number,
+) {
+  const h = await harness(t),
+    held = await h.hold()
+  await h.write([user(1), model(4, 80)])
+  await h.read()
+  await mutateTail(h.path)
+  held.done.resolve({ stopReason: 'cancelled' })
+  await held.running
+  assert.equal(h.latest().contextWindowUsedTokens, 81)
+  assert.equal(h.session.state.lastKnownStepIndex, expectedLastStepIndex)
+  assert.deepEqual(h.turns(), ['canceled'])
+}
+
+test(
+  'final older tail preserves observed context while reconciling only complete boundaries',
+  { timeout: 5000 },
+  async (t) => {
+    await runFinalTailTest(
+      t,
+      (path) => writeFile(path, JSON.stringify(model(2, 10))),
+      4,
+    )
+  },
+)
+
+test(
+  'final missing tail preserves observed context while reconciling only complete boundaries',
+  { timeout: 5000 },
+  async (t) => {
+    await runFinalTailTest(t, (path) => rm(path), 4)
+  },
+)
+
+test(
+  'final higher-nonusage tail preserves observed context while reconciling only complete boundaries',
+  { timeout: 5000 },
+  async (t) => {
+    await runFinalTailTest(
+      t,
+      (path) =>
+        appendFile(
+          path,
           JSON.stringify({
             step_index: 6,
             type: 'GENERIC',
             status: 'CANCELED',
           }),
-        )
-      held.done.resolve({ stopReason: 'cancelled' })
-      await held.running
-      assert.equal(h.latest().contextWindowUsedTokens, 81)
-      assert.equal(
-        h.session.state.lastKnownStepIndex,
-        tail === 'higher-nonusage' ? 6 : 4,
-      )
-      assert.deepEqual(h.turns(), ['canceled'])
-    },
-  )
+        ),
+      6,
+    )
+  },
+)
 
 test(
   'already closing turn skips final snapshot and pending local interruption without waiting for the RPC',
@@ -1261,54 +1364,51 @@ test(
   'a recovered reader fault cannot poison a real pending question continuation',
   { timeout: 5000 },
   async (t) => {
-    const h = await harness(t),
+    const reader = new SwappableTranscriptReader()
+    const h = await harness(t, {
+        observationPollIntervalMs: 60_000,
+        createTranscriptReader: () => reader,
+      }),
       entered = deferred<void>(),
       continued = deferred<Result>()
-    let calls = 0
     const args = { questions: [{ question: 'Choose', options: ['A', 'B'] }] }
-    t.mock.method(h.session.transport.rpc, 'prompt', async () => {
-      if (++calls === 1) {
-        await h.write([
-          user(1),
-          model(2, 10, 'waiting'),
-          {
-            step_index: 3,
-            type: 'SYSTEM_MESSAGE',
-            content:
-              '[Message] sender=system priority=MESSAGE_PRIORITY_HIGH content=wake',
-          },
-          {
-            step_index: 4,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            tool_calls: [{ id: 'ask', name: 'ask_question', args }],
-          },
-        ])
-        return { stopReason: 'end_turn' as const }
-      }
-      entered.resolve()
-      return continued.promise
-    })
+    h.setPromptHandler(
+      sequenceDouble<[], Promise<Result>>([
+        async () => {
+          await h.write([
+            user(1),
+            model(2, 10, 'waiting'),
+            {
+              step_index: 3,
+              type: 'SYSTEM_MESSAGE',
+              content:
+                '[Message] sender=system priority=MESSAGE_PRIORITY_HIGH content=wake',
+            },
+            {
+              step_index: 4,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              tool_calls: [{ id: 'ask', name: 'ask_question', args }],
+            },
+          ])
+          return { stopReason: 'end_turn' as const }
+        },
+        async () => {
+          entered.resolve()
+          return continued.promise
+        },
+      ]),
+    )
     const running = h.prompt()
     await h.wait(() => h.events.some((e) => e.type === 'session.permission'))
     const question = h.events.find((e) => e.type === 'session.permission')
     assert.ok(question?.type === 'session.permission')
-    const obs = h.session.state.observation!,
-      read = obs.reader.read.bind(obs.reader)
-    let failed = false
-    const busy = Object.assign(new Error('synthetic transient EBUSY'), {
-      code: 'EBUSY',
-    })
-    t.mock.method(
-      obs.reader,
-      'read',
-      async (...args: Parameters<typeof read>) => {
-        if (!failed) {
-          failed = true
-          throw busy
-        }
-        return read(...args)
-      },
+    const obs = h.session.state.observation!
+    await obs.poll()
+    reader.injectOnce(
+      Object.assign(new Error('synthetic transient EBUSY'), {
+        code: 'EBUSY',
+      }),
     )
     await assert.rejects(obs.poll(), /synthetic transient EBUSY/)
     await obs.poll()
@@ -1339,11 +1439,13 @@ async function pendingBrainQuestion(
   options?: {
     promptText?: 'brain-question-pending' | 'brain-question-ignore-cancel'
     cancelConvergenceTimeoutMs?: number
+    observationPollIntervalMs?: number
     createTranscriptReader?: () => TranscriptReader
   },
 ) {
   const h = await harness(t, {
     cancelConvergenceTimeoutMs: options?.cancelConvergenceTimeoutMs,
+    observationPollIntervalMs: options?.observationPollIntervalMs,
     createTranscriptReader: options?.createTranscriptReader,
   })
   const running = h.prompt(options?.promptText ?? 'brain-question-pending')
@@ -1370,6 +1472,7 @@ async function setupReaderFaultQuestion(t: TestContext) {
   const reader = new SwappableTranscriptReader()
   const h = await pendingBrainQuestion(t, {
       createTranscriptReader: () => reader,
+      observationPollIntervalMs: 60_000,
     }),
     obs = h.session.state.observation!
   let reads = 0
@@ -1452,22 +1555,16 @@ test(
   'reader recovery cannot erase an actual Brain terminal failure',
   { timeout: 5000 },
   async (t) => {
-    const h = await harness(t),
+    const reader = new SwappableTranscriptReader()
+    const h = await harness(t, {
+        observationPollIntervalMs: 60_000,
+        createTranscriptReader: () => reader,
+      }),
       held = await h.hold(),
       obs = held.observation
     await obs.poll()
-    const read = obs.reader.read.bind(obs.reader)
-    let fault = true
-    t.mock.method(
-      obs.reader,
-      'read',
-      async (...args: Parameters<typeof read>) => {
-        if (fault) {
-          fault = false
-          throw Object.assign(new Error('temporary I/O'), { code: 'EBUSY' })
-        }
-        return read(...args)
-      },
+    reader.injectOnce(
+      Object.assign(new Error('temporary I/O'), { code: 'EBUSY' }),
     )
     await assert.rejects(obs.poll(), /temporary I\/O/)
     await h.write([
@@ -1663,7 +1760,6 @@ test(
     assert.equal(held.observation.wokeUp, false)
 
     // Foreground RPC ends with cumulative multi-model totals; turn stays open awaiting background task
-    const rev = held.observation.revision
     held.done.resolve({
       stopReason: 'end_turn',
       usage: {
@@ -1673,7 +1769,7 @@ test(
         totalTokens: 183_200,
       },
     })
-    await held.observation.wait(rev)
+    await held.observation.attached.promise
     await h.read()
     assert.equal(held.observation.phase, 'settling')
     assert.deepEqual(h.turns(), [])
@@ -1809,166 +1905,196 @@ test(
     const askArgs = {
       questions: [{ question: 'Approve review?', options: ['Yes', 'No'] }],
     }
-    let promptCalls = 0
-    t.mock.method(h.session.transport.rpc, 'prompt', async () => {
-      promptCalls++
-      if (promptCalls === 1) {
-        // Foreground turn with tool-less Hydrogen DONE -> intra-turn [plan review due] -> foreground [Message] while Planner has pending tools -> woken ask_question
-        await h.write([
-          user(1),
-          {
-            step_index: 2,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            input_tokens: 10_000,
-            output_tokens: 100,
-            content: 'Execution done.',
-          },
-          {
-            step_index: 3,
-            type: 'SYSTEM_MESSAGE',
-            content:
-              '<SYSTEM_MESSAGE>\n[plan review due] Return to plan mode.\n</SYSTEM_MESSAGE>',
-          },
-          {
-            step_index: 4,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            input_tokens: 10_500,
-            output_tokens: 100,
-            tool_calls: [
-              { id: 'fg-enter', name: 'contrib:enter_plan_mode', args: {} },
-            ],
-          },
-          { step_index: 5, type: 'GENERIC', status: 'DONE', content: 'ok' },
-          {
-            step_index: 6,
-            type: 'SYSTEM_MESSAGE',
-            content:
-              '<SYSTEM_MESSAGE>\n[plan review] Plan mode is on: this turn runs on the planning model.\n</SYSTEM_MESSAGE>',
-          },
-          {
-            step_index: 7,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            input_tokens: 11_000,
-            output_tokens: 200,
-            content: 'Foreground planner spawned helper.',
-            tool_calls: [
-              {
-                id: 'fg-bg',
-                name: 'run_command',
-                args: { CommandLine: 'check' },
-              },
-            ],
-          },
-          {
-            step_index: 8,
-            type: 'GENERIC',
-            status: 'RUNNING',
-            content: 'Tool is running as a background task with task id: bg1',
-          },
-          {
-            step_index: 9,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            input_tokens: 11_200,
-            output_tokens: 50,
-            content: 'Waiting on helper.',
-          },
-          // Post-RPC wakeup asks a woken ask_question
-          {
-            step_index: 10,
-            type: 'SYSTEM_MESSAGE',
-            content:
-              '[Message] sender=bg1 content=Task id "bg1" finished with result:\nready',
-          },
-          {
-            step_index: 11,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            input_tokens: 12_000,
-            output_tokens: 100,
-            tool_calls: [
-              { id: 'woken-q', name: 'ask_question', args: askArgs },
-            ],
-          },
-        ])
-        return {
-          stopReason: 'end_turn' as const,
-          usage: {
-            inputTokens: 42_700,
-            outputTokens: 450,
-            totalTokens: 43_150,
-          },
-        }
-      }
-      if (promptCalls === 2) {
-        // Synthetic continuation RPC runs Orchestrator contrib:exit_plan_mode -> Hydrogen 95k KV-cache miss and ends cleanly (no post-continuation wakeup)
-        await h.append([
-          { step_index: 12, type: 'GENERIC', status: 'DONE', content: 'Yes' },
-          user(13),
-          {
-            step_index: 14,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            input_tokens: 13_000,
-            output_tokens: 200,
-            tool_calls: [
-              {
-                id: 'cont-exit',
-                name: 'contrib:exit_plan_mode',
-                args: { plan: '# Ship' },
-              },
-            ],
-          },
-          { step_index: 15, type: 'GENERIC', status: 'DONE', content: 'off' },
-          {
-            step_index: 16,
-            type: 'SYSTEM_MESSAGE',
-            content:
-              '<SYSTEM_MESSAGE>\nPlan mode is off: this turn runs on the execution model.\n</SYSTEM_MESSAGE>',
-          },
-          {
-            step_index: 17,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            cache_read_tokens: 0,
-            input_tokens: 95_000,
-            output_tokens: 500,
-            content: 'Continuation Hydrogen finished.',
-          },
-        ])
-        return {
-          stopReason: 'end_turn' as const,
-          usage: {
-            inputTokens: 120_000,
-            outputTokens: 800,
-            totalTokens: 120_800,
-          },
-        }
-      }
-      // Turn 2: fresh Orchestrator turn reporting 120k inputTokens; must NOT subtract Turn 1's 120k continuation tokens!
-      await h.append([
-        user(18),
-        {
-          step_index: 19,
-          type: 'PLANNER_RESPONSE',
-          status: 'DONE',
-          input_tokens: 120_000,
-          output_tokens: 400,
-          content: 'Turn 2 done.',
+    h.setPromptHandler(
+      sequenceDouble([
+        async () => {
+          // Foreground turn with tool-less Hydrogen DONE -> intra-turn [plan review due] -> foreground [Message] while Planner has pending tools -> woken ask_question
+          await h.write([
+            user(1),
+            {
+              step_index: 2,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              input_tokens: 10_000,
+              output_tokens: 100,
+              content: 'Execution done.',
+            },
+            {
+              step_index: 3,
+              type: 'SYSTEM_MESSAGE',
+              content:
+                '<SYSTEM_MESSAGE>\n[plan review due] Return to plan mode.\n</SYSTEM_MESSAGE>',
+            },
+            {
+              step_index: 4,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              input_tokens: 10_500,
+              output_tokens: 100,
+              tool_calls: [
+                { id: 'fg-enter', name: 'contrib:enter_plan_mode', args: {} },
+              ],
+            },
+            { step_index: 5, type: 'GENERIC', status: 'DONE', content: 'ok' },
+            {
+              step_index: 6,
+              type: 'SYSTEM_MESSAGE',
+              content:
+                '<SYSTEM_MESSAGE>\n[plan review] Plan mode is on: this turn runs on the planning model.\n</SYSTEM_MESSAGE>',
+            },
+            {
+              step_index: 7,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              input_tokens: 11_000,
+              output_tokens: 200,
+              content: 'Foreground planner spawned helper.',
+              tool_calls: [
+                {
+                  id: 'fg-bg',
+                  name: 'run_command',
+                  args: { CommandLine: 'check' },
+                },
+              ],
+            },
+            {
+              step_index: 8,
+              type: 'GENERIC',
+              status: 'RUNNING',
+              content: 'Tool is running as a background task with task id: bg1',
+            },
+            {
+              step_index: 9,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              input_tokens: 11_200,
+              output_tokens: 50,
+              content: 'Waiting on helper.',
+            },
+            // Post-RPC wakeup asks a woken ask_question
+            {
+              step_index: 10,
+              type: 'SYSTEM_MESSAGE',
+              content:
+                '[Message] sender=bg1 content=Task id "bg1" finished with result:\nready',
+            },
+            {
+              step_index: 11,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              input_tokens: 12_000,
+              output_tokens: 100,
+              tool_calls: [
+                { id: 'woken-q', name: 'ask_question', args: askArgs },
+              ],
+            },
+          ])
+          return {
+            stopReason: 'end_turn' as const,
+            usage: {
+              inputTokens: 42_700,
+              outputTokens: 450,
+              totalTokens: 43_150,
+            },
+          }
         },
-      ])
-      return {
-        stopReason: 'end_turn' as const,
-        usage: {
-          inputTokens: 120_000,
-          outputTokens: 400,
-          totalTokens: 120_400,
+        async () => {
+          // Synthetic continuation RPC runs Orchestrator contrib:exit_plan_mode -> Hydrogen 95k KV-cache miss and ends cleanly (no post-continuation wakeup)
+          await h.append([
+            { step_index: 12, type: 'GENERIC', status: 'DONE', content: 'Yes' },
+            user(13),
+            {
+              step_index: 14,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              input_tokens: 13_000,
+              output_tokens: 200,
+              tool_calls: [
+                {
+                  id: 'cont-exit',
+                  name: 'contrib:exit_plan_mode',
+                  args: { plan: '# Ship' },
+                },
+              ],
+            },
+            { step_index: 15, type: 'GENERIC', status: 'DONE', content: 'off' },
+            {
+              step_index: 16,
+              type: 'SYSTEM_MESSAGE',
+              content:
+                '<SYSTEM_MESSAGE>\nPlan mode is off: this turn runs on the execution model.\n</SYSTEM_MESSAGE>',
+            },
+            {
+              step_index: 17,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              cache_read_tokens: 0,
+              input_tokens: 95_000,
+              output_tokens: 500,
+              content: 'Continuation Hydrogen finished.',
+            },
+          ])
+          return {
+            stopReason: 'end_turn' as const,
+            usage: {
+              inputTokens: 120_000,
+              outputTokens: 800,
+              totalTokens: 120_800,
+            },
+          }
         },
-      }
-    })
+        async () => {
+          // Turn 2: fresh Orchestrator turn reporting 120k inputTokens; must NOT subtract Turn 1's 120k continuation tokens!
+          await h.append([
+            user(18),
+            {
+              step_index: 19,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              input_tokens: 120_000,
+              output_tokens: 400,
+              content: 'Turn 2 done.',
+            },
+          ])
+          return {
+            stopReason: 'end_turn' as const,
+            usage: {
+              inputTokens: 120_000,
+              outputTokens: 400,
+              totalTokens: 120_400,
+            },
+          }
+        },
+        async () => {
+          // Woken elicitation decline cancels immediately without hanging for stallTimeoutMs
+          h.session.state.handledElicitations.push({
+            questions: normalizeAskQuestionInput(askArgs),
+            answerText: null,
+            wokeUp: true,
+            declined: true,
+          })
+          await h.append([
+            user(20),
+            model(21, 1000, 'idle'),
+            {
+              step_index: 22,
+              type: 'SYSTEM_MESSAGE',
+              content:
+                '[Message] sender=system priority=MESSAGE_PRIORITY_HIGH content=wake',
+            },
+            {
+              step_index: 23,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              tool_calls: [
+                { id: 'declined-q', name: 'ask_question', args: askArgs },
+              ],
+            },
+          ])
+          return { stopReason: 'end_turn' as const }
+        },
+      ]),
+    )
 
     const turn1 = h.prompt('turn 1')
     await h.wait(() =>
@@ -1999,34 +2125,6 @@ test(
     assert.deepEqual(h.turns(), ['completed', 'completed'])
     assert.equal(h.latest().inputTokens, 120_000)
 
-    // Woken elicitation decline cancels immediately without hanging for stallTimeoutMs
-    t.mock.method(h.session.transport.rpc, 'prompt', async () => {
-      h.session.state.handledElicitations.push({
-        questions: normalizeAskQuestionInput(askArgs),
-        answerText: null,
-        wokeUp: true,
-        declined: true,
-      })
-      await h.append([
-        user(20),
-        model(21, 1000, 'idle'),
-        {
-          step_index: 22,
-          type: 'SYSTEM_MESSAGE',
-          content:
-            '[Message] sender=system priority=MESSAGE_PRIORITY_HIGH content=wake',
-        },
-        {
-          step_index: 23,
-          type: 'PLANNER_RESPONSE',
-          status: 'DONE',
-          tool_calls: [
-            { id: 'declined-q', name: 'ask_question', args: askArgs },
-          ],
-        },
-      ])
-      return { stopReason: 'end_turn' as const }
-    })
     await h.prompt('turn 3')
     assert.deepEqual(h.turns(), ['completed', 'completed', 'canceled'])
   },
