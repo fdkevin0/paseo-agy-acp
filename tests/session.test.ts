@@ -964,6 +964,7 @@ const stream = ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(proce
 agent()
   .onRequest(methods.agent.initialize, async () => ({
     protocolVersion: 1,
+    agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
     agentCapabilities: { loadSession: true },
   }))
   .onRequest(methods.agent.authenticate, async () => ({}))
@@ -1122,6 +1123,7 @@ const stream = ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(proce
 agent()
   .onRequest(methods.agent.initialize, async () => ({
     protocolVersion: 1,
+    agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
     agentCapabilities: { loadSession: true },
   }))
   .onRequest(methods.agent.authenticate, async () => ({}))
@@ -1944,6 +1946,7 @@ stream.writable = new WritableStream({
 agent()
   .onRequest(methods.agent.initialize, async () => ({
     protocolVersion: 1,
+    agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
     agentCapabilities: { loadSession: true },
   }))
   .onRequest(methods.agent.authenticate, async () => ({}))

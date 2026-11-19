@@ -86,6 +86,9 @@ export class BrainTurnObservation {
   get error(): unknown {
     return this.failure ?? this.readError
   }
+  get hasReaderFault(): boolean {
+    return this.failure === undefined && this.readError !== undefined
+  }
   lastStepIndex = -1
   historicalMessages = 0
   postEpochSignatures = new Map<string, number>()
@@ -309,7 +312,9 @@ export class BrainTurnObservation {
       }
   }
   async attach(consumer: (read: BrainRead) => Promise<void>) {
-    await this.inflight
+    await this.inflight?.catch((error) => {
+      if (!this.hasReaderFault) throw error
+    })
     this.consumer = consumer
     this.inflight = (async () => {
       const rows = [...this.buffered.values()].sort(

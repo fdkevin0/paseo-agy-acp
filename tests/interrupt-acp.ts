@@ -103,6 +103,7 @@ const commands = () =>
 connection = agent()
   .onRequest(methods.agent.initialize, async () => ({
     protocolVersion: 1,
+    agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
     agentCapabilities: noReload
       ? { loadSession: false }
       : {

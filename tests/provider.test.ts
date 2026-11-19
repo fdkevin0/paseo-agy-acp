@@ -62,6 +62,91 @@ async function harness(env: Record<string, string> = {}) {
 
 type Harness = Awaited<ReturnType<typeof harness>>
 
+async function assertRejectsRuntimeVersion(
+  version: string,
+  diagnostic: RegExp,
+) {
+  const h = await harness({ AGY_TEST_VERSION: version })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      config: h.config,
+      history: 'skip',
+    })
+    const failure = await h.wait(
+      (event) =>
+        event.type === 'request.failed' || event.type === 'session.opened',
+    )
+    assert.ok(failure.type === 'request.failed')
+    assert.match(failure.error.message, diagnostic)
+    assert.equal(
+      h.events.some((event) => event.type === 'session.opened'),
+      false,
+    )
+  } finally {
+    await h.provider.close()
+  }
+}
+
+test('session.open rejects an unsupported ACP initialize version without status preflight', async () => {
+  await assertRejectsRuntimeVersion(
+    '1.5.9',
+    /agy 1\.5\.9 is too old; requires >=1\.5\.10/,
+  )
+})
+
+test('session.open rejects a minimum-version ACP prerelease', async () => {
+  await assertRejectsRuntimeVersion(
+    '1.5.10-rc.1',
+    /agy 1\.5\.10-rc\.1 is too old/,
+  )
+})
+
+test('session.open rejects ACP initialize without agentInfo version', async () => {
+  await assertRejectsRuntimeVersion(
+    'missing',
+    /Could not determine agy version; requires >=1\.5\.10/,
+  )
+})
+
+test('session configure rejects a replacement runtime below the ACP minimum', async () => {
+  const h = await harness({ AGY_TEST_RELAUNCH_VERSION: '1.5.9' })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      config: h.config,
+      history: 'skip',
+    })
+    await h.wait((event) => event.type === 'session.ready')
+    await h.provider.send({
+      type: 'session.configure',
+      requestId: 'relaunch',
+      sessionId: 's',
+      changes: { mode: 'full-access' },
+    })
+    const failure = await h.wait(
+      (event) =>
+        event.type === 'session.runtime_failed' ||
+        (event.type === 'request.completed' && event.requestId === 'relaunch'),
+    )
+    assert.ok(failure.type === 'session.runtime_failed')
+    assert.match(
+      failure.error.message,
+      /agy 1\.5\.9 is too old; requires >=1\.5\.10/,
+    )
+    await h.wait(
+      (event) =>
+        event.type === 'request.failed' && event.requestId === 'relaunch',
+    )
+  } finally {
+    await h.provider.close()
+  }
+})
+
 function interruptOnTurnStart(
   provider: ProviderConnection,
   sessionId: string,

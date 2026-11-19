@@ -20,7 +20,10 @@ import type {
   ProviderEvent,
   ProviderTimelineItem,
 } from '@getpaseo/plugin/server/provider'
-import type { NormalizedQuestion } from './questions.ts'
+import {
+  sameNormalizedQuestions,
+  type NormalizedQuestion,
+} from './questions.ts'
 import type { ToolCall } from '@agentclientprotocol/sdk/unstable'
 import { alignReplayTools } from './history.ts'
 import {
@@ -47,6 +50,7 @@ import {
   BrainNode,
   BrainTranscriptProjector,
   activeChildIdsForTurn,
+  type PendingTool,
 } from './brain-projector.ts'
 
 export {
@@ -661,14 +665,22 @@ class ForegroundReconciler {
   }
 }
 
-type QuestionAnswer = { answerText: string | null; declined: boolean }
+type QuestionAnswer = {
+  answerText: string | null
+  declined: boolean
+  callId?: string
+}
 
 /** Follow background tasks and post-RPC Reactive Wakeup steps in transcript_full.jsonl until the turn settles. */
 export async function settleBrainTurn(
   root: string,
   nativeId: string,
   sessionId: string,
-  onItem: (item: ProviderTimelineItem, timestamp?: string) => void,
+  onItem: (
+    item: ProviderTimelineItem,
+    timestamp?: string,
+    toolResult?: { rawOutput: unknown },
+  ) => void,
   {
     signal,
     minStepIndex = -1,
@@ -685,6 +697,7 @@ export async function settleBrainTurn(
     wokenStallTimeoutMs = 15 * 60_000,
     retryTimeoutMs = RETRY_IDLE_TIMEOUT_MS,
     isWaitingOnUser,
+    isWaitingOnQuestion,
     takeQuestionAnswer,
     isWakeupQuestionDeclined,
     onSubagents,
@@ -725,10 +738,12 @@ export async function settleBrainTurn(
     retryTimeoutMs?: number
     /** Pending approvals legitimately block agy; they suspend the stall timeout. */
     isWaitingOnUser?: () => boolean
+    isWaitingOnQuestion?: () => boolean
     /** Match an already resolved ACP elicitation to its Brain row, without asking again. */
     takeQuestionAnswer?: (
       questions: readonly NormalizedQuestion[],
       wokeUp: boolean,
+      callId: string,
     ) => QuestionAnswer | undefined
     isWakeupQuestionDeclined?: () => boolean
   } = {},
@@ -746,13 +761,37 @@ export async function settleBrainTurn(
     runtimeEpoch?.afterStepIndex ?? -1,
   )
   const fgReconciler = new ForegroundReconciler(foregroundAcp)
-  const matchedQuestions = new Map<number, QuestionAnswer>()
+  const foregroundToolIds = foregroundAcp.flatMap((seg) =>
+    seg.type === 'tool_call' ? [seg.callId] : [],
+  )
+  const answersByTool = new WeakMap<PendingTool, QuestionAnswer>()
+  const answersByCallId = new Map<
+    string,
+    {
+      questions: readonly NormalizedQuestion[]
+      answer: QuestionAnswer
+    }
+  >()
+  const answerForQuestion = (
+    questions: readonly NormalizedQuestion[],
+    tool: PendingTool,
+  ) => {
+    const cached = answersByCallId.get(tool.callId)
+    if (cached && sameNormalizedQuestions(cached.questions, questions))
+      return cached.answer
+    const local = answersByTool.get(tool)
+    const answer =
+      local && (!tool.callId || !local.callId || tool.callId === local.callId)
+        ? local
+        : takeQuestionAnswer?.(questions, fgReconciler.postRpc, tool.callId)
+    if (answer) {
+      if (tool.callId) answersByCallId.set(tool.callId, { questions, answer })
+      else answersByTool.set(tool, answer)
+    }
+    return answer
+  }
   const node = new BrainNode(nativeId, sessionId, {
-    onQuestionSettled: (questions, slot) => {
-      if (matchedQuestions.has(slot)) return
-      const answer = takeQuestionAnswer?.(questions, fgReconciler.postRpc)
-      if (answer) matchedQuestions.set(slot, answer)
-    },
+    onQuestionSettled: answerForQuestion,
     reader: observation?.reader,
     allowInitialSpawnPrompt: false,
     mcpServerNames,
@@ -834,7 +873,9 @@ export async function settleBrainTurn(
       return
     if (deniedToolCallIds?.has(item.callId)) {
       if (shouldUpdateTool?.(item))
-        onItem({ ...item, status: 'canceled', error: null }, timestamp)
+        onItem({ ...item, status: 'canceled', error: null }, timestamp, {
+          rawOutput: null,
+        })
       return
     }
     const snapshot = toolSnapshot?.(item.callId)
@@ -846,7 +887,7 @@ export async function settleBrainTurn(
         ? snapshot.rawOutput == null && snapshot.content == null
         : item.detail.type !== 'sub_agent')
     )
-      onItem(item, timestamp)
+      onItem(item, timestamp, { rawOutput: node.projector.toolRawOutput(item) })
   }
   const resolveLiveTools = (rows: readonly Record<string, unknown>[]) => {
     const slots = node.projector.observeRows(rows)
@@ -855,15 +896,27 @@ export async function settleBrainTurn(
       const snapshot = toolSnapshot?.(id)
       if (snapshot) snapshots.set(id, snapshot)
     }
-    const { alignedIds, verifiedAcpToolIds } = alignReplayTools(
-      [],
-      inbox.stepCallIds,
-      subagents,
-      acpToolCallIds,
-      snapshots,
-      slots,
+    const align = (ids: readonly string[]) =>
+      alignReplayTools([], inbox.stepCallIds, subagents, ids, snapshots, slots)
+    const turn = align(acpToolCallIds)
+    // The wire can already have post-response calls while Brain still ends in the RPC.
+    // Prove the foreground prefix independently so a longer ACP stream cannot hide it.
+    const foreground = align(
+      foregroundToolIds.slice(0, slots.filter((slot) => !slot.invalid).length),
     )
-    node.projector.bindLiveToolCallIds(alignedIds, verifiedAcpToolIds)
+    const alignedIds = slots.map(({ slot }) => {
+      const foregroundId = foreground.alignedIds[slot]
+      if (foregroundId && foreground.verifiedAcpToolIds.has(foregroundId))
+        return foregroundId
+      const turnId = turn.alignedIds[slot]
+      return turnId && !foreground.verifiedAcpToolIds.has(turnId)
+        ? turnId
+        : undefined
+    })
+    node.projector.bindLiveToolCallIds(
+      alignedIds,
+      new Set([...foreground.verifiedAcpToolIds, ...turn.verifiedAcpToolIds]),
+    )
     const resolved = node.projector.resolveToolIdentities()
     if (resolved.length) foldVersion++
     for (const item of resolved) emitLiveTool(item)
@@ -968,10 +1021,14 @@ export async function settleBrainTurn(
       }
     }
   }
+  const deferReaderFault = () =>
+    stream.hasReaderFault && isWaitingOnQuestion?.()
   try {
     await stream.attach(consume)
     if (ownsObservation) stream.start()
-    await stream.poll()
+    await stream.poll().catch((error) => {
+      if (!signal?.aborted && !deferReaderFault()) throw error
+    })
     while (true) {
       const revision = stream.revision
       if (signal?.aborted) {
@@ -982,7 +1039,12 @@ export async function settleBrainTurn(
           throw signal.reason
         return finish('canceled')
       }
-      if (stream.error) throw stream.error
+      if (stream.error) {
+        if (!deferReaderFault()) throw stream.error
+        // A native question can remain pending long enough for transient I/O to recover.
+        await stream.wait(revision, signal)
+        continue
+      }
       if (!stream.acceptsRows())
         throw new Error('Brain observation stopped during turn')
       if (isWakeupQuestionDeclined?.()) return finish('canceled')
@@ -1007,15 +1069,8 @@ export async function settleBrainTurn(
         }
       node.settleAbortedDenial(deniedToolCallIds)
       while (takeQuestionAnswer) {
-        const question = node.projector.consumePendingQuestion(
-          (questions, slot) => {
-            const answer =
-              matchedQuestions.get(slot) ??
-              takeQuestionAnswer(questions, fgReconciler.postRpc)
-            if (answer) matchedQuestions.set(slot, answer)
-            return answer
-          },
-        )
+        const question =
+          node.projector.consumePendingQuestion(answerForQuestion)
         if (!question) break
         if (fgReconciler.postRpc) {
           node.markQuestionAnswered()

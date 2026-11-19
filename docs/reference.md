@@ -17,7 +17,7 @@ The resolved native directory is used for temporary artifact cleanup, Brain trac
 
 ### Availability and catalog discovery
 
-Provider status runs the executable with `--version`, with a five-second timeout, requires a parseable version of at least 1.5.10 (pre-release `1.5.10-*` builds are rejected), and caches successful checks for 60 seconds per launch key (bounded to 100 entries). Catalog identity hashes the command, arguments and sorted environment using SHA-256; environment values are not included in plain-text cache keys. Within a connection, catalog requests for the same working directory share the first successful probe (bounded to 100 directories per connection); failed probes are evicted so subsequent requests retry, and failed probes do not replace remembered usage launches.
+Provider status runs the executable with `--version`, with a five-second timeout, requires a parseable version of at least 1.5.10 (pre-release `1.5.10-*` builds are rejected), and caches successful checks for 60 seconds per launch key (bounded to 100 entries). Every ACP runtime, including a replacement, must also report a supported `agentInfo.version` during `initialize`. Catalog identity hashes the command, arguments and sorted environment using SHA-256; environment values are not included in plain-text cache keys. Within a connection, catalog requests for the same working directory share the first successful probe (bounded to 100 directories per connection); failed probes are evicted so subsequent requests retry, and failed probes do not replace remembered usage launches.
 
 ### Temporary session cleanup
 

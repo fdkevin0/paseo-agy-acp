@@ -16,6 +16,7 @@ import recordedWakeup from './fixtures/agy-1.5.12-wakeup.json' with { type: 'jso
 
 let nativeId = ''
 let afterPromptResponse: (() => Promise<void>) | undefined
+let finishRecordedReads: (() => Promise<void>) | undefined
 if (process.env.AGY_TEST_PID_FILE)
   writeFileSync(process.env.AGY_TEST_PID_FILE, String(process.pid))
 function log(method: string) {
@@ -186,9 +187,14 @@ connection = agent()
       params.clientCapabilities?.elicitation?.form
     )
       log('cap:elicitation.form')
+    const version = process.argv.includes('--dangerously-skip-permissions')
+      ? (process.env.AGY_TEST_RELAUNCH_VERSION ?? '1.5.12')
+      : (process.env.AGY_TEST_VERSION ?? '1.5.12')
     return {
       protocolVersion: 1,
-      agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
+      ...(version === 'missing'
+        ? {}
+        : { agentInfo: { name: 'Antigravity ACP Server', version } }),
       agentCapabilities: {
         loadSession: true,
         sessionCapabilities: {
@@ -326,6 +332,13 @@ connection = agent()
   .onRequest(
     methods.agent.session.setConfigOption,
     async ({ params: { configId, value } }) => {
+      if (configId === 'fixture-release-reads') {
+        if (!finishRecordedReads)
+          throw new Error('Recorded reads are not waiting')
+        await finishRecordedReads()
+        finishRecordedReads = undefined
+        return { configOptions }
+      }
       log(`configure:${configId}=${value}`)
       return {
         configOptions: configOptions.map((o) =>
@@ -351,6 +364,7 @@ connection = agent()
         [
           'recorded-wakeup',
           'recorded-wakeup-repeat',
+          'recorded-wakeup-delayed-reads',
           'recorded-wakeup-denied-tool',
           'recorded-next',
         ].includes(text)
@@ -456,7 +470,20 @@ connection = agent()
               return
             }
             writeSessionTranscript(sessionId, recordedWakeup.wakeup.rows)
-            await sendUpdates(recordedWakeup.wakeup.updates)
+            if (text === 'recorded-wakeup-delayed-reads') {
+              const readCompleted = (
+                u: (typeof recordedWakeup.wakeup.updates)[number],
+              ) =>
+                u.sessionUpdate === 'tool_call_update' &&
+                (u.toolCallId === 'call_2' || u.toolCallId === 'call_3')
+              finishRecordedReads = () =>
+                sendUpdates(recordedWakeup.wakeup.updates.filter(readCompleted))
+              await sendUpdates(
+                recordedWakeup.wakeup.updates.filter((u) => !readCompleted(u)),
+              )
+            } else {
+              await sendUpdates(recordedWakeup.wakeup.updates)
+            }
             const answer = await client.createElicitation({
               ...recordedWakeup.wakeup.question,
               sessionId,
@@ -477,8 +504,8 @@ connection = agent()
               })
               return
             }
-            await sendUpdates(recordedWakeup.answer.updates)
             writeSessionTranscript(sessionId, recordedWakeup.answer.rows)
+            await sendUpdates(recordedWakeup.answer.updates)
           }
         }
         return phase.response as {

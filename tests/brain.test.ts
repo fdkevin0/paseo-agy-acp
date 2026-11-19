@@ -33,7 +33,9 @@ import {
   flushObs,
   sequenceDouble,
   waitUntil,
+  writeFileAtomic,
 } from './helpers.ts'
+import recordedWakeup from './fixtures/agy-1.5.12-wakeup.json' with { type: 'json' }
 import { TranscriptReader } from '../server/brain-io.ts'
 import { BrainTurnObservation } from '../server/brain-observer.ts'
 import {
@@ -2528,6 +2530,68 @@ test('a woken native question is not interrupt-relaunch work but blocks settleme
   }
 })
 
+test(
+  'a rewritten transcript cannot give a replacement question an anonymous slot’s cached answer',
+  { timeout: 5000 },
+  async (t) => {
+    const f = await fixture()
+    t.after(f.close)
+    const tracker = createStepTracker()
+    const obs = manualObs(f.root, parent)
+    const abort = new AbortController()
+    t.after(() => {
+      abort.abort()
+      return obs.dispose()
+    })
+    const ask = (question: string, id?: string): Row => ({
+      ...done(1, ''),
+      tool_calls: [
+        {
+          id,
+          name: 'ask_question',
+          args: { questions: [{ question, options: ['A', 'B'] }] },
+        },
+      ],
+    })
+    await f.put(parent, [
+      { step_index: 0, type: 'USER_INPUT', content: 'work' },
+      ask('Original question?'),
+      { step_index: 2, type: 'GENERIC', status: 'DONE', content: 'A' },
+      { step_index: 3, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+    ])
+    const items: ProviderTimelineItem[] = []
+    const running = alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+        signal: abort.signal,
+        observation: obs,
+        onStep: tracker.onStep,
+        takeQuestionAnswer: sequenceDouble([
+          () => ({ answerText: 'original answer', declined: false }),
+          () => ({ answerText: 'replacement answer', declined: false }),
+        ]),
+      }),
+    )
+    await tracker.waitFor(3)
+    await writeFileAtomic(
+      f.path(parent),
+      encode([
+        { step_index: 0, type: 'USER_INPUT', content: 'work' },
+        ask('Replacement question?', 'replacement-call'),
+      ]),
+    )
+    await flushObs(obs)
+    assert.equal((await running).status, 'completed')
+    const replacement = items.find(
+      (item) => item.type === 'tool_call' && item.callId === 'replacement-call',
+    )
+    assert.ok(
+      replacement?.type === 'tool_call' &&
+        replacement.detail.type === 'plain_text',
+    )
+    assert.match(replacement.detail.text ?? '', /Answer:\nreplacement answer$/)
+  },
+)
+
 test('ask_question results stay attributed by step next to sibling tool calls', () => {
   // Mixed [ask_question, run_command] in one PLANNER_RESPONSE preserves FIFO/step attribution
   const p1 = new BrainTranscriptProjector('s')
@@ -4176,6 +4240,87 @@ test('orphan trailing GENERIC(DONE) after complete PLANNER_RESPONSE does not un-
     await f.close()
   }
 })
+
+test(
+  'an ACP post-response tool frame ahead of Brain cannot re-bill the in-RPC wakeup',
+  { timeout: 5000 },
+  async (t) => {
+    const f = await fixture()
+    t.after(f.close)
+    const tracker = createStepTracker()
+    const obs = manualObs(f.root, parent)
+    const abort = new AbortController()
+    t.after(() => {
+      abort.abort()
+      return obs.dispose()
+    })
+    const { foreground, wakeup, answer } = recordedWakeup
+    const snapshots = new Map(
+      [...foreground.updates, ...wakeup.updates].flatMap((update) =>
+        update.sessionUpdate === 'tool_call' &&
+        update.toolCallId &&
+        update.title
+          ? [
+              [
+                update.toolCallId,
+                {
+                  toolCallId: update.toolCallId,
+                  title: update.title,
+                  rawInput: update.rawInput,
+                },
+              ] as const,
+            ]
+          : [],
+      ),
+    )
+    await f.put(parent, [
+      ...foreground.rows,
+      ...wakeup.rows.slice(0, 4),
+      { ...done(8, 'Reads finished.'), input_tokens: 40, output_tokens: 1 },
+      message(9, 'second-inbox-message', 'Continue after the response'),
+    ])
+    const usage = new Map<number, number>()
+    let wakeupInput: number | undefined
+    const running = alive(
+      settleBrainTurn(f.root, parent, 'p', () => {}, {
+        signal: abort.signal,
+        observation: obs,
+        acpToolCallIds: ['call_1', 'call_2', 'call_3', 'call_4'],
+        foregroundAcp: [
+          { type: 'reasoning', text: 'Checking background progress.' },
+          { type: 'tool_call', callId: 'call_1' },
+          { type: 'assistant_message', text: 'started' },
+          { type: 'reasoning', text: 'Checking background progress.' },
+          { type: 'tool_call', callId: 'call_2' },
+          { type: 'tool_call', callId: 'call_3' },
+          { type: 'assistant_message', text: 'Reads finished.' },
+        ],
+        toolSnapshot: (id) => snapshots.get(id),
+        onStep: (step) => {
+          tracker.onStep(step)
+          usage.set(step, wakeupInput ?? 0)
+        },
+        onWakeupState: (state) => {
+          wakeupInput = state.wakeupUsage?.inputTokens
+        },
+      }),
+    )
+    await tracker.waitFor(9)
+    assert.equal(usage.get(8), 0)
+    await appendFile(
+      f.path(parent),
+      encode([
+        { ...wakeup.rows[4], step_index: 10 },
+        { ...answer.rows[0], step_index: 11 },
+        { ...answer.rows[1], step_index: 12 },
+      ]),
+    )
+    await flushObs(obs)
+    const result = await running
+    assert.equal(result.status, 'completed')
+    assert.equal(result.wakeupUsage?.inputTokens, 4814)
+  },
+)
 
 async function assertCachedWakeupBilled(
   root: string,

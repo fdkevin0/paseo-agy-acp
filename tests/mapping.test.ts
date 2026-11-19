@@ -696,6 +696,48 @@ test('write_file with kind:edit and diff maps to Write card and denied failed up
   assert.equal(t.isRunning(deniedLate.id), false)
 })
 
+test('native tool content and raw output take precedence over a recovered Brain result', () => {
+  const timeline = new Timeline('s')
+  const running = timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'read',
+    title: 'read_file',
+    status: 'in_progress',
+    rawInput: { Path: '/fixture/text' },
+    content: [],
+  })
+  assert.ok(running?.type === 'tool_call')
+  const brain = { ...running, status: 'completed' as const, error: null }
+  timeline.recoverToolResult(brain, 'Brain result')
+  const statusOnly = timeline.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'read',
+    status: 'completed',
+  })
+  assert.match(JSON.stringify(statusOnly), /Brain result/)
+  const contentOnly = timeline.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'read',
+    content: [
+      { type: 'content', content: { type: 'text', text: 'Native content' } },
+    ],
+  })
+  assert.match(JSON.stringify(contentOnly), /Native content/)
+  assert.doesNotMatch(JSON.stringify(contentOnly), /Brain result/)
+  const raw = timeline.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'read',
+    rawOutput: 'Native raw output',
+  })
+  assert.match(JSON.stringify(raw), /Native raw output/)
+  assert.match(
+    JSON.stringify(
+      timeline.recoverToolResult(brain, 'another Brain result').detail,
+    ),
+    /Native raw output/,
+  )
+})
+
 test('late status-less tool_call_update preserves terminal status and metadata while orphan updates are ignored', () => {
   const t = new Timeline('s')
   assert.equal(

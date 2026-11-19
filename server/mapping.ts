@@ -711,6 +711,12 @@ export function promptUsage(
   }
 }
 
+type ToolSnapshot = {
+  acp: ToolCall
+  hasAcpResult: boolean
+  brainOutput?: unknown
+}
+
 /** Assemble full snapshots and terminalize tools whose final native update is absent. */
 export class Timeline {
   private sequence = 0
@@ -718,7 +724,7 @@ export class Timeline {
     ProviderTimelineItem,
     { type: 'user_message' | 'assistant_message' | 'reasoning' }
   >
-  private tools = new Map<string, ToolCall>()
+  private tools = new Map<string, ToolSnapshot>()
   private running = new Map<
     string,
     Extract<ProviderTimelineItem, { type: 'tool_call' }>
@@ -738,7 +744,23 @@ export class Timeline {
     else this.running.delete(item.id)
   }
   toolCallSnapshot(callId: string): Readonly<ToolCall> | undefined {
-    return this.tools.get(callId)
+    return this.tools.get(callId)?.acp
+  }
+  recoverToolResult(
+    item: Extract<ProviderTimelineItem, { type: 'tool_call' }>,
+    output: unknown,
+  ): typeof item {
+    const snapshot = this.tools.get(item.callId)
+    if (!snapshot) return item
+    if (!snapshot.hasAcpResult) {
+      // agy can send a status-only completion after Brain has already supplied the result.
+      if (output != null) snapshot.brainOutput = output
+      return item
+    }
+    const detail = toolDetail(snapshot.acp)
+    if (detail.type === 'sub_agent' && item.detail.type === 'sub_agent')
+      detail.childSessionId ??= item.detail.childSessionId
+    return { ...item, detail }
   }
   isRunning(id: string): boolean {
     return this.running.has(id)
@@ -759,9 +781,12 @@ export class Timeline {
             item.callId,
             {
               ...prev,
-              status: (nextStatus === 'canceled'
-                ? 'cancelled'
-                : nextStatus) as ToolCall['status'],
+              acp: {
+                ...prev.acp,
+                status: (nextStatus === 'canceled'
+                  ? 'cancelled'
+                  : nextStatus) as ToolCall['status'],
+              },
             },
             TOOL_SNAPSHOT_LIMIT,
           )
@@ -823,10 +848,11 @@ export class Timeline {
       update.sessionUpdate === 'tool_call' ||
       update.sessionUpdate === 'tool_call_update'
     ) {
-      const old =
+      const previous =
         update.sessionUpdate === 'tool_call_update'
           ? this.tools.get(update.toolCallId)
           : undefined
+      const old = previous?.acp
       if (
         !old &&
         update.sessionUpdate === 'tool_call_update' &&
@@ -863,7 +889,7 @@ export class Timeline {
         (old?.kind == null ||
           old.kind === 'other' ||
           old.kind === 'switch_mode')
-      const tool = {
+      const acp = {
         ...old,
         // ACP v1 raw input/output null is equivalent to omission, not a clear.
         ...Object.fromEntries(
@@ -872,7 +898,21 @@ export class Timeline {
         ...(preserveStatus ? { status: old!.status } : {}),
         ...(preservePlanMode ? { kind: 'switch_mode' as const } : {}),
       } as ToolCall
-      setBounded(this.tools, update.toolCallId, tool, TOOL_SNAPSHOT_LIMIT)
+      // A running card's empty content must not become a supplied result on a status-only completion.
+      const hasAcpResult =
+        acp.rawOutput != null ||
+        (update.content == null
+          ? previous?.hasAcpResult === true
+          : update.content.length > 0 || isTerminalToolStatus(acp.status))
+      const brainOutput = hasAcpResult ? undefined : previous?.brainOutput
+      setBounded(
+        this.tools,
+        update.toolCallId,
+        { acp, hasAcpResult, brainOutput },
+        TOOL_SNAPSHOT_LIMIT,
+      )
+      const tool =
+        brainOutput != null ? { ...acp, rawOutput: brainOutput } : acp
       const base = {
         type: 'tool_call' as const,
         id: `${this.prefix}:tool:${tool.toolCallId}`,

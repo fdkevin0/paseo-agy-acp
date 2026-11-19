@@ -811,6 +811,173 @@ test(
 )
 
 test(
+  'recorded result-less ACP completions retain read results Brain recovered first',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, running, question } = await recordedQuestion(
+      t,
+      { observationPollIntervalMs: 60_000 },
+      'recorded-wakeup-delayed-reads',
+    )
+    await h.session.drain()
+    await h.read()
+    const lastRead = (callId: string) =>
+      h.toolCalls().findLast((item) => item.callId === callId)
+    assert.equal(lastRead('call_2')?.status, 'completed')
+    assert.match(JSON.stringify(lastRead('call_2')?.detail), /alpha/)
+    assert.equal(lastRead('call_3')?.status, 'completed')
+    assert.match(JSON.stringify(lastRead('call_3')?.detail), /beta/)
+    const before = h.toolCalls().length
+    await h.session.transport.rpc.setSessionConfigOption({
+      sessionId: h.session.state.nativeId,
+      configId: 'fixture-release-reads',
+      value: 'release',
+    })
+    await h.session.drain()
+    assert.deepEqual(
+      h
+        .toolCalls()
+        .slice(before)
+        .map(({ callId, status }) => [callId, status]),
+      [
+        ['call_2', 'completed'],
+        ['call_3', 'completed'],
+      ],
+    )
+    assert.match(JSON.stringify(lastRead('call_2')?.detail), /alpha/)
+    assert.match(JSON.stringify(lastRead('call_3')?.detail), /beta/)
+    await finishRecordedQuestion(h, question.request.id, running)
+    assert.deepEqual(h.turns(), ['completed'])
+  },
+)
+
+async function finishRecordedQuestion(
+  h: Awaited<ReturnType<typeof harness>>,
+  permissionId: string,
+  running: Promise<void>,
+) {
+  await answerRecordedQuestion(h, permissionId)
+  await h.wait(() =>
+    h.events.some(
+      (e) =>
+        e.type === 'timeline.item' &&
+        e.item.type === 'assistant_message' &&
+        e.item.text === '\n\nfinal: one',
+    ),
+  )
+  await h.read()
+  await running
+}
+
+async function recordedQuestionWithReaderFault(t: TestContext) {
+  const reader = new SwappableTranscriptReader()
+  const setup = await recordedQuestion(t, {
+    createTranscriptReader: () => reader,
+    observationPollIntervalMs: 60_000,
+  })
+  const obs = setup.h.session.state.observation as TrackingObservation
+  await obs.attached.promise
+  await setup.h.read()
+  const error = Object.assign(
+    new Error('recorded question reader unavailable'),
+    { code: 'EBUSY' },
+  )
+  return { ...setup, obs, reader, error }
+}
+
+async function assertFaultedQuestionTerminated(
+  h: Awaited<ReturnType<typeof harness>>,
+  obs: BrainTurnObservation,
+  running: Promise<void>,
+  status: 'failed' | 'canceled',
+) {
+  await running
+  assert.deepEqual(h.turns(), [status])
+  assert.deepEqual(await promptRequests(h.acpLog), ['prompt:recorded-wakeup'])
+  const count = h.events.length
+  await obs.poll()
+  assert.equal(h.events.length, count)
+}
+
+test(
+  'a transient reader fault recovers while native elicitation is pending',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, obs, reader, error, question, running } =
+      await recordedQuestionWithReaderFault(t)
+    reader.injectOnce(error)
+    await assert.rejects(obs.poll(), /recorded question reader unavailable/)
+    assert.equal(obs.error, error)
+    await obs.poll()
+    assert.equal(obs.error, undefined)
+    await finishRecordedQuestion(h, question.request.id, running)
+    assert.deepEqual(h.turns(), ['completed'])
+    assert.deepEqual(await promptRequests(h.acpLog), ['prompt:recorded-wakeup'])
+  },
+)
+
+test(
+  'an unresolved reader fault fails after native elicitation is answered',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, obs, reader, error, question, running } =
+      await recordedQuestionWithReaderFault(t)
+    reader.impl = async () => {
+      throw error
+    }
+    await assert.rejects(obs.poll(), /recorded question reader unavailable/)
+    assert.deepEqual(h.turns(), [])
+    await answerRecordedQuestion(h, question.request.id)
+    await obs.poll().catch(() => undefined)
+    await assertFaultedQuestionTerminated(h, obs, running, 'failed')
+    const terminal = h.events.findLast(
+      (e) => e.type === 'session.turn' && e.state === 'failed',
+    )
+    assert.ok(terminal?.type === 'session.turn' && terminal.state === 'failed')
+    assert.match(
+      terminal.error?.message ?? '',
+      /recorded question reader unavailable/,
+    )
+  },
+)
+
+test(
+  'interrupt cancels native elicitation despite an unresolved reader fault',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, obs, reader, error, running } =
+      await recordedQuestionWithReaderFault(t)
+    reader.impl = async () => {
+      throw error
+    }
+    await assert.rejects(obs.poll(), /recorded question reader unavailable/)
+    assert.deepEqual(h.turns(), [])
+    await h.manager.handle({
+      type: 'session.interrupt',
+      sessionId: 's',
+      requestId: 'interrupt',
+    })
+    await assertFaultedQuestionTerminated(h, obs, running, 'canceled')
+  },
+)
+
+test(
+  'close cancels native elicitation despite an unresolved reader fault',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, obs, reader, error, running } =
+      await recordedQuestionWithReaderFault(t)
+    reader.impl = async () => {
+      throw error
+    }
+    await assert.rejects(obs.poll(), /recorded question reader unavailable/)
+    assert.deepEqual(h.turns(), [])
+    await h.manager.close()
+    await assertFaultedQuestionTerminated(h, obs, running, 'canceled')
+  },
+)
+
+test(
   'declining the recorded wakeup question cancels without relaunching or sending another prompt',
   { timeout: 5000 },
   async (t) => {

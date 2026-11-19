@@ -316,12 +316,12 @@ export class BrainTranscriptProjector {
   consumePendingQuestion<T>(
     takeAnswer: (
       questions: readonly NormalizedQuestion[],
-      slot: number,
+      tool: PendingTool,
     ) => T | undefined,
   ) {
     const next = this.pending.find((p) => !p.questionConsumed)
     if (!next?.questions) return undefined
-    const answer = takeAnswer(next.questions, next.slotIndex)
+    const answer = takeAnswer(next.questions, next)
     if (answer === undefined) return undefined
     next.questionConsumed = true
     return { tool: next, answer }
@@ -827,7 +827,7 @@ export type BrainNodeOptions = {
   mcpServerNames?: readonly string[]
   onQuestionSettled?: (
     questions: readonly NormalizedQuestion[],
-    slot: number,
+    tool: PendingTool,
   ) => void
   reader?: TranscriptReader
   allowInitialSpawnPrompt?: boolean
@@ -865,10 +865,7 @@ export class BrainNode {
   private allowInitialSpawnPrompt: boolean
   readonly nativeId: string
   readonly sessionId: string
-  private onQuestionSettled?: (
-    questions: readonly NormalizedQuestion[],
-    slot: number,
-  ) => void
+  private onQuestionSettled?: BrainNodeOptions['onQuestionSettled']
 
   constructor(
     nativeId: string,
@@ -888,7 +885,7 @@ export class BrainNode {
   private createProjector() {
     return new BrainTranscriptProjector(
       this.sessionId,
-      (questions, tool) => this.onQuestionSettled?.(questions, tool.slotIndex),
+      this.onQuestionSettled,
       this.allowInitialSpawnPrompt,
       this.mcpServerNames,
     )

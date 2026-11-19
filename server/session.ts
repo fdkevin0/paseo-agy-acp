@@ -57,7 +57,11 @@ import {
 } from './brain-io.ts'
 import { projectReplayHistory, type HistoryEntry } from './history.ts'
 import { SubagentRegistry } from './subagents.ts'
-import { dataDirectory, removeSessionArtifacts } from './preflight.ts'
+import {
+  agyVersionDiagnostic,
+  dataDirectory,
+  removeSessionArtifacts,
+} from './preflight.ts'
 import { connectAcp } from './transport.ts'
 import {
   PACKAGE_VERSION,
@@ -471,6 +475,7 @@ async function createSession(
     inSettle: false,
     handledElicitations: [] as Array<{
       questions: NormalizedQuestion[]
+      callId?: string
       answerText: string | null
       wokeUp: boolean
       declined: boolean
@@ -690,9 +695,14 @@ async function createSession(
       ...(status === 'failed' && error ? { error: { message: error } } : {}),
     })
   }
-  /** Brain-projected items are not yet known to the ACP timeline. */
-  function emitItem(item: ProviderTimelineItem, timestamp?: string) {
+  function emitItem(
+    item: ProviderTimelineItem,
+    timestamp?: string,
+    toolResult?: { rawOutput: unknown },
+  ) {
     if (state.silenced) return
+    if (item.type === 'tool_call' && toolResult)
+      item = timeline.recoverToolResult(item, toolResult.rawOutput)
     timeline.track(item)
     subagents.linkSubsession(id, state.nativeId, item)
     emit({
@@ -925,6 +935,8 @@ async function createSession(
         state.wakeupQuestionDeclined = true
       state.handledElicitations.push({
         questions,
+        callId:
+          typeof params.toolCallId === 'string' ? params.toolCallId : undefined,
         answerText: formatQuestionAnswersText(questions, response) || null,
         wokeUp: state.inSettle,
         declined: response.behavior === 'deny',
@@ -1034,8 +1046,8 @@ async function createSession(
     void transport.stopped.then(() => transports.delete(transport))
     return transport
   }
-  function initializeRuntime(transport: ReturnType<typeof connectAcp>) {
-    return transport.request(
+  async function initializeRuntime(transport: ReturnType<typeof connectAcp>) {
+    const initialized = await transport.request(
       transport.rpc.initialize({
         protocolVersion: PROTOCOL_VERSION,
         clientInfo: { name: 'paseo-agy-acp', version: PACKAGE_VERSION },
@@ -1046,6 +1058,9 @@ async function createSession(
         },
       }),
     )
+    const diagnostic = agyVersionDiagnostic(initialized.agentInfo?.version)
+    if (diagnostic) throw new Error(diagnostic)
+    return initialized
   }
   let currentTransport = startRuntime(state.skipPermissions)
   try {
@@ -2038,10 +2053,15 @@ async function promptSession(
           stallTimeoutMs: session.stallTimeoutMs,
           retryTimeoutMs: session.retryTimeoutMs,
           isWaitingOnUser: () => session.permissions.size > 0,
-          takeQuestionAnswer: (questions, wokeUp) => {
+          isWaitingOnQuestion: () =>
+            [...session.permissions.values()].some(
+              (permission) => permission.type === 'question',
+            ),
+          takeQuestionAnswer: (questions, wokeUp, callId) => {
             const index = session.state.handledElicitations.findIndex(
               (entry) =>
                 entry.wokeUp === wokeUp &&
+                (!callId || !entry.callId || entry.callId === callId) &&
                 sameNormalizedQuestions(entry.questions, questions),
             )
             if (index >= 0)
