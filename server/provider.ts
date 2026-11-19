@@ -14,7 +14,7 @@ import type {
   ProviderEvent,
   ProviderInput,
 } from '@getpaseo/plugin/server/provider'
-import { providerStatus, catalogCacheKey } from './preflight.ts'
+import { providerStatus, resolveCatalogCacheKey } from './preflight.ts'
 import { configState } from './mapping.ts'
 import { formatErrorMessage, record, setBounded } from './common.ts'
 import { AgyUsageSource } from './usage.ts'
@@ -47,7 +47,7 @@ export function createProvider(
     icon: 'icon.svg',
     status: ({ launch }) => providerStatus(launch),
     async getCatalogCacheKey({ launch }) {
-      return catalogCacheKey(launch)
+      return resolveCatalogCacheKey(launch)
     },
     async connect(connection): Promise<ProviderConnection> {
       if (!connection.versions.includes(PROVIDER_PROTOCOL_VERSION))
@@ -69,12 +69,12 @@ export function createProvider(
         emit,
       })
       const pending = new Set<Promise<void>>()
-      const catalogs = new Map<string, Promise<ProviderCatalog>>()
+      const pendingCatalogs = new Map<string, Promise<ProviderCatalog>>()
       let closed = false
       async function handle(input: ProviderInput) {
         if (input.type === 'catalog') {
           const cwd = input.cwd ?? homedir()
-          let catalog = catalogs.get(cwd)
+          let catalog = pendingCatalogs.get(cwd)
           if (!catalog) {
             const pendingCatalog = probeCatalog(
               manager,
@@ -83,10 +83,17 @@ export function createProvider(
               usage,
             )
             catalog = pendingCatalog
-            setBounded(catalogs, cwd, pendingCatalog, CATALOG_CACHE_LIMIT)
-            void pendingCatalog.catch(() => {
-              if (catalogs.get(cwd) === pendingCatalog) catalogs.delete(cwd)
-            })
+            setBounded(
+              pendingCatalogs,
+              cwd,
+              pendingCatalog,
+              CATALOG_CACHE_LIMIT,
+            )
+            const clear = () => {
+              if (pendingCatalogs.get(cwd) === pendingCatalog)
+                pendingCatalogs.delete(cwd)
+            }
+            void pendingCatalog.then(clear, clear)
           }
           emit({
             type: 'catalog',

@@ -481,7 +481,7 @@ test('list/import and replay before ready; skip does not replay', async () => {
   }
 })
 
-test('catalog requests share a probe, close it, and skip unchanged opening config', async () => {
+test('catalog requests deduplicate in-flight probes, re-probe on refresh, and skip unchanged opening config', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-catalog-'))
   const log = join(home, 'calls')
   const h = await harness({ HOME: home, AGY_TEST_LOG: log })
@@ -507,7 +507,7 @@ test('catalog requests share a probe, close it, and skip unchanged opening confi
       cwd: h.config.cwd,
     })
     await h.wait((e) => e.type === 'catalog' && e.requestId === 'c')
-    assert.equal(await readFile(log, 'utf8'), 'new\nclose\n')
+    assert.equal(await readFile(log, 'utf8'), 'new\nclose\nnew\nclose\n')
     await h.provider.send({
       type: 'session.open',
       requestId: 'open',
@@ -516,7 +516,7 @@ test('catalog requests share a probe, close it, and skip unchanged opening confi
       history: 'skip',
     })
     await h.wait((e) => e.type === 'session.ready')
-    assert.equal(await readFile(log, 'utf8'), 'new\nclose\nnew\n')
+    assert.equal(await readFile(log, 'utf8'), 'new\nclose\nnew\nclose\nnew\n')
     assert.ok(
       h.events.some(
         (e) => e.type === 'session.config' && e.config.model === 'test',
@@ -844,17 +844,25 @@ test('missing transcript leaves context unknown and prompted sessions remain res
   }
 })
 
-test('failed probes cannot replace remembered usage launches with missing workspaces', async () => {
+test('failed probes clear pending catalog state, allow retries, and cannot replace remembered usage launches', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-failed-probe-'))
+  const missingCwd = join(home, 'missing')
   const h = await harness({ HOME: home })
   try {
-    await h.provider.send({
-      type: 'catalog',
-      requestId: 'missing',
-      cwd: join(home, 'missing'),
-    })
+    await Promise.all(
+      ['missing-a', 'missing-b'].map((requestId) =>
+        h.provider.send({
+          type: 'catalog',
+          requestId,
+          cwd: missingCwd,
+        }),
+      ),
+    )
     await h.wait(
-      (e) => e.type === 'request.failed' && e.requestId === 'missing',
+      (e) => e.type === 'request.failed' && e.requestId === 'missing-a',
+    )
+    await h.wait(
+      (e) => e.type === 'request.failed' && e.requestId === 'missing-b',
     )
     assert.deepEqual(
       await h.usage.discover({
@@ -863,6 +871,18 @@ test('failed probes cannot replace remembered usage launches with missing worksp
         env: { HOME: home },
       }),
       [],
+    )
+    await mkdir(missingCwd)
+    await h.provider.send({
+      type: 'catalog',
+      requestId: 'retry',
+      cwd: missingCwd,
+    })
+    const recovered = await h.wait(
+      (e) => e.type === 'catalog' && e.requestId === 'retry',
+    )
+    assert.ok(
+      recovered.type === 'catalog' && recovered.catalog.models.length > 0,
     )
   } finally {
     await h.provider.close()
