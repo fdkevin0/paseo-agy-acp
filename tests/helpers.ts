@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
-import { mkdir, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { mkdir, rename, utimes, writeFile } from 'node:fs/promises'
+import { basename, dirname, join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
   ProviderEventSchema,
@@ -115,21 +116,72 @@ export function collectProviderEvents(
   }
 }
 
+/** Build an isolated environment anchored under `home` without inheriting host config or credentials. */
+export function isolatedEnv(
+  home: string,
+  extra: Record<string, string> = {},
+): Record<string, string> {
+  return {
+    HOME: home,
+    XDG_CONFIG_HOME: join(home, '.config'),
+    XDG_CACHE_HOME: join(home, '.cache'),
+    PATH: '',
+    ...extra,
+  }
+}
+
+/** Per-call boundary double returning each scripted handler once in call order. */
+export function sequenceDouble<Args extends unknown[], R>(
+  handlers: readonly ((...args: Args) => R)[],
+): (...args: Args) => R {
+  let index = 0
+  return (...args: Args): R => {
+    assert.ok(
+      index < handlers.length,
+      `Unexpected call #${index + 1} (scripted ${handlers.length})`,
+    )
+    return handlers[index++](...args)
+  }
+}
+
+/** Drain any in-flight observation pass, then run one fresh read strictly after prior disk writes. */
+export async function flushObs(obs: { poll(): Promise<void> }): Promise<void> {
+  await obs.poll()
+  await obs.poll()
+}
+
+/** Write `content` (and optional `mtime`) atomically via a sibling `.tmp` file + `rename`. */
+export async function writeFileAtomic(
+  path: string,
+  content: string,
+  mtime?: Date,
+): Promise<void> {
+  const dir = dirname(path)
+  await mkdir(dir, { recursive: true })
+  const tmp = join(dir, `.${basename(path)}.${randomUUID()}.tmp`)
+  await writeFile(tmp, content)
+  if (mtime) await utimes(tmp, mtime, mtime)
+  await rename(tmp, path)
+}
+
 /** Write JSONL rows to `<brainRoot>/<nativeId>/.system_generated/logs/transcript_full.jsonl`. */
 export async function writeBrainTranscript(
   brainRoot: string,
   nativeId: string,
   rows: readonly Record<string, unknown>[],
+  mtime?: Date,
 ): Promise<string> {
   const path = join(
     brainRoot,
     nativeId,
     '.system_generated/logs/transcript_full.jsonl',
   )
-  await mkdir(dirname(path), { recursive: true })
-  await writeFile(
-    path,
-    rows.map((row) => JSON.stringify(row)).join('\n') + '\n',
-  )
+  const payload = rows.map((row) => JSON.stringify(row)).join('\n') + '\n'
+  if (mtime) {
+    await writeFileAtomic(path, payload, mtime)
+  } else {
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, payload)
+  }
   return path
 }

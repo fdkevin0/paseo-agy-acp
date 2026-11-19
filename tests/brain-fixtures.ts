@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdtemp, mkdir, open, readFile, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { writeFileAtomic } from './helpers.ts'
 
 export const parent = '11111111-1111-4111-8111-111111111111'
 export const child = '22222222-2222-4222-8222-222222222222'
@@ -98,8 +99,7 @@ export async function fixture() {
     spawnCallId = 'invoke',
   ) {
     const dir = join(root, parentId, '.system_generated/subagents')
-    await mkdir(dir, { recursive: true })
-    await writeFile(
+    await writeFileAtomic(
       join(dir, `${childId}.json`),
       JSON.stringify({
         conversationId: childId,
@@ -132,8 +132,7 @@ export async function fixture() {
     },
   ) {
     const dir = join(root, recipientId, '.system_generated/messages')
-    await mkdir(dir, { recursive: true })
-    await writeFile(
+    await writeFileAtomic(
       join(dir, `${msgId}.json`),
       JSON.stringify({
         id: msgId,
@@ -166,7 +165,7 @@ export async function fixture() {
     )
     if (read) current[msgId] = true
     else delete current[msgId]
-    await writeFile(readPath, JSON.stringify(current))
+    await writeFileAtomic(readPath, JSON.stringify(current))
     return msgId
   }
   return {
