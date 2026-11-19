@@ -28,10 +28,7 @@ async function harness(env: Record<string, string> = {}) {
     ? undefined
     : await mkdtemp(join(tmpdir(), 'agy-provider-'))
   const home = env.HOME ?? autoHome!
-  const launchEnv = isolatedEnv(home, {
-    PATH: process.env.PATH ?? '',
-    ...env,
-  })
+  const launchEnv = isolatedEnv(home, env)
   const usage = new AgyUsageSource({ env: launchEnv })
   const rawProvider = await createProvider(usage).connect({
     versions: [1],
@@ -454,15 +451,22 @@ test('catalog requests share a probe, close it, and skip unchanged opening confi
 })
 
 test('send rejects requests after the connection is closed', async () => {
-  const provider = await createProvider().connect({
-    versions: [1],
-    capabilities: [],
-  })
-  await provider.close()
-  await assert.rejects(
-    provider.send({ type: 'catalog', requestId: 'closed', cwd: tmpdir() }),
-    /connection is closed/,
-  )
+  const home = await mkdtemp(join(tmpdir(), 'agy-provider-closed-'))
+  try {
+    const provider = await createProvider(
+      new AgyUsageSource({ env: isolatedEnv(home) }),
+    ).connect({
+      versions: [1],
+      capabilities: [],
+    })
+    await provider.close()
+    await assert.rejects(
+      provider.send({ type: 'catalog', requestId: 'closed', cwd: home }),
+      /connection is closed/,
+    )
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
 })
 
 test('clearPendingPermissions cancels approval before rejecting a busy prompt', async () => {
@@ -1988,7 +1992,7 @@ test('Full Access without a launch override preserves process.env and missing cw
         {
           command: process.execPath,
           args: [mockPath],
-          env: isolatedEnv(root, { PATH: process.env.PATH ?? '' }),
+          env: isolatedEnv(root),
         },
         cwd,
         env,

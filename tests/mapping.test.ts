@@ -278,6 +278,7 @@ test('model metadata restricts effort variants and hides fixed-effort selectors'
   assert.equal(state.thinkingOption, undefined)
   assert.equal(state.modes.length, 1)
   assert.equal(state.modes[0]?.id, 'full-access')
+  assert.equal(state.modes[0]?.colorTier, 'dangerous')
   assert.equal(state.modes[0]?.isUnattended, true)
 })
 

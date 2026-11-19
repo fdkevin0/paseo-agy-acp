@@ -50,7 +50,6 @@ async function run(
 ) {
   const home = await mkdtemp(join(tmpdir(), 'agy-compat-'))
   const env = isolatedEnv(home, {
-    PATH: process.env.PATH ?? '',
     AGY_COMPAT_SCENARIO: scenario,
   })
   const provider = await createProvider(new AgyUsageSource({ env })).connect({

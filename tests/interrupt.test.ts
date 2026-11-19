@@ -65,10 +65,7 @@ async function connect(
   timeoutMs = 5000,
   extraEnv: Record<string, string> = {},
 ) {
-  const env = isolatedEnv(home, {
-    PATH: process.env.PATH ?? '',
-    ...extraEnv,
-  })
+  const env = isolatedEnv(home, extraEnv)
   const provider = await createProvider(new AgyUsageSource({ env })).connect({
     versions: [1],
     capabilities: PROVIDER_CAPABILITIES,
@@ -998,10 +995,7 @@ async function createSessionManagerHarness(
   },
 ) {
   const home = await mkdtemp(join(tmpdir(), prefix))
-  const env = isolatedEnv(home, {
-    PATH: process.env.PATH ?? '',
-    ...opts?.extraEnv,
-  })
+  const env = isolatedEnv(home, opts?.extraEnv)
   const collector = createEventCollector()
   const manager = new SessionManager({
     launch: {

@@ -16,7 +16,7 @@ import { TranscriptReader } from '../server/brain-io.ts'
 import { watchBrain } from '../server/brain.ts'
 import { BrainTranscriptProjector } from '../server/brain-projector.ts'
 import { normalizeAskQuestionInput } from '../server/questions.ts'
-import { sequenceDouble } from './helpers.ts'
+import { isolatedEnv, sequenceDouble } from './helpers.ts'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -151,13 +151,14 @@ async function harness(
   let promptHandler: PromptHandler | undefined
   let realPrompt!: RpcPrompt
   let lastObservation!: TrackingObservation
+  const env = isolatedEnv(home)
   const manager = new HarnessSessionManager({
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-      env: { HOME: home, PATH: process.env.PATH ?? '' },
+      env,
     },
-    usage: new AgyUsageSource(),
+    usage: new AgyUsageSource({ env }),
     capabilities: ['prompt.message', 'permission'],
     emit: (event) => {
       events.push(structuredClone(event))

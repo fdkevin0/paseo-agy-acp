@@ -126,7 +126,7 @@ async function replay(
     }
     await writeFile(join(dir, 'read.json'), JSON.stringify(read))
   }
-  const env = isolatedEnv(home, { PATH: process.env.PATH ?? '' })
+  const env = isolatedEnv(home)
   const events: ProviderEvent[] = []
   const manager = new SessionManager({
     launch: {
@@ -1080,7 +1080,7 @@ test('null-result history recovery remains intact when the next turn cancels aft
       text('AFTER'),
     ]),
   )
-  const env = isolatedEnv(home, { PATH: process.env.PATH ?? '' })
+  const env = isolatedEnv(home)
   const events: ProviderEvent[] = []
   const manager = new SessionManager({
     launch: {

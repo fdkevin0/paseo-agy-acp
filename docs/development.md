@@ -31,28 +31,29 @@ Paseo compiles the TypeScript plugin; no separate build output is required. Git/
 
 ## Source layout
 
-| File                                                                      | Responsibility                                                                          |
-| ------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `index.server.ts`                                                         | Register the provider and shared usage source.                                          |
-| `server/common.ts`                                                        | Shared primitives (`record`, `cleanToolName`, `setBounded`, `formatErrorMessage`, env). |
-| `server/provider.ts`                                                      | Provider contract, capability negotiation, bounded catalog cache and pending tracking.  |
-| `server/session.ts`                                                       | Session manager, notifications, prompts, woken question continuations and lifecycle.    |
-| `server/subagents.ts`                                                     | Subagent ownership cache, multi-level subsession linking and child Brain watchers.      |
-| `server/questions.ts`                                                     | Normalize `elicitation/create` schemas and `ask_question` calls into `QuestionCard`s.   |
-| `server/permissions.ts`                                                   | Classify permission requests, MCP `toolPolicy` preapprovals and option selection.       |
-| `server/transport.ts`                                                     | ACP stdio process, `elicitation/create` interception, metadata capture and shutdown.    |
-| `server/mapping.ts`                                                       | Timeline state machine, configuration, attachment and context/token usage mapping.      |
-| `server/brain-io.ts`                                                      | Realpath-contained Brain file readers, `O_TRUNC` cursor detection and inbox/subagents.  |
-| `server/brain-projector.ts`                                               | Pure state machine projecting Brain transcript steps and inbox messages into cards.     |
-| `server/brain.ts`                                                         | Turn-settlement polling loop (`settleBrainTurn`) and child transcript watcher.          |
-| `server/preflight.ts`                                                     | Version checks, cache identity, data directory resolution and symlink-safe cleanup.     |
-| `server/usage.ts`                                                         | Account discovery, bounded login-log reads and subscription quota windows.              |
-| `tests/helpers.ts`                                                        | Shared provider event collector and test harness utilities.                             |
-| `tests/mock-acp.ts`, `tests/mock-usage.ts`                                | Offline CLI substitutes.                                                                |
-| `tests/compat-acp.ts`, `tests/interrupt-acp.ts`, `tests/transport-acp.ts` | Native agy behavior models for Brain compatibility, interruption and process shutdown.  |
-| `tests/index.test.ts`, `tests/*.test.ts`                                  | Entry-point, mapping, permissions, lifecycle, Brain, discovery and quota tests.         |
-| `tests/workflows.test.ts`                                                 | Execute release workflow scripts against local command substitutes.                     |
-| `.github/workflows/`                                                      | CI checks (`npm run verify`) and tagged npm/GitHub releases.                            |
+| File                                                                      | Responsibility                                                                                    |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `index.server.ts`                                                         | Register the provider and shared usage source.                                                    |
+| `server/common.ts`                                                        | Shared primitives (`record`, `cleanToolName`, `setBounded`, `formatErrorMessage`, env).           |
+| `server/provider.ts`                                                      | Provider contract, capability negotiation, bounded catalog cache and pending tracking.            |
+| `server/session.ts`                                                       | Session manager, notifications, prompts, woken question continuations and lifecycle.              |
+| `server/subagents.ts`                                                     | Subagent ownership cache, multi-level subsession linking and child Brain watchers.                |
+| `server/questions.ts`                                                     | Normalize `elicitation/create` schemas and `ask_question` calls into `QuestionCard`s.             |
+| `server/permissions.ts`                                                   | Classify permission requests, MCP `toolPolicy` preapprovals and option selection.                 |
+| `server/transport.ts`                                                     | ACP stdio process, `elicitation/create` interception, metadata capture and shutdown.              |
+| `server/mapping.ts`                                                       | Timeline state machine, configuration, attachment and context/token usage mapping.                |
+| `server/brain-io.ts`                                                      | Realpath-contained Brain file readers, `O_TRUNC` cursor detection and inbox/subagents.            |
+| `server/brain-projector.ts`                                               | Pure state machine projecting Brain transcript steps and inbox messages into cards.               |
+| `server/brain.ts`                                                         | Turn-settlement polling loop (`settleBrainTurn`) and child transcript watcher.                    |
+| `server/preflight.ts`                                                     | Version checks, cache identity, data directory resolution and symlink-safe cleanup.               |
+| `server/usage.ts`                                                         | Account discovery, bounded login-log reads and subscription quota windows.                        |
+| `tests/helpers.ts`                                                        | Shared provider event collector and test harness utilities.                                       |
+| `tests/mock-acp.ts`, `tests/mock-usage.ts`                                | Offline CLI substitutes.                                                                          |
+| `tests/compat-acp.ts`, `tests/interrupt-acp.ts`, `tests/transport-acp.ts` | Native agy behavior models for Brain compatibility, interruption and process shutdown.            |
+| `tests/index.test.ts`, `tests/*.test.ts`                                  | Offline Tier 1 (`test:unit`) entry-point, mapping, permissions, lifecycle, Brain and quota tests. |
+| `tests/live/*.test.ts`                                                    | Tier 2 (`test:live`) real local `agy` CLI boundary checks in isolated temp homes.                 |
+| `tests/workflows.test.ts`                                                 | Execute release workflow scripts against local command substitutes.                               |
+| `.github/workflows/`                                                      | CI checks (`npm run verify`) and tagged npm/GitHub releases.                                      |
 
 ## Verification
 
@@ -61,9 +62,10 @@ Paseo compiles the TypeScript plugin; no separate build output is required. Git/
 ```sh
 npm run format
 npm run verify
+npm run test:live
 ```
 
-`npm run verify` runs `npm run format:check`, `npm run check`, `npm test`, and `npm pack --dry-run --ignore-scripts`.
+`npm run verify` runs `npm run format:check`, `npm run check`, `npm test` (`npm run test:unit`, the offline Tier 1 suite), and `npm pack --dry-run --ignore-scripts`. `npm run test:live` runs the Tier 2 suite (`tests/live/*.test.ts`) against the local `agy` CLI in isolated temporary homes.
 
 `tests/compat-acp.ts` models observed native notifications: display titles, omitted tool output and transcript calls without IDs. `tests/interrupt-acp.ts` models background work that outlives ordinary cancellation, so regression tests verify process shutdown and restoration rather than trusting a canceled UI state. `tests/transport-acp.ts` starts a detached command that outlives ACP EOF, so shutdown tests verify process-group cleanup, including hosts without `ps`.
 

@@ -453,6 +453,77 @@ test('failure and cancellation preserve input/output and agree across live/histo
   expectTerminalParity('cancelled', 'CANCELED', 'canceled', null, null)
 })
 
+test('native identities and ACP semantic hints retain dedicated cards', () => {
+  assert.equal(
+    toolDetail({
+      title: 'default_api:Run_Command',
+      rawInput: { CommandLine: 'echo example' },
+    }).type,
+    'shell',
+  )
+  assert.equal(
+    toolDetail({ title: 'read_file', rawInput: { Path: '/example' } }).type,
+    'read',
+  )
+  assert.equal(
+    toolDetail({
+      title: 'write_file',
+      rawInput: { Path: '/example', Content: 'data' },
+    }).type,
+    'write',
+  )
+  assert.equal(
+    toolDetail({
+      title: 'edit_file',
+      rawInput: { Path: '/example', Target: 'before', Replacement: 'after' },
+    }).type,
+    'edit',
+  )
+  assert.equal(
+    toolDetail({ title: 'grep_search', rawInput: { Query: 'example' } }).type,
+    'search',
+  )
+  assert.equal(
+    toolDetail({
+      title: 'read_url_content',
+      rawInput: { Url: 'https://example.com' },
+    }).type,
+    'fetch',
+  )
+  assert.equal(
+    toolDetail({ title: 'invoke_subagent', rawInput: { Prompt: 'example' } })
+      .type,
+    'sub_agent',
+  )
+  assert.equal(
+    toolDetail({
+      title: 'Run invoke_subagent',
+      rawInput: { Prompt: 'example' },
+    }).type,
+    'sub_agent',
+  )
+  assert.equal(
+    toolDetail({ title: 'Run send_message', rawInput: { Message: 'example' } })
+      .type,
+    'sub_agent',
+  )
+  assert.equal(
+    toolDetail({
+      title: 'ask_question',
+      rawInput: { questions: [{ question: 'Example?', options: ['A', 'B'] }] },
+    }).type,
+    'plain_text',
+  )
+  assert.equal(
+    toolDetail({
+      title: 'Command example',
+      kind: 'execute',
+      rawInput: { command: 'echo example' },
+    }).type,
+    'shell',
+  )
+})
+
 test('completion content replaces an earlier running null placeholder without losing input', () => {
   const timeline = new Timeline('session-example')
   const start = timeline.update({

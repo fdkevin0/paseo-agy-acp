@@ -26,6 +26,7 @@ import { AgyUsageSource } from '../server/usage.ts'
 import {
   collectProviderEvents,
   createEventCollector,
+  isolatedEnv,
   sequenceDouble,
   waitUntil,
   writeBrainTranscript,
@@ -129,13 +130,9 @@ test(
       launch: {
         command: process.execPath,
         args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-        env: {
-          HOME: home,
-          PATH: process.env.PATH ?? '',
-          AGY_TEST_PID_FILE: pidFile,
-        },
+        env: isolatedEnv(home, { AGY_TEST_PID_FILE: pidFile }),
       },
-      usage: new AgyUsageSource(),
+      usage: new AgyUsageSource({ env: isolatedEnv(home) }),
       capabilities: ['prompt.message'],
       emit: collector.emit,
     })
@@ -202,9 +199,9 @@ test(
       launch: {
         command: process.execPath,
         args: [fileURLToPath(new URL('./interrupt-acp.ts', import.meta.url))],
-        env: { HOME: home, PATH: process.env.PATH ?? '' },
+        env: isolatedEnv(home),
       },
-      usage: new AgyUsageSource(),
+      usage: new AgyUsageSource({ env: isolatedEnv(home) }),
       capabilities: ['prompt.message', 'permission', 'session.configure'],
       emit: collector.emit,
       stallTimeoutMs: 30,
@@ -382,13 +379,9 @@ async function assertRefreshBoundaryStripsNativeId(
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-      env: {
-        HOME: home,
-        PATH: process.env.PATH ?? '',
-        AGY_TEST_PID_FILE: pidFile,
-      },
+      env: isolatedEnv(home, { AGY_TEST_PID_FILE: pidFile }),
     },
-    usage: new AgyUsageSource(),
+    usage: new AgyUsageSource({ env: isolatedEnv(home) }),
     capabilities: ['prompt.message', 'session.subsession'],
     emit: collector.emit,
     readSubagents: () => reads.shift()!(),
@@ -532,9 +525,9 @@ test(
       launch: {
         command: process.execPath,
         args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-        env: { HOME: home, PATH: process.env.PATH ?? '' },
+        env: isolatedEnv(home),
       },
-      usage: new AgyUsageSource(),
+      usage: new AgyUsageSource({ env: isolatedEnv(home) }),
       capabilities: ['prompt.message', 'permission'],
       emit: collector.emit,
     })
@@ -615,9 +608,9 @@ test(
       launch: {
         command: process.execPath,
         args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-        env: { HOME: home, PATH: process.env.PATH ?? '' },
+        env: isolatedEnv(home),
       },
-      usage: new AgyUsageSource(),
+      usage: new AgyUsageSource({ env: isolatedEnv(home) }),
       capabilities: ['prompt.message'],
       emit: collector.emit,
     })
@@ -832,9 +825,9 @@ test('ownership read failures do not poison subsequent ACP notifications', async
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-      env: { HOME: home, PATH: process.env.PATH ?? '' },
+      env: isolatedEnv(home),
     },
-    usage: new AgyUsageSource(),
+    usage: new AgyUsageSource({ env: isolatedEnv(home) }),
     capabilities: ['prompt.message', 'session.subsession'],
     emit: (e) => events.push(structuredClone(e)),
   })
@@ -914,13 +907,9 @@ test('history:skip coalesces restored context usage before ready', async () => {
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-      env: {
-        HOME: home,
-        PATH: process.env.PATH ?? '',
-        AGY_TEST_LOAD_USAGE: '1',
-      },
+      env: isolatedEnv(home, { AGY_TEST_LOAD_USAGE: '1' }),
     },
-    usage: new AgyUsageSource(),
+    usage: new AgyUsageSource({ env: isolatedEnv(home) }),
     capabilities: [],
     emit: (e) => events.push(structuredClone(e)),
   })
@@ -1005,13 +994,9 @@ agent()
     launch: {
       command: process.execPath,
       args: [fixture],
-      env: {
-        HOME: home,
-        PATH: process.env.PATH ?? '',
-        AGY_TEST_LOG: log,
-      },
+      env: isolatedEnv(home, { AGY_TEST_LOG: log }),
     },
-    usage: new AgyUsageSource(),
+    usage: new AgyUsageSource({ env: isolatedEnv(home) }),
     capabilities: ['session.configure'],
     emit: (e) => events.push(structuredClone(e)),
   })
@@ -1175,13 +1160,9 @@ agent()
     launch: {
       command: process.execPath,
       args: [fixture],
-      env: {
-        HOME: home,
-        PATH: process.env.PATH ?? '',
-        AGY_TEST_LOG: log,
-      },
+      env: isolatedEnv(home, { AGY_TEST_LOG: log }),
     },
-    usage: new AgyUsageSource(),
+    usage: new AgyUsageSource({ env: isolatedEnv(home) }),
     capabilities: ['session.configure'],
     emit: (e) => events.push(structuredClone(e)),
   })
@@ -1245,9 +1226,9 @@ test(
       launch: {
         command: process.execPath,
         args: [fileURLToPath(new URL('./interrupt-acp.ts', import.meta.url))],
-        env: { HOME: home, PATH: process.env.PATH ?? '' },
+        env: isolatedEnv(home),
       },
-      usage: new AgyUsageSource(),
+      usage: new AgyUsageSource({ env: isolatedEnv(home) }),
       capabilities: ['prompt.message'],
       emit: (event) => events.push(event),
       stallTimeoutMs: 30,
@@ -1324,9 +1305,9 @@ test(
       launch: {
         command: process.execPath,
         args: [fileURLToPath(new URL('./interrupt-acp.ts', import.meta.url))],
-        env: { HOME: home, PATH: process.env.PATH ?? '' },
+        env: isolatedEnv(home),
       },
-      usage: new AgyUsageSource(),
+      usage: new AgyUsageSource({ env: isolatedEnv(home) }),
       capabilities: ['prompt.message'],
       emit: (event) => events.push(event),
       stallTimeoutMs: 10,
@@ -1435,9 +1416,9 @@ test('context uses latest turn snapshot on cancel/error/restore and preserves na
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-      env: { HOME: home, PATH: process.env.PATH ?? '' },
+      env: isolatedEnv(home),
     },
-    usage: new AgyUsageSource(),
+    usage: new AgyUsageSource({ env: isolatedEnv(home) }),
     capabilities: ['prompt.message'],
     emit: (e) => events.push(structuredClone(e)),
   })
@@ -1577,9 +1558,9 @@ test(
       launch: {
         command: process.execPath,
         args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-        env: { HOME: home, PATH: process.env.PATH ?? '' },
+        env: isolatedEnv(home),
       },
-      usage: new AgyUsageSource(),
+      usage: new AgyUsageSource({ env: isolatedEnv(home) }),
       capabilities: ['prompt.message'],
       emit: (e) => events.push(structuredClone(e)),
     })
@@ -1751,13 +1732,9 @@ test('native compaction has stable live/history identity, command-only visibilit
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-      env: {
-        HOME: home,
-        PATH: process.env.PATH ?? '',
-        AGY_TEST_CHECKPOINT_HISTORY: '1',
-      },
+      env: isolatedEnv(home, { AGY_TEST_CHECKPOINT_HISTORY: '1' }),
     },
-    usage: new AgyUsageSource(),
+    usage: new AgyUsageSource({ env: isolatedEnv(home) }),
     capabilities: ['prompt.message', 'prompt.command'],
     emit: (event) => events.push(structuredClone(event)),
   })
@@ -2010,17 +1987,15 @@ agent()
   .connect(stream)
 `,
     )
-    const provider = await createProvider(new AgyUsageSource()).connect({
+    const provider = await createProvider(
+      new AgyUsageSource({ env: isolatedEnv(home) }),
+    ).connect({
       versions: [1],
       capabilities: PROVIDER_CAPABILITIES,
       launch: {
         command: process.execPath,
         args: [fixturePath],
-        env: {
-          HOME: home,
-          PATH: process.env.PATH ?? '',
-          AGY_TEST_LOG: logPath,
-        },
+        env: isolatedEnv(home, { AGY_TEST_LOG: logPath }),
       },
     })
     const { events, wait } = collectProviderEvents(provider)
@@ -2295,14 +2270,12 @@ async function childSession(
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-      env: {
-        HOME: home,
-        PATH: process.env.PATH ?? '',
+      env: isolatedEnv(home, {
         AGY_TEST_LOG: logPath,
         AGY_TEST_LOG_LOAD: '1',
-      },
+      }),
     },
-    usage: new AgyUsageSource(),
+    usage: new AgyUsageSource({ env: isolatedEnv(home) }),
     capabilities: ['prompt.message', 'session.subsession'],
     retryTimeoutMs,
     connectAcp: wrapConnectAcp(() => promptHandler),
@@ -2957,9 +2930,9 @@ async function usageHarness(t: TestContext) {
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-      env: { HOME: home, PATH: process.env.PATH ?? '' },
+      env: isolatedEnv(home),
     },
-    usage: new AgyUsageSource(),
+    usage: new AgyUsageSource({ env: isolatedEnv(home) }),
     capabilities: ['prompt.message', 'prompt.command', 'session.configure'],
     emit: (e) => events.push(structuredClone(e)),
     connectAcp: wrapConnectAcp(
@@ -3401,9 +3374,9 @@ test('post-waitPrompt settle failure still publishes positive result.usage and c
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-      env: { HOME: home, PATH: process.env.PATH ?? '' },
+      env: isolatedEnv(home),
     },
-    usage: new AgyUsageSource(),
+    usage: new AgyUsageSource({ env: isolatedEnv(home) }),
     capabilities: ['prompt.message'],
     emit: (e) => events.push(structuredClone(e)),
   })
@@ -3482,9 +3455,9 @@ async function continuationHarness(t: TestContext, prefix: string) {
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-      env: { HOME: home, PATH: process.env.PATH ?? '' },
+      env: isolatedEnv(home),
     },
-    usage: new AgyUsageSource(),
+    usage: new AgyUsageSource({ env: isolatedEnv(home) }),
     capabilities: ['prompt.message', 'permission'],
     emit: collector.emit,
     connectAcp: wrapConnectAcp(

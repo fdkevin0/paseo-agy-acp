@@ -26,7 +26,7 @@ import {
 import { TranscriptReader } from '../server/brain-io.ts'
 import { settleBrainTurn } from '../server/brain.ts'
 import { BrainTranscriptProjector } from '../server/brain-projector.ts'
-import { createEventCollector, sequenceDouble } from './helpers.ts'
+import { createEventCollector, isolatedEnv, sequenceDouble } from './helpers.ts'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -157,13 +157,14 @@ async function harness(
   const collector = createEventCollector()
   const events = collector.events
   let promptHandler: PromptHandler | undefined
+  const env = isolatedEnv(home)
   const manager = new HarnessSessionManager({
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-      env: { HOME: home, PATH: process.env.PATH ?? '' },
+      env,
     },
-    usage: new AgyUsageSource(),
+    usage: new AgyUsageSource({ env }),
     capabilities: ['prompt.message', 'permission'],
     emit: collector.emit,
     observationPollIntervalMs: options?.observationPollIntervalMs,
