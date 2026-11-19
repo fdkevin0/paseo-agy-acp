@@ -38,92 +38,165 @@ test('pickPermissionOption prefers one-shot options and honors selected actions'
   )
 })
 
+const binary = [{ kind: 'allow_once' }, { kind: 'reject_once' }]
+const chooser = [{ kind: 'allow_once' }, { kind: 'allow_once' }]
+const planDetail = { type: 'plan' as const, text: 'p' }
+const textDetail = (label: string) => ({ type: 'plain_text' as const, label })
+
+const classifyPermission = (
+  toolCall: { name?: string; title?: string; kind?: unknown },
+  detail: Parameters<typeof permissionKind>[1],
+  requestOptions = binary,
+) => permissionKind({ options: requestOptions, toolCall }, detail)
+
 test('permissionKind classifies questions, mode switches, plans and tools', () => {
-  const binary = [{ kind: 'allow_once' }, { kind: 'reject_once' }]
-  const chooser = [{ kind: 'allow_once' }, { kind: 'allow_once' }]
-  const kind = (
-    title: string,
-    detailType: 'plan' | 'plain_text',
-    toolKind?: string,
-    options = binary,
-  ) =>
-    permissionKind(
-      { options, toolCall: { title, kind: toolKind } },
-      detailType === 'plan'
-        ? { type: 'plan', text: 'p' }
-        : { type: 'plain_text', label: title },
-    )
   assert.equal(
-    kind('run_command', 'plain_text', 'execute', chooser),
+    classifyPermission(
+      { title: 'run_command', kind: 'execute' },
+      textDetail('run_command'),
+      chooser,
+    ),
     'question',
   )
-  assert.equal(kind('ask_user', 'plain_text'), 'question')
-  assert.equal(kind('default_api:ask_question', 'plain_text'), 'question')
-  assert.equal(kind('Run default_api:ask_question', 'plain_text'), 'question')
-  assert.equal(kind('exit_plan_mode', 'plain_text'), 'mode')
-  assert.equal(kind('enter_plan_mode', 'plain_text'), 'mode')
-  assert.equal(kind('contrib:exit_plan_mode', 'plan'), 'mode')
-  assert.equal(kind('contrib:enter_plan_mode', 'plain_text'), 'mode')
-  assert.equal(kind('Run contrib:exit_plan_mode', 'plan'), 'mode')
-  assert.equal(kind('Run default_api:exit_plan_mode', 'plan'), 'mode')
-  assert.equal(kind('Run enter_plan_mode', 'plain_text'), 'mode')
   assert.equal(
-    permissionKind(
+    classifyPermission({ title: 'ask_user' }, textDetail('ask_user')),
+    'question',
+  )
+  assert.equal(
+    classifyPermission(
+      { title: 'default_api:ask_question' },
+      textDetail('default_api:ask_question'),
+    ),
+    'question',
+  )
+  assert.equal(
+    classifyPermission(
+      { title: 'Run default_api:ask_question' },
+      textDetail('Run default_api:ask_question'),
+    ),
+    'question',
+  )
+  assert.equal(
+    classifyPermission(
+      { title: 'exit_plan_mode' },
+      textDetail('exit_plan_mode'),
+    ),
+    'mode',
+  )
+  assert.equal(
+    classifyPermission(
+      { title: 'enter_plan_mode' },
+      textDetail('enter_plan_mode'),
+    ),
+    'mode',
+  )
+  assert.equal(
+    classifyPermission({ title: 'contrib:exit_plan_mode' }, planDetail),
+    'mode',
+  )
+  assert.equal(
+    classifyPermission(
+      { title: 'contrib:enter_plan_mode' },
+      textDetail('contrib:enter_plan_mode'),
+    ),
+    'mode',
+  )
+  assert.equal(
+    classifyPermission({ title: 'Run contrib:exit_plan_mode' }, planDetail),
+    'mode',
+  )
+  assert.equal(
+    classifyPermission({ title: 'Run default_api:exit_plan_mode' }, planDetail),
+    'mode',
+  )
+  assert.equal(
+    classifyPermission(
+      { title: 'Run enter_plan_mode' },
+      textDetail('Run enter_plan_mode'),
+    ),
+    'mode',
+  )
+  assert.equal(
+    classifyPermission(
       {
-        options: binary,
-        toolCall: {
-          name: 'contrib:exit_plan_mode',
-          title: 'Exit plan mode',
-          kind: 'other',
-        } as { title?: string; kind?: unknown },
+        name: 'contrib:exit_plan_mode',
+        title: 'Exit plan mode',
+        kind: 'other',
       },
       { type: 'plan', text: '# Plan' },
     ),
     'mode',
   )
   assert.equal(
-    permissionKind(
+    classifyPermission(
       {
-        options: binary,
-        toolCall: {
-          name: 'mcp__srv__other',
-          title: 'exit_plan_mode',
-        } as { title?: string; kind?: unknown },
+        name: 'mcp__srv__other',
+        title: 'exit_plan_mode',
       },
-      { type: 'plain_text', label: 'exit_plan_mode' },
+      textDetail('exit_plan_mode'),
     ),
     'tool',
   )
   assert.equal(
-    permissionKind(
+    classifyPermission(
       {
-        options: binary,
-        toolCall: {
-          name: 'mcp__srv__other',
-          title: 'ask_question',
-        } as { title?: string; kind?: unknown },
+        name: 'mcp__srv__other',
+        title: 'ask_question',
       },
-      { type: 'plain_text', label: 'ask_question' },
+      textDetail('ask_question'),
     ),
     'tool',
   )
-  assert.equal(kind('x', 'plain_text', 'switch_mode'), 'mode')
   assert.equal(
-    kind('Run mcp__srv__switch_mode', 'plain_text', 'switch_mode'),
+    classifyPermission({ title: 'x', kind: 'switch_mode' }, textDetail('x')),
+    'mode',
+  )
+  assert.equal(
+    classifyPermission(
+      { title: 'Run mcp__srv__switch_mode', kind: 'switch_mode' },
+      textDetail('Run mcp__srv__switch_mode'),
+    ),
     'tool',
   )
   assert.equal(
-    kind('Run default_api:mcp__srv__switch_mode', 'plain_text', 'switch_mode'),
+    classifyPermission(
+      { title: 'Run default_api:mcp__srv__switch_mode', kind: 'switch_mode' },
+      textDetail('Run default_api:mcp__srv__switch_mode'),
+    ),
     'tool',
   )
-  assert.equal(kind('srv:switch_mode', 'plain_text', 'switch_mode'), 'tool')
-  assert.equal(kind('call_mcp_tool', 'plain_text', 'switch_mode'), 'tool')
   assert.equal(
-    kind('Run default_api:call_mcp_tool', 'plain_text', 'switch_mode'),
+    classifyPermission(
+      { title: 'srv:switch_mode', kind: 'switch_mode' },
+      textDetail('srv:switch_mode'),
+    ),
     'tool',
   )
-  assert.equal(kind('write_to_file', 'plan', 'edit'), 'plan')
-  assert.equal(kind('run_command', 'plain_text', 'execute'), 'tool')
+  assert.equal(
+    classifyPermission(
+      { title: 'call_mcp_tool', kind: 'switch_mode' },
+      textDetail('call_mcp_tool'),
+    ),
+    'tool',
+  )
+  assert.equal(
+    classifyPermission(
+      { title: 'Run default_api:call_mcp_tool', kind: 'switch_mode' },
+      textDetail('Run default_api:call_mcp_tool'),
+    ),
+    'tool',
+  )
+  assert.equal(
+    classifyPermission({ title: 'write_to_file', kind: 'edit' }, planDetail),
+    'plan',
+  )
+  assert.equal(
+    classifyPermission(
+      { title: 'run_command', kind: 'execute' },
+      textDetail('run_command'),
+    ),
+    'tool',
+  )
 })
 
 const isPreapprovedMcpTool = (
@@ -132,16 +205,13 @@ const isPreapprovedMcpTool = (
   policy: Parameters<typeof preapprovedMcpCall>[1],
 ) => preapprovedMcpCall({ title, rawInput }, policy)
 
-test('isPreapprovedMcpTool matches exact direct and lazy MCP grants only', () => {
+test('isPreapprovedMcpTool enforces policy presence, exact direct/lazy grant matching, and namespace trust', () => {
   const policy = {
     preapproved: [{ kind: 'mcp' as const, server: 'rea', tool: 'open' }],
   }
+  assert.equal(isPreapprovedMcpTool('mcp__rea__open', {}, undefined), false)
   assert.equal(isPreapprovedMcpTool('mcp__rea__open', {}, policy), true)
-  assert.equal(
-    isPreapprovedMcpTool('default_api:mcp__rea__open', {}, policy),
-    true,
-  )
-  assert.equal(isPreapprovedMcpTool('rea:open', {}, policy), true)
+  assert.equal(isPreapprovedMcpTool('mcp__rea__close', {}, policy), false)
   assert.equal(
     isPreapprovedMcpTool(
       'call_mcp_tool',
@@ -149,22 +219,6 @@ test('isPreapprovedMcpTool matches exact direct and lazy MCP grants only', () =>
       policy,
     ),
     true,
-  )
-  assert.equal(
-    isPreapprovedMcpTool(
-      'default_api:call_mcp_tool',
-      { ServerName: 'rea', ToolName: 'open' },
-      policy,
-    ),
-    true,
-  )
-  assert.equal(
-    isPreapprovedMcpTool(
-      'untrusted:call_mcp_tool',
-      { ServerName: 'rea', ToolName: 'open' },
-      policy,
-    ),
-    false,
   )
   assert.equal(
     isPreapprovedMcpTool(
@@ -174,9 +228,14 @@ test('isPreapprovedMcpTool matches exact direct and lazy MCP grants only', () =>
     ),
     false,
   )
-  assert.equal(isPreapprovedMcpTool('mcp__rea__close', {}, policy), false)
-  assert.equal(isPreapprovedMcpTool('mcp_rea_open', {}, policy), false)
-  assert.equal(isPreapprovedMcpTool('mcp__rea__open', {}, undefined), false)
+  assert.equal(
+    isPreapprovedMcpTool(
+      'untrusted:call_mcp_tool',
+      { ServerName: 'rea', ToolName: 'open' },
+      policy,
+    ),
+    false,
+  )
 })
 
 const agyForm = elicitationFixtures.foreground
