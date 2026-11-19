@@ -21,6 +21,8 @@ import type {
   ProviderTimelineItem,
 } from '@getpaseo/plugin/server/provider'
 import type { NormalizedQuestion } from './questions.ts'
+import type { ToolCall } from '@agentclientprotocol/sdk/unstable'
+import { alignReplayTools } from './history.ts'
 import {
   StepDedupe,
   countRowMessages,
@@ -524,8 +526,16 @@ export function advanceForegroundCursor(
   }
   const current = segments[cursor.index]
   if (current?.type === item.type) {
-    if (current.text.startsWith(item.text, cursor.offset)) {
-      const end = cursor.offset + item.text.length
+    // agy inserts a paragraph break before some assistant chunks.
+    const offset = current.text.startsWith(item.text, cursor.offset)
+      ? cursor.offset
+      : item.type === 'assistant_message' &&
+          current.text.startsWith('\n\n', cursor.offset) &&
+          current.text.startsWith(item.text, cursor.offset + 2)
+        ? cursor.offset + 2
+        : undefined
+    if (offset !== undefined) {
+      const end = offset + item.text.length
       return end === current.text.length
         ? { index: cursor.index + 1, offset: 0 }
         : { index: cursor.index, offset: end }
@@ -675,6 +685,7 @@ export async function settleBrainTurn(
     pollIntervalMs = 200,
     acpToolCallIds = [],
     foregroundAcp = [],
+    liveAcp,
     deniedToolCallIds,
     shouldEmitPreWakeupTool,
     emitForeground = false,
@@ -710,6 +721,12 @@ export async function settleBrainTurn(
     acpToolCallIds?: readonly string[]
     /** Ordered ACP output observed before session/prompt returned, used to detect in-RPC inbox continuations. */
     foregroundAcp?: readonly ForegroundAcpSegment[]
+    /** agy 1.5.10+ delivers and consumes wakeup steps independently of prompt responses. */
+    liveAcp?: {
+      drain: () => Promise<void>
+      toolSnapshot: (id: string) => Readonly<ToolCall> | undefined
+      questionHandled: (questions: readonly NormalizedQuestion[]) => boolean
+    }
     deniedToolCallIds?: ReadonlySet<string>
     shouldEmitPreWakeupTool?: (
       item: Extract<ProviderTimelineItem, { type: 'tool_call' }>,
@@ -835,16 +852,18 @@ export async function settleBrainTurn(
     let carriedWakeupUsage: StepUsage | undefined
     for (const entry of wakeupSteps.values()) {
       wakeupUsage = addStepUsage(wakeupUsage, entry.usage)
-      if (entry.carried && !unanchoredSynthetic)
+      if (!liveAcp && entry.carried && !unanchoredSynthetic)
         carriedWakeupUsage = addStepUsage(carriedWakeupUsage, entry.usage)
     }
-    const pendingReplay = preservedPreContinuationReplay
-      ? fgReconciler.postRpc
-      : seenSyntheticPrompt || unanchoredSynthetic
-        ? !unanchoredSynthetic &&
-          node.wokeUpSinceLastPrompt &&
-          fgReconciler.postRpc
-        : fgReconciler.postRpc
+    const pendingReplay =
+      !liveAcp &&
+      (preservedPreContinuationReplay
+        ? fgReconciler.postRpc
+        : seenSyntheticPrompt || unanchoredSynthetic
+          ? !unanchoredSynthetic &&
+            node.wokeUpSinceLastPrompt &&
+            fgReconciler.postRpc
+          : fgReconciler.postRpc)
     return {
       wokeUp: fgReconciler.postRpc,
       wakeupUsage,
@@ -867,7 +886,8 @@ export async function settleBrainTurn(
       clearCarriedWakeup(true)
     }
     node.markQuestionContinuation(syntheticPrompt)
-    node.projector.bindToolCallIds(acpToolCallIds, boundary.acpIndex)
+    if (!liveAcp)
+      node.projector.bindToolCallIds(acpToolCallIds, boundary.acpIndex)
     fgReconciler.markPostRpcWakeup()
     stream.wokeUp = true
     emitWakeupState()
@@ -906,7 +926,50 @@ export async function settleBrainTurn(
       (info) => info.isDirectory(),
       () => false,
     )
+  const emitLiveTool = (
+    item: ProviderTimelineItem,
+    timestamp?: string,
+    backgroundCompletion = false,
+  ) => {
+    if (item.type !== 'tool_call' || item.status === 'running') return
+    if (deniedToolCallIds?.has(item.callId)) {
+      if (shouldEmitPreWakeupTool?.(item))
+        onItem({ ...item, status: 'canceled', error: null }, timestamp)
+      return
+    }
+    const snapshot = liveAcp?.toolSnapshot(item.callId)
+    if (
+      backgroundCompletion ||
+      !snapshot ||
+      shouldEmitPreWakeupTool?.(item) ||
+      (snapshot.rawOutput == null && snapshot.content == null)
+    )
+      onItem(item, timestamp)
+  }
+  const resolveLiveTools = (rows: readonly Record<string, unknown>[]) => {
+    if (!liveAcp) return
+    const slots = node.projector.observeRows(rows)
+    const snapshots = new Map<string, Readonly<ToolCall>>()
+    for (const id of acpToolCallIds) {
+      const snapshot = liveAcp.toolSnapshot(id)
+      if (snapshot) snapshots.set(id, snapshot)
+    }
+    const { alignedIds, verifiedAcpToolIds } = alignReplayTools(
+      [],
+      inbox.stepCallIds,
+      subagents,
+      acpToolCallIds,
+      snapshots,
+      slots,
+    )
+    node.projector.bindLiveToolCallIds(alignedIds, verifiedAcpToolIds)
+    const resolved = node.projector.resolveToolIdentities(true)
+    if (resolved.length) foldVersion++
+    for (const item of resolved) emitLiveTool(item)
+  }
   const consume = async (read: BrainRead) => {
+    if (!stream.acceptsRows() || signal?.aborted) return
+    if (liveAcp) await liveAcp.drain()
     if (!stream.acceptsRows() || signal?.aborted) return
     const metadata = await node.pollMetadata(root)
     if (!stream.acceptsRows() || signal?.aborted) return
@@ -942,12 +1005,17 @@ export async function settleBrainTurn(
       fgReconciler.reset()
       appliedHistoricalMessages = 0
     }
-    if (!initial) node.projector.observeRows(rows)
-    const identities = node.projector.resolveToolIdentities(
-      isRpcActive?.() === true,
-    )
-    if (identities.length) foldVersion++
-    for (const item of identities) onItem(item)
+    if (!initial) {
+      if (liveAcp) resolveLiveTools(rows)
+      else {
+        node.projector.observeRows(rows)
+        const identities = node.projector.resolveToolIdentities(
+          isRpcActive?.() === true,
+        )
+        if (identities.length) foldVersion++
+        for (const item of identities) onItem(item)
+      }
+    }
     const historicalDelta =
       stream.historicalMessages - appliedHistoricalMessages
     node.consumedMessages += historicalDelta
@@ -977,9 +1045,12 @@ export async function settleBrainTurn(
         node.consumedMessages += countRowMessages(row, false)
       slice = preamble.slice(start)
       preamble = []
-      node.projector.observeRows(slice)
-      node.projector.bindToolCallIds(acpToolCallIds)
-      node.projector.resolveToolIdentities(isRpcActive?.() === true)
+      if (liveAcp) resolveLiveTools(slice)
+      else {
+        node.projector.observeRows(slice)
+        node.projector.bindToolCallIds(acpToolCallIds)
+        node.projector.resolveToolIdentities(isRpcActive?.() === true)
+      }
     }
     if (slice.length > 0) node.initialReadDone = true
     for (const row of slice) {
@@ -1034,6 +1105,15 @@ export async function settleBrainTurn(
         for (const item of items) {
           if (item.type === 'user_message' || item.type === 'compaction')
             continue
+          if (liveAcp && item.type === 'tool_call') {
+            emitLiveTool(item, timestamp, row.type === 'SYSTEM_MESSAGE')
+            continue
+          }
+          if (
+            liveAcp &&
+            (item.type === 'assistant_message' || item.type === 'reasoning')
+          )
+            continue
           if (
             postRpcStep ||
             emitForeground ||
@@ -1075,8 +1155,9 @@ export async function settleBrainTurn(
         await stream.wait(revision, signal)
         continue
       }
-      for (const item of node.projector.resolveToolIdentities(false))
-        onItem(item)
+      if (!liveAcp)
+        for (const item of node.projector.resolveToolIdentities(false))
+          onItem(item)
       for (const [key, event] of settledQuestions) {
         if (!deliveredQuestions.has(key)) {
           onQuestionSettled?.(event.questions, event.wokeUp)
@@ -1103,13 +1184,25 @@ export async function settleBrainTurn(
           ...finish('failed', failure),
           ...(node.retryPending() ? { stalled: true } : {}),
         }
-      node.settleAbortedDenial(deniedToolCallIds)
+      node.settleAbortedDenial(deniedToolCallIds, liveAcp !== undefined)
       let continuedQuestion = false
       // A question at the head of the pending queue blocks agy until it is answered.
       // Without a handler (direct callers and tests) it is closed as already handled.
       while (true) {
-        const question = node.projector.consumePendingQuestion()
+        const nativeQuestion =
+          liveAcp && fgReconciler.postRpc ? liveAcp : undefined
+        const question = node.projector.consumePendingQuestion(
+          nativeQuestion?.questionHandled,
+        )
         if (!question) break
+        if (nativeQuestion && onQuestion) {
+          const outcome = await onQuestion({ ...question, wokeUp: true })
+          if (signal?.aborted || outcome.status === 'canceled')
+            return finish('canceled')
+          node.markQuestionContinuation()
+          lastActivity = Date.now()
+          continue
+        }
         let beganContinuation = false
         const previous = questionAnswers.get(question.tool.callId)
         const outcome: QuestionOutcome = previous
@@ -1208,7 +1301,24 @@ export async function settleBrainTurn(
           ...finish('failed', childStatus.error),
           ...(childStatus.stalled ? { stalled: true } : {}),
         }
-      if (childStatus.settled && node.isSettled(inbox)) {
+      if (
+        childStatus.settled &&
+        node.isSettled(inbox) &&
+        !(
+          liveAcp &&
+          (node.projector.hasPendingQuestion() || isWaitingOnUser?.())
+        )
+      ) {
+        if (liveAcp) {
+          await liveAcp.drain()
+          if (
+            signal?.aborted ||
+            checkedVersion !== foldVersion ||
+            isWaitingOnUser?.()
+          )
+            continue
+          resolveLiveTools([])
+        }
         if (activeChildIds.length > 0) {
           const latestInbox = adjustInboxForEpoch(
             await readInboxState(root, nativeId),

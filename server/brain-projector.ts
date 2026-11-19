@@ -34,6 +34,7 @@ export type NativeToolIdentitySource = 'tool_id' | 'step_metadata' | 'acp_input'
 export type ObservedToolSlot = {
   slot: number
   stepIndex: number
+  name: string
   args: unknown
   toolId?: string
   isQuestion: boolean
@@ -152,6 +153,7 @@ export class BrainTranscriptProjector {
   private retired: PendingTool[] = []
   private acpToolCallIds: readonly (string | undefined)[] = []
   private verifiedAcpToolIds?: ReadonlySet<string>
+  private liveToolAlignment = false
   private lastErrorCallId?: string
   private sessionId: string
   private onQuestionSettledByGeneric?: (
@@ -200,6 +202,15 @@ export class BrainTranscriptProjector {
     this.verifiedAcpToolIds = verifiedAcpToolIds
   }
 
+  bindLiveToolCallIds(
+    ids: readonly (string | undefined)[],
+    verified: ReadonlySet<string>,
+  ) {
+    this.liveToolAlignment = true
+    this.acpToolCallIds = ids
+    this.verifiedAcpToolIds = verified
+  }
+
   /**
    * Pre-scan transcript rows so tool slots know their checkpoint-shifted GENERIC step indexes before projection.
    * Invariant: every row passed here must also be passed to `project()` (in order, exactly once), because
@@ -242,6 +253,7 @@ export class BrainTranscriptProjector {
               const slot: ObservedToolSlot = {
                 slot: this.observedSlots.length,
                 stepIndex: stepIndex + index + 1,
+                name: cleanName,
                 args: tool.args,
                 toolId:
                   typeof tool.id === 'string' && tool.id ? tool.id : undefined,
@@ -275,14 +287,23 @@ export class BrainTranscriptProjector {
   }
 
   hasPending(): boolean {
-    return this.retired.length > 0 || this.pending.some((p) => !p.isQuestion)
+    return (
+      (!this.liveToolAlignment && this.retired.length > 0) ||
+      this.pending.some((p) => !p.isQuestion)
+    )
   }
 
   hasDeniedOutcome(
     denied: ReadonlySet<string>,
     lastStep?: Record<string, unknown>,
+    requireNoOtherPending = false,
   ): boolean {
     if (denied.size === 0) return false
+    if (
+      requireNoOtherPending &&
+      this.pending.some((p) => !denied.has(p.callId))
+    )
+      return false
     if (this.pending.some((p) => denied.has(p.callId))) return true
     return (
       lastStep?.type === 'GENERIC' &&
@@ -311,9 +332,12 @@ export class BrainTranscriptProjector {
     )
   }
 
-  consumePendingQuestion() {
+  consumePendingQuestion(
+    accept?: (questions: readonly NormalizedQuestion[]) => boolean,
+  ) {
     const next = this.pending.find((p) => !p.questionConsumed)
     if (!next?.isQuestion) return undefined
+    if (accept && !accept(next.questions ?? [])) return undefined
     next.questionConsumed = true
     return { tool: next, questions: next.questions ?? [] }
   }
@@ -742,7 +766,9 @@ export class BrainTranscriptProjector {
             const args = record(tool.args)
             const genericStep = stepIndex + index + 1
             const slotIndex = this.slotIndex++
-            const acpIndex = this.toolIndex++
+            const acpIndex = this.liveToolAlignment
+              ? slotIndex
+              : this.toolIndex++
             const acpId = this.verifiedAcpId(acpIndex)
             const toolId =
               typeof tool.id === 'string' && tool.id ? tool.id : undefined
@@ -946,11 +972,15 @@ export class BrainNode {
     this.answeredQuestionStep = -1
   }
 
-  settleAbortedDenial(denied?: ReadonlySet<string>) {
+  settleAbortedDenial(denied?: ReadonlySet<string>, allowWoken = false) {
     if (
-      this.promptPhase !== 'woken' &&
+      (allowWoken || this.promptPhase !== 'woken') &&
       denied &&
-      this.projector.hasDeniedOutcome(denied, this.lastStep)
+      this.projector.hasDeniedOutcome(
+        denied,
+        this.lastStep,
+        this.promptPhase === 'woken',
+      )
     ) {
       this.projector.clearPending()
       this.abortedByDenial = true

@@ -136,6 +136,7 @@ function wrapConnectAcp(
 async function harness(
   t: TestContext,
   options?: {
+    agyVersion?: string
     hasActiveBackgroundWork?: ConstructorParameters<
       typeof SessionManager
     >[0]['hasActiveBackgroundWork']
@@ -156,7 +157,9 @@ async function harness(
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-      env,
+      env: options?.agyVersion
+        ? { ...env, AGY_TEST_VERSION: options.agyVersion }
+        : env,
     },
     usage: new AgyUsageSource({ env }),
     capabilities: ['prompt.message', 'permission'],
@@ -773,6 +776,246 @@ test(
       130000,
       'step26 is counted once across replay',
     )
+  },
+)
+
+// Issue #52: the same wakeup can arrive on stdio and in the transcript.
+test(
+  'live wakeup keeps one timeline, aligns tools past an unstreamed slot and bills the wakeup',
+  { timeout: 5000 },
+  async (t) => {
+    const h = await harness(t, { agyVersion: '1.5.12' })
+    const held = await h.hold()
+    const stream = (text: string) =>
+      h.nativePrompt({
+        sessionId: h.session.state.nativeId,
+        prompt: [{ type: 'text', text }],
+      })
+    const items = () =>
+      h.events.flatMap((event) =>
+        event.type === 'timeline.item' ? [event.item] : [],
+      )
+    await h.write([
+      user(1),
+      {
+        ...model(2, 20, 'Waiting'),
+        tool_calls: [{ id: 'background', name: 'run_command', args: {} }],
+      },
+      {
+        step_index: 3,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: 'Tool is running as a background task with task id: tracked',
+      },
+    ])
+    held.done.resolve({
+      stopReason: 'end_turn',
+      usage: { inputTokens: 20, outputTokens: 1, totalTokens: 21 },
+    })
+    await held.observation.attached.promise
+    await h.append([
+      {
+        step_index: 4,
+        type: 'SYSTEM_MESSAGE',
+        content:
+          '<SYSTEM_MESSAGE>\n[Message] sender=tracked priority=MESSAGE_PRIORITY_HIGH content=Task id "tracked" finished with result:\nok\n</SYSTEM_MESSAGE>',
+      },
+      {
+        ...model(5, 30, ''),
+        thinking: 'Checking files',
+        tool_calls: ['invalid.txt', 'first.txt', 'second.txt'].map((Path) => ({
+          name: 'default_api:read_file',
+          args: { Path },
+        })),
+      },
+    ])
+    await h.read()
+    assert.equal(items().filter((item) => item.type === 'reasoning').length, 0)
+    const streamingTools = stream('stream-wakeup-tools')
+    await h.wait(() => h.permissions().length > 0)
+    const [request] = h.permissions()
+    assert.equal(request.request.kind, 'tool')
+    await h.manager.handle({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: request.request.id,
+      response: { behavior: 'deny', selectedActionId: 'reject' },
+    })
+    await streamingTools
+    await h.session.drain()
+    assert.equal(items().filter((item) => item.type === 'reasoning').length, 1)
+    await h.append([
+      { step_index: 6, type: 'GENERIC', status: 'INVALID' },
+      { step_index: 7, type: 'GENERIC', status: 'ERROR', content: 'denied' },
+      {
+        step_index: 8,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'second result',
+      },
+    ])
+    await h.read()
+    await stream('stream-wakeup-reply')
+    await h.session.drain()
+    await h.append([model(9, 40, 'Wakeup finished.')])
+    await held.running
+    assert.deepEqual(h.turns(), ['completed'])
+    assert.deepEqual(
+      items()
+        .filter((item) => item.type === 'reasoning')
+        .map((item) => item.text),
+      ['Checking files'],
+    )
+    const replies = items().filter((item) => item.type === 'assistant_message')
+    assert.equal(new Set(replies.map((item) => item.id)).size, 1)
+    assert.equal(replies.at(-1)?.text, '\n\nWakeup finished.')
+    const tools = h.toolCalls()
+    assert.deepEqual([...new Set(tools.map((item) => item.callId))].sort(), [
+      'background',
+      'call_first.txt',
+      'call_second.txt',
+    ])
+    assert.equal(
+      tools.findLast((item) => item.callId === 'call_first.txt')?.status,
+      'canceled',
+    )
+    assert.ok(
+      !tools.some(
+        (item) => item.callId === 'call_first.txt' && item.status === 'failed',
+      ),
+    )
+    const second = tools.findLast((item) => item.callId === 'call_second.txt')
+    assert.equal(second?.status, 'completed')
+    assert.match(JSON.stringify(second?.detail), /second result/)
+    assert.equal(h.latest().inputTokens, 90)
+    assert.equal(h.latest().contextWindowUsedTokens, 41)
+    assert.equal(h.session.state.wakeup.pendingReplay, false)
+    await h.prompt('stream-wakeup-next')
+    assert.deepEqual(h.turns(), ['completed', 'completed'])
+    assert.equal(h.latest().inputTokens, 100)
+    assert.equal(h.latest().outputTokens, 5)
+    assert.ok(
+      items().some(
+        (item) =>
+          item.type === 'assistant_message' && item.text === 'New turn.',
+      ),
+    )
+  },
+)
+
+async function liveWakeupQuestion(t: TestContext) {
+  const h = await harness(t, {
+    agyVersion: '1.5.10',
+    hasActiveBackgroundWork: async () => false,
+  })
+  const held = await h.hold()
+  await h.write([
+    user(1),
+    model(2, 20, 'Waiting'),
+    {
+      step_index: 3,
+      type: 'SYSTEM_MESSAGE',
+      content:
+        '[Message] sender=worker priority=MESSAGE_PRIORITY_HIGH content=ready',
+    },
+    {
+      ...model(4, 30, ''),
+      tool_calls: [
+        {
+          name: 'ask_question',
+          args: {
+            questions: [{ question: 'Choose a file', options: ['one', 'two'] }],
+          },
+        },
+      ],
+    },
+  ])
+  held.done.resolve({ stopReason: 'end_turn' })
+  await held.observation.attached.promise
+  await h.read()
+  assert.equal(h.permissions().length, 0)
+  assert.deepEqual(h.turns(), [])
+  const native = h.nativePrompt({
+    sessionId: h.session.state.nativeId,
+    prompt: [{ type: 'text', text: 'stream-wakeup-question' }],
+  })
+  await h.wait(() => h.permissions().length > 0)
+  const [question] = h.permissions()
+  assert.equal(question.request.kind, 'question')
+  const replies = () =>
+    h.events.flatMap((event) =>
+      event.type === 'timeline.item' && event.item.type === 'assistant_message'
+        ? [event.item.text]
+        : [],
+    )
+  return { h, held, native, permissionId: question.request.id, replies }
+}
+
+test(
+  'live wakeup answer uses the native elicitation without a synthetic prompt',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, held, native, permissionId, replies } =
+      await liveWakeupQuestion(t)
+    await h.manager.handle({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId,
+      response: {
+        behavior: 'allow',
+        updatedInput: { answers: { 'Choose a file': 'one' } },
+      },
+    })
+    await native
+    await h.session.drain()
+    await h.append([
+      { step_index: 5, type: 'GENERIC', status: 'DONE', content: 'one' },
+      model(6, 40, 'Answer: accept'),
+    ])
+    await held.running
+    assert.deepEqual(h.turns(), ['completed'])
+    assert.equal(h.permissions().length, 1)
+    assert.deepEqual(replies(), ['Answer: accept'])
+  },
+)
+
+test(
+  'live wakeup decline cancels the turn without a synthetic prompt',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, held, native, permissionId, replies } =
+      await liveWakeupQuestion(t)
+    await h.manager.handle({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId,
+      response: { behavior: 'deny' },
+    })
+    await native
+    await h.session.drain()
+    await held.running
+    assert.deepEqual(h.turns(), ['canceled'])
+    assert.equal(h.permissions().length, 1)
+    assert.deepEqual(replies(), [])
+  },
+)
+
+test(
+  'live wakeup interrupt during a native question cancels the turn',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, held, native, replies } = await liveWakeupQuestion(t)
+    await h.manager.handle({
+      type: 'session.interrupt',
+      sessionId: 's',
+      requestId: 'interrupt',
+    })
+    await native
+    await h.session.drain()
+    await held.running
+    assert.deepEqual(h.turns(), ['canceled'])
+    assert.equal(h.permissions().length, 1)
+    assert.deepEqual(replies(), [])
   },
 )
 

@@ -1090,7 +1090,7 @@ test('full-access mode launches with --dangerously-skip-permissions, auto-approv
 
 test('background task wakeup settles before completing turn and deduplicates next-turn replay', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-bg-wakeup-'))
-  const h = await harness({ HOME: home })
+  const h = await harness({ HOME: home, AGY_TEST_VERSION: '1.5.9' })
   try {
     await h.provider.send({
       type: 'session.open',

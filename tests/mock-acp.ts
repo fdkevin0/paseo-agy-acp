@@ -182,6 +182,14 @@ connection = agent()
       log('cap:elicitation.form')
     return {
       protocolVersion: 1,
+      ...(process.env.AGY_TEST_VERSION
+        ? {
+            agentInfo: {
+              name: 'Antigravity ACP Server',
+              version: process.env.AGY_TEST_VERSION,
+            },
+          }
+        : {}),
       agentCapabilities: {
         loadSession: true,
         sessionCapabilities: {
@@ -492,6 +500,121 @@ connection = agent()
           stopReason: 'cancelled' as const,
           usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
         }
+      }
+      if (text === 'stream-wakeup-tools') {
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_thought_chunk',
+            content: { type: 'text', text: 'Checking files' },
+          },
+        })
+        for (const name of ['first.txt', 'second.txt']) {
+          await client.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: `call_${name}`,
+              title: 'Run read_file',
+              status: 'in_progress',
+              rawInput: { Path: name },
+            },
+          })
+        }
+        const permission = await client.requestPermission({
+          sessionId,
+          toolCall: {
+            toolCallId: 'call_first.txt',
+            title: 'Run read_file',
+            rawInput: { Path: 'first.txt' },
+          },
+          options: [
+            { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+            { optionId: 'reject', name: 'Reject', kind: 'reject_once' },
+          ],
+        })
+        if (
+          permission.outcome.outcome === 'selected' &&
+          permission.outcome.optionId === 'reject'
+        ) {
+          await client.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'call_first.txt',
+              status: 'failed',
+            },
+          })
+        }
+        return { stopReason: 'end_turn' }
+      }
+      if (text === 'stream-wakeup-reply') {
+        for (const chunk of ['\n', '\nWakeup ', 'finished.']) {
+          await client.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: chunk },
+            },
+          })
+        }
+        return { stopReason: 'end_turn' }
+      }
+      if (text === 'stream-wakeup-next') {
+        writeSessionTranscript(sessionId, [
+          { step_index: 10, type: 'USER_INPUT', content: text },
+          {
+            step_index: 11,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'New turn.',
+            input_tokens: 100,
+            output_tokens: 5,
+          },
+        ])
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'user_message_chunk',
+            content: { type: 'text', text },
+          },
+        })
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'New turn.' },
+          },
+        })
+        return {
+          stopReason: 'end_turn' as const,
+          usage: { inputTokens: 100, outputTokens: 5, totalTokens: 105 },
+        }
+      }
+      if (text === 'stream-wakeup-question') {
+        const answer = await elicit({
+          sessionId,
+          message: 'Choose a file',
+          requestedSchema: {
+            type: 'object',
+            properties: {
+              q1: {
+                title: 'Choose a file',
+                type: 'string',
+                enum: ['one', 'two'],
+              },
+            },
+          },
+        })
+        if (answer.action !== 'accept') return { stopReason: 'cancelled' }
+        await client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: `Answer: ${answer.action}` },
+          },
+        })
+        return { stopReason: 'end_turn' }
       }
       if (text === 'native-context-then-wakeup') {
         await client.sessionUpdate({

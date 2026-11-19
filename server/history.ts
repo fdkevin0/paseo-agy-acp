@@ -4,7 +4,7 @@ import {
   type NativeToolIdentitySource,
   type ObservedToolSlot,
 } from './brain-projector.ts'
-import { record } from './common.ts'
+import { record, unwrapToolTitle } from './common.ts'
 import { toolDetail } from './mapping.ts'
 import type { ToolCall } from '@agentclientprotocol/sdk/unstable'
 import type { ProviderTimelineItem } from '@getpaseo/plugin/server/provider'
@@ -41,7 +41,10 @@ export function alignReplayTools(
   stepCallIds: ReadonlyMap<number, string>,
   subagents: readonly { spawnStepIndex: number; spawnCallId?: string }[],
   acpToolCallIds: readonly string[],
-  acpToolSnapshots: ReadonlyMap<string, { rawInput?: unknown }>,
+  acpToolSnapshots: ReadonlyMap<
+    string,
+    { rawInput?: unknown; title?: string | null }
+  >,
   slots: readonly ObservedToolSlot[] = new BrainTranscriptProjector(
     '',
   ).observeRows(rows),
@@ -49,9 +52,10 @@ export function alignReplayTools(
   alignedIds: readonly (string | undefined)[]
   verifiedAcpToolIds: ReadonlySet<string>
 } {
-  const claimedIds = new Set<string>(stepCallIds.values())
+  const metadataIds = new Map(stepCallIds)
   for (const sub of subagents)
-    if (sub.spawnCallId) claimedIds.add(sub.spawnCallId)
+    if (sub.spawnCallId) metadataIds.set(sub.spawnStepIndex, sub.spawnCallId)
+  const claimedIds = new Set(metadataIds.values())
   for (const s of slots) if (s.toolId) claimedIds.add(s.toolId)
   let firstStepIndex: number | undefined
   for (const raw of rows) {
@@ -108,12 +112,8 @@ export function alignReplayTools(
       count = N
     }
   }
-  if (count === 0)
-    return {
-      alignedIds: acpToolCallIds,
-      verifiedAcpToolIds: new Set(),
-    }
-  const alignedIds = new Array<string | undefined>(slots.length).fill(undefined)
+  const alignedIds: (string | undefined)[] =
+    count === 0 ? [...acpToolCallIds] : new Array(slots.length).fill(undefined)
   const verifiedAcpToolIds = new Set<string>()
   for (let j = 0; j < count; j++) {
     const s = valid[vOffset + j]
@@ -122,7 +122,74 @@ export function alignReplayTools(
     if (!claimedIds.has(callId) && inputMatches(s.args, callId))
       verifiedAcpToolIds.add(callId)
   }
-  return { alignedIds, verifiedAcpToolIds }
+  if (N === 0 || verifiedAcpToolIds.size === N)
+    return { alignedIds, verifiedAcpToolIds }
+
+  // An omitted call in the middle (for example a native question) breaks a
+  // contiguous window. Recover only same-name, same-input occurrences in order.
+  const acpBySignature = new Map<string, number[]>()
+  const brainBySignature = new Map<string, ObservedToolSlot[]>()
+  const acpIndex = new Map(acpToolCallIds.map((id, index) => [id, index]))
+  const positions = new Map<number, number>()
+  acpToolCallIds.forEach((id, index) => {
+    const snapshot = acpToolSnapshots.get(id)
+    if (claimedIds.has(id) || snapshot?.rawInput == null || !snapshot.title)
+      return
+    const key = JSON.stringify([
+      unwrapToolTitle(snapshot.title),
+      stableJson(snapshot.rawInput),
+    ])
+    const group = acpBySignature.get(key)
+    if (group) group.push(index)
+    else acpBySignature.set(key, [index])
+  })
+  for (const slot of valid) {
+    const id = slot.toolId ?? metadataIds.get(slot.stepIndex)
+    const aligned = alignedIds[slot.slot]
+    const known =
+      id ?? (aligned && verifiedAcpToolIds.has(aligned) ? aligned : undefined)
+    if (known) {
+      const index = acpIndex.get(known)
+      if (index !== undefined) positions.set(slot.slot, index)
+    }
+    if (id || slot.args == null) continue
+    const key = JSON.stringify([slot.name, stableJson(slot.args)])
+    const group = brainBySignature.get(key)
+    if (group) group.push(slot)
+    else brainBySignature.set(key, [slot])
+  }
+  for (const [key, brain] of brainBySignature) {
+    const acp = acpBySignature.get(key)
+    if (acp?.length !== brain.length) continue
+    brain.forEach((slot, index) => {
+      if (!positions.has(slot.slot)) positions.set(slot.slot, acp[index])
+    })
+  }
+  let last = -1
+  for (const slot of valid) {
+    const index = positions.get(slot.slot)
+    if (index === undefined) continue
+    if (index <= last) return { alignedIds, verifiedAcpToolIds }
+    last = index
+  }
+  for (const [slot, index] of positions) {
+    const id = acpToolCallIds[index]
+    if (claimedIds.has(id)) continue
+    // Never leave the same verified ID on a second, unverified ordinal slot.
+    alignedIds[slot] = id
+    verifiedAcpToolIds.add(id)
+  }
+  return {
+    alignedIds: positions.size
+      ? slots.map((slot) => {
+          const id = alignedIds[slot.slot]
+          return id && acpIndex.get(id) === positions.get(slot.slot)
+            ? id
+            : undefined
+        })
+      : alignedIds,
+    verifiedAcpToolIds,
+  }
 }
 
 /** Place checkpoints only in gaps proved by native call IDs or unique complete text. */

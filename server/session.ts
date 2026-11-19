@@ -743,7 +743,10 @@ async function createSession(
       ...(timestamp ? { timestamp } : {}),
     })
   }
-  async function update(notification: SessionNotification) {
+  async function update(
+    notification: SessionNotification,
+    foreground = !state.inSettle,
+  ) {
     if (state.closing || state.failed) return
     if (state.nativeId && notification.sessionId !== state.nativeId) return
     if (state.opening) {
@@ -825,7 +828,7 @@ async function createSession(
         u.sessionUpdate === 'tool_call' &&
         !state.turnToolCallIds.includes(u.toolCallId)
       if (isNewToolCall) state.turnToolCallIds.push(u.toolCallId)
-      if (!state.loading && state.turn && !state.inSettle) {
+      if (!state.loading && state.turn && foreground) {
         if (
           (u.sessionUpdate === 'agent_message_chunk' ||
             u.sessionUpdate === 'agent_thought_chunk') &&
@@ -989,7 +992,10 @@ async function createSession(
   }
   const client = {
     sessionUpdate: (notification: SessionNotification) => {
-      notificationLane = notificationLane.then(() => update(notification))
+      const foreground = !state.inSettle
+      notificationLane = notificationLane.then(() =>
+        update(notification, foreground),
+      )
       return notificationLane
     },
     requestElicitation: async (params: Record<string, unknown>) => {
@@ -1902,6 +1908,7 @@ async function promptSession(
   let observation: BrainTurnObservation | undefined
   let observationTransport = session.transport
   let continuationActive = false
+  let liveWakeups = false
   let pastWaitPrompt = false
   let suppressedForeground = false
   let effectiveUsage: Usage | null | undefined
@@ -1927,15 +1934,17 @@ async function promptSession(
       session.state.wakeup.pendingReplay = false
       session.state.wakeup.carriedUsage = undefined
     } else {
-      session.state.wakeup.pendingReplay = Boolean(
-        settledPendingReplay ||
-        (isError &&
-          turnWokeUp &&
-          !hasWakeupState &&
-          !session.state.closing &&
-          !session.state.failed) ||
-        (replayStillPending && !effectiveUsage && !turnWokeUp),
-      )
+      session.state.wakeup.pendingReplay =
+        !liveWakeups &&
+        Boolean(
+          settledPendingReplay ||
+          (isError &&
+            turnWokeUp &&
+            !hasWakeupState &&
+            !session.state.closing &&
+            !session.state.failed) ||
+          (replayStillPending && !effectiveUsage && !turnWokeUp),
+        )
       session.state.wakeup.carriedUsage = effectiveUsage
         ? nextCarriedWakeup
         : nextCarriedWakeup
@@ -1997,7 +2006,15 @@ async function promptSession(
       | { ok: false; error: unknown }
       | null = null
     const outcome = sendPrompt().then(
-      (value) => (settledOutcome = { ok: true as const, value }),
+      (value) => {
+        if (
+          liveWakeups &&
+          session.state.turnAbort === turnAbort &&
+          session.transport === transport
+        )
+          session.state.inSettle = true
+        return (settledOutcome = { ok: true as const, value })
+      },
       (error) => (settledOutcome = { ok: false as const, error }),
     )
     const promptEntry = {
@@ -2081,6 +2098,18 @@ async function promptSession(
   try {
     await session.waitForRuntimeReady(turnAbort.signal)
     turnAbort.signal.throwIfAborted()
+    const version = session.initialized.agentInfo?.version.match(
+      /^v?(\d+)\.(\d+)\.(\d+)(-|$|\+)/,
+    )
+    if (version) {
+      const [, major, minor, patch, suffix] = version
+      liveWakeups =
+        Number(major) > 1 ||
+        (major === '1' &&
+          (Number(minor) > 5 ||
+            (minor === '5' &&
+              (Number(patch) > 10 || (patch === '10' && suffix !== '-')))))
+    }
     hadPendingReplay = session.state.wakeup.pendingReplay
     prevCarried = session.state.wakeup.carriedUsage
     initialTransport = session.transport
@@ -2168,6 +2197,18 @@ async function promptSession(
           minStepIndex,
           runtimeEpoch: session.state.runtimeEpoch,
           acpToolCallIds: session.state.turnToolCallIds,
+          liveAcp: liveWakeups
+            ? {
+                drain: session.drain,
+                toolSnapshot: (id) => session.timeline.toolCallSnapshot(id),
+                questionHandled: (questions) =>
+                  session.state.handledElicitations.some(
+                    (entry) =>
+                      entry.wokeUp &&
+                      sameNormalizedQuestions(entry.questions, questions),
+                  ),
+              }
+            : undefined,
           onWakeupState: (wakeup) => {
             hasWakeupState = true
             turnWokeUp = wakeup.wokeUp

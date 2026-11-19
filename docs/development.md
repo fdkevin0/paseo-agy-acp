@@ -14,7 +14,7 @@ Paseo compiles the TypeScript plugin; no separate build output is required. Git/
 
 ## Protocol and identity primer
 
-- **ACP vs. Brain**: Foreground prompts, streaming deltas, config options and interactive tool approvals flow over JSON-RPC stdio (`agy acp`). Background tasks, scheduled timers, subagent conversations and post-RPC **Reactive Wakeup** steps execute asynchronously inside `agy` and are observed via local **Brain** files under `<appDataDir>/brain/<nativeId>/.system_generated/`.
+- **ACP vs. Brain**: Prompts, text and tool notifications, config options and interactive approvals flow over JSON-RPC stdio (`agy acp`). Starting in agy 1.5.10, wakeup updates also flow over ACP after the prompt RPC. Local Brain files under `<appDataDir>/brain/<nativeId>/.system_generated/` still track background work and consumption outside the RPC, and supply the wakeup timeline on legacy agy.
 - **Session identities**:
   - `sessionId`: Paseo's host-assigned session identifier (for example, `'s'`).
   - `nativeId`: `agy`'s UUIDv4 conversation identifier on disk and over ACP.
@@ -67,7 +67,7 @@ npm run test:live
 
 `npm run verify` runs `npm run format:check`, `npm run check`, `npm test` (`npm run test:unit`, the offline Tier 1 suite), and `npm pack --dry-run --ignore-scripts`. `npm run test:live` runs the Tier 2 suite (`tests/live/*.test.ts`) against the local `agy` CLI in isolated temporary homes.
 
-`tests/compat-acp.ts` models observed native notifications: display titles, omitted tool output and transcript calls without IDs. `tests/interrupt-acp.ts` models background work that outlives ordinary cancellation, so regression tests verify process shutdown and restoration rather than trusting a canceled UI state. `tests/transport-acp.ts` starts a detached command that outlives ACP EOF, so shutdown tests verify process-group cleanup, including hosts without `ps`.
+`tests/compat-acp.ts` models observed native notifications: display titles, omitted tool output and transcript calls without IDs. Versioned fixtures in `tests/mock-acp.ts` cover legacy wakeup replay and modern post-RPC streaming, including native elicitation and next-prompt usage. `tests/interrupt-acp.ts` models background work that outlives ordinary cancellation, so regression tests verify process shutdown and restoration rather than trusting a canceled UI state. `tests/transport-acp.ts` starts a detached command that outlives ACP EOF, so shutdown tests verify process-group cleanup, including hosts without `ps`.
 
 Tests run with Node's native TypeScript support and temporary files; they require no login or model quota. Workflow tests require Bash and stub `curl`, `gh` and `npm`, so they neither contact registries nor publish artifacts.
 
