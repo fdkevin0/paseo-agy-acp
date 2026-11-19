@@ -57,7 +57,11 @@ import {
 } from './brain-io.ts'
 import { projectReplayHistory, type HistoryEntry } from './history.ts'
 import { SubagentRegistry } from './subagents.ts'
-import { dataDirectory, removeSessionArtifacts } from './preflight.ts'
+import {
+  agyVersionDiagnostic,
+  dataDirectory,
+  removeSessionArtifacts,
+} from './preflight.ts'
 import { connectAcp } from './transport.ts'
 import {
   PACKAGE_VERSION,
@@ -69,7 +73,6 @@ import {
 } from './common.ts'
 import {
   configState,
-  addStepUsage,
   FULL_ACCESS_MODE_ID,
   hasPositivePromptUsage,
   Timeline,
@@ -87,21 +90,13 @@ type PermissionResponseInput = Extract<
   ProviderInput,
   { type: 'session.permission' }
 >['response']
-type PendingQuestionPermission = {
-  type: 'question'
-  questions: NormalizedQuestion[]
-  promise: Promise<PermissionResponseInput | null>
-  resolve: (r: PermissionResponseInput | null) => void
-  fromElicitation: boolean
-  fromBrain: boolean
-}
 type PendingPermission =
   | {
       type: 'acp'
       request: RequestPermissionRequest
       resolve: (r: RequestPermissionResponse) => void
     }
-  | PendingQuestionPermission
+  | { type: 'question'; resolve: (r: PermissionResponseInput | null) => void }
 type Session = Awaited<ReturnType<typeof createSession>>
 interface SessionOptions {
   usage: AgyUsageSource
@@ -480,27 +475,16 @@ async function createSession(
     inSettle: false,
     handledElicitations: [] as Array<{
       questions: NormalizedQuestion[]
+      callId?: string
       answerText: string | null
       wokeUp: boolean
-      declined?: boolean
+      declined: boolean
     }>,
-    suppressContinuationAcp: false,
-    continuationEchoSeen: false,
-    preStagedQuestion: undefined as
-      | {
-          questions: NormalizedQuestion[]
-          response: PermissionResponseInput
-        }
-      | undefined,
     turnToolCallIds: [] as string[],
     turnForegroundAcp: [] as ForegroundAcpSegment[],
+    wakeupQuestionDeclined: false,
     deniedToolCallIds: new Set<string>(),
     lastKnownStepIndex: -1,
-    wakeup: {
-      pendingReplay: false,
-      suppressEcho: false,
-      carriedUsage: undefined as StepUsage | undefined,
-    },
     opening: true,
     loading: true,
     ready: false,
@@ -577,15 +561,6 @@ async function createSession(
     )
     controlLane = settled
     return fg.finally(() => (trailing ? undefined : settled))
-  }
-  function clearWakeupAndTurnState() {
-    state.wakeup = {
-      pendingReplay: false,
-      suppressEcho: false,
-      carriedUsage: undefined,
-    }
-    state.turnToolCallIds = []
-    state.turnForegroundAcp = []
   }
   const runtimeExitedError = () => sessionRuntimeExitedError(state.failureError)
   const nativeWindowSizes = new Map<string | undefined, number>()
@@ -720,9 +695,14 @@ async function createSession(
       ...(status === 'failed' && error ? { error: { message: error } } : {}),
     })
   }
-  /** Brain-projected items are not yet known to the ACP timeline. */
-  function emitItem(item: ProviderTimelineItem, timestamp?: string) {
+  function emitItem(
+    item: ProviderTimelineItem,
+    timestamp?: string,
+    toolResult?: { rawOutput: unknown },
+  ) {
     if (state.silenced) return
+    if (item.type === 'tool_call' && toolResult)
+      item = timeline.recoverToolResult(item, toolResult.rawOutput)
     timeline.track(item)
     subagents.linkSubsession(id, state.nativeId, item)
     emit({
@@ -743,7 +723,10 @@ async function createSession(
       ...(timestamp ? { timestamp } : {}),
     })
   }
-  async function update(notification: SessionNotification) {
+  async function update(
+    notification: SessionNotification,
+    foreground = !state.inSettle,
+  ) {
     if (state.closing || state.failed) return
     if (state.nativeId && notification.sessionId !== state.nativeId) return
     if (state.opening) {
@@ -776,7 +759,6 @@ async function createSession(
       commandsReceived = true
       resolveCommands()
     } else if (u.sessionUpdate === 'usage_update') {
-      if (state.wakeup.suppressEcho || state.suppressContinuationAcp) return
       const next = contextUsage(u)
       if (!next) return
       const model = configState(state.metadata).model
@@ -795,37 +777,17 @@ async function createSession(
       }
     } else {
       if (isSuppressingReplay()) return
-      if (state.suppressContinuationAcp) {
-        if (u.sessionUpdate === 'user_message_chunk')
-          state.continuationEchoSeen = true
-        if (
-          u.sessionUpdate === 'tool_call' &&
-          state.continuationEchoSeen &&
-          !state.turnToolCallIds.includes(u.toolCallId)
-        )
-          state.turnToolCallIds.push(u.toolCallId)
-        if (
-          state.turn &&
-          (u.sessionUpdate === 'agent_message_chunk' ||
-            u.sessionUpdate === 'agent_thought_chunk' ||
-            u.sessionUpdate === 'tool_call')
-        )
-          state.turnHadModelOutput = true
-        return
-      }
       if (u.sessionUpdate === 'user_message_chunk' && !state.loading) {
-        state.wakeup.suppressEcho = false
         state.turnToolCallIds = []
         state.turnForegroundAcp = []
         timeline.boundary()
         return
       }
-      if (state.wakeup.suppressEcho) return
       const isNewToolCall =
         u.sessionUpdate === 'tool_call' &&
         !state.turnToolCallIds.includes(u.toolCallId)
       if (isNewToolCall) state.turnToolCallIds.push(u.toolCallId)
-      if (!state.loading && state.turn && !state.inSettle) {
+      if (!state.loading && state.turn && foreground) {
         if (
           (u.sessionUpdate === 'agent_message_chunk' ||
             u.sessionUpdate === 'agent_thought_chunk') &&
@@ -922,74 +884,12 @@ async function createSession(
       }
     }
   }
-  function askUserQuestion(
-    questions: NormalizedQuestion[],
-    title?: string,
-    source: 'elicitation' | 'brain' = 'elicitation',
-  ): {
-    promise: Promise<PermissionResponseInput | null>
-    entry: PendingQuestionPermission
-  } | null {
-    if (
-      !questions.length ||
-      !state.nativeId ||
-      !state.turn ||
-      isSuppressingReplay() ||
-      state.closing ||
-      state.failed
-    )
-      return null
-    for (const p of permissions.values()) {
-      if (
-        p.type === 'question' &&
-        (source === 'elicitation' ? !p.fromElicitation : !p.fromBrain) &&
-        sameNormalizedQuestions(p.questions, questions)
-      ) {
-        if (source === 'elicitation') p.fromElicitation = true
-        else p.fromBrain = true
-        return { promise: p.promise, entry: p }
-      }
-    }
-    const input = toQuestionPermissionInput(questions)
-    const detail = toolDetail({
-      title: 'ask_question',
-      rawInput: input,
-    })
-    let resolve!: (r: PermissionResponseInput | null) => void
-    const promise = new Promise<PermissionResponseInput | null>((res) => {
-      resolve = res
-    })
-    const entry: PendingQuestionPermission = {
-      type: 'question',
-      questions,
-      promise,
-      resolve,
-      fromElicitation: source === 'elicitation',
-      fromBrain: source === 'brain',
-    }
-    const permissionId = randomUUID()
-    permissions.set(permissionId, entry)
-    emit({
-      type: 'session.permission',
-      sessionId: id,
-      request: {
-        id: permissionId,
-        name: 'ask_question',
-        kind: 'question',
-        title: title ?? questions[0]?.question ?? 'Question',
-        input,
-        detail,
-        actions: [
-          { id: 'allow', label: 'Submit', behavior: 'allow' },
-          { id: 'deny', label: 'Cancel', behavior: 'deny' },
-        ],
-      },
-    })
-    return { promise, entry }
-  }
   const client = {
     sessionUpdate: (notification: SessionNotification) => {
-      notificationLane = notificationLane.then(() => update(notification))
+      const foreground = !state.inSettle
+      notificationLane = notificationLane.then(() =>
+        update(notification, foreground),
+      )
       return notificationLane
     },
     requestElicitation: async (params: Record<string, unknown>) => {
@@ -1005,42 +905,43 @@ async function createSession(
         return { action: 'cancel' }
       const questions = normalizeElicitationQuestions(params)
       if (!questions.length) return { action: 'cancel' }
-      if (state.preStagedQuestion) {
-        const staged = state.preStagedQuestion
-        state.preStagedQuestion = undefined
-        if (sameNormalizedQuestions(staged.questions, questions)) {
-          return buildElicitationResponse(
-            questions,
-            staged.response,
-            staged.questions,
-          )
-        }
-      }
-      const pending = askUserQuestion(
-        questions,
-        typeof params.message === 'string' && params.message.trim()
-          ? params.message.trim()
-          : undefined,
-        'elicitation',
+      const input = toQuestionPermissionInput(questions)
+      const permissionId = randomUUID()
+      const response = await new Promise<PermissionResponseInput | null>(
+        (resolve) => {
+          permissions.set(permissionId, { type: 'question', resolve })
+          emit({
+            type: 'session.permission',
+            sessionId: id,
+            request: {
+              id: permissionId,
+              name: 'ask_question',
+              kind: 'question',
+              title:
+                (typeof params.message === 'string' && params.message.trim()) ||
+                questions[0].question,
+              input,
+              detail: toolDetail({ title: 'ask_question', rawInput: input }),
+              actions: [
+                { id: 'allow', label: 'Submit', behavior: 'allow' },
+                { id: 'deny', label: 'Cancel', behavior: 'deny' },
+              ],
+            },
+          })
+        },
       )
-      if (!pending) return { action: 'cancel' }
-      const response = await pending.promise
       if (!response) return { action: 'cancel' }
-      if (!pending.entry.fromBrain) {
-        state.handledElicitations.push({
-          questions,
-          answerText:
-            formatQuestionAnswersText(pending.entry.questions, response) ||
-            null,
-          wokeUp: state.inSettle,
-          declined: response.behavior === 'deny',
-        })
-      }
-      return buildElicitationResponse(
+      if (state.inSettle && response.behavior === 'deny')
+        state.wakeupQuestionDeclined = true
+      state.handledElicitations.push({
         questions,
-        response,
-        pending.entry.questions,
-      )
+        callId:
+          typeof params.toolCallId === 'string' ? params.toolCallId : undefined,
+        answerText: formatQuestionAnswersText(questions, response) || null,
+        wokeUp: state.inSettle,
+        declined: response.behavior === 'deny',
+      })
+      return buildElicitationResponse(questions, response)
     },
     requestPermission: (request: RequestPermissionRequest) => {
       const parsed = RequestPermissionRequestSchema.safeParse(request)
@@ -1145,8 +1046,8 @@ async function createSession(
     void transport.stopped.then(() => transports.delete(transport))
     return transport
   }
-  function initializeRuntime(transport: ReturnType<typeof connectAcp>) {
-    return transport.request(
+  async function initializeRuntime(transport: ReturnType<typeof connectAcp>) {
+    const initialized = await transport.request(
       transport.rpc.initialize({
         protocolVersion: PROTOCOL_VERSION,
         clientInfo: { name: 'paseo-agy-acp', version: PACKAGE_VERSION },
@@ -1157,6 +1058,9 @@ async function createSession(
         },
       }),
     )
+    const diagnostic = agyVersionDiagnostic(initialized.agentInfo?.version)
+    if (diagnostic) throw new Error(diagnostic)
+    return initialized
   }
   let currentTransport = startRuntime(state.skipPermissions)
   try {
@@ -1258,7 +1162,8 @@ async function createSession(
         onExit(error instanceof Error ? error : new Error(String(error)))
         throw error
       } finally {
-        clearWakeupAndTurnState()
+        state.turnToolCallIds = []
+        state.turnForegroundAcp = []
         state.loading = false
         state.replay = true
         if (restoreMode && !state.closing && !state.failed) publishConfig()
@@ -1307,7 +1212,8 @@ async function createSession(
           }
           throw error
         }
-        clearWakeupAndTurnState()
+        state.turnToolCallIds = []
+        state.turnForegroundAcp = []
         if (!isRetireAlive(obsolete)) return
         if (!canReloadSession()) {
           const error = new Error(
@@ -1379,7 +1285,6 @@ async function createSession(
       },
       timeline,
       permissions,
-      askUserQuestion,
       cancelPermissions,
       publishConfig,
       publishUsage,
@@ -1852,9 +1757,6 @@ async function promptSession(
       : p.input.content.map(promptContent)
   const turnId = randomUUID()
   const turnAbort = new AbortController()
-  const expectsUserEcho =
-    p.input.type === 'message' &&
-    blocks.some((c) => c.type !== 'text' || c.text.trim().length > 0)
   session.state.turn = turnId
   session.state.turnAbort = turnAbort
   session.state.turnFinished = false
@@ -1862,14 +1764,10 @@ async function promptSession(
   session.state.turnHadModelOutput = false
   session.state.inSettle = false
   session.state.handledElicitations = []
-  session.state.suppressContinuationAcp = false
-  session.state.preStagedQuestion = undefined
+  session.state.wakeupQuestionDeclined = false
   session.state.turnToolCallIds = []
   session.state.turnForegroundAcp = []
   session.state.deniedToolCallIds.clear()
-  let hadPendingReplay = false
-  let prevCarried: StepUsage | undefined
-  let initialTransport = session.transport
   let started = false
   session.state.prompts.add(p.clientMessageId)
   session.timeline.boundary()
@@ -1901,47 +1799,14 @@ async function promptSession(
   let minStepIndex: number | undefined
   let observation: BrainTurnObservation | undefined
   let observationTransport = session.transport
-  let continuationActive = false
-  let pastWaitPrompt = false
-  let suppressedForeground = false
   let effectiveUsage: Usage | null | undefined
   let lastStep: StepUsage | undefined
   let turnWokeUp = false
   let turnWakeupUsage: StepUsage | undefined
-  let nextCarriedWakeup: StepUsage | undefined
-  let settledPendingReplay = false
   let pendingFinish:
     { status: 'completed' | 'canceled' | 'failed'; error?: string } | undefined
-  let hasWakeupState = false
-  const settleTurnUsageAndWakeup = (isError: boolean) => {
+  const settleTurnUsage = (isError: boolean) => {
     if (!started) return
-    const runtimeRelaunched = session.transport !== initialTransport
-    const replayStillPending =
-      !runtimeRelaunched &&
-      hadPendingReplay &&
-      (!expectsUserEcho ||
-        (pastWaitPrompt
-          ? suppressedForeground
-          : session.state.wakeup.suppressEcho))
-    if (runtimeRelaunched) {
-      session.state.wakeup.pendingReplay = false
-      session.state.wakeup.carriedUsage = undefined
-    } else {
-      session.state.wakeup.pendingReplay = Boolean(
-        settledPendingReplay ||
-        (isError &&
-          turnWokeUp &&
-          !hasWakeupState &&
-          !session.state.closing &&
-          !session.state.failed) ||
-        (replayStillPending && !effectiveUsage && !turnWokeUp),
-      )
-      session.state.wakeup.carriedUsage = effectiveUsage
-        ? nextCarriedWakeup
-        : nextCarriedWakeup
-          ? addStepUsage(prevCarried, nextCarriedWakeup)
-          : prevCarried
-    }
     const preserveContext = session.state.turnHadContextUsage && !turnWokeUp
     const maxTokens = session.contextWindowMaxTokens
     if (effectiveUsage || turnWakeupUsage) {
@@ -1949,7 +1814,6 @@ async function promptSession(
         contextWindowMaxTokens: maxTokens,
         preserveContext,
         lastStep,
-        carriedWakeup: prevCarried,
         wakeup: turnWakeupUsage,
       })
       if (
@@ -1984,9 +1848,7 @@ async function promptSession(
     turnAbort.signal.reason.name === 'AbortError'
   const stopObservation = () => observation?.stop()
   turnAbort.signal.addEventListener('abort', stopObservation, { once: true })
-  const waitPrompt = async (
-    sendPrompt: () => ReturnType<typeof session.transport.rpc.prompt>,
-  ) => {
+  const waitPrompt = async () => {
     turnAbort.signal.throwIfAborted()
     const transport = session.transport
     let settledOutcome:
@@ -1996,10 +1858,22 @@ async function promptSession(
         }
       | { ok: false; error: unknown }
       | null = null
-    const outcome = sendPrompt().then(
-      (value) => (settledOutcome = { ok: true as const, value }),
-      (error) => (settledOutcome = { ok: false as const, error }),
-    )
+    const outcome = transport.rpc
+      .prompt({
+        sessionId: nativeId,
+        prompt: blocks,
+      })
+      .then(
+        (value) => {
+          if (
+            session.state.turnAbort === turnAbort &&
+            session.transport === transport
+          )
+            session.state.inSettle = true
+          return (settledOutcome = { ok: true as const, value })
+        },
+        (error) => (settledOutcome = { ok: false as const, error }),
+      )
     const promptEntry = {
       transport,
       settled: outcome.then(() => undefined),
@@ -2081,12 +1955,7 @@ async function promptSession(
   try {
     await session.waitForRuntimeReady(turnAbort.signal)
     turnAbort.signal.throwIfAborted()
-    hadPendingReplay = session.state.wakeup.pendingReplay
-    prevCarried = session.state.wakeup.carriedUsage
-    initialTransport = session.transport
     observationTransport = session.transport
-    session.state.wakeup.suppressEcho = hadPendingReplay && expectsUserEcho
-    session.state.wakeup.pendingReplay = false
     session.state.turnRunning = true
     started = true
     const readStep = await readLastStepIndex(
@@ -2112,11 +1981,7 @@ async function promptSession(
       {
         isCurrent,
         onUsage: (usage) => {
-          if (
-            session.state.turnHadContextUsage &&
-            !observation?.wokeUp &&
-            observation?.phase !== 'continuation'
-          )
+          if (session.state.turnHadContextUsage && !observation?.wokeUp)
             return false
           session.publishStepContext(usage)
         },
@@ -2134,18 +1999,10 @@ async function promptSession(
     )
     session.state.observation = observation
     observation.start()
-    const result = await waitPrompt(() =>
-      session.transport.rpc.prompt({
-        sessionId: session.state.nativeId,
-        prompt: blocks,
-      }),
-    )
+    const result = await waitPrompt()
     await session.drain()
     if (!isCurrent() && !turnAbort.signal.aborted)
       throw new Error('ACP runtime replaced during turn')
-    suppressedForeground = session.state.wakeup.suppressEcho
-    pastWaitPrompt = true
-    session.state.wakeup.suppressEcho = false
     effectiveUsage = hasPositivePromptUsage(result.usage)
       ? result.usage
       : undefined
@@ -2162,25 +2019,21 @@ async function promptSession(
         {
           signal: turnAbort.signal,
           observation,
-          isRpcActive: () => continuationActive,
           mcpServerNames: Object.keys(session.config?.mcpServers ?? {}),
           onSubagents: session.rememberSubagents,
           minStepIndex,
           runtimeEpoch: session.state.runtimeEpoch,
           acpToolCallIds: session.state.turnToolCallIds,
+          drainAcp: session.drain,
+          toolSnapshot: (id) => session.timeline.toolCallSnapshot(id),
+          hasToolResult: (id) => session.timeline.hasToolResult(id),
           onWakeupState: (wakeup) => {
-            hasWakeupState = true
             turnWokeUp = wakeup.wokeUp
             turnWakeupUsage = wakeup.wakeupUsage
-            nextCarriedWakeup = wakeup.carriedWakeupUsage
-            settledPendingReplay = Boolean(wakeup.pendingReplay)
           },
-          foregroundAcp: suppressedForeground
-            ? []
-            : [...session.state.turnForegroundAcp],
+          foregroundAcp: [...session.state.turnForegroundAcp],
           deniedToolCallIds: session.state.deniedToolCallIds,
-          emitForeground: suppressedForeground,
-          shouldEmitPreWakeupTool: (item) =>
+          shouldUpdateTool: (item) =>
             session.timeline.isRunning(item.id) ||
             (item.detail.type === 'sub_agent' &&
               item.detail.childSessionId !== undefined &&
@@ -2197,107 +2050,25 @@ async function promptSession(
               session.state.lastKnownStepIndex = stepIndex
           },
           // A model turn always writes USER_INPUT; give agy a moment to flush it. Native commands may write none.
-          transcriptGraceMs:
-            session.state.turnHadModelOutput || suppressedForeground ? 2000 : 0,
+          transcriptGraceMs: session.state.turnHadModelOutput ? 2000 : 0,
           stallTimeoutMs: session.stallTimeoutMs,
           retryTimeoutMs: session.retryTimeoutMs,
           isWaitingOnUser: () => session.permissions.size > 0,
-          onQuestionSettled: (questions, wokeUp) => {
-            const idx = session.state.handledElicitations.findIndex(
+          isWaitingOnQuestion: () =>
+            [...session.permissions.values()].some(
+              (permission) => permission.type === 'question',
+            ),
+          takeQuestionAnswer: (questions, wokeUp, callId) => {
+            const index = session.state.handledElicitations.findIndex(
               (entry) =>
                 entry.wokeUp === wokeUp &&
+                (!callId || !entry.callId || entry.callId === callId) &&
                 sameNormalizedQuestions(entry.questions, questions),
             )
-            if (idx >= 0) session.state.handledElicitations.splice(idx, 1)
+            if (index >= 0)
+              return session.state.handledElicitations.splice(index, 1)[0]
           },
-          onQuestion: async (pendingQuestion) => {
-            const handledIndex = session.state.handledElicitations.findIndex(
-              (entry) =>
-                entry.wokeUp === pendingQuestion.wokeUp &&
-                sameNormalizedQuestions(
-                  entry.questions,
-                  pendingQuestion.questions,
-                ),
-            )
-            if (handledIndex >= 0) {
-              const [handled] = session.state.handledElicitations.splice(
-                handledIndex,
-                1,
-              )
-              if (pendingQuestion.wokeUp && handled.declined) {
-                await session.interrupt()
-                return { status: 'canceled' }
-              }
-              return {
-                status: pendingQuestion.wokeUp ? 'answered' : 'already_handled',
-                answerText: handled.answerText ?? undefined,
-              }
-            }
-            const pending = session.askUserQuestion(
-              pendingQuestion.questions,
-              pendingQuestion.questions[0]?.question,
-              'brain',
-            )
-            if (!pending) return { status: 'canceled' }
-            const response = await pending.promise
-            if (!response || turnAbort.signal.aborted) {
-              return { status: 'canceled' }
-            }
-            if (observation?.error) throw observation.error
-            if (!isCurrent())
-              throw new Error('ACP runtime replaced during question')
-            if (response.behavior === 'deny') {
-              await session.interrupt()
-              return { status: 'canceled' }
-            }
-            const answerText =
-              formatQuestionAnswersText(pending.entry.questions, response) ||
-              'Proceed'
-            if (pending.entry.fromElicitation) {
-              return { status: 'answered', answerText }
-            }
-            session.state.preStagedQuestion = {
-              questions: pendingQuestion.questions,
-              response,
-            }
-            pendingQuestion.beginContinuation?.(answerText)
-            session.state.suppressContinuationAcp = true
-            session.state.continuationEchoSeen = false
-            continuationActive = true
-            if (observation) {
-              observation.phase = 'continuation'
-              observation.wokeUp = true
-            }
-            try {
-              const contResult = await waitPrompt(() =>
-                session.transport.rpc.prompt({
-                  sessionId: session.state.nativeId,
-                  prompt: [{ type: 'text', text: answerText }],
-                }),
-              )
-              await session.drain()
-              if (contResult.stopReason === 'cancelled') {
-                return {
-                  status: 'canceled',
-                  preserveCarriedWakeup: !hasPositivePromptUsage(
-                    contResult.usage,
-                  ),
-                  preservePendingReplay: !session.state.continuationEchoSeen,
-                }
-              }
-            } catch (error) {
-              pendingQuestion.restoreContinuationCarry?.(
-                !session.state.continuationEchoSeen,
-              )
-              throw error
-            } finally {
-              continuationActive = false
-              if (observation?.acceptsRows()) observation.phase = 'settling'
-              session.state.suppressContinuationAcp = false
-              session.state.preStagedQuestion = undefined
-            }
-            return { status: 'answered', answerText }
-          },
+          isWakeupQuestionDeclined: () => session.state.wakeupQuestionDeclined,
         },
       )
       await session.syncKilledChildren()
@@ -2306,8 +2077,6 @@ async function promptSession(
       lastStep = settled.lastStepUsage
       turnWokeUp = Boolean(settled.wokeUp)
       turnWakeupUsage = settled.wakeupUsage
-      nextCarriedWakeup = settled.carriedWakeupUsage
-      settledPendingReplay = Boolean(settled.pendingReplay)
       if (
         !turnAbort.signal.aborted &&
         !session.state.closing &&
@@ -2330,6 +2099,10 @@ async function promptSession(
         }
       }
     }
+    if (session.state.wakeupQuestionDeclined && !turnAbort.signal.aborted) {
+      await session.interrupt()
+      status = 'canceled'
+    }
     lastStep = await reconcileFinalSnapshot(lastStep)
     if (!session.state.closing && session.state.nativeId === nativeId)
       await session.refreshCompactionWindow()
@@ -2341,7 +2114,7 @@ async function promptSession(
       // Stall or child failures cancel the runtime for cleanup without changing their terminal status.
       if (status !== 'failed') status = 'canceled'
     }
-    settleTurnUsageAndWakeup(false)
+    settleTurnUsage(false)
     pendingFinish = { status, error: turnError }
   } catch (error) {
     const restartError = session.state.closing
@@ -2356,7 +2129,7 @@ async function promptSession(
     if (!session.state.closing && session.state.nativeId === nativeId)
       await session.refreshCompactionWindow().catch(() => undefined)
     turnWokeUp ||= observation?.wokeUp === true
-    settleTurnUsageAndWakeup(true)
+    settleTurnUsage(true)
     const failure =
       (session.state.failed ? session.state.failureError : undefined) ??
       restartError ??
@@ -2379,11 +2152,9 @@ async function promptSession(
         )
           return
         session.state.turnRunning = false
-        session.state.wakeup.suppressEcho = false
         session.state.inSettle = false
         session.state.handledElicitations = []
-        session.state.suppressContinuationAcp = false
-        session.state.preStagedQuestion = undefined
+        session.state.wakeupQuestionDeclined = false
         session.state.turnAbort = null
         session.state.turn = ''
         session.timeline.boundary()

@@ -1,7 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  appliesCarriedWakeup,
   hasPositivePromptUsage,
   Timeline,
   toolDetail,
@@ -197,26 +196,6 @@ test('usage rejects invalid context, ignores foreign currency, and computes last
     },
   )
   assert.deepEqual(promptUsage(null), {})
-  assert.deepEqual(
-    promptUsage(
-      { totalTokens: 60, inputTokens: 50, outputTokens: 10 },
-      {
-        carriedWakeup: {
-          inputTokens: 20,
-          outputTokens: 4,
-          cachedReadTokens: 99,
-        },
-        lastStep: { inputTokens: 30, cachedReadTokens: 15, outputTokens: 6 },
-      },
-    ),
-    {
-      inputTokens: 30,
-      outputTokens: 6,
-      cachedInputTokens: 15,
-      contextWindowUsedTokens: 51,
-    },
-    'missing ACP cachedReadTokens still falls back to lastStep when carriedWakeup is deducted',
-  )
   assert.deepEqual(
     promptUsage(
       { totalTokens: 60, inputTokens: 50, outputTokens: 10 },
@@ -717,6 +696,48 @@ test('write_file with kind:edit and diff maps to Write card and denied failed up
   assert.equal(t.isRunning(deniedLate.id), false)
 })
 
+test('native tool content and raw output take precedence over a recovered Brain result', () => {
+  const timeline = new Timeline('s')
+  const running = timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'read',
+    title: 'read_file',
+    status: 'in_progress',
+    rawInput: { Path: '/fixture/text' },
+    content: [],
+  })
+  assert.ok(running?.type === 'tool_call')
+  const brain = { ...running, status: 'completed' as const, error: null }
+  timeline.recoverToolResult(brain, 'Brain result')
+  const statusOnly = timeline.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'read',
+    status: 'completed',
+  })
+  assert.match(JSON.stringify(statusOnly), /Brain result/)
+  const contentOnly = timeline.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'read',
+    content: [
+      { type: 'content', content: { type: 'text', text: 'Native content' } },
+    ],
+  })
+  assert.match(JSON.stringify(contentOnly), /Native content/)
+  assert.doesNotMatch(JSON.stringify(contentOnly), /Brain result/)
+  const raw = timeline.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'read',
+    rawOutput: 'Native raw output',
+  })
+  assert.match(JSON.stringify(raw), /Native raw output/)
+  assert.match(
+    JSON.stringify(
+      timeline.recoverToolResult(brain, 'another Brain result').detail,
+    ),
+    /Native raw output/,
+  )
+})
+
 test('late status-less tool_call_update preserves terminal status and metadata while orphan updates are ignored', () => {
   const t = new Timeline('s')
   assert.equal(
@@ -1125,7 +1146,7 @@ test('exit_plan_mode renders as a Markdown plan card across ACP variants and par
   assert.equal(entered.detail.type, 'unknown')
 })
 
-test('hasPositivePromptUsage and appliesCarriedWakeup reject zero placeholders and underflowing cache counters', () => {
+test('hasPositivePromptUsage rejects zero placeholders but accepts cache-only and thought-token usage', () => {
   const zeroUsage = {
     inputTokens: 0,
     outputTokens: 0,
@@ -1156,65 +1177,6 @@ test('hasPositivePromptUsage and appliesCarriedWakeup reject zero placeholders a
       cachedInputTokens: 40,
       contextWindowUsedTokens: 63,
     },
-  )
-  const cacheOnlyDebt = {
-    inputTokens: 0,
-    outputTokens: 0,
-    cachedReadTokens: 500,
-  }
-  assert.equal(appliesCarriedWakeup(zeroUsage, cacheOnlyDebt), false)
-  assert.equal(
-    appliesCarriedWakeup(
-      {
-        inputTokens: 10,
-        outputTokens: 2,
-        cachedReadTokens: 100,
-        totalTokens: 112,
-      },
-      cacheOnlyDebt,
-    ),
-    false,
-  )
-  const multiFieldDebt = {
-    inputTokens: 50,
-    outputTokens: 5,
-    cachedReadTokens: 500,
-  }
-  assert.deepEqual(
-    promptUsage(
-      {
-        inputTokens: 80,
-        outputTokens: 8,
-        cachedReadTokens: 100,
-        totalTokens: 188,
-      },
-      { carriedWakeup: multiFieldDebt },
-    ),
-    {
-      inputTokens: 80,
-      outputTokens: 8,
-      cachedInputTokens: 100,
-    },
-    'underflowing cachedReadTokens atomically skips all carriedWakeup deductions',
-  )
-  assert.equal(
-    appliesCarriedWakeup(
-      {
-        inputTokens: 10,
-        outputTokens: 2,
-        cachedReadTokens: 600,
-        totalTokens: 612,
-      },
-      cacheOnlyDebt,
-    ),
-    true,
-  )
-  assert.equal(
-    appliesCarriedWakeup(
-      { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
-      cacheOnlyDebt,
-    ),
-    true,
   )
 })
 

@@ -8,7 +8,7 @@ The plugin runs the locally installed `agy acp` on the daemon host and translate
 
 ## Requirements and setup
 
-Requires Paseo 0.15.0+, Node.js 22.18+, npm and an authenticated agy CLI 1.5.3+ on the daemon host. Sign in through agy before using the plugin. The provider ID is `agy`; it accepts Paseo's command and environment overrides. Model, mode, thinking options and slash commands come from agy. The plugin does not install the CLI, change login credentials or globally bypass approvals.
+Requires Paseo 0.15.0+, Node.js 22.18+, npm and an authenticated agy CLI 1.5.10+ on the daemon host. Sign in through agy before using the plugin. The provider ID is `agy`; it accepts Paseo's command and environment overrides. Model, mode, thinking options and slash commands come from agy. The plugin does not install the CLI, change login credentials or globally bypass approvals.
 
 Linux has been smoke-tested; other operating systems have not been verified. See the [README](https://github.com/fdkevin0/paseo-agy-acp#readme) for setup and usage.
 

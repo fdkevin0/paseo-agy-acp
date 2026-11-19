@@ -167,7 +167,12 @@ const update = (update: SessionUpdate) =>
     sessionId: nativeId,
     update,
   })
-async function tool(toolCallId: string, title: string, rawInput: object) {
+async function tool(
+  toolCallId: string,
+  title: string,
+  rawInput: object,
+  rawOutput?: string,
+) {
   await update({
     sessionUpdate: 'tool_call',
     toolCallId,
@@ -179,6 +184,7 @@ async function tool(toolCallId: string, title: string, rawInput: object) {
     sessionUpdate: 'tool_call_update',
     toolCallId,
     status: 'completed',
+    ...(rawOutput !== undefined ? { rawOutput } : {}),
   })
 }
 async function observedMessage() {
@@ -228,6 +234,7 @@ async function invoke() {
 connection = agent()
   .onRequest(methods.agent.initialize, async () => ({
     protocolVersion: 1,
+    agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
     agentCapabilities: { loadSession: true },
   }))
   .onRequest(methods.agent.authenticate, async () => ({}))
@@ -401,7 +408,7 @@ connection = agent()
         result(2, 'Message sent'),
         done(3),
       ])
-      await tool('call_345678901', 'Run send_message', input)
+      await tool('call_345678901', 'Run send_message', input, 'Message sent')
       await observedMessage()
     } else if (scenario === 'child') {
       await invoke()
@@ -427,7 +434,7 @@ connection = agent()
         ],
         true,
       )
-      await tool('call_345678901', 'Run send_message', input)
+      await tool('call_345678901', 'Run send_message', input, 'Message sent')
       await observedMessage()
       writeSubagent(nativeId, childId, 'SUBAGENT_STATE_KILLED', 2)
       await tool('call_456789012', 'Run manage_subagents', action)

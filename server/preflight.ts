@@ -14,6 +14,25 @@ import { formatErrorMessage, sessionIdPattern, setBounded } from './common.ts'
 const STATUS_CACHE_LIMIT = 100
 const statusCache = new Map<string, number>()
 
+// agy 1.5.10 streams Reactive Wakeup output after session/prompt returns.
+const MIN_AGY_VERSION = '1.5.10'
+const agyVersionPattern =
+  /v?(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?/
+
+export function agyVersionDiagnostic(version?: string): string | undefined {
+  const match = version?.match(agyVersionPattern)
+  if (!match || match[0] !== version)
+    return `Could not determine agy version; requires >=${MIN_AGY_VERSION}.`
+  const [, major, minor, patch, prerelease] = match
+  const [minMajor, minMinor, minPatch] = MIN_AGY_VERSION.split('.').map(Number)
+  const order =
+    Number(major) - minMajor ||
+    Number(minor) - minMinor ||
+    Number(patch) - minPatch
+  if (order < 0 || (order === 0 && prerelease))
+    return `agy ${version} is too old; requires >=${MIN_AGY_VERSION}. Run agy update.`
+}
+
 /** Verify that the configured executable supports the required ACP version. */
 export async function providerStatus(
   launch?: ProviderLaunch,
@@ -28,30 +47,12 @@ export async function providerStatus(
       timeout: 5000,
     })
     const version = `${stdout}\n${stderr}`.match(
-      /\bv?(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?\b/,
-    )
-    if (!version)
-      return {
-        available: false,
-        diagnostic: 'Could not determine agy version; requires >=1.5.3.',
-      }
-    const major = Number(version[1])
-    const minor = Number(version[2])
-    const patch = Number(version[3])
-    const prerelease = version[4]
-    const supported =
-      major > 1 ||
-      (major === 1 &&
-        (minor > 5 ||
-          (minor === 5 && (patch > 3 || (patch === 3 && !prerelease)))))
-    if (supported) {
-      setBounded(statusCache, key, Date.now(), STATUS_CACHE_LIMIT)
-      return { available: true }
-    }
-    return {
-      available: false,
-      diagnostic: `agy ${version[0]} is too old; requires >=1.5.3. Run agy update.`,
-    }
+      new RegExp(`\\b${agyVersionPattern.source}\\b`),
+    )?.[0]
+    const diagnostic = agyVersionDiagnostic(version)
+    if (diagnostic) return { available: false, diagnostic }
+    setBounded(statusCache, key, Date.now(), STATUS_CACHE_LIMIT)
+    return { available: true }
   } catch (error) {
     const target = cmd === 'agy' ? 'agy --version' : `agy (${cmd} --version)`
     return {

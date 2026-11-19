@@ -1711,7 +1711,7 @@ test('checkpoint shift preserves per-tool metadata identity', async () => {
 
   // Live deferred-anonymous path across split poll batches with an intervening CHECKPOINT
   const projector = new BrainTranscriptProjector('live')
-  projector.resolveToolIdentities(true)
+  projector.bindLiveToolCallIds([], new Set())
   projector.observeRows(nativeRows.slice(0, 1))
   assert.deepEqual(projector.project(nativeRows[0]), [])
   projector.syncMetadata(
@@ -1728,7 +1728,7 @@ test('checkpoint shift preserves per-tool metadata identity', async () => {
     [],
   )
   projector.observeRows(nativeRows.slice(1))
-  const resolved = projector.resolveToolIdentities(true)
+  const resolved = projector.resolveToolIdentities()
   assert.deepEqual(itemIdentifiers(resolved), ['a', 'b'])
 })
 

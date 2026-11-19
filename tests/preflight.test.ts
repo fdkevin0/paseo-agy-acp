@@ -107,10 +107,10 @@ test('status reports missing executable clearly', async () => {
   assert.match(status.diagnostic ?? '', /Cannot run agy/)
 })
 
-test('providerStatus accepts version >= 1.5.3 and caches result', async () => {
+test('providerStatus accepts version >= 1.5.10 and caches result', async () => {
   const tmp = await mkdtemp(join(tmpdir(), 'agy-version-ok-'))
   const fakeBin = join(tmp, 'fake-agy')
-  await writeFile(fakeBin, '#!/bin/sh\necho "agy 1.5.3"\n', { mode: 0o755 })
+  await writeFile(fakeBin, '#!/bin/sh\necho "agy 1.5.10"\n', { mode: 0o755 })
   try {
     const status = await providerStatus({
       command: fakeBin,
@@ -133,10 +133,10 @@ test('providerStatus accepts version >= 1.5.3 and caches result', async () => {
   }
 })
 
-test('providerStatus rejects version < 1.5.3', async () => {
+test('providerStatus rejects version < 1.5.10', async () => {
   const tmp = await mkdtemp(join(tmpdir(), 'agy-version-old-'))
   const fakeBin = join(tmp, 'fake-agy-old')
-  await writeFile(fakeBin, '#!/bin/sh\necho "agy 1.5.0"\n', { mode: 0o755 })
+  await writeFile(fakeBin, '#!/bin/sh\necho "agy 1.5.9"\n', { mode: 0o755 })
   try {
     const status = await providerStatus({
       command: fakeBin,
@@ -144,7 +144,7 @@ test('providerStatus rejects version < 1.5.3', async () => {
       env: {},
     })
     assert.equal(status.available, false)
-    assert.match(status.diagnostic ?? '', /too old; requires >=1.5.3/)
+    assert.match(status.diagnostic ?? '', /too old; requires >=1\.5\.10/)
   } finally {
     await rm(tmp, { recursive: true, force: true })
   }
@@ -167,10 +167,10 @@ test('providerStatus reports diagnostic when version cannot be parsed', async ()
   }
 })
 
-test('providerStatus rejects 1.5.3 pre-release builds and dataDirectory ignores flag-like missing values', async () => {
+test('providerStatus rejects 1.5.10 pre-release builds and dataDirectory ignores flag-like missing values', async () => {
   const tmp = await mkdtemp(join(tmpdir(), 'agy-version-pre-'))
   const fakeBin = join(tmp, 'fake-agy-pre')
-  await writeFile(fakeBin, '#!/bin/sh\necho "agy 1.5.3-alpha.1" >&2\n', {
+  await writeFile(fakeBin, '#!/bin/sh\necho "agy 1.5.10-rc.1" >&2\n', {
     mode: 0o755,
   })
   try {
@@ -180,7 +180,7 @@ test('providerStatus rejects 1.5.3 pre-release builds and dataDirectory ignores 
       env: {},
     })
     assert.equal(status.available, false)
-    assert.match(status.diagnostic ?? '', /too old; requires >=1\.5\.3/)
+    assert.match(status.diagnostic ?? '', /too old; requires >=1\.5\.10/)
     assert.equal(
       dataDirectory(
         {

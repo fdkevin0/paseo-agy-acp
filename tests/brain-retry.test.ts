@@ -370,7 +370,7 @@ test('confirmed model or correlated tool progress releases retry state; unrelate
   )
 })
 
-test('synthetic continuation denial settles cleanly even when turn wokeUp latch is true, and mixed planexecute/wakeup SYSTEM_MESSAGE enters woken', () => {
+test('a mixed planexecute and wakeup notice enters woken and a denied wakeup tool settles', () => {
   const node = new BrainNode(id)
   node.ingest({ step_index: 1, type: 'USER_INPUT' })
   node.ingest(quiet(2))
@@ -385,11 +385,6 @@ test('synthetic continuation denial settles cleanly even when turn wokeUp latch 
   assert.equal(node.promptPhase, 'woken')
   assert.equal(node.wokeUp, true)
 
-  // Woken question triggers a synthetic continuation prompt (wokeUp stays true, promptPhase resets to foreground).
-  node.markQuestionContinuation(true)
-  node.ingest({ step_index: 4, type: 'USER_INPUT', content: 'Proceed' })
-  assert.equal(node.wokeUp, true)
-  assert.equal(node.promptPhase, 'foreground')
   node.projector.bindToolCallIds(['call-denied'])
   node.ingest({
     step_index: 5,
@@ -397,7 +392,7 @@ test('synthetic continuation denial settles cleanly even when turn wokeUp latch 
     status: 'DONE',
     tool_calls: [{ id: 'call-denied', name: 'run_command', args: {} }],
   })
-  assert.equal(node.promptPhase, 'foreground_active')
+  assert.equal(node.promptPhase, 'woken')
   node.settleAbortedDenial(new Set(['call-denied']))
   assert.equal(node.promptPhase, 'foreground_idle')
   assert.equal(node.isWokenWorking(), false)

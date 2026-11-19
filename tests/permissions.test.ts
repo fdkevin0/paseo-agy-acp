@@ -457,7 +457,7 @@ test('raw ask_question arguments normalize like agy writes them and disambiguate
   )
 })
 
-test('a replayed schema is matched by question and labels, and answered from the card that asked it', () => {
+test('an elicitation schema matches its Brain tool input by question and labels', () => {
   const wokenAsked = normalizeAskQuestionInput({
     questions: [
       {
@@ -472,18 +472,6 @@ test('a replayed schema is matched by question and labels, and answered from the
     elicitationFixtures.wokenReplay,
   )
   assert.equal(sameNormalizedQuestions(wokenAsked, wokenReplayed), true)
-  assert.deepEqual(
-    buildElicitationResponse(
-      wokenReplayed,
-      {
-        behavior: 'allow',
-        updatedInput: { answers: { Choice: '(Recommended) Option 1' } },
-      },
-      wokenAsked,
-    ),
-    { action: 'accept', content: { q1: '1' } },
-  )
-
   const asked = normalizeAskQuestionInput({
     questions: [
       {
@@ -506,21 +494,4 @@ test('a replayed schema is matched by question and labels, and answered from the
   assert.equal(sameNormalizedQuestions(asked, replayed), true)
   assert.equal(sameNormalizedQuestions(asked, wokenReplayed), false)
   assert.equal(sameNormalizedQuestions([], []), false)
-  // The card used the raw headers, so answers are read by them and mapped to the replayed schema's 1-based const values.
-  assert.deepEqual(
-    buildElicitationResponse(
-      replayed,
-      {
-        behavior: 'allow',
-        updatedInput: {
-          answers: {
-            Environment: 'Option B: Full refactor',
-            Platform: 'Linux, x86_64, macOS',
-          },
-        },
-      },
-      asked,
-    ),
-    { action: 'accept', content: { q1: '2', q2: ['1', '2'] } },
-  )
 })

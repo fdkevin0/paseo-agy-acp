@@ -655,22 +655,6 @@ export function hasPositivePromptUsage(usage?: Usage | null): boolean {
   )
 }
 
-export function appliesCarriedWakeup(
-  usage: Usage | null | undefined,
-  carriedWakeup: StepUsage | undefined,
-): carriedWakeup is StepUsage {
-  if (!carriedWakeup || !hasPositivePromptUsage(usage)) return false
-  const raw = record(usage)
-  return (
-    nonnegative(raw.inputTokens) &&
-    raw.inputTokens >= carriedWakeup.inputTokens &&
-    nonnegative(raw.outputTokens) &&
-    raw.outputTokens >= carriedWakeup.outputTokens &&
-    (!nonnegative(raw.cachedReadTokens) ||
-      raw.cachedReadTokens >= carriedWakeup.cachedReadTokens)
-  )
-}
-
 /** Combine ACP turn token counters with per-step context occupancy from transcript_full.jsonl when available. */
 export function promptUsage(
   usage?: Usage | null,
@@ -678,40 +662,29 @@ export function promptUsage(
     preserveContext?: boolean
     contextWindowMaxTokens?: number
     lastStep?: StepUsage
-    carriedWakeup?: StepUsage
     wakeup?: StepUsage
   },
 ): ProviderUsage {
   const effective = hasPositivePromptUsage(usage) ? usage : undefined
   if (!effective && !options?.lastStep && !options?.wakeup) return {}
   const raw = record(effective)
-  const carried = appliesCarriedWakeup(effective, options?.carriedWakeup)
-    ? options.carriedWakeup
-    : undefined
   const field = (
     rawVal: unknown,
-    sub: number | undefined,
     add: number | undefined,
     fallback: number | undefined,
-  ) =>
-    nonnegative(rawVal)
-      ? Math.max(0, rawVal - (sub ?? 0)) + (add ?? 0)
-      : ((add || fallback) ?? 0)
+  ) => (nonnegative(rawVal) ? rawVal + (add ?? 0) : ((add || fallback) ?? 0))
   const input = field(
     raw.inputTokens,
-    carried?.inputTokens,
     options?.wakeup?.inputTokens,
     options?.lastStep?.inputTokens,
   )
   const cacheRead = field(
     raw.cachedReadTokens,
-    carried?.cachedReadTokens,
     options?.wakeup?.cachedReadTokens,
     options?.lastStep?.cachedReadTokens,
   )
   const output = field(
     raw.outputTokens,
-    carried?.outputTokens,
     options?.wakeup?.outputTokens,
     options?.lastStep?.outputTokens,
   )
@@ -738,6 +711,12 @@ export function promptUsage(
   }
 }
 
+type ToolSnapshot = {
+  acp: ToolCall
+  hasAcpResult: boolean
+  brainOutput?: unknown
+}
+
 /** Assemble full snapshots and terminalize tools whose final native update is absent. */
 export class Timeline {
   private sequence = 0
@@ -745,7 +724,7 @@ export class Timeline {
     ProviderTimelineItem,
     { type: 'user_message' | 'assistant_message' | 'reasoning' }
   >
-  private tools = new Map<string, ToolCall>()
+  private tools = new Map<string, ToolSnapshot>()
   private running = new Map<
     string,
     Extract<ProviderTimelineItem, { type: 'tool_call' }>
@@ -765,7 +744,26 @@ export class Timeline {
     else this.running.delete(item.id)
   }
   toolCallSnapshot(callId: string): Readonly<ToolCall> | undefined {
-    return this.tools.get(callId)
+    return this.tools.get(callId)?.acp
+  }
+  hasToolResult(callId: string): boolean {
+    return this.tools.get(callId)?.hasAcpResult === true
+  }
+  recoverToolResult(
+    item: Extract<ProviderTimelineItem, { type: 'tool_call' }>,
+    output: unknown,
+  ): typeof item {
+    const snapshot = this.tools.get(item.callId)
+    if (!snapshot) return item
+    if (!snapshot.hasAcpResult) {
+      // agy can send a status-only completion after Brain has already supplied the result.
+      if (output != null) snapshot.brainOutput = output
+      return item
+    }
+    const detail = toolDetail(snapshot.acp)
+    if (detail.type === 'sub_agent' && item.detail.type === 'sub_agent')
+      detail.childSessionId ??= item.detail.childSessionId
+    return { ...item, detail }
   }
   isRunning(id: string): boolean {
     return this.running.has(id)
@@ -786,9 +784,12 @@ export class Timeline {
             item.callId,
             {
               ...prev,
-              status: (nextStatus === 'canceled'
-                ? 'cancelled'
-                : nextStatus) as ToolCall['status'],
+              acp: {
+                ...prev.acp,
+                status: (nextStatus === 'canceled'
+                  ? 'cancelled'
+                  : nextStatus) as ToolCall['status'],
+              },
             },
             TOOL_SNAPSHOT_LIMIT,
           )
@@ -850,10 +851,11 @@ export class Timeline {
       update.sessionUpdate === 'tool_call' ||
       update.sessionUpdate === 'tool_call_update'
     ) {
-      const old =
+      const previous =
         update.sessionUpdate === 'tool_call_update'
           ? this.tools.get(update.toolCallId)
           : undefined
+      const old = previous?.acp
       if (
         !old &&
         update.sessionUpdate === 'tool_call_update' &&
@@ -890,7 +892,7 @@ export class Timeline {
         (old?.kind == null ||
           old.kind === 'other' ||
           old.kind === 'switch_mode')
-      const tool = {
+      const acp = {
         ...old,
         // ACP v1 raw input/output null is equivalent to omission, not a clear.
         ...Object.fromEntries(
@@ -899,7 +901,21 @@ export class Timeline {
         ...(preserveStatus ? { status: old!.status } : {}),
         ...(preservePlanMode ? { kind: 'switch_mode' as const } : {}),
       } as ToolCall
-      setBounded(this.tools, update.toolCallId, tool, TOOL_SNAPSHOT_LIMIT)
+      // A running card's empty content must not become a supplied result on a status-only completion.
+      const hasAcpResult =
+        acp.rawOutput != null ||
+        (update.content == null
+          ? previous?.hasAcpResult === true
+          : update.content.length > 0 || isTerminalToolStatus(acp.status))
+      const brainOutput = hasAcpResult ? undefined : previous?.brainOutput
+      setBounded(
+        this.tools,
+        update.toolCallId,
+        { acp, hasAcpResult, brainOutput },
+        TOOL_SNAPSHOT_LIMIT,
+      )
+      const tool =
+        brainOutput != null ? { ...acp, rawOutput: brainOutput } : acp
       const base = {
         type: 'tool_call' as const,
         id: `${this.prefix}:tool:${tool.toolCallId}`,

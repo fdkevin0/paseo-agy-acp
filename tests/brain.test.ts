@@ -33,7 +33,9 @@ import {
   flushObs,
   sequenceDouble,
   waitUntil,
+  writeFileAtomic,
 } from './helpers.ts'
+import recordedWakeup from './fixtures/agy-1.5.12-wakeup.json' with { type: 'json' }
 import { TranscriptReader } from '../server/brain-io.ts'
 import { BrainTurnObservation } from '../server/brain-observer.ts'
 import {
@@ -49,6 +51,7 @@ import {
   type Row,
 } from './brain-fixtures.ts'
 import { SubagentRegistry } from '../server/subagents.ts'
+import { Timeline } from '../server/mapping.ts'
 import type {
   ProviderEvent,
   ProviderTimelineItem,
@@ -108,10 +111,6 @@ function eventKindSummary(event: ProviderEvent): string {
 function itemTag(item: ProviderTimelineItem): string {
   if (item.type === 'tool_call')
     return `${item.type}:${item.callId}:${item.status}`
-  const text = 'text' in item ? item.text : ''
-  return `${item.type}:${text}`
-}
-function itemTextTag(item: ProviderTimelineItem): string {
   const text = 'text' in item ? item.text : ''
   return `${item.type}:${text}`
 }
@@ -178,18 +177,6 @@ function assistantTextsFromEvents(events: readonly ProviderEvent[]): string[] {
       } => e.type === 'timeline.item' && e.item.type === 'assistant_message',
     )
     .map((e) => e.item.text)
-}
-function assistantTextsFromItems(
-  items: readonly ProviderTimelineItem[],
-): string[] {
-  return items
-    .filter(
-      (
-        item,
-      ): item is Extract<ProviderTimelineItem, { type: 'assistant_message' }> =>
-        item.type === 'assistant_message',
-    )
-    .map((item) => item.text)
 }
 function turnAndReplySummary(events: readonly ProviderEvent[]): string[] {
   const result: string[] = []
@@ -334,22 +321,15 @@ test('parent waits for the terminal child report, then its own response, without
         cachedReadTokens: 30,
       },
       wokeUp: true,
-      pendingReplay: true,
       wakeupUsage: {
         inputTokens: 100,
         outputTokens: 20,
         cachedReadTokens: 30,
       },
-      carriedWakeupUsage: {
-        inputTokens: 100,
-        outputTokens: 20,
-        cachedReadTokens: 30,
-      },
     })
-    assert.ok(
-      items.some(
-        (item) => item.type === 'assistant_message' && item.text === 'Summary',
-      ),
+    assert.equal(
+      items.some((item) => item.type === 'assistant_message'),
+      false,
     )
   } finally {
     abort.abort()
@@ -393,7 +373,6 @@ test('nested child completion uses delivered reports and sending to parent never
       status: 'completed',
       lastStepUsage: undefined,
       wokeUp: true,
-      pendingReplay: true,
     })
   } finally {
     stop?.()
@@ -728,7 +707,6 @@ test('a child can report to its parent and a sibling before completing', async (
       status: 'completed',
       lastStepUsage: undefined,
       wokeUp: true,
-      pendingReplay: true,
     })
   } finally {
     await f.close()
@@ -967,7 +945,6 @@ test('batched SYSTEM_MESSAGE with multiple task completions resolves all tasks a
       status: 'completed',
       lastStepUsage: undefined,
       wokeUp: true,
-      pendingReplay: true,
     })
     const completedTools = items.filter(
       (i): i is Extract<ProviderTimelineItem, { type: 'tool_call' }> =>
@@ -1036,7 +1013,6 @@ test('literal [Message] inside a subagent report body does not over-count consum
       status: 'completed',
       lastStepUsage: undefined,
       wokeUp: true,
-      pendingReplay: true,
     })
   } finally {
     abort.abort()
@@ -1046,7 +1022,7 @@ test('literal [Message] inside a subagent report body does not over-count consum
   }
 })
 
-test('shouldEmitPreWakeupTool suppresses completed foreground tools while emitting post-wakeup items and identical OK replies', async () => {
+test('Brain fills missing wakeup tool results without replaying ACP text or completed foreground tools', async () => {
   const f = await fixture()
   try {
     const taskId = `${parent}/task-4`
@@ -1118,6 +1094,12 @@ test('shouldEmitPreWakeupTool suppresses completed foreground tools while emitti
       done(9, 'OK'),
     ])
     const items: ProviderTimelineItem[] = []
+    const snapshots = new Map([
+      [
+        'fg-edit',
+        { toolCallId: 'fg-edit', title: 'Edit', rawOutput: 'ACP output' },
+      ],
+    ])
     const result = await settleBrainTurn(
       f.root,
       parent,
@@ -1125,7 +1107,7 @@ test('shouldEmitPreWakeupTool suppresses completed foreground tools while emitti
       (item) => items.push(item),
       {
         minStepIndex: 0,
-        shouldEmitPreWakeupTool: (item) => item.callId === 'bg-cmd',
+        toolSnapshot: (id) => snapshots.get(id),
       },
     )
     assert.equal(result.status, 'completed')
@@ -1136,48 +1118,7 @@ test('shouldEmitPreWakeupTool suppresses completed foreground tools while emitti
     )
     assert.deepEqual(items.map(itemTag), [
       'tool_call:bg-cmd:completed',
-      'tool_call:post-read:running',
       'tool_call:post-read:completed',
-      'assistant_message:OK',
-    ])
-
-    // When emitForeground is true (fallback if user_message_chunk never arrived), foreground items are recovered without duplicating user_message
-    const recovered: ProviderTimelineItem[] = []
-    await appendFile(
-      f.path(parent),
-      encode([
-        { step_index: 10, type: 'USER_INPUT', content: 'next turn' },
-        {
-          step_index: 11,
-          type: 'PLANNER_RESPONSE',
-          status: 'DONE',
-          thinking: 'Think',
-          content: 'Recovered reply',
-          tool_calls: [{ id: 'rec-tool', name: 'read_file', args: {} }],
-        },
-        {
-          step_index: 12,
-          type: 'GENERIC',
-          status: 'DONE',
-          content: 'read output',
-        },
-        done(13, 'Final reply'),
-      ]),
-    )
-    const recResult = await settleBrainTurn(
-      f.root,
-      parent,
-      'p',
-      (item) => recovered.push(item),
-      { minStepIndex: 9, emitForeground: true },
-    )
-    assert.equal(recResult.status, 'completed')
-    assert.deepEqual(recovered.map(itemTag), [
-      'reasoning:Think',
-      'assistant_message:Recovered reply',
-      'tool_call:rec-tool:running',
-      'tool_call:rec-tool:completed',
-      'assistant_message:Final reply',
     ])
   } finally {
     await f.close()
@@ -1340,7 +1281,7 @@ test('an in-place O_TRUNC rewrite re-delivers changed steps once and drops unlog
       settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
         signal: abort.signal,
         observation: obs,
-        shouldEmitPreWakeupTool: () => true,
+        shouldUpdateTool: () => true,
         onStep: (step) => {
           stepEvents.emit(String(step))
         },
@@ -1662,13 +1603,7 @@ test('woken-turn LLM generation after SYSTEM_MESSAGE or completed GENERIC uses w
       items.some((i) => i.type === 'error'),
       false,
     )
-    assert.ok(
-      items.some(
-        (i) =>
-          i.type === 'assistant_message' &&
-          i.text === 'Final synthesis complete.',
-      ),
-    )
+    assert.equal(result.wokeUp, true)
 
     // A woken turn that never produces a follow-up response after SYSTEM_MESSAGE or GENERIC still stalls at wokenStallTimeoutMs.
     await f.put(parent, [
@@ -1807,7 +1742,7 @@ test('unmatched foreground tool calls and permanent consumed-message drift still
   }
 })
 
-test('a restart notice inside a woken turn keeps projecting the woken response', async () => {
+test('a restart notice inside a woken turn keeps accounting for the woken response', async () => {
   const f = await fixture()
   try {
     const notice = message(
@@ -1820,7 +1755,11 @@ test('a restart notice inside a woken turn keeps projecting the woken response',
       done(2, 'Foreground answer'),
       message(3, child, 'Wake up'),
       notice,
-      done(5, 'Woken answer after notice'),
+      {
+        ...done(5, 'Woken answer after notice'),
+        input_tokens: 10,
+        output_tokens: 2,
+      },
     ])
     const items: ProviderTimelineItem[] = []
     const result = await alive(
@@ -1831,13 +1770,7 @@ test('a restart notice inside a woken turn keeps projecting the woken response',
       }),
     )
     assert.equal(result.status, 'completed')
-    assert.ok(
-      items.some(
-        (i) =>
-          i.type === 'assistant_message' &&
-          i.text === 'Woken answer after notice',
-      ),
-    )
+    assert.equal(result.wakeupUsage?.inputTokens, 10)
 
     // The restarted runtime has no woken turn left running, even if a stopped child's report lands after the notice.
     await f.put(parent, [
@@ -2543,97 +2476,7 @@ const loadWokenQuestionFixture = async (): Promise<Row[]> =>
     .split('\n')
     .map((line) => JSON.parse(line) as Row)
 
-test('a woken ask_question is not background work and closes without a question handler', async () => {
-  const f = await fixture()
-  try {
-    const rows = await loadWokenQuestionFixture()
-    // Steps 0..5: background run_command wakes the session, and step 5 calls ask_question with no GENERIC row yet.
-    await f.put(parent, rows.slice(0, 6))
-
-    // Waiting on user question in a woken turn is NOT active background work (must not relaunch on interrupt)
-    assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
-
-    // Without onQuestion, settleBrainTurn completes immediately instead of stalling for 15m
-    const directItems: ProviderTimelineItem[] = []
-    const direct = await settleBrainTurn(
-      f.root,
-      parent,
-      'p',
-      (item) => directItems.push(item),
-      { minStepIndex: -1, pollIntervalMs: 5, stallTimeoutMs: 30 },
-    )
-    assert.equal(direct.status, 'completed')
-    assert.equal(direct.wokeUp, true)
-    assert.ok(
-      directItems.some(
-        (i) =>
-          i.type === 'tool_call' &&
-          i.name === 'ask_question' &&
-          i.status === 'completed',
-      ),
-    )
-  } finally {
-    await f.close()
-  }
-})
-
-test('answering a woken ask_question continues the turn and records the answer', async () => {
-  const f = await fixture()
-  const contItems: ProviderTimelineItem[] = []
-  const obs = manualObs(f.root, parent, -1, (item) => contItems.push(item))
-  try {
-    const rows = await loadWokenQuestionFixture()
-    await f.put(parent, rows.slice(0, 6))
-    const answered = new EventEmitter()
-    const questionAnswered = once(answered, 'done')
-
-    // With onQuestion answering and appending agy's GENERIC + PLANNER_RESPONSE (steps 6..7), settleBrainTurn continues and emits the final reply
-    const pending = alive(
-      settleBrainTurn(f.root, parent, 'p', (item) => contItems.push(item), {
-        minStepIndex: -1,
-        observation: obs,
-        onQuestion: async (q) => {
-          assert.equal(q.wokeUp, true)
-          assert.equal(q.questions.length, 1)
-          assert.equal(
-            q.questions[0].question,
-            'Background check finished. Which option?',
-          )
-          await appendFile(f.path(parent), encode(rows.slice(6)))
-          queueMicrotask(() => answered.emit('done'))
-          return {
-            status: 'answered',
-            answerText: '(Recommended) Option 1',
-          }
-        },
-      }),
-    )
-    await questionAnswered
-    await flushObs(obs)
-    const cont = await pending
-    assert.equal(cont.status, 'completed')
-    assert.equal(cont.wokeUp, true)
-    const completedAsk = contItems.findLast(
-      (i) =>
-        i.type === 'tool_call' &&
-        i.name === 'ask_question' &&
-        i.status === 'completed',
-    )
-    assert.ok(
-      completedAsk?.type === 'tool_call' &&
-        completedAsk.detail.type === 'plain_text' &&
-        completedAsk.detail.text?.includes('Answer:\n(Recommended) Option 1'),
-    )
-    assert.deepEqual(assistantTextsFromItems(contItems), [
-      'Done: (Recommended) Option 1',
-    ])
-  } finally {
-    await obs.dispose()
-    await f.close()
-  }
-})
-
-test('a woken question answered through elicitation waits for agy to reply to the answer', async () => {
+test('a woken native question is not interrupt-relaunch work but blocks settlement until agy replies', async () => {
   const f = await fixture()
   const abort = new AbortController()
   const items: ProviderTimelineItem[] = []
@@ -2642,26 +2485,31 @@ test('a woken question answered through elicitation waits for agy to reply to th
   try {
     const rows = await loadWokenQuestionFixture()
     await f.put(parent, rows.slice(0, 6))
-    const answered = new EventEmitter()
-    const questionAnswered = once(answered, 'done')
+    assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
+    const checks = new EventEmitter()
+    const questionChecked = once(checks, 'question')
+    let answer: { answerText: string; declined: boolean } | undefined
     let isSettled = false
     running = alive(
       settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
         minStepIndex: -1,
         signal: abort.signal,
         observation: obs,
-        onQuestion: async () => {
-          // agy logs the tool result and its reply only after the elicitation response, so later than this return.
-          queueMicrotask(() => answered.emit('done'))
-          return { status: 'answered', answerText: '(Recommended) Option 1' }
+        takeQuestionAnswer: () => {
+          checks.emit('question')
+          return answer
         },
       }),
     ).then((res) => {
       isSettled = true
       return res
     })
-    await questionAnswered
+    await questionChecked
+    assert.equal(isSettled, false)
+    const matched = once(checks, 'question')
+    answer = { answerText: '(Recommended) Option 1', declined: false }
     await flushObs(obs)
+    await matched
     assert.equal(isSettled, false)
     await appendFile(
       f.path(parent),
@@ -2671,9 +2519,10 @@ test('a woken question answered through elicitation waits for agy to reply to th
     const settled = await running
     running = undefined
     assert.equal(settled.status, 'completed')
-    assert.deepEqual(assistantTextsFromItems(items), [
-      'Done: (Recommended) Option 1',
-    ])
+    assert.equal(
+      items.some((item) => item.type === 'assistant_message'),
+      false,
+    )
   } finally {
     abort.abort()
     await obs.dispose()
@@ -2681,6 +2530,68 @@ test('a woken question answered through elicitation waits for agy to reply to th
     await f.close()
   }
 })
+
+test(
+  'a rewritten transcript cannot give a replacement question an anonymous slot’s cached answer',
+  { timeout: 5000 },
+  async (t) => {
+    const f = await fixture()
+    t.after(f.close)
+    const tracker = createStepTracker()
+    const obs = manualObs(f.root, parent)
+    const abort = new AbortController()
+    t.after(() => {
+      abort.abort()
+      return obs.dispose()
+    })
+    const ask = (question: string, id?: string): Row => ({
+      ...done(1, ''),
+      tool_calls: [
+        {
+          id,
+          name: 'ask_question',
+          args: { questions: [{ question, options: ['A', 'B'] }] },
+        },
+      ],
+    })
+    await f.put(parent, [
+      { step_index: 0, type: 'USER_INPUT', content: 'work' },
+      ask('Original question?'),
+      { step_index: 2, type: 'GENERIC', status: 'DONE', content: 'A' },
+      { step_index: 3, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+    ])
+    const items: ProviderTimelineItem[] = []
+    const running = alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+        signal: abort.signal,
+        observation: obs,
+        onStep: tracker.onStep,
+        takeQuestionAnswer: sequenceDouble([
+          () => ({ answerText: 'original answer', declined: false }),
+          () => ({ answerText: 'replacement answer', declined: false }),
+        ]),
+      }),
+    )
+    await tracker.waitFor(3)
+    await writeFileAtomic(
+      f.path(parent),
+      encode([
+        { step_index: 0, type: 'USER_INPUT', content: 'work' },
+        ask('Replacement question?', 'replacement-call'),
+      ]),
+    )
+    await flushObs(obs)
+    assert.equal((await running).status, 'completed')
+    const replacement = items.find(
+      (item) => item.type === 'tool_call' && item.callId === 'replacement-call',
+    )
+    assert.ok(
+      replacement?.type === 'tool_call' &&
+        replacement.detail.type === 'plain_text',
+    )
+    assert.match(replacement.detail.text ?? '', /Answer:\nreplacement answer$/)
+  },
+)
 
 test('ask_question results stay attributed by step next to sibling tool calls', () => {
   // Mixed [ask_question, run_command] in one PLANNER_RESPONSE preserves FIFO/step attribution
@@ -2756,7 +2667,7 @@ test('ask_question results stay attributed by step next to sibling tool calls', 
   assert.equal(completedUnlogged.length, 1)
   assert.equal(completedUnlogged[0].callId, 'cmd')
   assert.equal(p2.hasPending(), false)
-  assert.equal(p2.consumePendingQuestion()?.tool.callId, 'ask')
+  assert.equal(p2.consumePendingQuestion(() => true)?.tool.callId, 'ask')
 
   // A CHECKPOINT between the response and its GENERIC rows shifts the expected step of later calls.
   const p3 = new BrainTranscriptProjector('s')
@@ -2782,93 +2693,6 @@ test('ask_question results stay attributed by step next to sibling tool calls', 
     ['ask', 'Choose\n  1. A\n  2. B\n\nAnswer:\nUser chose A'],
     ['cmd', 'hi'],
   ])
-})
-
-test('a leading ask_question fires onQuestion before its sibling has a GENERIC row', async () => {
-  const f = await fixture()
-  try {
-    // Same PLANNER_RESPONSE [ask_question, run_command] with no GENERIC rows yet still fires onQuestion immediately
-    await f.put(parent, [
-      {
-        step_index: 0,
-        type: 'USER_INPUT',
-        content: '<USER_REQUEST>Ask then run</USER_REQUEST>',
-      },
-      {
-        step_index: 1,
-        type: 'PLANNER_RESPONSE',
-        status: 'DONE',
-        content: 'Need confirmation before running command:',
-        tool_calls: [
-          {
-            id: 'ask-first',
-            name: 'ask_question',
-            args: {
-              questions: [{ question: 'Run echo?', options: ['Yes', 'No'] }],
-            },
-          },
-          {
-            id: 'cmd-second',
-            name: 'run_command',
-            args: { CommandLine: 'echo hi' },
-          },
-        ],
-      },
-    ])
-    const leadingAskItems: ProviderTimelineItem[] = []
-    let leadingAskTriggered = false
-    const leadingAskSettled = await alive(
-      settleBrainTurn(
-        f.root,
-        parent,
-        'p',
-        (item) => leadingAskItems.push(item),
-        {
-          minStepIndex: -1,
-          pollIntervalMs: 5,
-          stallTimeoutMs: 80,
-          onQuestion: async (q) => {
-            leadingAskTriggered = true
-            assert.equal(q.tool.callId, 'ask-first')
-            assert.equal(q.questions[0]?.question, 'Run echo?')
-            await appendFile(
-              f.path(parent),
-              encode([
-                {
-                  step_index: 2,
-                  type: 'GENERIC',
-                  status: 'DONE',
-                  content: 'Yes',
-                },
-                {
-                  step_index: 3,
-                  type: 'GENERIC',
-                  status: 'DONE',
-                  content: 'hi',
-                },
-                done(4, 'Command completed.'),
-              ]),
-            )
-            return { status: 'answered', answerText: 'Yes' }
-          },
-        },
-      ),
-    )
-    assert.equal(leadingAskTriggered, true)
-    assert.equal(leadingAskSettled.status, 'completed')
-    const completedCmdSecond = leadingAskItems.find(
-      (i): i is Extract<ProviderTimelineItem, { type: 'tool_call' }> =>
-        i.type === 'tool_call' &&
-        i.callId === 'cmd-second' &&
-        i.status === 'completed',
-    )
-    assert.ok(
-      completedCmdSecond?.detail.type === 'shell' &&
-        completedCmdSecond.detail.output === 'hi',
-    )
-  } finally {
-    await f.close()
-  }
 })
 
 test('countRowMessages aligns with inbox wakeup counts across restart notices, low priority, and batched step 0', () => {
@@ -2980,7 +2804,13 @@ test('foreground turn aborted by user permission denial settles immediately with
         step_index: 1,
         type: 'PLANNER_RESPONSE',
         status: 'DONE',
-        tool_calls: [{ name: 'run_command', args: { CommandLine: 'echo 1' } }],
+        tool_calls: [
+          {
+            id: 'call_denied_0',
+            name: 'run_command',
+            args: { CommandLine: 'echo 1' },
+          },
+        ],
       },
       {
         step_index: 2,
@@ -3043,14 +2873,20 @@ test('foreground turn aborted by user permission denial settles immediately with
     spoofRunning = undefined
     assert.equal(spoofResult.status, 'failed')
 
-    // agy 1.5.5 returns end_turn without flushing the GENERIC row when permission is denied.
+    // A denied call does not need a GENERIC row to settle.
     await f.put(unlogged, [
       { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'echo 2' },
       {
         step_index: 1,
         type: 'PLANNER_RESPONSE',
         status: 'DONE',
-        tool_calls: [{ name: 'run_command', args: { CommandLine: 'echo 2' } }],
+        tool_calls: [
+          {
+            id: 'call_denied_1',
+            name: 'run_command',
+            args: { CommandLine: 'echo 2' },
+          },
+        ],
       },
     ])
     const result2 = await settleBrainTurn(f.root, unlogged, 'p', () => {}, {
@@ -4306,7 +4142,6 @@ test('low-priority kill notice during foreground loop or after inline ask_questi
       (item) => itemsA.push(item),
       {
         minStepIndex: 0,
-        shouldEmitPreWakeupTool: () => false,
       },
     )
     assert.equal(resA.status, 'completed')
@@ -4359,7 +4194,6 @@ test('low-priority kill notice during foreground loop or after inline ask_questi
       (item) => itemsQ.push(item),
       {
         minStepIndex: 9,
-        shouldEmitPreWakeupTool: () => false,
       },
     )
     assert.equal(resQ.status, 'completed')
@@ -4402,20 +4236,402 @@ test('orphan trailing GENERIC(DONE) after complete PLANNER_RESPONSE does not un-
     )
     assert.equal(res.status, 'completed')
     assert.equal(res.wokeUp, true)
-    assert.equal(
-      items.some(
-        (i) => i.type === 'assistant_message' && i.text === 'Task ready.',
-      ),
-      true,
-    )
+    assert.equal(res.wakeupUsage?.inputTokens, 20)
   } finally {
     await f.close()
   }
 })
 
-async function assertCachedWakeupEmitted(
+test('a verified wakeup call keeps its ID when its input repeats a foreground call', async (t) => {
+  const f = await fixture()
+  t.after(f.close)
+  const repeated = { CommandLine: 'echo repeated' }
+  const snapshots = new Map([
+    ['fg', { toolCallId: 'fg', title: 'Command', rawInput: repeated }],
+    ['post', { toolCallId: 'post', title: 'Command', rawInput: repeated }],
+  ])
+  await f.put(parent, [
+    { step_index: 1, type: 'USER_INPUT', content: 'run and wait' },
+    {
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        { name: 'run_command', args: { CommandLine: 'echo other' } },
+      ],
+    },
+    { step_index: 3, type: 'GENERIC', status: 'DONE', content: 'other output' },
+    done(4, 'Waiting for inbox.'),
+    message(5, 'inbox', 'Continue after the response'),
+    {
+      step_index: 6,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: 'run_command', args: repeated }],
+    },
+    {
+      step_index: 7,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: 'wakeup output',
+    },
+    { ...done(8, 'Finished.'), input_tokens: 42, output_tokens: 1 },
+  ])
+  const items: ProviderTimelineItem[] = []
+  const result = await settleBrainTurn(
+    f.root,
+    parent,
+    'p',
+    (item) => items.push(item),
+    {
+      acpToolCallIds: ['fg', 'post'],
+      foregroundAcp: [
+        { type: 'tool_call', callId: 'fg' },
+        { type: 'assistant_message', text: 'Waiting for inbox.' },
+      ],
+      toolSnapshot: (id) => snapshots.get(id),
+    },
+  )
+  assert.deepEqual(completedToolOutputs(items), [['post', 'wakeup output']])
+  assert.equal(result.status, 'completed')
+  assert.equal(result.wakeupUsage?.inputTokens, 42)
+})
+
+test(
+  'an ACP post-response tool frame ahead of Brain cannot re-bill the in-RPC wakeup',
+  { timeout: 5000 },
+  async (t) => {
+    const f = await fixture()
+    t.after(f.close)
+    const tracker = createStepTracker()
+    const obs = manualObs(f.root, parent)
+    const abort = new AbortController()
+    t.after(() => {
+      abort.abort()
+      return obs.dispose()
+    })
+    const { foreground, wakeup, answer } = recordedWakeup
+    const toolStarts = [
+      foreground.updates[2],
+      wakeup.updates[3],
+      wakeup.updates[5],
+      wakeup.updates[9],
+    ]
+    const snapshots = new Map(
+      toolStarts.map(({ sessionUpdate, toolCallId, title, rawInput }) => {
+        assert.equal(sessionUpdate, 'tool_call')
+        assert.ok(toolCallId && title)
+        return [toolCallId, { toolCallId, title, rawInput }] as const
+      }),
+    )
+    await f.put(parent, [
+      ...foreground.rows,
+      ...wakeup.rows.slice(0, 4),
+      { ...done(8, 'Reads finished.'), input_tokens: 40, output_tokens: 1 },
+      message(9, 'second-inbox-message', 'Continue after the response'),
+    ])
+    const items: ProviderTimelineItem[] = []
+    const usage = new Map<number, number>()
+    let wakeupInput: number | undefined
+    const running = alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+        signal: abort.signal,
+        observation: obs,
+        acpToolCallIds: ['call_1', 'call_2', 'call_3', 'call_4'],
+        foregroundAcp: [
+          { type: 'reasoning', text: 'Checking background progress.' },
+          { type: 'tool_call', callId: 'call_1' },
+          { type: 'assistant_message', text: 'started' },
+          { type: 'reasoning', text: 'Checking background progress.' },
+          { type: 'tool_call', callId: 'call_2' },
+          { type: 'tool_call', callId: 'call_3' },
+          { type: 'assistant_message', text: 'Reads finished.' },
+        ],
+        toolSnapshot: (id) => snapshots.get(id),
+        onStep: (step) => {
+          tracker.onStep(step)
+          usage.set(step, wakeupInput ?? 0)
+        },
+        onWakeupState: (state) => {
+          wakeupInput = state.wakeupUsage?.inputTokens
+        },
+      }),
+    )
+    await tracker.waitFor(9)
+    assert.equal(usage.get(8), 0)
+    assert.deepEqual(items.filter(isTerminalToolCall), [])
+    await appendFile(
+      f.path(parent),
+      encode([
+        { ...wakeup.rows[4], step_index: 10 },
+        { ...answer.rows[0], step_index: 11 },
+        { ...answer.rows[1], step_index: 12 },
+      ]),
+    )
+    await flushObs(obs)
+    const result = await running
+    assert.equal(result.status, 'completed')
+    assert.equal(result.wakeupUsage?.inputTokens, 4814)
+    assert.deepEqual(
+      items
+        .filter(isTerminalToolCall)
+        .map(({ callId }) => callId)
+        .filter((id) => id === 'call_2' || id === 'call_3'),
+      ['call_2', 'call_3'],
+    )
+  },
+)
+
+test(
+  'an ACP-ahead turn still verifies the foreground prefix after Brain flushes past foreground tools',
+  { timeout: 5000 },
+  async (t) => {
+    const f = await fixture()
+    t.after(f.close)
+    const tracker = createStepTracker()
+    const obs = manualObs(f.root, parent)
+    const abort = new AbortController()
+    t.after(() => {
+      abort.abort()
+      return obs.dispose()
+    })
+    const fgInput = { Path: '/fixture/fg.txt' }
+    const postInput1 = { Path: '/fixture/post-1.txt' }
+    const postInput2 = { Path: '/fixture/post-2.txt' }
+    const snapshots = new Map([
+      ['fg-1', { toolCallId: 'fg-1', title: 'Read', rawInput: fgInput }],
+      ['post-1', { toolCallId: 'post-1', title: 'Read', rawInput: postInput1 }],
+      ['post-2', { toolCallId: 'post-2', title: 'Read', rawInput: postInput2 }],
+    ])
+    await f.put(parent, [
+      { step_index: 0, type: 'USER_INPUT', content: 'work' },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ name: 'read_file', args: fgInput }],
+      },
+      { step_index: 2, type: 'GENERIC', status: 'DONE', content: 'fg data' },
+      done(3, 'started'),
+      message(4, 'task-in-rpc', 'In-RPC completion'),
+      {
+        ...done(5, 'in-rpc reply'),
+        input_tokens: 40,
+        output_tokens: 1,
+      },
+      message(6, 'task-post-rpc', 'Post-RPC completion'),
+      {
+        step_index: 7,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ name: 'read_file', args: postInput1 }],
+      },
+      { step_index: 8, type: 'GENERIC', status: 'DONE', content: 'post 1' },
+    ])
+    const items: ProviderTimelineItem[] = []
+    const usage = new Map<number, number>()
+    let wakeupInput: number | undefined
+    const running = alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+        signal: abort.signal,
+        observation: obs,
+        acpToolCallIds: ['fg-1', 'post-1', 'post-2'],
+        foregroundAcp: [
+          { type: 'tool_call', callId: 'fg-1' },
+          { type: 'assistant_message', text: 'started' },
+          { type: 'assistant_message', text: 'in-rpc reply' },
+        ],
+        toolSnapshot: (id) => snapshots.get(id),
+        onStep: (step) => {
+          tracker.onStep(step)
+          usage.set(step, wakeupInput ?? 0)
+        },
+        onWakeupState: (state) => {
+          wakeupInput = state.wakeupUsage?.inputTokens
+        },
+      }),
+    )
+    await tracker.waitFor(8)
+    assert.equal(usage.get(5), 0)
+    await appendFile(
+      f.path(parent),
+      encode([
+        {
+          step_index: 9,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [{ name: 'read_file', args: postInput2 }],
+        },
+        { step_index: 10, type: 'GENERIC', status: 'DONE', content: 'post 2' },
+        { ...done(11, 'post-rpc final'), input_tokens: 99, output_tokens: 3 },
+      ]),
+    )
+    await flushObs(obs)
+    const result = await running
+    assert.equal(result.status, 'completed')
+    assert.equal(result.wakeupUsage?.inputTokens, 99)
+    assert.equal(result.wakeupUsage?.outputTokens, 3)
+    assert.deepEqual(
+      items
+        .filter(isTerminalToolCall)
+        .map(({ callId, detail }) => [
+          callId,
+          detail.type === 'read' && detail.content,
+        ]),
+      [
+        ['fg-1', 'fg data'],
+        ['post-1', 'post 1'],
+        ['post-2', 'post 2'],
+      ],
+    )
+  },
+)
+
+test('running empty ACP content followed by status-only completion still recovers Brain result', async (t) => {
+  const f = await fixture()
+  t.after(f.close)
+  const timeline = new Timeline('p')
+  const readA = { Path: '/fixture/a.txt' }
+  const readB = { Path: '/fixture/b.txt' }
+  const startA = timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'read-a',
+    title: 'read_file',
+    status: 'in_progress',
+    rawInput: readA,
+    content: [],
+  })
+  assert.ok(startA)
+  timeline.track(startA)
+  const doneA = timeline.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'read-a',
+    status: 'completed',
+  })
+  assert.ok(doneA)
+  timeline.track(doneA)
+  const startB = timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'read-b',
+    title: 'read_file',
+    status: 'in_progress',
+    rawInput: readB,
+    content: [],
+  })
+  assert.ok(startB)
+  timeline.track(startB)
+  const doneB = timeline.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'read-b',
+    status: 'completed',
+    content: [],
+  })
+  assert.ok(doneB)
+  timeline.track(doneB)
+  assert.equal(timeline.isRunning('p:tool:read-a'), false)
+  assert.equal(timeline.hasToolResult('read-a'), false)
+  assert.equal(timeline.hasToolResult('read-b'), true)
+  await f.put(parent, [
+    { step_index: 1, type: 'USER_INPUT', content: 'read both' },
+    {
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        { name: 'read_file', args: readA },
+        { name: 'read_file', args: readB },
+      ],
+    },
+    { step_index: 3, type: 'GENERIC', status: 'DONE', content: 'alpha' },
+    { step_index: 4, type: 'GENERIC', status: 'DONE', content: 'beta' },
+    done(5, 'Done.'),
+  ])
+  const items: ProviderTimelineItem[] = []
+  const result = await settleBrainTurn(
+    f.root,
+    parent,
+    'p',
+    (item) => items.push(item),
+    {
+      acpToolCallIds: ['read-a', 'read-b'],
+      toolSnapshot: (id) => timeline.toolCallSnapshot(id),
+      hasToolResult: (id) => timeline.hasToolResult(id),
+      shouldUpdateTool: (item) => timeline.isRunning(item.id),
+    },
+  )
+  assert.equal(result.status, 'completed')
+  assert.deepEqual(
+    items
+      .filter(isTerminalToolCall)
+      .map(({ callId, detail }) => [
+        callId,
+        detail.type === 'read' && detail.content,
+      ]),
+    [['read-a', 'alpha']],
+  )
+})
+
+test('anonymous live ask_question GENERIC(DONE) resumes foreground_active instead of staying foreground_idle', () => {
+  const node = new BrainNode(parent, 'p', { allowInitialSpawnPrompt: false })
+  node.projector.bindLiveToolCallIds([], new Set())
+  node.ingest({ step_index: 1, type: 'USER_INPUT', content: 'ask me' })
+  node.ingest({
+    step_index: 2,
+    type: 'PLANNER_RESPONSE',
+    status: 'DONE',
+    tool_calls: [
+      {
+        name: 'ask_question',
+        args: { questions: [{ question: 'Pick?', options: ['A', 'B'] }] },
+      },
+    ],
+  })
+  assert.equal(node.promptPhase, 'foreground_idle')
+  node.ingest({ step_index: 3, type: 'GENERIC', status: 'DONE', content: 'A' })
+  assert.equal(node.promptPhase, 'foreground_active')
+  node.ingest(message(4, 'task-bg', 'Background finished'))
+  assert.equal(node.promptPhase, 'foreground_active')
+  assert.equal(node.wokeUp, false)
+})
+
+test('pure [plan review due] notice resumes foreground_active from foreground_idle without entering woken', () => {
+  const node = new BrainNode(parent, 'p', { allowInitialSpawnPrompt: false })
+  node.ingest({ step_index: 1, type: 'USER_INPUT', content: 'implement plan' })
+  node.ingest(done(2, 'Finished implementing.'))
+  assert.equal(node.promptPhase, 'foreground_idle')
+  node.ingest({
+    step_index: 3,
+    type: 'SYSTEM_MESSAGE',
+    content:
+      '<SYSTEM_MESSAGE>\n[plan review due] Review the completed work.\n</SYSTEM_MESSAGE>',
+  })
+  assert.equal(node.promptPhase, 'foreground_active')
+  assert.equal(node.wokeUp, false)
+  node.ingest(message(4, 'task-bg', 'Background update during review'))
+  assert.equal(node.promptPhase, 'foreground_active')
+  assert.equal(node.wokeUp, false)
+})
+
+test('declining native elicitation does not suppress a non-reader observation fault', async (t) => {
+  const f = await fixture()
+  t.after(f.close)
+  await f.put(parent, [{ step_index: 1, type: 'USER_INPUT', content: 'work' }])
+  const fault = Object.assign(new Error('step callback failed'), {
+    code: 'EBUSY',
+  })
+  await assert.rejects(
+    settleBrainTurn(f.root, parent, 'p', () => {}, {
+      isWakeupQuestionDeclined: () => true,
+      onStep: () => {
+        throw fault
+      },
+    }),
+    fault,
+  )
+})
+
+async function assertCachedWakeupBilled(
   root: string,
-  emitForeground: boolean,
   foregroundAcp: readonly ForegroundAcpSegment[],
 ) {
   const itemsC: ProviderTimelineItem[] = []
@@ -4426,7 +4642,6 @@ async function assertCachedWakeupEmitted(
     (item) => itemsC.push(item),
     {
       minStepIndex: 0,
-      emitForeground,
       foregroundAcp,
     },
   )
@@ -4437,16 +4652,9 @@ async function assertCachedWakeupEmitted(
     cachedReadTokens: 50000,
     outputTokens: 10,
   })
-  assert.equal(
-    itemsC.some(
-      (i) =>
-        i.type === 'assistant_message' && i.text === 'Cached wakeup reply.',
-    ),
-    true,
-  )
 }
 
-test('in-RPC high-priority continuation is suppressed and excluded from wakeupUsage while genuine post-RPC wakeup is emitted', async () => {
+test('in-RPC high-priority continuation is suppressed and excluded from wakeupUsage while genuine post-RPC wakeup usage is included', async () => {
   // Subcase 1: Covered in-RPC continuation with tool calls, retry warning, and foreground reasoning/text.
   const f1 = await fixture()
   try {
@@ -4535,7 +4743,11 @@ test('in-RPC high-priority continuation is suppressed and excluded from wakeupUs
       {
         minStepIndex: 0,
         acpToolCallIds: ['bg-196', 'fg-read'],
-        shouldEmitPreWakeupTool: (item) => item.callId === 'bg-196',
+        toolSnapshot: () => ({
+          toolCallId: 'fg-read',
+          title: 'Read',
+          rawOutput: 'ACP result',
+        }),
         foregroundAcp: [
           { type: 'tool_call', callId: 'bg-196' },
           { type: 'assistant_message', text: 'OK' },
@@ -4557,7 +4769,7 @@ test('in-RPC high-priority continuation is suppressed and excluded from wakeupUs
     await f1.close()
   }
 
-  // Subcase 2: 100% KV-cache-hit post-RPC wakeup (input_tokens: 0) is never swallowed, even with emitForeground.
+  // Subcase 2: 100% KV-cache-hit post-RPC wakeup (input_tokens: 0) still bills the wakeup.
   const f2 = await fixture()
   try {
     await f2.deliver(parent, 'bg-cached', 'ping', true)
@@ -4572,10 +4784,9 @@ test('in-RPC high-priority continuation is suppressed and excluded from wakeupUs
         output_tokens: 10,
       },
     ])
-    await assertCachedWakeupEmitted(f2.root, false, [
+    await assertCachedWakeupBilled(f2.root, [
       { type: 'assistant_message', text: 'Start' },
     ])
-    await assertCachedWakeupEmitted(f2.root, true, [])
   } finally {
     await f2.close()
   }
@@ -4621,7 +4832,7 @@ test('in-RPC high-priority continuation is suppressed and excluded from wakeupUs
       cachedReadTokens: 10,
       outputTokens: 6,
     })
-    assert.deepEqual(items2.map(itemTextTag), ['assistant_message:OK'])
+    assert.deepEqual(items2, [])
   } finally {
     await f3.close()
   }
@@ -5970,7 +6181,7 @@ test('child initial spawn prompt after step-0 system reminder projects user_mess
   }
 })
 
-test('question-continuation USER_INPUT preserves turnStartStep and touchedSubagents across replay and live continuation', () => {
+test('historical question-continuation USER_INPUT preserves turnStartStep and touchedSubagents', () => {
   const spawnAndAsk = (startStep: number): Row[] => [
     { step_index: startStep, type: 'USER_INPUT', content: 'start turn' },
     {
@@ -5994,7 +6205,7 @@ test('question-continuation USER_INPUT preserves turnStartStep and touchedSubage
     },
   ]
 
-  // 1. Replay path (hasPendingQuestion() === true without markQuestionContinuation):
+  // A persisted continuation follows an unlogged question.
   const replayNode = new BrainNode(parent, 'p', {
     allowInitialSpawnPrompt: false,
   })
@@ -6029,27 +6240,7 @@ test('question-continuation USER_INPUT preserves turnStartStep and touchedSubage
   assert.equal(replayNode.turnStartStep, 15)
   assert.deepEqual([...replayNode.projector.touchedSubagentIds()], [])
 
-  // 2. Live continuation path (consumePendingQuestion() + markQuestionContinuation(true)):
-  const liveNode = new BrainNode(parent, 'p', {
-    allowInitialSpawnPrompt: false,
-  })
-  ingestAll(liveNode, spawnAndAsk(20))
-  assert.ok(liveNode.projector.consumePendingQuestion())
-  assert.equal(liveNode.projector.hasPendingQuestion(), false)
-  liveNode.markQuestionContinuation(true)
-  liveNode.ingest({
-    step_index: 23,
-    type: 'USER_INPUT',
-    content: 'Yes',
-  })
-  assert.equal(
-    liveNode.turnStartStep,
-    20,
-    'live synthetic question continuation must preserve turnStartStep',
-  )
-  assert.deepEqual([...liveNode.projector.touchedSubagentIds()], [child])
-
-  // 3. Stateless replay of woken ask_question preserves node.wokeUp and works when a sibling tool precedes ask_question.
+  // Stateless replay of woken ask_question preserves node.wokeUp and works when a sibling tool precedes ask_question.
   const wokenReplayNode = new BrainNode(parent, 'p', {
     allowInitialSpawnPrompt: false,
   })

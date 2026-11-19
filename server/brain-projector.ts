@@ -53,7 +53,6 @@ export type PendingTool = {
   questions?: NormalizedQuestion[]
   questionConsumed?: boolean
   acpIndex?: number
-  fallbackId?: string
   genericSeen?: boolean
   deferredCompletion?: {
     output: unknown
@@ -62,22 +61,6 @@ export type PendingTool = {
   }
   questionCompleted?: boolean
 }
-
-export type PendingQuestion = {
-  tool: PendingTool
-  questions: NormalizedQuestion[]
-  wokeUp: boolean
-  beginContinuation?: (answerText: string) => void
-  restoreContinuationCarry?: (preservePendingReplay: boolean) => void
-}
-
-export type QuestionOutcome =
-  | { status: 'answered' | 'already_handled'; answerText?: string }
-  | {
-      status: 'canceled'
-      preserveCarriedWakeup?: boolean
-      preservePendingReplay?: boolean
-    }
 
 const backgroundTaskPattern =
   /Tool is running as a background task with task id:\s*(\S+)/
@@ -131,6 +114,7 @@ export class BrainTranscriptProjector {
     callId: string
     source: NativeToolIdentitySource
   }
+  private lastGenericMatched = false
   private background = new Map<string, PendingTool>()
   private daemons = new Map<string, number>()
   private subagentTouches: { childId: string; stepIndex: number }[] = []
@@ -147,11 +131,10 @@ export class BrainTranscriptProjector {
   private observedSlots: ObservedToolSlot[] = []
   private observedPending: ObservedToolSlot[] = []
   private slotIndex = 0
-  private toolIndex = 0
-  private deferAnonymous = false
   private retired: PendingTool[] = []
   private acpToolCallIds: readonly (string | undefined)[] = []
   private verifiedAcpToolIds?: ReadonlySet<string>
+  private liveToolAlignment = false
   private lastErrorCallId?: string
   private sessionId: string
   private onQuestionSettledByGeneric?: (
@@ -190,14 +173,25 @@ export class BrainTranscriptProjector {
     return this.lastBackgroundGeneric
   }
 
+  matchedLastGeneric(): boolean {
+    return this.lastGenericMatched
+  }
+
   bindToolCallIds(
     ids: readonly (string | undefined)[],
-    startIndex = 0,
     verifiedAcpToolIds?: ReadonlySet<string>,
   ) {
     this.acpToolCallIds = ids
-    this.toolIndex = startIndex
     this.verifiedAcpToolIds = verifiedAcpToolIds
+  }
+
+  bindLiveToolCallIds(
+    ids: readonly (string | undefined)[],
+    verified: ReadonlySet<string>,
+  ) {
+    this.liveToolAlignment = true
+    this.acpToolCallIds = ids
+    this.verifiedAcpToolIds = verified
   }
 
   /**
@@ -257,6 +251,14 @@ export class BrainTranscriptProjector {
     return this.observedSlots
   }
 
+  /** Read immediately after projecting a planner row, in that row's tool order. */
+  plannerToolCallIds(prefixIds: readonly (string | undefined)[]): string[] {
+    return this.pending.flatMap(({ callId, slotIndex }) => {
+      const id = callId || prefixIds[slotIndex]
+      return id ? [id] : []
+    })
+  }
+
   private effectiveStepIndex(slotIndex: number, stepIndex: number): number {
     return this.observedSlots[slotIndex]?.stepIndex ?? stepIndex
   }
@@ -275,14 +277,23 @@ export class BrainTranscriptProjector {
   }
 
   hasPending(): boolean {
-    return this.retired.length > 0 || this.pending.some((p) => !p.isQuestion)
+    return (
+      (!this.liveToolAlignment && this.retired.length > 0) ||
+      this.pending.some((p) => !p.isQuestion)
+    )
   }
 
   hasDeniedOutcome(
     denied: ReadonlySet<string>,
     lastStep?: Record<string, unknown>,
+    requireNoOtherPending = false,
   ): boolean {
     if (denied.size === 0) return false
+    if (
+      requireNoOtherPending &&
+      this.pending.some((p) => !denied.has(p.callId))
+    )
+      return false
     if (this.pending.some((p) => denied.has(p.callId))) return true
     return (
       lastStep?.type === 'GENERIC' &&
@@ -304,18 +315,29 @@ export class BrainTranscriptProjector {
     return this.daemons.size > 0
   }
 
+  followsHistoricalQuestion(): boolean {
+    // Older transcripts do not distinguish an answer USER_INPUT from a new turn.
+    return !this.liveToolAlignment && this.hasPendingQuestion()
+  }
+
   hasPendingQuestion(): boolean {
-    // shortcut: JSONL has no cancel marker for an unlogged ask_question immediately followed by USER_INPUT, so replay treats it as a continuation.
     return this.pending.some((p) =>
-      Boolean(p.isQuestion && !p.questionConsumed && !p.questionCompleted),
+      Boolean(p.isQuestion && !p.questionConsumed),
     )
   }
 
-  consumePendingQuestion() {
+  consumePendingQuestion<T>(
+    takeAnswer: (
+      questions: readonly NormalizedQuestion[],
+      tool: PendingTool,
+    ) => T | undefined,
+  ) {
     const next = this.pending.find((p) => !p.questionConsumed)
-    if (!next?.isQuestion) return undefined
+    if (!next?.questions) return undefined
+    const answer = takeAnswer(next.questions, next)
+    if (answer === undefined) return undefined
     next.questionConsumed = true
-    return { tool: next, questions: next.questions ?? [] }
+    return { tool: next, answer }
   }
 
   completePendingQuestion(
@@ -538,9 +560,8 @@ export class BrainTranscriptProjector {
       ? id
       : undefined
   }
-  /** Anonymous continuation tools wait for ACP/metadata identity; only the RPC boundary permits fallback. */
-  resolveToolIdentities(deferAnonymous: boolean): ProviderTimelineItem[] {
-    this.deferAnonymous = deferAnonymous
+  /** Late ACP/metadata identities may resolve anonymous live tool results. */
+  resolveToolIdentities(): ProviderTimelineItem[] {
     const items: ProviderTimelineItem[] = []
     for (const pending of [...this.retired, ...this.pending]) {
       if (pending.callId) continue
@@ -548,8 +569,7 @@ export class BrainTranscriptProjector {
         this.effectiveStepIndex(pending.slotIndex, pending.stepIndex),
       )
       const acpId = this.verifiedAcpId(pending.acpIndex)
-      const callId =
-        stepId ?? acpId ?? (deferAnonymous ? undefined : pending.fallbackId)
+      const callId = stepId ?? acpId
       if (!callId) continue
       pending.callId = callId
       pending.nativeIdentitySource = stepId
@@ -577,8 +597,9 @@ export class BrainTranscriptProjector {
     }
     return items
   }
-  project(value: unknown, continuingQuestion = false): ProviderTimelineItem[] {
+  project(value: unknown): ProviderTimelineItem[] {
     this.lastBackgroundGeneric = undefined
+    this.lastGenericMatched = false
     const row = record(value)
     if (!Number.isInteger(row.step_index)) return []
     const stepIndex = Number(row.step_index)
@@ -587,7 +608,7 @@ export class BrainTranscriptProjector {
     const text = typeof row.content === 'string' ? row.content : ''
     switch (row.type) {
       case 'USER_INPUT': {
-        const isContinuation = continuingQuestion || this.hasPendingQuestion()
+        const isContinuation = this.followsHistoricalQuestion()
         this.pending = []
         this.retired = []
         this.lastErrorCallId = undefined
@@ -711,8 +732,9 @@ export class BrainTranscriptProjector {
       case 'GENERIC': {
         const pending = takePendingForGeneric(this.pending, stepIndex)
         if (!pending || pending.questionCompleted) return []
+        this.lastGenericMatched = true
         pending.stepIndex = stepIndex
-        if (!pending.callId && this.deferAnonymous) {
+        if (!pending.callId && this.liveToolAlignment) {
           pending.genericSeen = true
           this.retired.push(pending)
         }
@@ -742,7 +764,7 @@ export class BrainTranscriptProjector {
             const args = record(tool.args)
             const genericStep = stepIndex + index + 1
             const slotIndex = this.slotIndex++
-            const acpIndex = this.toolIndex++
+            const acpIndex = slotIndex
             const acpId = this.verifiedAcpId(acpIndex)
             const toolId =
               typeof tool.id === 'string' && tool.id ? tool.id : undefined
@@ -753,7 +775,7 @@ export class BrainTranscriptProjector {
               toolId ??
               stepId ??
               acpId ??
-              (this.deferAnonymous ? '' : `tool-${stepIndex}-${index}`)
+              (this.liveToolAlignment ? '' : `tool-${stepIndex}-${index}`)
             const nativeIdentitySource = toolId
               ? 'tool_id'
               : stepId
@@ -767,7 +789,6 @@ export class BrainTranscriptProjector {
               callId,
               acpIndex,
               nativeIdentitySource,
-              fallbackId: `tool-${stepIndex}-${index}`,
               name: cleanName,
               args,
               rawInput: tool.args,
@@ -821,8 +842,7 @@ export type BrainNodeOptions = {
   mcpServerNames?: readonly string[]
   onQuestionSettled?: (
     questions: readonly NormalizedQuestion[],
-    wokeUp: boolean,
-    occurrence: string,
+    tool: PendingTool,
   ) => void
   reader?: TranscriptReader
   allowInitialSpawnPrompt?: boolean
@@ -837,9 +857,8 @@ export class BrainNode {
   turnStartStep = -1
   turnFloor = -1
   promptPhase: BrainPromptPhase = 'foreground'
-  // Turn-wide projection ownership survives synthetic continuation resets of promptPhase.
+  // Historical question continuations can reset promptPhase without ending the woken turn.
   wokeUp = false
-  continuingQuestion = false
   questionSettled = false
   abortedByDenial = false
   /** Last step seen when a question was answered; agy's reply must come after it. */
@@ -861,11 +880,7 @@ export class BrainNode {
   private allowInitialSpawnPrompt: boolean
   readonly nativeId: string
   readonly sessionId: string
-  private onQuestionSettled?: (
-    questions: readonly NormalizedQuestion[],
-    wokeUp: boolean,
-    occurrence: string,
-  ) => void
+  private onQuestionSettled?: BrainNodeOptions['onQuestionSettled']
 
   constructor(
     nativeId: string,
@@ -885,8 +900,7 @@ export class BrainNode {
   private createProjector() {
     return new BrainTranscriptProjector(
       this.sessionId,
-      (questions, tool) =>
-        this.onQuestionSettled?.(questions, this.wokeUp, tool.callId),
+      this.onQuestionSettled,
       this.allowInitialSpawnPrompt,
       this.mcpServerNames,
     )
@@ -917,10 +931,6 @@ export class BrainNode {
     )
   }
 
-  get wokeUpSinceLastPrompt(): boolean {
-    return this.promptPhase === 'woken'
-  }
-
   wakeupStepsFrom(sender: string): readonly number[] {
     return this.wakeupStepsBySender.get(sender) ?? []
   }
@@ -940,7 +950,6 @@ export class BrainNode {
     this.terminalErrorStep = -1
     this.promptPhase = 'foreground'
     this.wokeUp = false
-    this.continuingQuestion = false
     this.questionSettled = false
     this.abortedByDenial = false
     this.answeredQuestionStep = -1
@@ -948,9 +957,12 @@ export class BrainNode {
 
   settleAbortedDenial(denied?: ReadonlySet<string>) {
     if (
-      this.promptPhase !== 'woken' &&
       denied &&
-      this.projector.hasDeniedOutcome(denied, this.lastStep)
+      this.projector.hasDeniedOutcome(
+        denied,
+        this.lastStep,
+        this.promptPhase === 'woken',
+      )
     ) {
       this.projector.clearPending()
       this.abortedByDenial = true
@@ -958,13 +970,8 @@ export class BrainNode {
     }
   }
 
-  markQuestionContinuation(syntheticPrompt = false) {
+  markQuestionAnswered() {
     this.questionSettled = false
-    this.wokeUp = true
-    if (syntheticPrompt) {
-      this.continuingQuestion = true
-      this.promptPhase = 'foreground'
-    }
     this.answeredQuestionStep = Number(this.lastStep?.step_index ?? -1)
   }
 
@@ -983,8 +990,7 @@ export class BrainNode {
 
   private isQuestionContinuationInput(row: Record<string, unknown>): boolean {
     return (
-      row.type === 'USER_INPUT' &&
-      (this.continuingQuestion || this.projector.hasPendingQuestion())
+      row.type === 'USER_INPUT' && this.projector.followsHistoricalQuestion()
     )
   }
 
@@ -1008,18 +1014,13 @@ export class BrainNode {
       isRestartNotice(row)
     )
       this.turnStartStep = stepIndex
-    // A restart notice or a question-continuation USER_INPUT does not end a woken turn:
-    // the rows after it are still Brain's to project.
-    const liveQuestionContinuation = continuingQuestion
     const msgSenders = this.projector.consumeRowMessageSenders(row)
     const rowMessages = msgSenders.length
     // shortcut: zero counts exclude user/low-priority headers; revisit if agy mixes headerless wakeups with handoffs.
     const purePlanExecuteNotice = isPlanExecuteNotice(row) && rowMessages === 0
     if (row.type === 'USER_INPUT') {
-      if (continuingQuestion) {
-        this.continuingQuestion = false
-        this.promptPhase = 'foreground'
-      } else this.resetPhase()
+      if (continuingQuestion) this.promptPhase = 'foreground'
+      else this.resetPhase()
     } else if (this.promptPhase === 'foreground_idle' && rowMessages > 0) {
       // agy drains MESSAGE_PRIORITY_LOW and pure planexecute notices into SYSTEM_MESSAGE with
       // countRowMessages === 0; only actionable inbox messages (rowMessages > 0) enter 'woken'.
@@ -1080,7 +1081,7 @@ export class BrainNode {
         steps.push(stepIndex)
       }
     }
-    const items = this.projector.project(row, liveQuestionContinuation)
+    const items = this.projector.project(row)
     if (row.type !== 'CHECKPOINT') this.lastStep = row
     if (this.promptPhase !== 'woken') {
       if (
@@ -1105,9 +1106,8 @@ export class BrainNode {
             if (this.projector.hasBackground())
               this.promptPhase = 'foreground_idle'
           } else if (
-            // items.length > 0 proves project() settled a tracked pending tool/question
-            // (anonymous deferred tools set hasPending() via retired and hit the branch above).
-            items.length > 0 &&
+            // Anonymous live completions defer emission into retired, so check match state directly.
+            this.projector.matchedLastGeneric() &&
             row.status !== 'CANCELED' &&
             row.status !== 'INTERRUPTED'
           ) {

@@ -8,17 +8,15 @@ import {
   type SessionNotification,
 } from '@agentclientprotocol/sdk/unstable'
 import { randomUUID } from 'node:crypto'
-import {
-  appendFileSync,
-  existsSync,
-  mkdirSync,
-  writeFileSync,
-  readFileSync,
-} from 'node:fs'
+import { appendFileSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { WritableStream } from 'node:stream/web'
 import { Readable, Writable } from 'node:stream'
+import recordedWakeup from './fixtures/agy-1.5.12-wakeup.json' with { type: 'json' }
+
 let nativeId = ''
+let afterPromptResponse: (() => Promise<void>) | undefined
+let finishRecordedReads: (() => Promise<void>) | undefined
 if (process.env.AGY_TEST_PID_FILE)
   writeFileSync(process.env.AGY_TEST_PID_FILE, String(process.pid))
 function log(method: string) {
@@ -57,11 +55,6 @@ const canceled = new Set<string>()
 const cancels = new Map<string, () => void>()
 let wokenStepBase = 0
 let holdSeq = 0
-const pendingBrainContinuation = new Map<string, { ignoreCancel: boolean }>()
-/** Sessions waiting on a woken ask_question, keyed to their transcript step base. */
-const wokenQuestions = new Map<string, number>()
-const readWokenMsgIds: Record<string, boolean> = {}
-
 function writeSessionTranscript(
   sessionId: string,
   body: string | object[],
@@ -117,7 +110,21 @@ stream.writable = new WritableStream({
       message.method === 'session/request_permission'
     )
       message = { ...message, params: { sessionId: nativeId, options: null } }
-    return output.write(message)
+    const afterResponse =
+      'result' in message &&
+      typeof message.result === 'object' &&
+      message.result !== null &&
+      'stopReason' in message.result
+        ? afterPromptResponse
+        : undefined
+    if (afterResponse) afterPromptResponse = undefined
+    return output.write(message).then(() => {
+      void afterResponse?.().catch((error) => {
+        console.error(error)
+        process.exitCode = 1
+        process.stdin.destroy()
+      })
+    })
   },
 })
 let connection!: AgentConnection
@@ -180,8 +187,14 @@ connection = agent()
       params.clientCapabilities?.elicitation?.form
     )
       log('cap:elicitation.form')
+    const version = process.argv.includes('--dangerously-skip-permissions')
+      ? (process.env.AGY_TEST_RELAUNCH_VERSION ?? '1.5.12')
+      : (process.env.AGY_TEST_VERSION ?? '1.5.12')
     return {
       protocolVersion: 1,
+      ...(version === 'missing'
+        ? {}
+        : { agentInfo: { name: 'Antigravity ACP Server', version } }),
       agentCapabilities: {
         loadSession: true,
         sessionCapabilities: {
@@ -319,6 +332,13 @@ connection = agent()
   .onRequest(
     methods.agent.session.setConfigOption,
     async ({ params: { configId, value } }) => {
+      if (configId === 'fixture-release-reads') {
+        if (!finishRecordedReads)
+          throw new Error('Recorded reads are not waiting')
+        await finishRecordedReads()
+        finishRecordedReads = undefined
+        return { configOptions }
+      }
       log(`configure:${configId}=${value}`)
       return {
         configOptions: configOptions.map((o) =>
@@ -340,26 +360,158 @@ connection = agent()
     async ({ params: { sessionId, prompt } }) => {
       const text = prompt.map((c) => (c.type === 'text' ? c.text : '')).join('')
       if (process.env.AGY_TEST_LOG_ELICITATION_CAP) log(`prompt:${text}`)
-      const continuation = pendingBrainContinuation.get(sessionId)
-      if (continuation) {
-        pendingBrainContinuation.delete(sessionId)
-        await client.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: 'available_commands_update',
-            availableCommands: [
-              { name: 'continuation-entered', description: '' },
-            ],
-          },
-        })
-        if (continuation.ignoreCancel) return await new Promise<never>(() => {})
-        await new Promise<void>((resolve) => {
-          if (canceled.has(sessionId)) resolve()
-          else cancels.set(sessionId, resolve)
-        })
-        cancels.delete(sessionId)
-        canceled.delete(sessionId)
-        return { stopReason: 'cancelled' as const }
+      if (
+        [
+          'recorded-wakeup',
+          'recorded-wakeup-repeat',
+          'recorded-wakeup-delayed-reads',
+          'recorded-wakeup-denied-tool',
+          'recorded-next',
+        ].includes(text)
+      ) {
+        const sendUpdates = async (
+          updates:
+            | typeof recordedWakeup.foreground.updates
+            | typeof recordedWakeup.wakeup.updates
+            | typeof recordedWakeup.answer.updates,
+        ) => {
+          for (const update of updates)
+            await output.write({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: { sessionId, update },
+            })
+        }
+        const phase =
+          text === 'recorded-next'
+            ? recordedWakeup.next
+            : recordedWakeup.foreground
+        writeSessionTranscript(sessionId, phase.rows)
+        await sendUpdates(phase.updates)
+        if (text !== 'recorded-next') {
+          afterPromptResponse = async () => {
+            // This notification batch starts only after the sole prompt RPC returns.
+            if (text === 'recorded-wakeup-denied-tool') {
+              // Insert a rejected transcript-only slot before the two recorded reads.
+              const [message, reads, , beta] = recordedWakeup.wakeup.rows
+              writeSessionTranscript(sessionId, [
+                message,
+                {
+                  ...reads,
+                  tool_calls: [
+                    { name: 'read_file', args: { Path: '/fixture/invalid' } },
+                    ...reads.tool_calls!,
+                  ],
+                },
+              ])
+              await sendUpdates(
+                recordedWakeup.wakeup.updates
+                  .filter(
+                    (update) =>
+                      update.sessionUpdate === 'agent_thought_chunk' ||
+                      (update.sessionUpdate === 'tool_call' &&
+                        (update.toolCallId === 'call_2' ||
+                          update.toolCallId === 'call_3')),
+                  )
+                  .slice(0, 3),
+              )
+              const decision = await client.requestPermission({
+                sessionId,
+                toolCall: {
+                  toolCallId: 'call_2',
+                  title: 'Run read_file',
+                  rawInput: { Path: '/fixture/a.txt' },
+                },
+                options: [
+                  { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+                  { optionId: 'reject', name: 'Reject', kind: 'reject_once' },
+                ],
+              })
+              if (
+                decision.outcome.outcome !== 'selected' ||
+                decision.outcome.optionId !== 'reject'
+              )
+                throw new Error('Expected the tool denial')
+              await client.sessionUpdate({
+                sessionId,
+                update: {
+                  sessionUpdate: 'tool_call_update',
+                  toolCallId: 'call_2',
+                  status: 'failed',
+                },
+              })
+              for (const chunk of ['\n', '\nWakeup ', 'finished.']) {
+                await client.sessionUpdate({
+                  sessionId,
+                  update: {
+                    sessionUpdate: 'agent_message_chunk',
+                    content: { type: 'text', text: chunk },
+                  },
+                })
+              }
+              writeSessionTranscript(sessionId, [
+                { step_index: 6, type: 'GENERIC', status: 'INVALID' },
+                {
+                  step_index: 7,
+                  type: 'GENERIC',
+                  status: 'ERROR',
+                  content: 'denied',
+                },
+                { ...beta, step_index: 8 },
+                {
+                  step_index: 9,
+                  type: 'PLANNER_RESPONSE',
+                  status: 'DONE',
+                  content: 'Wakeup finished.',
+                  input_tokens: 40,
+                  output_tokens: 1,
+                },
+              ])
+              return
+            }
+            writeSessionTranscript(sessionId, recordedWakeup.wakeup.rows)
+            if (text === 'recorded-wakeup-delayed-reads') {
+              const readCompleted = (
+                u: (typeof recordedWakeup.wakeup.updates)[number],
+              ) =>
+                u.sessionUpdate === 'tool_call_update' &&
+                (u.toolCallId === 'call_2' || u.toolCallId === 'call_3')
+              finishRecordedReads = () =>
+                sendUpdates(recordedWakeup.wakeup.updates.filter(readCompleted))
+              await sendUpdates(
+                recordedWakeup.wakeup.updates.filter((u) => !readCompleted(u)),
+              )
+            } else {
+              await sendUpdates(recordedWakeup.wakeup.updates)
+            }
+            const answer = await client.createElicitation({
+              ...recordedWakeup.wakeup.question,
+              sessionId,
+            })
+            if (answer.action !== 'accept') return
+            if (
+              typeof answer.content !== 'object' ||
+              answer.content === null ||
+              !('q1' in answer.content) ||
+              answer.content.q1 !== '1'
+            )
+              throw new Error('Expected the recorded answer')
+            if (text === 'recorded-wakeup-repeat') {
+              await client.createElicitation({
+                ...recordedWakeup.wakeup.question,
+                sessionId,
+                toolCallId: 'call_5',
+              })
+              return
+            }
+            writeSessionTranscript(sessionId, recordedWakeup.answer.rows)
+            await sendUpdates(recordedWakeup.answer.updates)
+          }
+        }
+        return phase.response as {
+          stopReason: 'end_turn'
+          usage: typeof phase.response.usage
+        }
       }
       if (
         text === 'hold:cancel' ||
@@ -412,50 +564,6 @@ connection = agent()
             },
           }
         return { stopReason: 'cancelled' as const }
-      }
-      if (
-        text === 'brain-question-pending' ||
-        text === 'brain-question-ignore-cancel'
-      ) {
-        writeSessionTranscript(
-          sessionId,
-          [
-            { step_index: 1, type: 'USER_INPUT', content: 'work' },
-            {
-              step_index: 2,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              content: 'waiting',
-              input_tokens: 10,
-              output_tokens: 1,
-            },
-            {
-              step_index: 3,
-              type: 'SYSTEM_MESSAGE',
-              content:
-                '[Message] sender=system priority=MESSAGE_PRIORITY_HIGH content=wake',
-            },
-            {
-              step_index: 4,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              tool_calls: [
-                {
-                  id: 'ask',
-                  name: 'ask_question',
-                  args: {
-                    questions: [{ question: 'Choose', options: ['A', 'B'] }],
-                  },
-                },
-              ],
-            },
-          ],
-          'write',
-        )
-        pendingBrainContinuation.set(sessionId, {
-          ignoreCancel: text === 'brain-question-ignore-cancel',
-        })
-        return { stopReason: 'end_turn' as const }
       }
       if (text === 'flushed-cancel') {
         writeSessionTranscript(
@@ -715,7 +823,7 @@ connection = agent()
         })
         return { stopReason: 'end_turn' as const }
       }
-      if (text === 'seed-woken-carry') {
+      if (text === 'seed-wakeup-usage') {
         const step = ++wokenStepBase * 10
         writeSessionTranscript(sessionId, [
           { step_index: step, type: 'USER_INPUT', content: text },
@@ -791,83 +899,6 @@ connection = agent()
       if (text === 'must-not-run-after-interrupt') {
         log('unexpected-prompt')
         return { stopReason: 'end_turn' as const }
-      }
-      if (text === 'after-background') {
-        const logs = join(
-          process.env.HOME!,
-          '.gemini/antigravity-cli/brain',
-          sessionId,
-          '.system_generated/logs',
-        )
-        const file = join(logs, 'transcript_full.jsonl')
-        appendFileSync(
-          file,
-          [
-            {
-              step_index: 7,
-              type: 'USER_INPUT',
-              content: '<USER_REQUEST>after-background</USER_REQUEST>',
-            },
-            {
-              step_index: 8,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              content: 'Next turn reply.',
-              input_tokens: 20,
-              output_tokens: 3,
-            },
-          ]
-            .map((r) => JSON.stringify(r) + '\n')
-            .join(''),
-        )
-        // agy replays post-RPC Reactive Wakeup steps from Turn 1 before emitting Turn 2's user_message_chunk.
-        await client.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: 'agent_thought_chunk',
-            content: { type: 'text', text: 'Analyzing scan output' },
-          },
-        })
-        await client.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: 'tool_call',
-            toolCallId: 'stale-wakeup-tool',
-            title: 'manage_subagents',
-            status: 'completed',
-            rawInput: { Action: 'list' },
-          },
-        })
-        await client.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: 'Scan complete: 42G.' },
-          },
-        })
-        await client.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: 'user_message_chunk',
-            content: { type: 'text', text },
-          },
-        })
-        await client.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: 'Next turn reply.' },
-          },
-        })
-        return {
-          stopReason: 'end_turn' as const,
-          usage: {
-            inputTokens: 60,
-            outputTokens: 8,
-            totalTokens: 78,
-            cachedReadTokens: 10,
-          },
-        }
       }
       if (text === 'in-rpc-continuation') {
         const sys = join(
@@ -1079,22 +1110,16 @@ connection = agent()
           content: { type: 'text', text },
         },
       })
-      if (
-        text !== 'background' &&
-        text !== 'woken-question' &&
-        !wokenQuestions.has(sessionId)
-      ) {
-        await client.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: 'tool_call',
-            toolCallId: 'unfinished',
-            title: 'run_command',
-            status: 'in_progress',
-            rawInput: { CommandLine: 'echo unfinished' },
-          },
-        })
-      }
+      await client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'unfinished',
+          title: 'run_command',
+          status: 'in_progress',
+          rawInput: { CommandLine: 'echo unfinished' },
+        },
+      })
       if (text === 'disconnect') {
         setInterval(() => {}, 1000)
         process.stdout.end()
@@ -1102,137 +1127,6 @@ connection = agent()
       }
       if (text === 'crash') {
         process.exit(7)
-      }
-      if (text === 'background') {
-        const sys = join(
-          process.env.HOME!,
-          '.gemini/antigravity-cli/brain',
-          sessionId,
-          '.system_generated',
-        )
-        const logs = join(sys, 'logs')
-        const messagesDir = join(sys, 'messages')
-        mkdirSync(logs, { recursive: true })
-        mkdirSync(messagesDir, { recursive: true })
-        const file = join(logs, 'transcript_full.jsonl')
-        const taskId = `${sessionId}/task-3`
-        writeFileSync(
-          file,
-          [
-            {
-              step_index: 1,
-              type: 'USER_INPUT',
-              content: '<USER_REQUEST>background</USER_REQUEST>',
-            },
-            {
-              step_index: 2,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              content: 'Scanning disk...',
-              tool_calls: [
-                {
-                  id: 'bg-scan',
-                  name: 'run_command',
-                  args: { CommandLine: 'du -sh /home' },
-                },
-              ],
-            },
-            {
-              step_index: 3,
-              type: 'GENERIC',
-              status: 'RUNNING',
-              content: `Tool is running as a background task with task id: ${taskId}\n`,
-            },
-            {
-              step_index: 4,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              content: 'Waiting for background scan to finish...',
-            },
-          ]
-            .map((r) => JSON.stringify(r) + '\n')
-            .join(''),
-        )
-        await client.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: 'tool_call',
-            toolCallId: 'bg-scan',
-            title: 'run_command',
-            status: 'in_progress',
-            rawInput: { CommandLine: 'du -sh /home' },
-          },
-        })
-        await client.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: 'agent_message_chunk',
-            content: {
-              type: 'text',
-              text: 'Waiting for background scan to finish...',
-            },
-          },
-        })
-        setTimeout(() => {
-          const now = new Date().toISOString()
-          writeFileSync(
-            join(messagesDir, 'msg-scan.json'),
-            JSON.stringify({
-              id: 'msg-scan',
-              sender: taskId,
-              recipient: sessionId,
-              priority: 'MESSAGE_PRIORITY_HIGH',
-              content: `Task id "${taskId}" finished with result:\nCommand exited with code 0.\n\nCommand output:\n42G\t/home\nLog: file:///tmp/task-scan.log`,
-              timestamp: now,
-              sourceMetadata: {
-                tool: {
-                  conversationId: sessionId,
-                  stepIndex: 3,
-                  toolCall: {
-                    id: 'bg-scan',
-                    name: 'run_command',
-                    argumentsJson: '{"CommandLine":"du -sh /home"}',
-                  },
-                },
-              },
-            }),
-          )
-          writeFileSync(
-            join(messagesDir, 'read.json'),
-            JSON.stringify({ 'msg-scan': true }),
-          )
-          appendFileSync(
-            file,
-            [
-              {
-                step_index: 5,
-                type: 'SYSTEM_MESSAGE',
-                content: `<SYSTEM_MESSAGE>\n[Message] timestamp=${now} sender=${taskId} priority=MESSAGE_PRIORITY_HIGH content=Task id "${taskId}" finished with result:\nCommand exited with code 0.\n\nCommand output:\n42G\t/home\nLog: file:///tmp/task-scan.log\n</SYSTEM_MESSAGE>`,
-              },
-              {
-                step_index: 6,
-                type: 'PLANNER_RESPONSE',
-                status: 'DONE',
-                thinking: 'Analyzing scan output',
-                content: 'Scan complete: 42G.',
-                input_tokens: 40,
-                cache_read_tokens: 10,
-                output_tokens: 5,
-              },
-            ]
-              .map((r) => JSON.stringify(r) + '\n')
-              .join(''),
-          )
-        }, 80)
-        return {
-          stopReason: 'end_turn' as const,
-          usage: {
-            inputTokens: 10,
-            outputTokens: 2,
-            totalTokens: 12,
-            cachedReadTokens: 0,
-          },
-        }
       }
       if (text === 'mcp-preapproved') {
         const lazy = await client.requestPermission({
@@ -1509,416 +1403,6 @@ connection = agent()
             },
           },
         })
-        return { stopReason: 'end_turn' as const }
-      }
-      if (text === 'woken-native-elicitation') {
-        const base = wokenStepBase
-        wokenStepBase += 20
-        const sys = join(
-          process.env.HOME!,
-          '.gemini/antigravity-cli/brain',
-          sessionId,
-          '.system_generated',
-        )
-        const logs = join(sys, 'logs')
-        const messagesDir = join(sys, 'messages')
-        mkdirSync(logs, { recursive: true })
-        mkdirSync(messagesDir, { recursive: true })
-        const file = join(logs, 'transcript_full.jsonl')
-        const taskId = `${sessionId}/task-woken-native-${base}`
-        const msgId = `msg-native-${base}`
-        const now = new Date().toISOString()
-        writeFileSync(
-          join(messagesDir, `${msgId}.json`),
-          JSON.stringify({
-            id: msgId,
-            sender: taskId,
-            recipient: sessionId,
-            priority: 'MESSAGE_PRIORITY_HIGH',
-            content: `Task id "${taskId}" finished with result:\nCommand exited with code 0.\n\nCommand output:\nready\nLog: file:///tmp/task-native.log`,
-            timestamp: now,
-          }),
-        )
-        readWokenMsgIds[msgId] = true
-        writeFileSync(
-          join(messagesDir, 'read.json'),
-          JSON.stringify(readWokenMsgIds),
-        )
-        // Write PLANNER_RESPONSE (ask_question without GENERIC) first so Brain's onQuestion pops the card before elicitation arrives.
-        appendFileSync(
-          file,
-          [
-            {
-              step_index: base + 1,
-              type: 'USER_INPUT',
-              content: '<USER_REQUEST>woken-native-elicitation</USER_REQUEST>',
-            },
-            {
-              step_index: base + 2,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              content: 'Starting background check...',
-              tool_calls: [
-                {
-                  id: `bg-native-${base}`,
-                  name: 'run_command',
-                  args: { CommandLine: 'check-env' },
-                },
-              ],
-            },
-            {
-              step_index: base + 3,
-              type: 'GENERIC',
-              status: 'RUNNING',
-              content: `Tool is running as a background task with task id: ${taskId}\n`,
-            },
-            {
-              step_index: base + 4,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              content: 'Waiting for background check...',
-            },
-            {
-              step_index: base + 5,
-              type: 'SYSTEM_MESSAGE',
-              content: `<SYSTEM_MESSAGE>\n[Message] timestamp=${now} sender=${taskId} priority=MESSAGE_PRIORITY_HIGH content=Task id "${taskId}" finished with result:\nCommand exited with code 0.\n\nCommand output:\nready\nLog: file:///tmp/task-native.log\n</SYSTEM_MESSAGE>`,
-            },
-            {
-              step_index: base + 6,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              content: 'Background check finished. Please select:',
-              tool_calls: [
-                {
-                  id: `woken-native-ask-${base}`,
-                  name: 'default_api:ask_question',
-                  args: {
-                    questions: [
-                      {
-                        question: 'Which option?',
-                        options: ['(Recommended) Option 1', 'Option 2'],
-                        is_multi_select: false,
-                      },
-                    ],
-                  },
-                },
-              ],
-            },
-          ]
-            .map((r) => JSON.stringify(r) + '\n')
-            .join(''),
-        )
-        void (async () => {
-          // Wait for the test harness to confirm Brain's onQuestion has already popped the card.
-          const gatePath = join(process.env.HOME!, 'question-opened')
-          const deadline = Date.now() + 5000
-          while (!existsSync(gatePath) && Date.now() < deadline)
-            await new Promise((resolve) => setTimeout(resolve, 5))
-          const pendingResponse = elicit({
-            message: 'The agent has a question.',
-            requestedSchema: {
-              type: 'object',
-              properties: {
-                q1: {
-                  type: 'string',
-                  title: 'Which option?',
-                  oneOf: [
-                    { const: '1', title: '(Recommended) Option 1' },
-                    { const: '2', title: 'Option 2' },
-                  ],
-                },
-              },
-            },
-          })
-          await client.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: 'available_commands_update',
-              availableCommands: [
-                { name: 'elicit-dispatched', description: 'sync' },
-              ],
-            },
-          })
-          const response = await pendingResponse
-          appendFileSync(
-            file,
-            [
-              {
-                step_index: base + 7,
-                type: 'GENERIC',
-                status: 'DONE',
-                content:
-                  'Created At: 2026-11-10T18:59:59+08:00\nCompleted At: 2026-11-10T19:00:05+08:00\nA1: (Recommended) Option 1',
-              },
-              {
-                step_index: base + 8,
-                type: 'PLANNER_RESPONSE',
-                status: 'DONE',
-                content: `Native woken:${JSON.stringify(response)}`,
-              },
-            ]
-              .map((r) => JSON.stringify(r) + '\n')
-              .join(''),
-          )
-        })()
-        return { stopReason: 'end_turn' as const }
-      }
-      if (text === 'woken-question') {
-        const base = wokenStepBase
-        wokenStepBase += 20
-        wokenQuestions.set(sessionId, base)
-        const sys = join(
-          process.env.HOME!,
-          '.gemini/antigravity-cli/brain',
-          sessionId,
-          '.system_generated',
-        )
-        const logs = join(sys, 'logs')
-        const messagesDir = join(sys, 'messages')
-        mkdirSync(logs, { recursive: true })
-        mkdirSync(messagesDir, { recursive: true })
-        const file = join(logs, 'transcript_full.jsonl')
-        const taskId = `${sessionId}/task-woken-q-${base}`
-        const msgId = `msg-q-${base}`
-        appendFileSync(
-          file,
-          [
-            {
-              step_index: base + 1,
-              type: 'USER_INPUT',
-              content: '<USER_REQUEST>woken-question</USER_REQUEST>',
-            },
-            {
-              step_index: base + 2,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              content: 'Starting background check...',
-              tool_calls: [
-                {
-                  id: `bg-q-${base}`,
-                  name: 'run_command',
-                  args: { CommandLine: 'check-env' },
-                },
-              ],
-            },
-            {
-              step_index: base + 3,
-              type: 'GENERIC',
-              status: 'RUNNING',
-              content: `Tool is running as a background task with task id: ${taskId}\n`,
-            },
-            {
-              step_index: base + 4,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              content: 'Waiting for background check...',
-            },
-          ]
-            .map((r) => JSON.stringify(r) + '\n')
-            .join(''),
-        )
-        await client.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: 'tool_call',
-            toolCallId: `bg-q-${base}`,
-            title: 'run_command',
-            status: 'in_progress',
-            rawInput: { CommandLine: 'check-env' },
-          },
-        })
-        await client.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: 'agent_message_chunk',
-            content: {
-              type: 'text',
-              text: 'Waiting for background check...',
-            },
-          },
-        })
-        setTimeout(() => {
-          const now = new Date().toISOString()
-          writeFileSync(
-            join(messagesDir, `${msgId}.json`),
-            JSON.stringify({
-              id: msgId,
-              sender: taskId,
-              recipient: sessionId,
-              priority: 'MESSAGE_PRIORITY_HIGH',
-              content: `Task id "${taskId}" finished with result:\nCommand exited with code 0.\n\nCommand output:\nready\nLog: file:///tmp/task-q.log`,
-              timestamp: now,
-            }),
-          )
-          readWokenMsgIds[msgId] = true
-          writeFileSync(
-            join(messagesDir, 'read.json'),
-            JSON.stringify(readWokenMsgIds),
-          )
-          appendFileSync(
-            file,
-            [
-              {
-                step_index: base + 5,
-                type: 'SYSTEM_MESSAGE',
-                content: `<SYSTEM_MESSAGE>\n[Message] timestamp=${now} sender=${taskId} priority=MESSAGE_PRIORITY_HIGH content=Task id "${taskId}" finished with result:\nCommand exited with code 0.\n\nCommand output:\nready\nLog: file:///tmp/task-q.log\n</SYSTEM_MESSAGE>`,
-              },
-              {
-                step_index: base + 6,
-                type: 'PLANNER_RESPONSE',
-                status: 'DONE',
-                content: 'Background check finished. Please select:',
-                tool_calls: [
-                  {
-                    id: `woken-ask-${base}`,
-                    name: 'default_api:ask_question',
-                    args: {
-                      questions: [
-                        {
-                          question: 'Which option?',
-                          options: ['(Recommended) Option 1', 'Option 2'],
-                          is_multi_select: false,
-                        },
-                      ],
-                    },
-                  },
-                ],
-              },
-            ]
-              .map((r) => JSON.stringify(r) + '\n')
-              .join(''),
-          )
-        }, 50)
-        return { stopReason: 'end_turn' as const }
-      }
-      const wokenBase = wokenQuestions.get(sessionId)
-      if (wokenBase !== undefined) {
-        // The prompt is the answer to the woken ask_question.
-        wokenQuestions.delete(sessionId)
-        const base = wokenBase
-        const logs = join(
-          process.env.HOME!,
-          '.gemini/antigravity-cli/brain',
-          sessionId,
-          '.system_generated/logs',
-        )
-        const file = join(logs, 'transcript_full.jsonl')
-        // For Option 1, replay the matching question (with real agy's 1-based const IDs);
-        // for Option 2, ask a different question to verify preStagedQuestion does not mis-answer it.
-        const replayed = await elicit({
-          message: 'The agent has a question.',
-          requestedSchema: {
-            type: 'object',
-            properties: {
-              q1: {
-                type: 'string',
-                title:
-                  text === 'Option 2'
-                    ? 'Different follow-up question?'
-                    : 'Which option?',
-                oneOf: [
-                  { const: '1', title: '(Recommended) Option 1' },
-                  { const: '2', title: 'Option 2' },
-                ],
-              },
-              q1_other: {
-                type: 'string',
-                title: 'Other',
-                description: 'Optional free-form answer to: Which option?',
-              },
-            },
-          },
-        })
-        await client.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: 'agent_message_chunk',
-            content: {
-              type: 'text',
-              text: 'Background check finished. Please select:',
-            },
-          },
-        })
-        await client.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: 'user_message_chunk',
-            content: { type: 'text', text },
-          },
-        })
-        await client.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: 'agent_message_chunk',
-            content: {
-              type: 'text',
-              text: `Completed woken question:${JSON.stringify(replayed)}`,
-            },
-          },
-        })
-        appendFileSync(
-          file,
-          [
-            {
-              step_index: base + 7,
-              type: 'GENERIC',
-              status: 'DONE',
-              content: `Created At: 2026-11-10T18:59:59+08:00\nCompleted At: 2026-11-10T19:00:05+08:00\nA1: ${text}`,
-            },
-            {
-              step_index: base + 8,
-              type: 'USER_INPUT',
-              content: `<USER_REQUEST>${text}</USER_REQUEST>`,
-            },
-            ...(text === 'Option 2'
-              ? [
-                  {
-                    step_index: base + 9,
-                    type: 'PLANNER_RESPONSE',
-                    status: 'DONE',
-                    content: `Completed woken question:${JSON.stringify(replayed)}`,
-                    tool_calls: [
-                      {
-                        id: `woken-followup-${base}`,
-                        name: 'default_api:ask_question',
-                        args: {
-                          questions: [
-                            {
-                              question: 'Different follow-up question?',
-                              options: ['(Recommended) Option 1', 'Option 2'],
-                              is_multi_select: false,
-                            },
-                          ],
-                        },
-                      },
-                    ],
-                  },
-                  // agy logs the answered follow-up and replies to it.
-                  {
-                    step_index: base + 10,
-                    type: 'GENERIC',
-                    status: 'DONE',
-                    content: `A1: ${JSON.stringify(replayed)}`,
-                  },
-                  {
-                    step_index: base + 11,
-                    type: 'PLANNER_RESPONSE',
-                    status: 'DONE',
-                    content: 'Follow-up done',
-                  },
-                ]
-              : [
-                  {
-                    step_index: base + 9,
-                    type: 'PLANNER_RESPONSE',
-                    status: 'DONE',
-                    content: `Completed woken question:${JSON.stringify(replayed)}`,
-                  },
-                ]),
-          ]
-            .map((r) => JSON.stringify(r) + '\n')
-            .join(''),
-        )
         return { stopReason: 'end_turn' as const }
       }
       if (text === 'chooser') {

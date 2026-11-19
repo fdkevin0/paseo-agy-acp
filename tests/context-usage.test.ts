@@ -726,11 +726,11 @@ test('cancel snapshot follows interrupt work and advances cross-turn boundary (t
   )
 })
 
-test('snapshot-only cancellation preserves consumption and wakeup debt for the next bill', async (t) => {
-  const home = await mkdtemp(join(tmpdir(), 'agy-context-woken-debt-'))
+test('snapshot-only cancellation preserves consumption without modifying the next bill', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-context-snapshot-cancel-'))
   const { manager, latestUsage } = setupUsageManager(t, home)
   await openFreshUsageSession(manager, home)
-  await sendUsagePrompt(manager, 'p1', 'seed-woken-carry')
+  await sendUsagePrompt(manager, 'p1', 'seed-wakeup-usage')
   assert.equal(latestUsage().inputTokens, 140)
   assert.equal(latestUsage().outputTokens, 14)
 
@@ -740,8 +740,8 @@ test('snapshot-only cancellation preserves consumption and wakeup debt for the n
   assert.equal(latestUsage().outputTokens, 14)
 
   await sendUsagePrompt(manager, 'p3', 'cancelled-positive-usage')
-  assert.equal(latestUsage().inputTokens, 60)
-  assert.equal(latestUsage().outputTokens, 6)
+  assert.equal(latestUsage().inputTokens, 100)
+  assert.equal(latestUsage().outputTokens, 10)
 })
 
 test('foreground native context does not freeze later wakeup occupancy or lose its size', async (t) => {

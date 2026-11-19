@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict'
 import { test, type TestContext } from 'node:test'
-import { mkdtemp, mkdir, writeFile, rm, appendFile } from 'node:fs/promises'
+import {
+  mkdtemp,
+  mkdir,
+  writeFile,
+  rm,
+  appendFile,
+  readFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -16,7 +23,7 @@ import { TranscriptReader } from '../server/brain-io.ts'
 import { watchBrain } from '../server/brain.ts'
 import { BrainTranscriptProjector } from '../server/brain-projector.ts'
 import { normalizeAskQuestionInput } from '../server/questions.ts'
-import { isolatedEnv, sequenceDouble } from './helpers.ts'
+import { isolatedEnv } from './helpers.ts'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -136,10 +143,11 @@ function wrapConnectAcp(
 async function harness(
   t: TestContext,
   options?: {
+    logAcp?: boolean
+    cancelConvergenceTimeoutMs?: number
     hasActiveBackgroundWork?: ConstructorParameters<
       typeof SessionManager
     >[0]['hasActiveBackgroundWork']
-    cancelConvergenceTimeoutMs?: number
     backgroundProbeTimeoutMs?: number
     observationPollIntervalMs?: number
     createTranscriptReader?: () => TranscriptReader
@@ -151,12 +159,20 @@ async function harness(
   let promptHandler: PromptHandler | undefined
   let realPrompt!: RpcPrompt
   let lastObservation!: TrackingObservation
+  const acpLog = join(home, 'acp.log')
   const env = isolatedEnv(home)
   const manager = new HarnessSessionManager({
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-      env,
+      env: options?.logAcp
+        ? {
+            ...env,
+            AGY_TEST_LOG: acpLog,
+            AGY_TEST_LOG_LOAD: '1',
+            AGY_TEST_LOG_ELICITATION_CAP: '1',
+          }
+        : env,
     },
     usage: new AgyUsageSource({ env }),
     capabilities: ['prompt.message', 'permission'],
@@ -228,6 +244,12 @@ async function harness(
         ? [event]
         : [],
     )
+  const assistantMessages = () =>
+    events.flatMap((event) =>
+      event.type === 'timeline.item' && event.item.type === 'assistant_message'
+        ? [event.item]
+        : [],
+    )
   const toolCalls = () =>
     events.flatMap((event) =>
       event.type === 'timeline.item' && event.item.type === 'tool_call'
@@ -284,6 +306,7 @@ async function harness(
   }
   return {
     home,
+    acpLog,
     manager,
     session,
     events,
@@ -298,6 +321,7 @@ async function harness(
     latest,
     turns,
     compactions,
+    assistantMessages,
     toolCalls,
     permissions,
     wait,
@@ -373,6 +397,7 @@ test(
       questions,
       answerText: 'A',
       wokeUp: false,
+      declined: false,
     })
     await h.write([
       user(1),
@@ -427,124 +452,6 @@ test(
       h.events.some((event) => event.type === 'session.permission'),
       false,
     )
-  },
-)
-
-test(
-  'continuation streams Brain text/context and resolves only anonymous tool slots after late native IDs',
-  { timeout: 5000 },
-  async (t) => {
-    const h = await harness(t),
-      continuation = deferred<Result>(),
-      entered = deferred<void>()
-    const args = { questions: [{ question: 'Choose', options: ['A', 'B'] }] }
-    h.setPromptHandler(
-      sequenceDouble<[], Promise<Result>>([
-        async () => {
-          await h.write([
-            user(1),
-            model(2, 10, 'waiting'),
-            {
-              step_index: 3,
-              type: 'SYSTEM_MESSAGE',
-              content:
-                '[Message] sender=system priority=MESSAGE_PRIORITY_HIGH content=continue',
-            },
-            {
-              step_index: 4,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              tool_calls: [{ id: 'ask', name: 'ask_question', args }],
-            },
-          ])
-          return { stopReason: 'end_turn' as const }
-        },
-        async () => {
-          entered.resolve()
-          return continuation.promise
-        },
-      ]),
-    )
-    const running = h.prompt()
-    await h.wait(() =>
-      h.events.some((event) => event.type === 'session.permission'),
-    )
-    const question = h.events.find(
-      (event) => event.type === 'session.permission',
-    )
-    assert.ok(question?.type === 'session.permission')
-    await h.manager.handle({
-      type: 'session.permission',
-      sessionId: 's',
-      permissionId: question.request.id,
-      response: {
-        behavior: 'allow',
-        updatedInput: { answers: { Choose: 'A' } },
-      },
-    })
-    await entered.promise
-    // Native context from the initial phase must not freeze newer continuation occupancy.
-    h.session.state.turnHadContextUsage = true
-    h.session.publishUsage({ contextWindowUsedTokens: 15 })
-    await h.append([
-      user(5),
-      {
-        ...model(6, 90, 'live continuation'),
-        tool_calls: [
-          { name: 'run_command', args: { CommandLine: 'first' } },
-          { id: 'known', name: 'run_command', args: { CommandLine: 'second' } },
-        ],
-      },
-      {
-        step_index: 7,
-        type: 'GENERIC',
-        status: 'DONE',
-        content: 'first result',
-      },
-      {
-        step_index: 8,
-        type: 'GENERIC',
-        status: 'DONE',
-        content: 'second result',
-      },
-      checkpoint(9),
-    ])
-    await h.read()
-    assert.equal(h.latest().contextWindowUsedTokens, 91)
-    assert.ok(
-      h.events.some(
-        (event) =>
-          event.type === 'timeline.item' &&
-          event.item.type === 'assistant_message' &&
-          event.item.text === 'live continuation',
-      ),
-    )
-    assert.ok(
-      h
-        .toolCalls()
-        .some((item) => item.callId === 'known' && item.status === 'completed'),
-    )
-    assert.equal(
-      h.toolCalls().some((item) => item.callId.startsWith('tool-')),
-      false,
-    )
-    assert.deepEqual(h.turns(), [])
-    h.session.state.turnToolCallIds.push('native-late')
-    await h.read()
-    assert.ok(
-      h
-        .toolCalls()
-        .some(
-          (item) =>
-            item.callId === 'native-late' && item.status === 'completed',
-        ),
-    )
-    await h.append([model(10, 40, 'final')])
-    await h.read()
-    continuation.resolve({ stopReason: 'end_turn' })
-    await running
-    assert.deepEqual(h.turns(), ['completed'])
-    assert.equal(h.compactions().length, 1)
   },
 )
 
@@ -645,11 +552,11 @@ test('rewrite reconciliation permits a lower eligible snapshot without flashing 
   assert.deepEqual(observed, [101, 13, 14])
 })
 
-test('parallel identical anonymous tools retain their slot identities and explicit fallback waits for RPC boundary', () => {
+test('parallel identical anonymous tools retain their slot identities without emitting a live fallback', () => {
   const p = new BrainTranscriptProjector('s'),
-    ids: string[] = []
-  p.bindToolCallIds(ids)
-  p.resolveToolIdentities(true)
+    ids: string[] = [],
+    verified = new Set<string>()
+  p.bindLiveToolCallIds(ids, verified)
   const row = {
     step_index: 1,
     type: 'PLANNER_RESPONSE',
@@ -677,7 +584,8 @@ test('parallel identical anonymous tools retain their slot identities and explic
     content: 'second',
   })
   ids.push('first-native')
-  const first = p.resolveToolIdentities(true)
+  verified.add('first-native')
+  const first = p.resolveToolIdentities()
   assert.ok(
     first.some(
       (item) =>
@@ -692,14 +600,18 @@ test('parallel identical anonymous tools retain their slot identities and explic
     ),
     false,
   )
-  const second = p.resolveToolIdentities(false)
-  assert.ok(
-    second.some(
-      (item) =>
-        item.type === 'tool_call' &&
-        item.callId === 'tool-1-1' &&
-        item.status === 'completed',
-    ),
+  assert.deepEqual(p.resolveToolIdentities(), [])
+  ids.push('second-native')
+  verified.add('second-native')
+  const second = p.resolveToolIdentities()
+  assert.deepEqual(
+    second
+      .filter((item) => item.type === 'tool_call')
+      .map(({ callId, status }) => [callId, status]),
+    [
+      ['second-native', 'running'],
+      ['second-native', 'completed'],
+    ],
   )
 })
 
@@ -769,10 +681,387 @@ test(
     assert.equal(h.latest().contextWindowUsedTokens, 40001)
     assert.equal(h.latest().contextWindowMaxTokens, 128000)
     assert.equal(
-      h.session.state.wakeup.carriedUsage?.inputTokens,
+      h.latest().inputTokens,
       130000,
       'step26 is counted once across replay',
     )
+  },
+)
+
+// Issue #52: the same wakeup can arrive on stdio and in the transcript.
+test(
+  'live wakeup aligns tools past an invalid slot and keeps a native denial canceled',
+  { timeout: 5000 },
+  async (t) => {
+    const h = await harness(t, { logAcp: true })
+    const running = h.prompt('recorded-wakeup-denied-tool')
+    await h.wait(() => h.permissions().length > 0)
+    const [request] = h.permissions()
+    assert.equal(request.request.kind, 'tool')
+    assert.deepEqual(h.turns(), [])
+    await h.manager.handle({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: request.request.id,
+      response: { behavior: 'deny', selectedActionId: 'reject' },
+    })
+    await running
+    assert.deepEqual(h.turns(), ['completed'])
+    const replies = h.assistantMessages()
+    assert.equal(new Set(replies.map((item) => item.id)).size, 2)
+    assert.equal(replies.at(-1)?.text, '\n\nWakeup finished.')
+    const tools = h.toolCalls()
+    assert.deepEqual(
+      [...new Set(tools.map((item) => item.callId))],
+      ['call_1', 'call_2', 'call_3'],
+    )
+    assert.equal(
+      tools.findLast((item) => item.callId === 'call_2')?.status,
+      'canceled',
+    )
+    assert.equal(
+      tools.some(
+        (item) => item.callId === 'call_2' && item.status === 'failed',
+      ),
+      false,
+    )
+    const beta = tools.findLast((item) => item.callId === 'call_3')
+    assert.equal(beta?.status, 'completed')
+    assert.match(JSON.stringify(beta?.detail), /beta/)
+    assert.equal(h.latest().inputTokens, 29488)
+    assert.equal(h.latest().contextWindowUsedTokens, 41)
+    assert.deepEqual(await promptRequests(h.acpLog), [
+      'prompt:recorded-wakeup-denied-tool',
+    ])
+  },
+)
+
+const promptRequests = async (log: string) =>
+  (await readFile(log, 'utf8'))
+    .split('\n')
+    .filter((line) => line.startsWith('prompt:'))
+
+async function recordedQuestion(
+  t: TestContext,
+  options?: Parameters<typeof harness>[1],
+  text = 'recorded-wakeup',
+) {
+  const h = await harness(t, { ...options, logAcp: true })
+  const running = h.prompt(text)
+  await h.wait(() => h.permissions().length === 1)
+  const [question] = h.permissions()
+  assert.equal(question.request.kind, 'question')
+  return { h, running, question }
+}
+
+const answerRecordedQuestion = (
+  h: Awaited<ReturnType<typeof harness>>,
+  permissionId: string,
+) =>
+  h.manager.handle({
+    type: 'session.permission',
+    sessionId: 's',
+    permissionId,
+    response: {
+      behavior: 'allow',
+      updatedInput: { answers: { 'Question 1': 'one' } },
+    },
+  })
+
+test(
+  'recorded agy wakeup streams once and bills only the turn that produced it',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, running, question } = await recordedQuestion(t)
+    assert.deepEqual(h.turns(), [])
+    await answerRecordedQuestion(h, question.request.id)
+    await running
+    assert.deepEqual(h.turns(), ['completed'])
+    const items = h.events
+      .filter((event) => event.type === 'timeline.item')
+      .map((event) => event.item)
+    const replies = items.filter((item) => item.type === 'assistant_message')
+    assert.deepEqual(
+      replies.map((item) => item.text),
+      ['started', '\n\nfinal: one'],
+    )
+    assert.equal(new Set(replies.map((item) => item.id)).size, 2)
+    assert.deepEqual(
+      [...new Set(h.toolCalls().map((item) => item.callId))],
+      ['call_1', 'call_2', 'call_3', 'call_4'],
+    )
+    assert.match(
+      JSON.stringify(
+        h.toolCalls().findLast((item) => item.callId === 'call_2')?.detail,
+      ),
+      /alpha/,
+    )
+    assert.match(
+      JSON.stringify(
+        h.toolCalls().findLast((item) => item.callId === 'call_3')?.detail,
+      ),
+      /beta/,
+    )
+    assert.equal(h.latest().inputTokens, 34262)
+    await h.prompt('recorded-next')
+    assert.deepEqual(h.turns(), ['completed', 'completed'])
+    assert.equal(h.latest().inputTokens, 2156)
+    assert.deepEqual(await promptRequests(h.acpLog), [
+      'prompt:recorded-wakeup',
+      'prompt:recorded-next',
+    ])
+  },
+)
+
+test(
+  'recorded result-less ACP completions retain read results Brain recovered first',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, running, question } = await recordedQuestion(
+      t,
+      { observationPollIntervalMs: 60_000 },
+      'recorded-wakeup-delayed-reads',
+    )
+    await h.session.drain()
+    await h.read()
+    const lastRead = (callId: string) =>
+      h.toolCalls().findLast((item) => item.callId === callId)
+    assert.equal(lastRead('call_2')?.status, 'completed')
+    assert.match(JSON.stringify(lastRead('call_2')?.detail), /alpha/)
+    assert.equal(lastRead('call_3')?.status, 'completed')
+    assert.match(JSON.stringify(lastRead('call_3')?.detail), /beta/)
+    const before = h.toolCalls().length
+    await h.session.transport.rpc.setSessionConfigOption({
+      sessionId: h.session.state.nativeId,
+      configId: 'fixture-release-reads',
+      value: 'release',
+    })
+    await h.session.drain()
+    assert.deepEqual(
+      h
+        .toolCalls()
+        .slice(before)
+        .map(({ callId, status }) => [callId, status]),
+      [
+        ['call_2', 'completed'],
+        ['call_3', 'completed'],
+      ],
+    )
+    assert.match(JSON.stringify(lastRead('call_2')?.detail), /alpha/)
+    assert.match(JSON.stringify(lastRead('call_3')?.detail), /beta/)
+    await finishRecordedQuestion(h, question.request.id, running)
+    assert.deepEqual(h.turns(), ['completed'])
+  },
+)
+
+async function finishRecordedQuestion(
+  h: Awaited<ReturnType<typeof harness>>,
+  permissionId: string,
+  running: Promise<void>,
+) {
+  await answerRecordedQuestion(h, permissionId)
+  await h.wait(() =>
+    h.events.some(
+      (e) =>
+        e.type === 'timeline.item' &&
+        e.item.type === 'assistant_message' &&
+        e.item.text === '\n\nfinal: one',
+    ),
+  )
+  await h.read()
+  await running
+}
+
+async function recordedQuestionWithReaderFault(t: TestContext) {
+  const reader = new SwappableTranscriptReader()
+  const setup = await recordedQuestion(t, {
+    createTranscriptReader: () => reader,
+    observationPollIntervalMs: 60_000,
+  })
+  const obs = setup.h.session.state.observation as TrackingObservation
+  await obs.attached.promise
+  await setup.h.read()
+  const error = Object.assign(
+    new Error('recorded question reader unavailable'),
+    { code: 'EBUSY' },
+  )
+  return { ...setup, obs, reader, error }
+}
+
+async function assertFaultedQuestionTerminated(
+  h: Awaited<ReturnType<typeof harness>>,
+  obs: BrainTurnObservation,
+  running: Promise<void>,
+  status: 'failed' | 'canceled',
+) {
+  await running
+  assert.deepEqual(h.turns(), [status])
+  assert.deepEqual(await promptRequests(h.acpLog), ['prompt:recorded-wakeup'])
+  const count = h.events.length
+  await obs.poll()
+  assert.equal(h.events.length, count)
+}
+
+test(
+  'a transient reader fault recovers while native elicitation is pending',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, obs, reader, error, question, running } =
+      await recordedQuestionWithReaderFault(t)
+    reader.injectOnce(error)
+    await assert.rejects(obs.poll(), /recorded question reader unavailable/)
+    assert.equal(obs.error, error)
+    await obs.poll()
+    assert.equal(obs.error, undefined)
+    await finishRecordedQuestion(h, question.request.id, running)
+    assert.deepEqual(h.turns(), ['completed'])
+    assert.deepEqual(await promptRequests(h.acpLog), ['prompt:recorded-wakeup'])
+  },
+)
+
+test(
+  'an unresolved reader fault fails after native elicitation is answered',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, obs, reader, error, question, running } =
+      await recordedQuestionWithReaderFault(t)
+    reader.impl = async () => {
+      throw error
+    }
+    await assert.rejects(obs.poll(), /recorded question reader unavailable/)
+    assert.deepEqual(h.turns(), [])
+    await answerRecordedQuestion(h, question.request.id)
+    await obs.poll().catch(() => undefined)
+    await assertFaultedQuestionTerminated(h, obs, running, 'failed')
+    const terminal = h.events.findLast(
+      (e) => e.type === 'session.turn' && e.state === 'failed',
+    )
+    assert.ok(terminal?.type === 'session.turn' && terminal.state === 'failed')
+    assert.match(
+      terminal.error?.message ?? '',
+      /recorded question reader unavailable/,
+    )
+  },
+)
+
+test(
+  'declining native elicitation cancels despite an unresolved reader fault',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, obs, reader, error, question, running } =
+      await recordedQuestionWithReaderFault(t)
+    reader.impl = async () => {
+      throw error
+    }
+    await assert.rejects(obs.poll(), /recorded question reader unavailable/)
+    assert.deepEqual(h.turns(), [])
+    await h.manager.handle({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: question.request.id,
+      response: { behavior: 'deny' },
+    })
+    await assert.rejects(obs.poll(), /recorded question reader unavailable/)
+    await assertFaultedQuestionTerminated(h, obs, running, 'canceled')
+  },
+)
+
+test(
+  'interrupt cancels native elicitation despite an unresolved reader fault',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, obs, reader, error, running } =
+      await recordedQuestionWithReaderFault(t)
+    reader.impl = async () => {
+      throw error
+    }
+    await assert.rejects(obs.poll(), /recorded question reader unavailable/)
+    assert.deepEqual(h.turns(), [])
+    await h.manager.handle({
+      type: 'session.interrupt',
+      sessionId: 's',
+      requestId: 'interrupt',
+    })
+    await assertFaultedQuestionTerminated(h, obs, running, 'canceled')
+  },
+)
+
+test(
+  'close cancels native elicitation despite an unresolved reader fault',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, obs, reader, error, running } =
+      await recordedQuestionWithReaderFault(t)
+    reader.impl = async () => {
+      throw error
+    }
+    await assert.rejects(obs.poll(), /recorded question reader unavailable/)
+    assert.deepEqual(h.turns(), [])
+    await h.manager.close()
+    await assertFaultedQuestionTerminated(h, obs, running, 'canceled')
+  },
+)
+
+test(
+  'declining the recorded wakeup question cancels without relaunching or sending another prompt',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, running, question } = await recordedQuestion(t)
+    const transport = h.session.transport
+    await h.manager.handle({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: question.request.id,
+      response: { behavior: 'deny' },
+    })
+    await running
+    assert.deepEqual(h.turns(), ['canceled'])
+    assert.equal(h.session.transport, transport)
+    assert.deepEqual(await promptRequests(h.acpLog), ['prompt:recorded-wakeup'])
+    assert.equal(
+      h.toolCalls().findLast((item) => item.callId === 'call_4')?.status,
+      'canceled',
+    )
+  },
+)
+
+test(
+  'interrupting the recorded wakeup question cancels without relaunching',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, running } = await recordedQuestion(t)
+    const transport = h.session.transport
+    await h.manager.handle({
+      type: 'session.interrupt',
+      sessionId: 's',
+      requestId: 'interrupt',
+    })
+    await running
+    assert.deepEqual(h.turns(), ['canceled'])
+    assert.equal(h.session.transport, transport)
+    assert.deepEqual(await promptRequests(h.acpLog), ['prompt:recorded-wakeup'])
+  },
+)
+
+test(
+  'a repeated native wakeup question gets its own card and close unblocks it',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, running, question } = await recordedQuestion(
+      t,
+      undefined,
+      'recorded-wakeup-repeat',
+    )
+    await answerRecordedQuestion(h, question.request.id)
+    await h.wait(() => h.permissions().length === 2)
+    const second = h.permissions()[1]
+    assert.notEqual(second.request.id, question.request.id)
+    await h.manager.close()
+    await running
+    assert.deepEqual(h.turns(), ['canceled'])
+    assert.deepEqual(await promptRequests(h.acpLog), [
+      'prompt:recorded-wakeup-repeat',
+    ])
   },
 )
 
@@ -832,80 +1121,6 @@ test(
       0,
       'skip history cannot invent a late live checkpoint',
     )
-  },
-)
-
-test(
-  'same-text questions in separate continuation occurrences remain separate, with close unblocking the second wait',
-  { timeout: 5000 },
-  async (t) => {
-    const h = await harness(t),
-      continued = deferred<Result>(),
-      entered = deferred<void>()
-    const args = { questions: [{ question: 'Choose', options: ['A', 'B'] }] }
-    h.setPromptHandler(
-      sequenceDouble<[], Promise<Result>>([
-        async () => {
-          await h.write([
-            user(1),
-            model(2, 10, 'waiting'),
-            {
-              step_index: 3,
-              type: 'SYSTEM_MESSAGE',
-              content:
-                '[Message] sender=system priority=MESSAGE_PRIORITY_HIGH content=wake',
-            },
-            {
-              step_index: 4,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              tool_calls: [{ id: 'first-ask', name: 'ask_question', args }],
-            },
-          ])
-          return { stopReason: 'end_turn' as const }
-        },
-        async () => {
-          entered.resolve()
-          return continued.promise
-        },
-      ]),
-    )
-    const running = h.prompt()
-    await h.wait(() => h.permissions().length === 1)
-    await h.manager.handle({
-      type: 'session.permission',
-      sessionId: 's',
-      permissionId: h.permissions()[0].request.id,
-      response: {
-        behavior: 'allow',
-        updatedInput: { answers: { Choose: 'A' } },
-      },
-    })
-    await entered.promise
-    await h.append([
-      user(5),
-      {
-        step_index: 6,
-        type: 'PLANNER_RESPONSE',
-        status: 'DONE',
-        tool_calls: [{ id: 'second-ask', name: 'ask_question', args }],
-      },
-    ])
-    await h.read()
-    assert.equal(
-      h.permissions().length,
-      1,
-      'no recursive question action while continuation is in flight',
-    )
-    continued.resolve({ stopReason: 'end_turn' })
-    await h.wait(() => h.permissions().length === 2)
-    assert.notEqual(
-      h.permissions()[0].request.id,
-      h.permissions()[1].request.id,
-    )
-    await h.manager.close()
-    await running
-    assert.deepEqual(h.turns(), ['canceled'])
   },
 )
 
@@ -1362,193 +1577,21 @@ test(
 )
 
 test(
-  'a recovered reader fault cannot poison a real pending question continuation',
+  'a foreground prompt that ignores cancel relaunches and leaves the next turn usable',
   { timeout: 5000 },
   async (t) => {
-    const reader = new SwappableTranscriptReader()
-    const h = await harness(t, {
-        observationPollIntervalMs: 60_000,
-        createTranscriptReader: () => reader,
-      }),
-      entered = deferred<void>(),
-      continued = deferred<Result>()
-    const args = { questions: [{ question: 'Choose', options: ['A', 'B'] }] }
-    h.setPromptHandler(
-      sequenceDouble<[], Promise<Result>>([
-        async () => {
-          await h.write([
-            user(1),
-            model(2, 10, 'waiting'),
-            {
-              step_index: 3,
-              type: 'SYSTEM_MESSAGE',
-              content:
-                '[Message] sender=system priority=MESSAGE_PRIORITY_HIGH content=wake',
-            },
-            {
-              step_index: 4,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              tool_calls: [{ id: 'ask', name: 'ask_question', args }],
-            },
-          ])
-          return { stopReason: 'end_turn' as const }
-        },
-        async () => {
-          entered.resolve()
-          return continued.promise
-        },
-      ]),
-    )
-    const running = h.prompt()
-    await h.wait(() => h.events.some((e) => e.type === 'session.permission'))
-    const question = h.events.find((e) => e.type === 'session.permission')
-    assert.ok(question?.type === 'session.permission')
-    const obs = h.session.state.observation!
-    await obs.poll()
-    reader.injectOnce(
-      Object.assign(new Error('synthetic transient EBUSY'), {
-        code: 'EBUSY',
-      }),
-    )
-    await assert.rejects(obs.poll(), /synthetic transient EBUSY/)
-    await obs.poll()
-    await h.manager.handle({
-      type: 'session.permission',
-      sessionId: 's',
-      permissionId: question.request.id,
-      response: {
-        behavior: 'allow',
-        updatedInput: { answers: { Choose: 'A' } },
-      },
-    })
-    const phase = await Promise.race([
-      entered.promise.then(() => 'entered'),
-      running.then(() => 'finished'),
-    ])
-    assert.equal(phase, 'entered')
-    await h.append([user(5), model(6, 40, 'answer')])
-    await obs.poll()
-    continued.resolve({ stopReason: 'end_turn' })
-    await running
-    assert.deepEqual(h.turns(), ['completed'])
-  },
-)
-
-async function pendingBrainQuestion(
-  t: TestContext,
-  options?: {
-    promptText?: 'brain-question-pending' | 'brain-question-ignore-cancel'
-    cancelConvergenceTimeoutMs?: number
-    observationPollIntervalMs?: number
-    createTranscriptReader?: () => TranscriptReader
-  },
-) {
-  const h = await harness(t, {
-    cancelConvergenceTimeoutMs: options?.cancelConvergenceTimeoutMs,
-    observationPollIntervalMs: options?.observationPollIntervalMs,
-    createTranscriptReader: options?.createTranscriptReader,
-  })
-  const running = h.prompt(options?.promptText ?? 'brain-question-pending')
-  await h.wait(() =>
-    h.events.some((event) => event.type === 'session.permission'),
-  )
-  const question = h.events.find((event) => event.type === 'session.permission')
-  assert.ok(question?.type === 'session.permission')
-  await h.session.state.observation!.poll()
-  const answer = () =>
-    h.manager.handle({
-      type: 'session.permission',
-      sessionId: 's',
-      permissionId: question.request.id,
-      response: {
-        behavior: 'allow',
-        updatedInput: { answers: { Choose: 'A' } },
-      },
-    })
-  return { ...h, running, answer }
-}
-
-async function setupReaderFaultQuestion(t: TestContext) {
-  const reader = new SwappableTranscriptReader()
-  const h = await pendingBrainQuestion(t, {
-      createTranscriptReader: () => reader,
-      observationPollIntervalMs: 60_000,
-    }),
-    obs = h.session.state.observation!
-  let reads = 0
-  reader.impl = async () => {
-    throw Object.assign(new Error(`unavailable reader ${++reads}`), {
-      code: 'EBUSY',
-    })
-  }
-  await assert.rejects(obs.poll(), /unavailable reader 1/)
-  await assert.rejects(obs.poll(), /unavailable reader 2/)
-  assert.match(String(obs.error), /unavailable reader 2/)
-  return { h, obs }
-}
-
-async function assertReaderFaultPreservedTermination(
-  h: Awaited<ReturnType<typeof pendingBrainQuestion>>,
-  obs: NonNullable<
-    Awaited<
-      ReturnType<typeof pendingBrainQuestion>
-    >['session']['state']['observation']
-  >,
-  expectedTurn: 'failed' | 'canceled',
-) {
-  await h.running
-  assert.deepEqual(h.turns(), [expectedTurn])
-  assert.equal(
-    h.events.some(
-      (event) =>
-        event.type === 'session.commands' &&
-        event.commands[0]?.name === 'continuation-entered',
-    ),
-    false,
-    'no continuation RPC starts while the reader is still failing',
-  )
-  const count = h.events.length
-  await obs.poll()
-  assert.equal(h.events.length, count)
-}
-
-test(
-  'an unresolved reader I/O fault preserves failure question termination',
-  { timeout: 5000 },
-  async (t) => {
-    const { h, obs } = await setupReaderFaultQuestion(t)
-    await h.answer()
-    await assertReaderFaultPreservedTermination(h, obs, 'failed')
-    const terminal = h.events.findLast(
-      (event) => event.type === 'session.turn' && event.state === 'failed',
-    )
-    assert.ok(terminal?.type === 'session.turn' && terminal.state === 'failed')
-    assert.match(terminal.error?.message ?? '', /unavailable reader/)
-  },
-)
-
-test(
-  'an unresolved reader I/O fault preserves cancel question termination',
-  { timeout: 5000 },
-  async (t) => {
-    const { h, obs } = await setupReaderFaultQuestion(t)
+    const h = await harness(t, { cancelConvergenceTimeoutMs: 50 })
+    const held = await h.holdLive('hold:never')
+    const previousTransport = h.session.transport
     await h.manager.handle({
       type: 'session.interrupt',
-      requestId: 'interrupt',
       sessionId: 's',
+      requestId: 'interrupt',
     })
-    await assertReaderFaultPreservedTermination(h, obs, 'canceled')
-  },
-)
-
-test(
-  'an unresolved reader I/O fault preserves close question termination',
-  { timeout: 5000 },
-  async (t) => {
-    const { h, obs } = await setupReaderFaultQuestion(t)
-    await h.manager.close()
-    await assertReaderFaultPreservedTermination(h, obs, 'canceled')
+    await held.running
+    assert.notEqual(h.session.transport, previousTransport)
+    await h.prompt('cancel-only')
+    assert.deepEqual(h.turns(), ['canceled', 'canceled'])
   },
 )
 
@@ -1590,39 +1633,7 @@ test(
 )
 
 test(
-  'cancel convergence timeout relaunches the real mock transport and clears continuation flags',
-  { timeout: 5000 },
-  async (t) => {
-    const h = await pendingBrainQuestion(t, {
-      promptText: 'brain-question-ignore-cancel',
-      cancelConvergenceTimeoutMs: 50,
-    })
-    await h.answer()
-    await h.wait(() =>
-      h.events.some(
-        (event) =>
-          event.type === 'session.commands' &&
-          event.commands[0]?.name === 'continuation-entered',
-      ),
-    )
-    const oldTransport = h.session.transport
-    await h.manager.handle({
-      type: 'session.interrupt',
-      requestId: 'interrupt',
-      sessionId: 's',
-    })
-    await h.running
-    assert.notEqual(h.session.transport, oldTransport)
-    assert.equal(h.session.state.suppressContinuationAcp, false)
-    assert.equal(h.session.state.inSettle, false)
-    assert.deepEqual(h.turns(), ['canceled'])
-    await h.prompt('cancel-only')
-    assert.deepEqual(h.turns(), ['canceled', 'canceled'])
-  },
-)
-
-test(
-  'Orchestrator planexecute intra-turn handoffs keep exact step occupancy without false wokeUp double-billing, while woken handback and Turn 2 carriedWakeup settle cleanly',
+  'Orchestrator planexecute intra-turn handoffs keep exact step occupancy without false wokeUp double-billing, while woken handback and independent Turn 2 usage settle cleanly',
   { timeout: 5000 },
   async (t) => {
     const h = await harness(t)
@@ -1643,12 +1654,6 @@ test(
     const askArgs = {
       questions: [{ question: 'Deploy target?', options: ['Staging', 'Prod'] }],
     }
-    h.session.state.handledElicitations.push({
-      questions: normalizeAskQuestionInput(askArgs),
-      answerText: 'Staging',
-      wokeUp: false,
-    })
-
     const held = await h.hold()
     h.session.state.turnToolCallIds.push('acp-ask', 'acp-exit', 'acp-cmd')
     h.session.timeline.update({
@@ -1850,21 +1855,7 @@ test(
     assert.equal(h.latest().inputTokens, 101_000)
     assert.equal(h.latest().cachedInputTokens, 177_100)
     assert.equal(h.latest().outputTokens, 3_100)
-    assert.deepEqual(h.session.state.wakeup.carriedUsage, {
-      inputTokens: 49_400,
-      cachedReadTokens: 47_800,
-      outputTokens: 800,
-    })
-    assert.ok(
-      h.events.some(
-        (event) =>
-          event.type === 'timeline.item' &&
-          event.item.type === 'assistant_message' &&
-          event.item.text === 'Verification complete.',
-      ),
-    )
-
-    // Turn 2: agy includes Turn 1 woken tokens in cumulative PromptResponse.usage; carriedWakeup deducts them cleanly
+    // The next RPC reports only its own consumption.
     const held2 = await h.hold()
     await h.append([
       user(16),
@@ -1882,10 +1873,10 @@ test(
     held2.done.resolve({
       stopReason: 'end_turn',
       usage: {
-        inputTokens: 49_400 + 1_200,
-        cachedReadTokens: 47_800 + 49_500,
-        outputTokens: 800 + 300,
-        totalTokens: 149_000,
+        inputTokens: 1_200,
+        cachedReadTokens: 49_500,
+        outputTokens: 300,
+        totalTokens: 51_000,
       },
     })
     await held2.running
@@ -1895,238 +1886,5 @@ test(
     assert.equal(h.latest().inputTokens, 1_200)
     assert.equal(h.latest().cachedInputTokens, 49_500)
     assert.equal(h.latest().outputTokens, 300)
-  },
-)
-
-test(
-  'Orchestrator intra-turn [plan review due], woken ask_question continuation KV-cache misses, and woken elicitation decline settle cleanly',
-  { timeout: 5000 },
-  async (t) => {
-    const h = await harness(t)
-    const askArgs = {
-      questions: [{ question: 'Approve review?', options: ['Yes', 'No'] }],
-    }
-    h.setPromptHandler(
-      sequenceDouble([
-        async () => {
-          // Foreground turn with tool-less Hydrogen DONE -> intra-turn [plan review due] -> foreground [Message] while Planner has pending tools -> woken ask_question
-          await h.write([
-            user(1),
-            {
-              step_index: 2,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              input_tokens: 10_000,
-              output_tokens: 100,
-              content: 'Execution done.',
-            },
-            {
-              step_index: 3,
-              type: 'SYSTEM_MESSAGE',
-              content:
-                '<SYSTEM_MESSAGE>\n[plan review due] Return to plan mode.\n</SYSTEM_MESSAGE>',
-            },
-            {
-              step_index: 4,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              input_tokens: 10_500,
-              output_tokens: 100,
-              tool_calls: [
-                { id: 'fg-enter', name: 'contrib:enter_plan_mode', args: {} },
-              ],
-            },
-            { step_index: 5, type: 'GENERIC', status: 'DONE', content: 'ok' },
-            {
-              step_index: 6,
-              type: 'SYSTEM_MESSAGE',
-              content:
-                '<SYSTEM_MESSAGE>\n[plan review] Plan mode is on: this turn runs on the planning model.\n</SYSTEM_MESSAGE>',
-            },
-            {
-              step_index: 7,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              input_tokens: 11_000,
-              output_tokens: 200,
-              content: 'Foreground planner spawned helper.',
-              tool_calls: [
-                {
-                  id: 'fg-bg',
-                  name: 'run_command',
-                  args: { CommandLine: 'check' },
-                },
-              ],
-            },
-            {
-              step_index: 8,
-              type: 'GENERIC',
-              status: 'RUNNING',
-              content: 'Tool is running as a background task with task id: bg1',
-            },
-            {
-              step_index: 9,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              input_tokens: 11_200,
-              output_tokens: 50,
-              content: 'Waiting on helper.',
-            },
-            // Post-RPC wakeup asks a woken ask_question
-            {
-              step_index: 10,
-              type: 'SYSTEM_MESSAGE',
-              content:
-                '[Message] sender=bg1 content=Task id "bg1" finished with result:\nready',
-            },
-            {
-              step_index: 11,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              input_tokens: 12_000,
-              output_tokens: 100,
-              tool_calls: [
-                { id: 'woken-q', name: 'ask_question', args: askArgs },
-              ],
-            },
-          ])
-          return {
-            stopReason: 'end_turn' as const,
-            usage: {
-              inputTokens: 42_700,
-              outputTokens: 450,
-              totalTokens: 43_150,
-            },
-          }
-        },
-        async () => {
-          // Synthetic continuation RPC runs Orchestrator contrib:exit_plan_mode -> Hydrogen 95k KV-cache miss and ends cleanly (no post-continuation wakeup)
-          await h.append([
-            { step_index: 12, type: 'GENERIC', status: 'DONE', content: 'Yes' },
-            user(13),
-            {
-              step_index: 14,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              input_tokens: 13_000,
-              output_tokens: 200,
-              tool_calls: [
-                {
-                  id: 'cont-exit',
-                  name: 'contrib:exit_plan_mode',
-                  args: { plan: '# Ship' },
-                },
-              ],
-            },
-            { step_index: 15, type: 'GENERIC', status: 'DONE', content: 'off' },
-            {
-              step_index: 16,
-              type: 'SYSTEM_MESSAGE',
-              content:
-                '<SYSTEM_MESSAGE>\nPlan mode is off: this turn runs on the execution model.\n</SYSTEM_MESSAGE>',
-            },
-            {
-              step_index: 17,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              cache_read_tokens: 0,
-              input_tokens: 95_000,
-              output_tokens: 500,
-              content: 'Continuation Hydrogen finished.',
-            },
-          ])
-          return {
-            stopReason: 'end_turn' as const,
-            usage: {
-              inputTokens: 120_000,
-              outputTokens: 800,
-              totalTokens: 120_800,
-            },
-          }
-        },
-        async () => {
-          // Turn 2: fresh Orchestrator turn reporting 120k inputTokens; must NOT subtract Turn 1's 120k continuation tokens!
-          await h.append([
-            user(18),
-            {
-              step_index: 19,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              input_tokens: 120_000,
-              output_tokens: 400,
-              content: 'Turn 2 done.',
-            },
-          ])
-          return {
-            stopReason: 'end_turn' as const,
-            usage: {
-              inputTokens: 120_000,
-              outputTokens: 400,
-              totalTokens: 120_400,
-            },
-          }
-        },
-        async () => {
-          // Woken elicitation decline cancels immediately without hanging for stallTimeoutMs
-          h.session.state.handledElicitations.push({
-            questions: normalizeAskQuestionInput(askArgs),
-            answerText: null,
-            wokeUp: true,
-            declined: true,
-          })
-          await h.append([
-            user(20),
-            model(21, 1000, 'idle'),
-            {
-              step_index: 22,
-              type: 'SYSTEM_MESSAGE',
-              content:
-                '[Message] sender=system priority=MESSAGE_PRIORITY_HIGH content=wake',
-            },
-            {
-              step_index: 23,
-              type: 'PLANNER_RESPONSE',
-              status: 'DONE',
-              tool_calls: [
-                { id: 'declined-q', name: 'ask_question', args: askArgs },
-              ],
-            },
-          ])
-          return { stopReason: 'end_turn' as const }
-        },
-      ]),
-    )
-
-    const turn1 = h.prompt('turn 1')
-    await h.wait(() =>
-      h.events.some((event) => event.type === 'session.permission'),
-    )
-    const perm = h.events.find((event) => event.type === 'session.permission')
-    assert.ok(perm?.type === 'session.permission')
-    await h.manager.handle({
-      type: 'session.permission',
-      sessionId: 's',
-      permissionId: perm.request.id,
-      response: {
-        behavior: 'allow',
-        updatedInput: { answers: { 'Approve review?': 'Yes' } },
-      },
-    })
-    await turn1
-    assert.deepEqual(h.turns(), ['completed'])
-    // Turn 1 bills foreground (42,700) + woken/continuation steps 11, 14, 17 (12,000 + 13,000 + 95,000 = 120,000) = 162,700
-    assert.equal(h.latest().inputTokens, 162_700)
-    assert.equal(h.latest().contextWindowUsedTokens, 95_500)
-    // Because continuation RPC finished cleanly with no post-continuation wakeup, carriedUsage is undefined and pendingReplay is false!
-    assert.equal(h.session.state.wakeup.carriedUsage, undefined)
-    assert.equal(h.session.state.wakeup.pendingReplay, false)
-
-    // Turn 2 must report full 120,000 inputTokens (zero false deduction)
-    await h.prompt('turn 2')
-    assert.deepEqual(h.turns(), ['completed', 'completed'])
-    assert.equal(h.latest().inputTokens, 120_000)
-
-    await h.prompt('turn 3')
-    assert.deepEqual(h.turns(), ['completed', 'completed', 'canceled'])
   },
 )

@@ -62,6 +62,91 @@ async function harness(env: Record<string, string> = {}) {
 
 type Harness = Awaited<ReturnType<typeof harness>>
 
+async function assertRejectsRuntimeVersion(
+  version: string,
+  diagnostic: RegExp,
+) {
+  const h = await harness({ AGY_TEST_VERSION: version })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      config: h.config,
+      history: 'skip',
+    })
+    const failure = await h.wait(
+      (event) =>
+        event.type === 'request.failed' || event.type === 'session.opened',
+    )
+    assert.ok(failure.type === 'request.failed')
+    assert.match(failure.error.message, diagnostic)
+    assert.equal(
+      h.events.some((event) => event.type === 'session.opened'),
+      false,
+    )
+  } finally {
+    await h.provider.close()
+  }
+}
+
+test('session.open rejects an unsupported ACP initialize version without status preflight', async () => {
+  await assertRejectsRuntimeVersion(
+    '1.5.9',
+    /agy 1\.5\.9 is too old; requires >=1\.5\.10/,
+  )
+})
+
+test('session.open rejects a minimum-version ACP prerelease', async () => {
+  await assertRejectsRuntimeVersion(
+    '1.5.10-rc.1',
+    /agy 1\.5\.10-rc\.1 is too old/,
+  )
+})
+
+test('session.open rejects ACP initialize without agentInfo version', async () => {
+  await assertRejectsRuntimeVersion(
+    'missing',
+    /Could not determine agy version; requires >=1\.5\.10/,
+  )
+})
+
+test('session configure rejects a replacement runtime below the ACP minimum', async () => {
+  const h = await harness({ AGY_TEST_RELAUNCH_VERSION: '1.5.9' })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      config: h.config,
+      history: 'skip',
+    })
+    await h.wait((event) => event.type === 'session.ready')
+    await h.provider.send({
+      type: 'session.configure',
+      requestId: 'relaunch',
+      sessionId: 's',
+      changes: { mode: 'full-access' },
+    })
+    const failure = await h.wait(
+      (event) =>
+        event.type === 'session.runtime_failed' ||
+        (event.type === 'request.completed' && event.requestId === 'relaunch'),
+    )
+    assert.ok(failure.type === 'session.runtime_failed')
+    assert.match(
+      failure.error.message,
+      /agy 1\.5\.9 is too old; requires >=1\.5\.10/,
+    )
+    await h.wait(
+      (event) =>
+        event.type === 'request.failed' && event.requestId === 'relaunch',
+    )
+  } finally {
+    await h.provider.close()
+  }
+})
+
 function interruptOnTurnStart(
   provider: ProviderConnection,
   sessionId: string,
@@ -156,13 +241,6 @@ function timelineItems(
         e.type === 'timeline.item',
     )
     .map((e) => e.item)
-}
-
-function timelineSummary(events: readonly ProviderEvent[]): string[] {
-  return timelineItems(events).map(
-    (item) =>
-      `${item.type}:${'text' in item ? item.text : item.type === 'tool_call' ? item.callId : ''}`,
-  )
 }
 
 type SubAgentToolEvent = Extract<ProviderEvent, { type: 'timeline.item' }> & {
@@ -1088,103 +1166,6 @@ test('full-access mode launches with --dangerously-skip-permissions, auto-approv
   }
 })
 
-test('background task wakeup settles before completing turn and deduplicates next-turn replay', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'agy-bg-wakeup-'))
-  const h = await harness({ HOME: home })
-  try {
-    await h.provider.send({
-      type: 'session.open',
-      requestId: 'open',
-      sessionId: 's',
-      config: h.config,
-      history: 'skip',
-    })
-    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's')
-    await h.provider.send({
-      type: 'session.prompt',
-      sessionId: 's',
-      prompt: {
-        clientMessageId: 'bg-1',
-        delivery: 'auto',
-        input: {
-          type: 'message',
-          content: [{ type: 'text', text: 'background' }],
-        },
-      },
-    })
-    await h.wait(
-      (e) =>
-        e.type === 'session.turn' &&
-        e.sessionId === 's' &&
-        e.state === 'completed',
-    )
-    const completedTool = h.events.findLast(
-      (e) =>
-        e.type === 'timeline.item' &&
-        e.item.type === 'tool_call' &&
-        e.item.callId === 'bg-scan' &&
-        e.item.status === 'completed',
-    )
-    assert.ok(
-      completedTool?.type === 'timeline.item' &&
-        completedTool.item.type === 'tool_call' &&
-        completedTool.item.detail.type === 'shell' &&
-        completedTool.item.detail.output?.includes('42G'),
-    )
-    assert.ok(
-      h.events.some(
-        (e) =>
-          e.type === 'timeline.item' &&
-          e.item.type === 'assistant_message' &&
-          e.item.text === 'Scan complete: 42G.',
-      ),
-    )
-    const turn1Usage = h.events.findLast((e) => e.type === 'session.usage')
-    assert.ok(turn1Usage?.type === 'session.usage')
-    assert.deepEqual(turn1Usage.usage, {
-      inputTokens: 50,
-      outputTokens: 7,
-      cachedInputTokens: 10,
-      contextWindowUsedTokens: 55,
-    })
-
-    h.events.length = 0
-    await h.provider.send({
-      type: 'session.prompt',
-      sessionId: 's',
-      prompt: {
-        clientMessageId: 'bg-2',
-        delivery: 'auto',
-        input: {
-          type: 'message',
-          content: [{ type: 'text', text: 'after-background' }],
-        },
-      },
-    })
-    await h.wait(
-      (e) =>
-        e.type === 'session.turn' &&
-        e.sessionId === 's' &&
-        e.state === 'completed',
-    )
-    assert.deepEqual(timelineSummary(h.events), [
-      'user_message:after-background',
-      'assistant_message:Next turn reply.',
-    ])
-    const turn2Usage = h.events.findLast((e) => e.type === 'session.usage')
-    assert.ok(turn2Usage?.type === 'session.usage')
-    assert.deepEqual(turn2Usage.usage, {
-      inputTokens: 20,
-      outputTokens: 3,
-      cachedInputTokens: 0,
-      contextWindowUsedTokens: 23,
-    })
-  } finally {
-    await h.provider.close()
-    await rm(home, { recursive: true, force: true })
-  }
-})
-
 test('Incident B: in-RPC high-priority continuation is emitted once and does not double-bill Turn 1 or steal Turn 2 usage', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-inrpc-cont-'))
   const h = await harness({ HOME: home })
@@ -1253,7 +1234,7 @@ test('Incident B: in-RPC high-priority continuation is emitted once and does not
       contextWindowUsedTokens: 48,
     })
 
-    // Turn 2: must NOT subtract Turn 1's step 6 tokens (30/10/8) via carriedUsage even though Turn 2 > 30/8.
+    // The next RPC reports its own tokens, independent of the earlier in-RPC continuation.
     h.events.length = 0
     await h.provider.send({
       type: 'session.prompt',
@@ -1830,147 +1811,6 @@ test('two elicitations in one turn ask once each and settle both unlogged cards'
           e.item.status === 'completed',
       ).length,
       2,
-    )
-  } finally {
-    await q.close()
-  }
-})
-
-test('a woken ask_question is answered once and its replayed elicitation reuses the answer', async () => {
-  const q = await questionSession('woken-question')
-  try {
-    await q.prompt('woken-question')
-    const card = await q.nextQuestion()
-    assert.equal(card.kind, 'question')
-    await q.answer(card.id, { 'Question 1': '(Recommended) Option 1' })
-    await q.turn('completed')
-    assert.equal(q.questionCards(), 1)
-    assert.deepEqual(q.assistantTexts(), [
-      'Waiting for background check...',
-      'Background check finished. Please select:',
-      'Completed woken question:{"action":"accept","content":{"q1":"1"}}',
-    ])
-  } finally {
-    await q.close()
-  }
-})
-
-test('an elicitation sent during a native background wakeup reuses the pending card without sending an extra prompt', async () => {
-  const q = await questionSession('woken-native-elicitation')
-  try {
-    await q.prompt('woken-native-elicitation')
-    const card = await q.nextQuestion()
-    assert.equal(card.kind, 'question')
-    await writeFile(join(q.home, 'question-opened'), 'ok')
-    // Wait until elicitation/create has arrived while Brain's QuestionCard is still open.
-    await q.h.wait(
-      (e) =>
-        e.type === 'session.commands' &&
-        e.commands.some((c) => c.name === 'elicit-dispatched'),
-    )
-    assert.equal(q.questionCards(), 1)
-    await q.answer(card.id, { 'Question 1': '(Recommended) Option 1' })
-    await q.turn('completed')
-    assert.equal(q.questionCards(), 1)
-    assert.deepEqual(
-      (await readFile(q.log, 'utf8'))
-        .split('\n')
-        .filter((line) => line.startsWith('prompt:')),
-      ['prompt:woken-native-elicitation'],
-    )
-    assert.ok(
-      q
-        .assistantTexts()
-        .includes('Native woken:{"action":"accept","content":{"q1":"1"}}'),
-    )
-    assert.equal(
-      q.h.events.filter(
-        (e) =>
-          e.type === 'timeline.item' &&
-          e.item.type === 'tool_call' &&
-          e.item.name === 'ask_question' &&
-          e.item.status === 'completed',
-      ).length,
-      1,
-    )
-  } finally {
-    await q.close()
-  }
-})
-
-test('a different question during a woken continuation gets its own card', async () => {
-  const q = await questionSession('woken-mismatch')
-  try {
-    await q.prompt('woken-question')
-    await q.answer((await q.nextQuestion()).id, { 'Question 1': 'Option 2' })
-    await q.answer((await q.nextQuestion()).id, {
-      'Question 1': 'Custom follow-up answer',
-    })
-    await q.turn('completed')
-    assert.equal(q.questionCards(), 2)
-    assert.ok(
-      q
-        .assistantTexts()
-        .includes(
-          'Completed woken question:{"action":"accept","content":{"q1_other":"Custom follow-up answer"}}',
-        ),
-    )
-  } finally {
-    await q.close()
-  }
-})
-
-test('canceling a woken ask_question cancels the native turn without relaunching', async () => {
-  const q = await questionSession('woken-deny')
-  try {
-    await q.prompt('woken-question')
-    const card = await q.nextQuestion()
-    const before = await readFile(q.log, 'utf8')
-    await q.h.provider.send({
-      type: 'session.permission',
-      sessionId: 's',
-      permissionId: card.id,
-      response: { behavior: 'deny' },
-    })
-    await q.turn('canceled')
-    await q.h.provider.close()
-    assert.equal(
-      (await readFile(q.log, 'utf8')).slice(before.length),
-      'cancel\n',
-    )
-    assert.ok(
-      q.h.events.some(
-        (e) =>
-          e.type === 'timeline.item' &&
-          e.item.type === 'tool_call' &&
-          e.item.name === 'ask_question' &&
-          e.item.status === 'canceled',
-      ),
-    )
-  } finally {
-    await q.close()
-  }
-})
-
-test('interrupting a woken ask_question cancels without relaunching', async () => {
-  const q = await questionSession('woken-interrupt')
-  try {
-    await q.prompt('woken-question')
-    await q.nextQuestion()
-    const before = await readFile(q.log, 'utf8')
-    await q.h.provider.send({
-      type: 'session.interrupt',
-      requestId: 'interrupt',
-      sessionId: 's',
-    })
-    await q.h.wait(
-      (e) => e.type === 'request.completed' && e.requestId === 'interrupt',
-    )
-    await q.turn('canceled')
-    await q.h.provider.close()
-    assert.equal(
-      (await readFile(q.log, 'utf8')).slice(before.length),
-      'cancel\n',
     )
   } finally {
     await q.close()
