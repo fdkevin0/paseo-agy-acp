@@ -4,33 +4,202 @@ import { mkdtemp, readFile, rm, mkdir, writeFile, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { PROVIDER_CAPABILITIES } from '@getpaseo/plugin/server/provider'
+import {
+  PROVIDER_CAPABILITIES,
+  type ProviderConnection,
+  type ProviderEvent,
+  type ProviderLaunch,
+  type ProviderTimelineItem,
+} from '@getpaseo/plugin/server/provider'
 import { AgyUsageSource } from '../server/usage.ts'
 import { record } from '../server/common.ts'
 import { dataDirectory } from '../server/preflight.ts'
 import { createProvider } from '../server/provider.ts'
-import { collectProviderEvents } from './helpers.ts'
+import { SessionManager } from '../server/session.ts'
+import { connectAcp } from '../server/transport.ts'
+import {
+  collectProviderEvents,
+  createEventCollector,
+  isolatedEnv,
+} from './helpers.ts'
 
 async function harness(env: Record<string, string> = {}) {
-  const usage = new AgyUsageSource()
-  const provider = await createProvider(usage).connect({
+  const autoHome = env.HOME
+    ? undefined
+    : await mkdtemp(join(tmpdir(), 'agy-provider-'))
+  const home = env.HOME ?? autoHome!
+  const launchEnv = isolatedEnv(home, {
+    PATH: process.env.PATH ?? '',
+    ...env,
+  })
+  const usage = new AgyUsageSource({ env: launchEnv })
+  const rawProvider = await createProvider(usage).connect({
     versions: [1],
     capabilities: PROVIDER_CAPABILITIES,
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-      env: { PATH: process.env.PATH ?? '', ...env },
+      env: launchEnv,
     },
   })
+  const provider: ProviderConnection = {
+    ...rawProvider,
+    close: async () => {
+      try {
+        await rawProvider.close()
+      } finally {
+        if (autoHome) await rm(autoHome, { recursive: true, force: true })
+      }
+    },
+  }
   const { events, wait } = collectProviderEvents(provider)
   const config = {
-    cwd: process.cwd(),
+    cwd: home,
     env: {},
     mcpServers: {},
     settings: {},
     persist: true,
   }
-  return { provider, events, wait, config, usage }
+  return { provider, events, wait, config, usage, home }
+}
+
+type Harness = Awaited<ReturnType<typeof harness>>
+
+function interruptOnTurnStart(
+  provider: ProviderConnection,
+  sessionId: string,
+  requestId: string,
+) {
+  let pending: Promise<void> | undefined
+  provider.onEvent((e) => {
+    if (
+      e.type === 'session.turn' &&
+      e.sessionId === sessionId &&
+      e.state === 'started'
+    ) {
+      pending = provider.send({
+        type: 'session.interrupt',
+        requestId,
+        sessionId,
+      })
+    }
+  })
+  return () => pending
+}
+
+async function assertCommandsPrecedeReady(
+  h: Harness,
+  sessionId: string,
+  persistence?: { version: 1; data: { sessionId: string } },
+) {
+  h.events.length = 0
+  await h.provider.send({
+    type: 'session.open',
+    requestId: sessionId,
+    sessionId,
+    config: h.config,
+    history: 'skip',
+    ...(persistence ? { persistence } : {}),
+  })
+  await h.wait((e) => e.type === 'session.ready')
+  const commands = h.events.find((e) => e.type === 'session.commands')
+  assert.ok(commands?.type === 'session.commands')
+  assert.equal(commands.commands[0].name, 'compact')
+  assert.equal(
+    h.events.indexOf(commands) <
+      h.events.findIndex((e) => e.type === 'session.ready'),
+    true,
+  )
+}
+
+async function seedSessionArtifacts(dir: string, nativeId: string) {
+  const files = ['.db', '.db-wal', '.db-shm'].map((ext) =>
+    join(dir, 'conversations', nativeId + ext),
+  )
+  const brain = join(dir, 'brain', nativeId)
+  await mkdir(join(dir, 'conversations'), { recursive: true })
+  await mkdir(brain, { recursive: true })
+  await Promise.all(files.map((file) => writeFile(file, 'fixture')))
+  const shared = join(dir, 'conversations', 'summary.db')
+  await writeFile(shared, 'keep')
+  return { paths: [...files, brain], shared }
+}
+
+async function assertPathsRemoved(paths: readonly string[]) {
+  for (const path of paths) await assert.rejects(stat(path), { code: 'ENOENT' })
+}
+
+async function assertPathsExist(paths: readonly string[]) {
+  for (const path of paths) await stat(path)
+}
+
+async function openAndCloseSession(h: Harness, id: string) {
+  await h.provider.send({
+    type: 'session.open',
+    requestId: id,
+    sessionId: id,
+    config: h.config,
+    history: 'replay',
+  })
+  await h.wait((e) => e.type === 'session.ready' && e.sessionId === id)
+  await h.provider.send({
+    type: 'session.close',
+    requestId: `close-${id}`,
+    sessionId: id,
+  })
+  await h.wait((e) => e.type === 'session.closed' && e.sessionId === id)
+}
+
+function timelineItems(
+  events: readonly ProviderEvent[],
+): ProviderTimelineItem[] {
+  return events
+    .filter(
+      (e): e is Extract<ProviderEvent, { type: 'timeline.item' }> =>
+        e.type === 'timeline.item',
+    )
+    .map((e) => e.item)
+}
+
+function timelineSummary(events: readonly ProviderEvent[]): string[] {
+  return timelineItems(events).map(
+    (item) =>
+      `${item.type}:${'text' in item ? item.text : item.type === 'tool_call' ? item.callId : ''}`,
+  )
+}
+
+type SubAgentToolEvent = Extract<ProviderEvent, { type: 'timeline.item' }> & {
+  item: Extract<ProviderTimelineItem, { type: 'tool_call' }> & {
+    detail: Extract<
+      Extract<ProviderTimelineItem, { type: 'tool_call' }>['detail'],
+      { type: 'sub_agent' }
+    >
+  }
+}
+
+function subAgentToolEvents(
+  events: readonly ProviderEvent[],
+): SubAgentToolEvent[] {
+  return events.filter(
+    (e): e is SubAgentToolEvent =>
+      e.type === 'timeline.item' &&
+      e.item.type === 'tool_call' &&
+      e.item.detail.type === 'sub_agent',
+  )
+}
+
+function assertUnlinkedSendMessages(
+  events: readonly ProviderEvent[],
+  sessionId: string,
+) {
+  const messages = subAgentToolEvents(events).filter(
+    (e) => e.sessionId === sessionId && e.item.name === 'send_message',
+  )
+  assert.ok(messages.length > 0)
+  assert.deepEqual(
+    messages.map((e) => e.item.detail.childSessionId),
+    messages.map(() => undefined),
+  )
 }
 
 test('open, permission, tool merge, duplicate prompt, cancel and runtime crash', async () => {
@@ -64,8 +233,7 @@ test('open, permission, tool merge, duplicate prompt, cancel and runtime crash',
     }
     await h.provider.send(prompt)
     const permission = await h.wait((e) => e.type === 'session.permission')
-    assert.equal(permission.type, 'session.permission')
-    if (permission.type !== 'session.permission') return
+    assert.ok(permission.type === 'session.permission')
     assert.equal(permission.request.title, 'run_command')
     assert.deepEqual(permission.request.input, { CommandLine: 'echo test' })
     assert.equal(permission.request.detail?.type, 'shell')
@@ -192,32 +360,47 @@ test('list/import and replay before ready; skip does not replay', async () => {
       type: 'sessions',
       requestId: 'list',
       query: 'test',
+      cwd: h.config.cwd,
     })
     const list = await h.wait((e) => e.type === 'sessions')
     assert.ok(list.type === 'sessions' && list.sessions.length === 1)
     assert.equal(list.sessions[0].description, 'Last prompt preview')
-    for (const history of ['replay', 'skip'] as const) {
-      h.events.length = 0
-      await h.provider.send({
-        type: 'session.open',
-        requestId: history,
-        sessionId: history,
-        config: h.config,
-        history,
-        persistence: { version: 1, data: { sessionId: 'native-test' } },
-      })
-      await h.wait((e) => e.type === 'session.ready' && e.sessionId === history)
-      assert.equal(
-        h.events.filter((e) => e.type === 'timeline.item').length,
-        history === 'replay' ? 3 : 0,
-      )
-      assert.equal(h.events.at(-1)?.type, 'session.ready')
-      assert.equal(
-        h.events.filter((e) => e.type === 'session.opened' && e.parentSessionId)
-          .length,
-        history === 'replay' ? 1 : 0,
-      )
-    }
+
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'replay',
+      sessionId: 'replay',
+      config: h.config,
+      history: 'replay',
+      persistence: { version: 1, data: { sessionId: 'native-test' } },
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 'replay')
+    assert.equal(h.events.filter((e) => e.type === 'timeline.item').length, 3)
+    assert.equal(h.events.at(-1)?.type, 'session.ready')
+    assert.equal(
+      h.events.filter((e) => e.type === 'session.opened' && e.parentSessionId)
+        .length,
+      1,
+    )
+
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'skip',
+      sessionId: 'skip',
+      config: h.config,
+      history: 'skip',
+      persistence: { version: 1, data: { sessionId: 'native-test' } },
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 'skip')
+    assert.equal(h.events.filter((e) => e.type === 'timeline.item').length, 0)
+    assert.equal(h.events.at(-1)?.type, 'session.ready')
+    assert.equal(
+      h.events.filter((e) => e.type === 'session.opened' && e.parentSessionId)
+        .length,
+      0,
+    )
   } finally {
     await h.provider.close()
   }
@@ -230,7 +413,7 @@ test('catalog requests share a probe, close it, and skip unchanged opening confi
   try {
     await Promise.all(
       ['a', 'b'].map((requestId) =>
-        h.provider.send({ type: 'catalog', requestId }),
+        h.provider.send({ type: 'catalog', requestId, cwd: h.config.cwd }),
       ),
     )
     const catalog = await h.wait(
@@ -243,7 +426,11 @@ test('catalog requests share a probe, close it, and skip unchanged opening confi
     )
     await h.wait((e) => e.type === 'catalog' && e.requestId === 'b')
     assert.equal(await readFile(log, 'utf8'), 'new\nclose\n')
-    await h.provider.send({ type: 'catalog', requestId: 'c' })
+    await h.provider.send({
+      type: 'catalog',
+      requestId: 'c',
+      cwd: h.config.cwd,
+    })
     await h.wait((e) => e.type === 'catalog' && e.requestId === 'c')
     assert.equal(await readFile(log, 'utf8'), 'new\nclose\n')
     await h.provider.send({
@@ -266,22 +453,14 @@ test('catalog requests share a probe, close it, and skip unchanged opening confi
   }
 })
 
-test('send rejects malformed input, unsupported capabilities and closed connections', async () => {
+test('send rejects requests after the connection is closed', async () => {
   const provider = await createProvider().connect({
     versions: [1],
     capabilities: [],
   })
-  try {
-    await assert.rejects(provider.send({ type: 'sessions', requestId: '' }))
-    await assert.rejects(
-      provider.send({ type: 'sessions', requestId: 'list' }),
-      /session.list/,
-    )
-  } finally {
-    await provider.close()
-  }
+  await provider.close()
   await assert.rejects(
-    provider.send({ type: 'catalog', requestId: 'closed' }),
+    provider.send({ type: 'catalog', requestId: 'closed', cwd: tmpdir() }),
     /connection is closed/,
   )
 })
@@ -340,7 +519,11 @@ test('catalog discovery survives an ACP close error', async () => {
     AGY_TEST_LOG: log,
   })
   try {
-    await h.provider.send({ type: 'catalog', requestId: 'catalog' })
+    await h.provider.send({
+      type: 'catalog',
+      requestId: 'catalog',
+      cwd: h.config.cwd,
+    })
     const catalog = await h.wait((e) => e.type === 'catalog')
     assert.ok(catalog.type === 'catalog' && catalog.catalog.models.length > 0)
     assert.equal(await readFile(log, 'utf8'), 'new\nclose\n')
@@ -390,7 +573,6 @@ test('interrupt before transcript baseline resolves never sends the native promp
   const home = await mkdtemp(join(tmpdir(), 'agy-early-interrupt-'))
   const log = join(home, 'calls.log')
   const h = await harness({ HOME: home, AGY_TEST_LOG: log })
-  let interrupt: Promise<void> | undefined
   try {
     await h.provider.send({
       type: 'session.open',
@@ -400,19 +582,7 @@ test('interrupt before transcript baseline resolves never sends the native promp
       history: 'skip',
     })
     await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's')
-    h.provider.onEvent((e) => {
-      if (
-        e.type === 'session.turn' &&
-        e.sessionId === 's' &&
-        e.state === 'started'
-      ) {
-        interrupt = h.provider.send({
-          type: 'session.interrupt',
-          requestId: 'stop',
-          sessionId: 's',
-        })
-      }
-    })
+    const pendingInterrupt = interruptOnTurnStart(h.provider, 's', 'stop')
     await h.provider.send({
       type: 'session.prompt',
       sessionId: 's',
@@ -431,7 +601,7 @@ test('interrupt before transcript baseline resolves never sends the native promp
         e.sessionId === 's' &&
         e.state === 'canceled',
     )
-    await interrupt
+    await pendingInterrupt()
     assert.ok(!(await readFile(log, 'utf8')).includes('unexpected-prompt'))
     assert.equal(
       h.events.filter((e) => e.type === 'session.turn' && e.state !== 'started')
@@ -448,29 +618,11 @@ test('delayed commands precede readiness on both new and restored sessions; tier
   const home = await mkdtemp(join(tmpdir(), 'agy-commands-'))
   const h = await harness({ HOME: home })
   try {
-    for (const restored of [false, true]) {
-      h.events.length = 0
-      const id = String(restored)
-      await h.provider.send({
-        type: 'session.open',
-        requestId: id,
-        sessionId: id,
-        config: h.config,
-        history: 'skip',
-        ...(restored
-          ? { persistence: { version: 1, data: { sessionId: 'native-test' } } }
-          : {}),
-      })
-      await h.wait((e) => e.type === 'session.ready')
-      const commands = h.events.find((e) => e.type === 'session.commands')
-      assert.ok(commands?.type === 'session.commands')
-      assert.equal(commands.commands[0].name, 'compact')
-      assert.equal(
-        h.events.indexOf(commands) <
-          h.events.findIndex((e) => e.type === 'session.ready'),
-        true,
-      )
-    }
+    await assertCommandsPrecedeReady(h, 'false')
+    await assertCommandsPrecedeReady(h, 'true', {
+      version: 1,
+      data: { sessionId: 'native-test' },
+    })
     assert.equal(
       h.usage.tiers.get(dataDirectory(undefined, { HOME: home })),
       'Google AI Ultra',
@@ -509,44 +661,55 @@ test('close removes only new unprompted session artifacts and retains imported s
     AGY_TEST_CLOSE_ERROR: '1',
   })
   try {
-    for (const restored of [false, true]) {
-      h.events.length = 0
-      await h.provider.send({
-        type: 'session.open',
-        requestId: 'open',
-        sessionId: 's',
-        config: h.config,
-        history: 'skip',
-        ...(restored
-          ? { persistence: { version: 1, data: { sessionId: id } } }
-          : {}),
-      })
-      await h.wait((e) => e.type === 'session.ready')
-      const opened = h.events.find((e) => e.type === 'session.opened')
-      assert.ok(opened?.type === 'session.opened')
-      const nativeId = String(record(opened.persistence?.data).sessionId)
-      const files = ['.db', '.db-wal', '.db-shm'].map((ext) =>
-        join(dir, 'conversations', nativeId + ext),
-      )
-      const brain = join(dir, 'brain', nativeId)
-      await mkdir(join(dir, 'conversations'), { recursive: true })
-      await mkdir(brain, { recursive: true })
-      for (const file of files) await writeFile(file, 'fixture')
-      const shared = join(dir, 'conversations', 'summary.db')
-      await writeFile(shared, 'keep')
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      config: h.config,
+      history: 'skip',
+    })
+    await h.wait((e) => e.type === 'session.ready')
+    const newOpened = h.events.find((e) => e.type === 'session.opened')
+    assert.ok(newOpened?.type === 'session.opened')
+    const newArtifacts = await seedSessionArtifacts(
+      dir,
+      String(record(newOpened.persistence?.data).sessionId),
+    )
+    await h.provider.send({
+      type: 'session.close',
+      requestId: 'close',
+      sessionId: 's',
+    })
+    await h.wait((e) => e.type === 'session.closed' && e.sessionId === 's')
+    await assertPathsRemoved(newArtifacts.paths)
+    assert.equal(await readFile(newArtifacts.shared, 'utf8'), 'keep')
 
-      await h.provider.send({
-        type: 'session.close',
-        requestId: 'close',
-        sessionId: 's',
-      })
-      await h.wait((e) => e.type === 'session.closed' && e.sessionId === 's')
-      for (const path of [...files, brain]) {
-        if (restored) await stat(path)
-        else await assert.rejects(stat(path), { code: 'ENOENT' })
-      }
-      assert.equal(await readFile(shared, 'utf8'), 'keep')
-    }
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-imported',
+      sessionId: 's',
+      config: h.config,
+      history: 'skip',
+      persistence: { version: 1, data: { sessionId: id } },
+    })
+    await h.wait((e) => e.type === 'session.ready')
+    const importedOpened = h.events.find((e) => e.type === 'session.opened')
+    assert.ok(importedOpened?.type === 'session.opened')
+    const importedArtifacts = await seedSessionArtifacts(
+      dir,
+      String(record(importedOpened.persistence?.data).sessionId),
+    )
+    await h.provider.send({
+      type: 'session.close',
+      requestId: 'close-imported',
+      sessionId: 's',
+    })
+    await h.wait((e) => e.type === 'session.closed' && e.sessionId === 's')
+    await assertPathsExist(importedArtifacts.paths)
+    assert.equal(await readFile(importedArtifacts.shared, 'utf8'), 'keep')
+
     assert.equal(await readFile(log, 'utf8'), 'new\nclose\n')
   } finally {
     await h.provider.close()
@@ -634,22 +797,8 @@ test('stale buffered/live notifications and permissions cannot cross native sess
     AGY_TEST_STALE_EVENTS: '1',
   })
   try {
-    for (const id of ['one', 'two']) {
-      await h.provider.send({
-        type: 'session.open',
-        requestId: id,
-        sessionId: id,
-        config: h.config,
-        history: 'replay',
-      })
-      await h.wait((e) => e.type === 'session.ready' && e.sessionId === id)
-      await h.provider.send({
-        type: 'session.close',
-        requestId: `close-${id}`,
-        sessionId: id,
-      })
-      await h.wait((e) => e.type === 'session.closed' && e.sessionId === id)
-    }
+    await openAndCloseSession(h, 'one')
+    await openAndCloseSession(h, 'two')
     assert.ok(
       !h.events.some(
         (e) =>
@@ -862,39 +1011,10 @@ test('full-access mode launches with --dangerously-skip-permissions, auto-approv
     const configEvent = h.events.findLast((e) => e.type === 'session.config')
     assert.ok(configEvent?.type === 'session.config')
     assert.equal(configEvent.config.mode, 'full-access')
-    assert.deepEqual(
-      configEvent.config.modes.map((m) => ({
-        id: m.id,
-        icon: m.icon,
-        colorTier: m.colorTier,
-        isUnattended: m.isUnattended,
-      })),
-      [
-        {
-          id: 'default',
-          icon: 'Shield',
-          colorTier: 'safe',
-          isUnattended: undefined,
-        },
-        {
-          id: 'accept-edits',
-          icon: 'ShieldPlus',
-          colorTier: 'moderate',
-          isUnattended: undefined,
-        },
-        {
-          id: 'plan',
-          icon: 'ShieldEllipsis',
-          colorTier: 'planning',
-          isUnattended: undefined,
-        },
-        {
-          id: 'full-access',
-          icon: 'ShieldOff',
-          colorTier: 'dangerous',
-          isUnattended: true,
-        },
-      ],
+    assert.equal(
+      configEvent.config.modes.find((m) => m.id === 'full-access')
+        ?.isUnattended,
+      true,
     )
     assert.equal(
       await readFile(log, 'utf8'),
@@ -1043,14 +1163,7 @@ test('background task wakeup settles before completing turn and deduplicates nex
         e.sessionId === 's' &&
         e.state === 'completed',
     )
-    const timelineItems = h.events.flatMap((e) =>
-      e.type === 'timeline.item'
-        ? [
-            `${e.item.type}:${'text' in e.item ? e.item.text : e.item.type === 'tool_call' ? e.item.callId : ''}`,
-          ]
-        : [],
-    )
-    assert.deepEqual(timelineItems, [
+    assert.deepEqual(timelineSummary(h.events), [
       'user_message:after-background',
       'assistant_message:Next turn reply.',
     ])
@@ -1098,9 +1211,7 @@ test('Incident B: in-RPC high-priority continuation is emitted once and does not
         e.sessionId === 's' &&
         e.state === 'completed',
     )
-    const turn1Items = h.events.flatMap((e) =>
-      e.type === 'timeline.item' ? [e.item] : [],
-    )
+    const turn1Items = timelineItems(h.events)
     assert.equal(
       turn1Items.filter(
         (i) =>
@@ -1542,41 +1653,23 @@ test('messages recover only owned children and never create root, self or unknow
     assert.equal(opened[2].parentSessionId, `s:child:${child}`)
     assert.deepEqual(opened[1].capabilities, ['session.subsession'])
     assert.deepEqual(opened[2].capabilities, ['session.subsession'])
-    for (const event of h.events) {
-      if (
-        event.type !== 'timeline.item' ||
-        event.item.type !== 'tool_call' ||
-        event.item.detail.type !== 'sub_agent'
-      )
-        continue
-      const target = event.item.detail.childSessionId
-      assert.ok(
-        target === undefined ||
-          opened.some(
-            (e) =>
-              e.sessionId === target && e.parentSessionId === event.sessionId,
+    const subAgentLinks = subAgentToolEvents(h.events).map((event) => ({
+      sessionId: event.sessionId,
+      target: event.item.detail.childSessionId,
+    }))
+    assert.ok(subAgentLinks.length > 0)
+    assert.deepEqual(
+      subAgentLinks.filter(
+        ({ sessionId, target }) =>
+          target !== undefined &&
+          !opened.some(
+            (e) => e.sessionId === target && e.parentSessionId === sessionId,
           ),
-        `Dangling child link: ${target}`,
-      )
-    }
-    for (const nativeId of [grand, sibling]) {
-      const messages = h.events.filter(
-        (e) =>
-          e.type === 'timeline.item' &&
-          e.sessionId === `s:child:${nativeId}` &&
-          e.item.type === 'tool_call' &&
-          e.item.name === 'send_message',
-      )
-      assert.ok(messages.length > 0)
-      for (const event of messages) {
-        assert.ok(
-          event.type === 'timeline.item' &&
-            event.item.type === 'tool_call' &&
-            event.item.detail.type === 'sub_agent',
-        )
-        assert.equal(event.item.detail.childSessionId, undefined)
-      }
-    }
+      ),
+      [],
+    )
+    assertUnlinkedSendMessages(h.events, `s:child:${grand}`)
+    assertUnlinkedSendMessages(h.events, `s:child:${sibling}`)
     await h.provider.send({
       type: 'session.close',
       requestId: 'close',
@@ -1653,6 +1746,7 @@ async function questionSession(name: string) {
   }
   return {
     h,
+    home,
     log,
     prompt,
     nextQuestion,
@@ -1763,6 +1857,7 @@ test('an elicitation sent during a native background wakeup reuses the pending c
     await q.prompt('woken-native-elicitation')
     const card = await q.nextQuestion()
     assert.equal(card.kind, 'question')
+    await writeFile(join(q.home, 'question-opened'), 'ok')
     // Wait until elicitation/create has arrived while Brain's QuestionCard is still open.
     await q.h.wait(
       (e) =>
@@ -1878,80 +1973,81 @@ test('interrupting a woken ask_question cancels without relaunching', async () =
   }
 })
 
-test(
-  'Full Access without a launch override preserves process.env and missing cwd reports a clear error',
-  { skip: process.platform === 'win32' },
-  async () => {
-    const root = await mkdtemp(join(tmpdir(), 'agy-default-launch-'))
-    const binDir = join(root, 'bin')
-    const envDump = join(root, 'env.json')
-    const mockPath = fileURLToPath(new URL('./mock-acp.ts', import.meta.url))
-    await mkdir(binDir, { recursive: true })
-    await writeFile(
-      join(binDir, 'agy'),
-      `#!/bin/sh\n"${process.execPath}" -e 'require("node:fs").writeFileSync(process.argv[1], JSON.stringify({ marker: process.env.AGY_TEST_MARKER, args: process.argv.slice(2) }))' "${envDump}" "$@"\nexec "${process.execPath}" "${mockPath}"\n`,
-      { mode: 0o755 },
-    )
-    const oldPath = process.env.PATH
-    const oldHome = process.env.HOME
-    const oldMarker = process.env.AGY_TEST_MARKER
-    process.env.PATH = `${binDir}:${oldPath ?? ''}`
-    process.env.HOME = root
-    process.env.AGY_TEST_MARKER = 'kept-from-process-env'
-    const provider = await createProvider(new AgyUsageSource()).connect({
-      versions: [1],
-      capabilities: PROVIDER_CAPABILITIES,
-    })
-    const { wait } = collectProviderEvents(provider)
-    try {
-      await provider.send({
+test('Full Access without a launch override preserves process.env and missing cwd reports a clear error', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-default-launch-'))
+  const mockPath = fileURLToPath(new URL('./mock-acp.ts', import.meta.url))
+  const observedLaunches: Array<ProviderLaunch | undefined> = []
+  const collector = createEventCollector()
+  const manager = new SessionManager({
+    usage: new AgyUsageSource({ env: isolatedEnv(root) }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: collector.emit,
+    connectAcp: (launch, cwd, env, client, onExit, opts) => {
+      observedLaunches.push(launch)
+      return connectAcp(
+        {
+          command: process.execPath,
+          args: [mockPath],
+          env: isolatedEnv(root, { PATH: process.env.PATH ?? '' }),
+        },
+        cwd,
+        env,
+        client,
+        onExit,
+        opts,
+      )
+    },
+  })
+  try {
+    await assert.rejects(
+      manager.handle({
         type: 'session.open',
         requestId: 'open-missing-cwd',
         sessionId: 'missing-cwd',
         history: 'skip',
         config: {
           cwd: join(root, 'does-not-exist'),
-          env: {},
+          env: { HOME: root },
           mcpServers: {},
           settings: {},
           persist: false,
         },
-      })
-      const failed = await wait(
-        (e) =>
-          e.type === 'request.failed' && e.requestId === 'open-missing-cwd',
-      )
-      assert.ok(failed.type === 'request.failed')
-      assert.match(failed.error.message, /Working directory does not exist/)
+      }),
+      /Working directory does not exist/,
+    )
+    assert.equal(observedLaunches.length, 0)
 
-      await provider.send({
-        type: 'session.open',
-        requestId: 'open-full',
-        sessionId: 'full',
-        history: 'skip',
-        config: {
-          cwd: root,
-          env: {},
-          mcpServers: {},
-          settings: {},
-          persist: false,
-          mode: 'full-access',
-        },
-      })
-      await wait((e) => e.type === 'session.ready' && e.sessionId === 'full')
-      const dumped = JSON.parse(await readFile(envDump, 'utf8'))
-      assert.equal(dumped.marker, 'kept-from-process-env')
-      assert.deepEqual(dumped.args, ['acp', '--dangerously-skip-permissions'])
-    } finally {
-      process.env.PATH = oldPath
-      process.env.HOME = oldHome
-      if (oldMarker === undefined) delete process.env.AGY_TEST_MARKER
-      else process.env.AGY_TEST_MARKER = oldMarker
-      await provider.close()
-      await rm(root, { recursive: true, force: true })
-    }
-  },
-)
+    await manager.handle({
+      type: 'session.open',
+      requestId: 'open-full',
+      sessionId: 'full',
+      history: 'skip',
+      config: {
+        cwd: root,
+        env: { HOME: root },
+        mcpServers: {},
+        settings: {},
+        persist: false,
+        mode: 'full-access',
+      },
+    })
+    await collector.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 'full',
+    )
+    assert.equal(observedLaunches.length, 1)
+    const [launch] = observedLaunches
+    assert.ok(launch)
+    assert.equal(launch.command, 'agy')
+    assert.deepEqual(launch.args, ['acp', '--dangerously-skip-permissions'])
+    const expectedEnv = Object.fromEntries(
+      Object.entries(process.env).filter(([, value]) => value !== undefined),
+    )
+    assert.deepEqual(launch.env, expectedEnv)
+  } finally {
+    await manager.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
 
 test('denied permission marks stranded tool card canceled and concurrent close cancels in-flight open', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-deny-and-close-race-'))

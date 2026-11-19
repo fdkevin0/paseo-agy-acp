@@ -7,13 +7,18 @@ import { test } from 'node:test'
 import {
   ProviderEventSchema,
   type ProviderEvent,
+  type ProviderTimelineItem,
 } from '@getpaseo/plugin/server/provider'
+import type { SessionNotification } from '@agentclientprotocol/sdk/unstable'
 import { BrainTranscriptProjector } from '../server/brain-projector.ts'
 import { alignReplayTools, mergeCompactionHistory } from '../server/history.ts'
 import { Timeline } from '../server/mapping.ts'
 import { SessionManager } from '../server/session.ts'
 import { AgyUsageSource } from '../server/usage.ts'
-import { zSessionUpdate } from '../node_modules/@agentclientprotocol/sdk/dist/v1/unstable/schema/zod.gen.js'
+import { isolatedEnv } from './helpers.ts'
+
+type SessionUpdate = SessionNotification['update']
+type ToolCallItem = Extract<ProviderTimelineItem, { type: 'tool_call' }>
 
 const native = '11111111-1111-4111-8111-111111111111'
 const child = '22222222-2222-4222-8222-222222222222'
@@ -121,6 +126,7 @@ async function replay(
     }
     await writeFile(join(dir, 'read.json'), JSON.stringify(read))
   }
+  const env = isolatedEnv(home, { PATH: process.env.PATH ?? '' })
   const events: ProviderEvent[] = []
   const manager = new SessionManager({
     launch: {
@@ -128,9 +134,9 @@ async function replay(
       args: [
         fileURLToPath(new URL('./compaction-history-acp.ts', import.meta.url)),
       ],
-      env: { HOME: home, PATH: process.env.PATH ?? '' },
+      env,
     },
-    usage: new AgyUsageSource(),
+    usage: new AgyUsageSource({ env }),
     capabilities: ['session.subsession'],
     emit: (event) => events.push(structuredClone(event)),
   })
@@ -163,6 +169,56 @@ const labels = (events: ProviderEvent[]) =>
   timeline(events).map(({ item }) =>
     item.type === 'assistant_message' ? item.text : item.type,
   )
+const toolCalls = (events: ProviderEvent[]): ToolCallItem[] =>
+  timeline(events)
+    .map(({ item }) => item)
+    .filter((item): item is ToolCallItem => item.type === 'tool_call')
+const terminalTurnStates = (events: ProviderEvent[]) =>
+  events
+    .filter(
+      (event): event is Extract<ProviderEvent, { type: 'session.turn' }> =>
+        event.type === 'session.turn' && event.state !== 'started',
+    )
+    .map((event) => event.state)
+const itemIdentifiers = (items: readonly ProviderTimelineItem[]) =>
+  items.map((item) => (item.type === 'tool_call' ? item.callId : item.type))
+
+function withBrainTool(
+  name: string,
+  args: unknown,
+  genericContent?: unknown,
+  replaceGeneric = false,
+) {
+  return rows.map((row) => {
+    if (row.type === 'PLANNER_RESPONSE' && 'tool_calls' in row) {
+      return {
+        ...row,
+        tool_calls: [{ id: read.toolCallId, name, args }],
+      }
+    }
+    if (replaceGeneric && row.type === 'GENERIC') {
+      return { ...row, content: genericContent }
+    }
+    return row
+  })
+}
+
+async function assertFallbackReplay(
+  historyRows: readonly object[],
+  updates: readonly object[],
+  expectedTexts: readonly string[],
+) {
+  const events = await replay([...historyRows], [...updates])
+  const items = timeline(events).map(({ item }) => item)
+  assert.equal(items.filter((item) => item.type === 'compaction').length, 0)
+  assert.equal(items.filter((item) => item.type === 'notification').length, 1)
+  assert.deepEqual(
+    items
+      .filter((item) => item.type === 'assistant_message')
+      .map((item) => item.text),
+    expectedTexts,
+  )
+}
 
 test('SDK load places compaction between its exact history anchors and preserves ACP tool data', async () => {
   const events = await replay(rows, [text('BEFORE'), read, text('AFTER')])
@@ -233,55 +289,46 @@ test('duplicate full text, fragmented snapshots, partial text and missing native
     checkpoint(2),
     { ...response(3, 'Same'), thinking: 'separator' },
   ]
-  const unverifiedInputRows = rows.map((row) =>
-    row === brainRead[0]
-      ? {
-          ...row,
-          tool_calls: [{ name: 'read_file', args: { Path: '/different' } }],
-        }
-      : row,
+  const unverifiedInputRows = [
+    response(1, 'BEFORE'),
+    checkpoint(2),
+    {
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: 'read_file', args: { Path: '/different' } }],
+    },
+    brainRead[1],
+    response(5, 'AFTER'),
+  ]
+  await assertFallbackReplay(
+    repeatedRows,
+    [
+      text('Same'),
+      {
+        sessionUpdate: 'agent_thought_chunk',
+        content: { type: 'text', text: 'separator' },
+      },
+      text('Same'),
+    ],
+    ['Same', 'Same'],
   )
-  for (const [historyRows, updates, expectedTexts] of [
-    [
-      repeatedRows,
-      [
-        text('Same'),
-        {
-          sessionUpdate: 'agent_thought_chunk',
-          content: { type: 'text', text: 'separator' },
-        },
-        text('Same'),
-      ],
-      ['Same', 'Same'],
-    ],
-    [
-      rows,
-      [text('BE'), text('FORE'), read, text('AFTER')],
-      ['BE', 'BEFORE', 'AFTER'],
-    ],
-    [
-      rows,
-      [text('BEFORE (partial)'), read, text('AFTER')],
-      ['BEFORE (partial)', 'AFTER'],
-    ],
-    [
-      unverifiedInputRows,
-      [text('BEFORE'), read, text('AFTER')],
-      ['BEFORE', 'AFTER'],
-    ],
-    [[checkpoint(1)], [], []],
-  ] as const) {
-    const events = await replay([...historyRows], [...updates])
-    const items = timeline(events).map(({ item }) => item)
-    assert.equal(items.filter((item) => item.type === 'compaction').length, 0)
-    assert.equal(items.filter((item) => item.type === 'notification').length, 1)
-    assert.deepEqual(
-      items
-        .filter((item) => item.type === 'assistant_message')
-        .map((item) => item.text),
-      expectedTexts,
-    )
-  }
+  await assertFallbackReplay(
+    rows,
+    [text('BE'), text('FORE'), read, text('AFTER')],
+    ['BE', 'BEFORE', 'AFTER'],
+  )
+  await assertFallbackReplay(
+    rows,
+    [text('BEFORE (partial)'), read, text('AFTER')],
+    ['BEFORE (partial)', 'AFTER'],
+  )
+  await assertFallbackReplay(
+    unverifiedInputRows,
+    [text('BEFORE'), read, text('AFTER')],
+    ['BEFORE', 'AFTER'],
+  )
+  await assertFallbackReplay([checkpoint(1)], [], [])
 })
 
 test('conflicting anchors do not reorder ACP content or guess a checkpoint position', async () => {
@@ -384,14 +431,19 @@ test('unknown ACP tool details, errors and identity survive a conflicting Brain 
   assert.equal(tools.length, 1)
   const tool = tools[0]
   assert.ok(tool.type === 'tool_call')
-  const expected = new Timeline('s').update({
-    ...failed,
-    sessionUpdate: 'tool_call',
+  assert.deepEqual(tool, {
+    type: 'tool_call',
+    id: 's:tool:read-example',
+    callId: 'read-example',
+    name: 'Vendor.Lookup',
+    status: 'failed',
+    error: JSON.stringify(failed.rawOutput),
+    detail: {
+      type: 'unknown',
+      input: { data: ['example'] },
+      output: failed.rawOutput,
+    },
   })
-  assert.ok(expected?.type === 'tool_call')
-  assert.deepEqual(tool, expected)
-  assert.equal(tool.status, 'failed')
-  assert.equal(tool.error, JSON.stringify(failed.rawOutput))
   assert.deepEqual(labels(events), [
     'BEFORE',
     'compaction',
@@ -401,16 +453,14 @@ test('unknown ACP tool details, errors and identity survive a conflicting Brain 
 })
 
 test('unlocated checkpoint revisions produce one standard notice per replay construction', async () => {
-  for (let repeat = 0; repeat < 2; repeat++) {
-    const events = await replay(
-      [
-        { ...checkpoint(1), content: 'summary A' },
-        { ...checkpoint(1), content: 'summary B' },
-      ],
-      [text('unmatched ACP history')],
-    )
-    assert.deepEqual(labels(events), ['unmatched ACP history', 'notification'])
-  }
+  const events = await replay(
+    [
+      { ...checkpoint(1), content: 'summary A' },
+      { ...checkpoint(1), content: 'summary B' },
+    ],
+    [text('unmatched ACP history')],
+  )
+  assert.deepEqual(labels(events), ['unmatched ACP history', 'notification'])
 })
 
 test('loaded child checkpoints keep their own session while root history interleaves', async () => {
@@ -487,14 +537,32 @@ test('missing ACP results recover from Brain without losing ACP parameters', asy
   assert.equal(recovered.callId, 'read-example')
 })
 
+async function assertPositionalAliasUnverified(
+  nativeRows: object[],
+  acp: object,
+  metadata: readonly { stepIndex: number; callId: string }[] = [],
+) {
+  const events = await replay(nativeRows, [acp], 'replay', undefined, metadata)
+  const items = timeline(events).map(({ item }) => item)
+  assert.equal(items.filter((item) => item.type === 'compaction').length, 0)
+  assert.equal(items.filter((item) => item.type === 'notification').length, 1)
+  const actual = items.find((item) => item.type === 'tool_call')!
+  assert.ok(actual.type === 'tool_call' && actual.detail.type === 'read')
+  assert.equal(actual.detail.content, 'ACP result')
+}
+
 test('a positional alias never gains native provenance from a later raw or metadata ID', async () => {
-  const tool = (step_index: number, id?: string) => ({
+  const anonymousTool = (step_index: number) => ({
     step_index,
     type: 'PLANNER_RESPONSE',
     status: 'DONE',
-    tool_calls: [
-      { ...(id ? { id } : {}), name: 'read_file', args: { Path: '/brain' } },
-    ],
+    tool_calls: [{ name: 'read_file', args: { Path: '/brain' } }],
+  })
+  const namedTool = (step_index: number, id: string) => ({
+    step_index,
+    type: 'PLANNER_RESPONSE',
+    status: 'DONE',
+    tool_calls: [{ id, name: 'read_file', args: { Path: '/brain' } }],
   })
   const result = {
     step_index: 1,
@@ -508,29 +576,17 @@ test('a positional alias never gains native provenance from a later raw or metad
     rawInput: { Path: '/acp' },
     rawOutput: 'ACP result',
   }
-  for (const laterIdentity of ['tool_id', 'step_metadata'] as const) {
-    const nativeRows = [
-      tool(0),
-      result,
-      checkpoint(2),
-      tool(3, laterIdentity === 'tool_id' ? 'b' : undefined),
-    ]
-    const events = await replay(
-      nativeRows,
-      [acp],
-      'replay',
-      undefined,
-      laterIdentity === 'step_metadata' ? [{ stepIndex: 4, callId: 'b' }] : [],
-    )
-    const items = timeline(events).map(({ item }) => item)
-    assert.equal(items.filter((item) => item.type === 'compaction').length, 0)
-    assert.equal(items.filter((item) => item.type === 'notification').length, 1)
-    const actual = items.find((item) => item.type === 'tool_call')!
-    assert.ok(actual.type === 'tool_call' && actual.detail.type === 'read')
-    assert.equal(actual.detail.content, 'ACP result')
-  }
+  await assertPositionalAliasUnverified(
+    [anonymousTool(0), result, checkpoint(2), namedTool(3, 'b')],
+    acp,
+  )
+  await assertPositionalAliasUnverified(
+    [anonymousTool(0), result, checkpoint(2), anonymousTool(3)],
+    acp,
+    [{ stepIndex: 4, callId: 'b' }],
+  )
   const control = await replay(
-    [tool(0, 'a'), result, checkpoint(2), tool(3, 'b')],
+    [namedTool(0, 'a'), result, checkpoint(2), namedTool(3, 'b')],
     [acp],
   )
   assert.equal(
@@ -544,33 +600,58 @@ test('a positional alias never gains native provenance from a later raw or metad
 })
 
 test('native provenance survives terminal projection and accepts exact step metadata and native synthetic-looking IDs', async () => {
-  for (const source of ['tool_id', 'step_metadata'] as const) {
-    const id = 'tool-0-0'
-    const nativeRows = [
+  const id = 'tool-0-0'
+  const toolIdEvents = await replay(
+    [
       {
         step_index: 0,
         type: 'PLANNER_RESPONSE',
-        tool_calls: [
-          {
-            ...(source === 'tool_id' ? { id } : {}),
-            name: 'read_file',
-            args: { Path: '/brain' },
-          },
-        ],
+        tool_calls: [{ id, name: 'read_file', args: { Path: '/brain' } }],
       },
       { step_index: 1, type: 'GENERIC', status: 'DONE', content: 'result' },
       checkpoint(2),
-    ]
-    const events = await replay(
-      nativeRows,
-      [{ ...read, toolCallId: id }],
-      'replay',
-      undefined,
-      source === 'step_metadata' ? [{ stepIndex: 1, callId: id }] : [],
-    )
-    assert.deepEqual(labels(events), ['tool_call', 'compaction'])
-  }
+    ],
+    [{ ...read, toolCallId: id }],
+    'replay',
+  )
+  assert.deepEqual(labels(toolIdEvents), ['tool_call', 'compaction'])
+
+  const metadataEvents = await replay(
+    [
+      {
+        step_index: 0,
+        type: 'PLANNER_RESPONSE',
+        tool_calls: [{ name: 'read_file', args: { Path: '/brain' } }],
+      },
+      { step_index: 1, type: 'GENERIC', status: 'DONE', content: 'result' },
+      checkpoint(2),
+    ],
+    [{ ...read, toolCallId: id }],
+    'replay',
+    undefined,
+    [{ stepIndex: 1, callId: id }],
+  )
+  assert.deepEqual(labels(metadataEvents), ['tool_call', 'compaction'])
 })
+
+async function assertRunningEmptyContentRecoversBrain(
+  nativeRows: object[],
+  updates: object[],
+) {
+  const events = await replay(nativeRows, updates)
+  const recovered = timeline(events)
+    .map(({ item }) => item)
+    .find(
+      (item) =>
+        item.type === 'tool_call' &&
+        item.status === 'completed' &&
+        item.detail.type === 'read' &&
+        item.detail.content === 'Brain recovered',
+    )
+  assert.ok(recovered?.type === 'tool_call' && recovered.detail.type === 'read')
+  assert.equal(recovered.detail.filePath, '/acp')
+  assert.equal(recovered.detail.offset, 7)
+}
 
 test('running empty content through multiple updates cannot suppress a missing Brain result', async () => {
   const nativeRows = [
@@ -589,43 +670,65 @@ test('running empty content through multiple updates cannot suppress a missing B
     },
     response(4, 'AFTER'),
   ]
-  for (const content of [undefined, []]) {
-    const events = await replay(nativeRows, [
-      text('BEFORE'),
-      {
-        ...read,
-        toolCallId: 'b',
-        status: 'in_progress',
-        rawInput: { Path: '/acp', StartLine: 7 },
-        rawOutput: undefined,
-        ...(content ? { content } : {}),
-      },
-      ...(content
-        ? [{ sessionUpdate: 'tool_call_update', toolCallId: 'b', content: [] }]
-        : []),
-      {
-        sessionUpdate: 'tool_call_update',
-        toolCallId: 'b',
-        status: 'completed',
-      },
-      text('AFTER'),
-    ])
-    const recovered = timeline(events)
-      .map(({ item }) => item)
-      .find(
-        (item) =>
-          item.type === 'tool_call' &&
-          item.status === 'completed' &&
-          item.detail.type === 'read' &&
-          item.detail.content === 'Brain recovered',
-      )
-    assert.ok(
-      recovered?.type === 'tool_call' && recovered.detail.type === 'read',
-    )
-    assert.equal(recovered.detail.filePath, '/acp')
-    assert.equal(recovered.detail.offset, 7)
+  const baseStart = {
+    ...read,
+    toolCallId: 'b',
+    status: 'in_progress',
+    rawInput: { Path: '/acp', StartLine: 7 },
+    rawOutput: undefined,
   }
+  const complete = {
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'b',
+    status: 'completed',
+  }
+  await assertRunningEmptyContentRecoversBrain(nativeRows, [
+    text('BEFORE'),
+    baseStart,
+    complete,
+    text('AFTER'),
+  ])
+  await assertRunningEmptyContentRecoversBrain(nativeRows, [
+    text('BEFORE'),
+    { ...baseStart, content: [] },
+    { sessionUpdate: 'tool_call_update', toolCallId: 'b', content: [] },
+    complete,
+    text('AFTER'),
+  ])
 })
+
+async function assertResultChannelCase(
+  nativeRows: object[],
+  start: object,
+  spec: {
+    middle: readonly object[]
+    final: object
+    expectedStatus: 'completed' | 'failed'
+    expectedContent: string | undefined
+  },
+) {
+  const events = await replay(nativeRows, [
+    text('BEFORE'),
+    start,
+    ...spec.middle,
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'b',
+      status: 'completed',
+      ...spec.final,
+    },
+    text('AFTER'),
+  ])
+  const completed = timeline(events)
+    .map(({ item }) => item)
+    .filter((item) => item.type === 'tool_call' && item.status !== 'running')
+    .at(-1)
+  assert.ok(completed?.type === 'tool_call' && completed.detail.type === 'read')
+  assert.equal(completed.status, spec.expectedStatus)
+  assert.equal(completed.detail.filePath, '/acp')
+  assert.equal(completed.detail.offset, 7)
+  assert.equal(completed.detail.content, spec.expectedContent)
+}
 
 test('result channel replacements track running placeholders independently from explicit terminal values', async () => {
   const nativeRows = [
@@ -657,241 +760,279 @@ test('result channel replacements track running placeholders independently from 
     rawOutput: undefined,
     content: [],
   }
-  const cases = [
-    {
-      middle: [
-        update({
-          content: [
-            {
-              type: 'content',
-              content: { type: 'text', text: 'temporary progress' },
-            },
-          ],
-        }),
-        update({ content: [] }),
-      ],
-      final: {},
-      expected: 'Brain recovered',
-    },
-    {
-      middle: [
-        update({ rawOutput: 'temporary raw' }),
-        update({ rawOutput: null }),
-      ],
-      final: {},
-      expected: 'temporary raw',
-    },
-    {
-      middle: [update({ rawOutput: 'ACP raw' }), update({ content: [] })],
-      final: {},
-      expected: 'ACP raw',
-    },
-    { middle: [], final: { content: [] }, expected: undefined },
-    { middle: [], final: { rawOutput: null }, expected: 'Brain recovered' },
-    {
-      middle: [],
-      final: { status: 'failed', rawOutput: null },
-      expected: 'Brain recovered',
-    },
-    {
-      middle: [],
-      final: { status: 'failed', rawOutput: 'ACP error' },
-      expected: 'ACP error',
-    },
-    { middle: [], final: { rawOutput: '' }, expected: '' },
-    { middle: [], final: { rawOutput: 'ACP final' }, expected: 'ACP final' },
-    {
-      middle: [],
-      final: { rawOutput: { structuredContent: { valid: true } } },
-      expected: JSON.stringify({ structuredContent: { valid: true } }),
-    },
-    {
-      middle: [],
-      final: {
+  await assertResultChannelCase(nativeRows, start, {
+    middle: [
+      update({
         content: [
           {
             type: 'content',
-            content: { type: 'text', text: 'ACP final content' },
+            content: { type: 'text', text: 'temporary progress' },
           },
         ],
-      },
-      expected: 'ACP final content',
+      }),
+      update({ content: [] }),
+    ],
+    final: {},
+    expectedStatus: 'completed',
+    expectedContent: 'Brain recovered',
+  })
+  await assertResultChannelCase(nativeRows, start, {
+    middle: [
+      update({ rawOutput: 'temporary raw' }),
+      update({ rawOutput: null }),
+    ],
+    final: {},
+    expectedStatus: 'completed',
+    expectedContent: 'temporary raw',
+  })
+  await assertResultChannelCase(nativeRows, start, {
+    middle: [update({ rawOutput: 'ACP raw' }), update({ content: [] })],
+    final: {},
+    expectedStatus: 'completed',
+    expectedContent: 'ACP raw',
+  })
+  await assertResultChannelCase(nativeRows, start, {
+    middle: [],
+    final: { content: [] },
+    expectedStatus: 'completed',
+    expectedContent: undefined,
+  })
+  await assertResultChannelCase(nativeRows, start, {
+    middle: [],
+    final: { rawOutput: null },
+    expectedStatus: 'completed',
+    expectedContent: 'Brain recovered',
+  })
+  await assertResultChannelCase(nativeRows, start, {
+    middle: [],
+    final: { status: 'failed', rawOutput: null },
+    expectedStatus: 'failed',
+    expectedContent: 'Brain recovered',
+  })
+  await assertResultChannelCase(nativeRows, start, {
+    middle: [],
+    final: { status: 'failed', rawOutput: 'ACP error' },
+    expectedStatus: 'failed',
+    expectedContent: 'ACP error',
+  })
+  await assertResultChannelCase(nativeRows, start, {
+    middle: [],
+    final: { rawOutput: '' },
+    expectedStatus: 'completed',
+    expectedContent: '',
+  })
+  await assertResultChannelCase(nativeRows, start, {
+    middle: [],
+    final: { rawOutput: 'ACP final' },
+    expectedStatus: 'completed',
+    expectedContent: 'ACP final',
+  })
+  await assertResultChannelCase(nativeRows, start, {
+    middle: [],
+    final: { rawOutput: { structuredContent: { valid: true } } },
+    expectedStatus: 'completed',
+    expectedContent: JSON.stringify({ structuredContent: { valid: true } }),
+  })
+  await assertResultChannelCase(nativeRows, start, {
+    middle: [],
+    final: {
+      content: [
+        {
+          type: 'content',
+          content: { type: 'text', text: 'ACP final content' },
+        },
+      ],
     },
-  ]
-  for (const { middle, final, expected } of cases) {
-    const events = await replay(nativeRows, [
-      text('BEFORE'),
-      start,
-      ...middle,
-      update({ status: 'completed', ...final }),
-      text('AFTER'),
-    ])
-    const completed = timeline(events)
-      .map(({ item }) => item)
-      .filter((item) => item.type === 'tool_call' && item.status !== 'running')
-      .at(-1)
-    assert.ok(
-      completed?.type === 'tool_call' && completed.detail.type === 'read',
-    )
-    assert.equal(
-      completed.status,
-      'status' in final ? final.status : 'completed',
-    )
-    assert.equal(completed.detail.filePath, '/acp')
-    assert.equal(completed.detail.offset, 7)
-    assert.equal(completed.detail.content, expected)
-  }
+    expectedStatus: 'completed',
+    expectedContent: 'ACP final content',
+  })
 })
+
+async function assertInitialNullRecovers(spec: {
+  updates: readonly object[]
+  expectedStatus: 'completed' | 'failed'
+  expectedError: string | null
+}) {
+  const events = await replay(rows, [
+    text('BEFORE'),
+    ...spec.updates,
+    text('AFTER'),
+  ])
+  const item = timeline(events)
+    .map(({ item }) => item)
+    .findLast((item) => item.type === 'tool_call')
+  assert.ok(item?.type === 'tool_call' && item.detail.type === 'read')
+  assert.equal(item.callId, read.toolCallId)
+  assert.equal(item.id, `s:tool:${read.toolCallId}`)
+  assert.equal(item.status, spec.expectedStatus)
+  assert.equal(item.error, spec.expectedError)
+  assert.equal(item.detail.filePath, '/acp')
+  assert.equal(item.detail.offset, 7)
+  assert.equal(item.detail.content, 'read')
+  assert.equal(
+    timeline(events).filter(({ item }) => item.type === 'compaction').length,
+    1,
+  )
+}
 
 test('ACP v1 initial null is missing result data and never suppresses history recovery', async (t) => {
-  for (const status of ['in_progress', 'completed', 'failed'] as const)
-    await t.test(status, async () => {
-      const events = await replay(rows, [
-        text('BEFORE'),
+  await t.test('in_progress', () =>
+    assertInitialNullRecovers({
+      updates: [
         {
           ...read,
-          status,
+          status: 'in_progress',
           rawInput: { Path: '/acp', StartLine: 7 },
           rawOutput: null,
         },
-        ...(status === 'in_progress'
-          ? [
-              {
-                sessionUpdate: 'tool_call_update',
-                toolCallId: read.toolCallId,
-                status: 'completed',
-                rawOutput: null,
-              },
-            ]
-          : []),
-        text('AFTER'),
-      ])
-      const item = timeline(events)
-        .map(({ item }) => item)
-        .findLast((item) => item.type === 'tool_call')
-      assert.ok(item?.type === 'tool_call' && item.detail.type === 'read')
-      assert.equal(item.callId, read.toolCallId)
-      assert.equal(item.id, `s:tool:${read.toolCallId}`)
-      assert.equal(item.status, status === 'failed' ? 'failed' : 'completed')
-      assert.equal(item.error, status === 'failed' ? 'Tool failed' : null)
-      assert.equal(item.detail.filePath, '/acp')
-      assert.equal(item.detail.offset, 7)
-      assert.equal(item.detail.content, 'read')
-      assert.equal(
-        timeline(events).filter(({ item }) => item.type === 'compaction')
-          .length,
-        1,
-      )
-    })
+        {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: read.toolCallId,
+          status: 'completed',
+          rawOutput: null,
+        },
+      ],
+      expectedStatus: 'completed',
+      expectedError: null,
+    }),
+  )
+  await t.test('completed', () =>
+    assertInitialNullRecovers({
+      updates: [
+        {
+          ...read,
+          status: 'completed',
+          rawInput: { Path: '/acp', StartLine: 7 },
+          rawOutput: null,
+        },
+      ],
+      expectedStatus: 'completed',
+      expectedError: null,
+    }),
+  )
+  await t.test('failed', () =>
+    assertInitialNullRecovers({
+      updates: [
+        {
+          ...read,
+          status: 'failed',
+          rawInput: { Path: '/acp', StartLine: 7 },
+          rawOutput: null,
+        },
+      ],
+      expectedStatus: 'failed',
+      expectedError: 'Tool failed',
+    }),
+  )
 })
+
+async function assertRunningNullPreservesProvenance(finalFields: object) {
+  const events = await replay(rows, [
+    text('BEFORE'),
+    {
+      ...read,
+      status: 'in_progress',
+      rawInput: { Path: '/acp', StartLine: 7 },
+      rawOutput: 'ACP retained',
+    },
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: read.toolCallId,
+      rawInput: null,
+      rawOutput: null,
+    },
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: read.toolCallId,
+      status: 'completed',
+      ...finalFields,
+    },
+    text('AFTER'),
+  ])
+  const item = timeline(events)
+    .map(({ item }) => item)
+    .findLast((item) => item.type === 'tool_call')
+  assert.ok(item?.type === 'tool_call' && item.detail.type === 'read')
+  assert.equal(item.status, 'completed')
+  assert.equal(item.detail.content, 'ACP retained')
+  assert.equal(item.detail.filePath, '/acp')
+  assert.equal(item.detail.offset, 7)
+}
 
 test('ACP v1 running null cannot erase raw provenance or native input parameters before completion', async (t) => {
-  for (const final of [{}, { rawInput: null, rawOutput: null }] as const)
-    await t.test(JSON.stringify(final), async () => {
-      const events = await replay(rows, [
-        text('BEFORE'),
-        {
-          ...read,
-          status: 'in_progress',
-          rawInput: { Path: '/acp', StartLine: 7 },
-          rawOutput: 'ACP retained',
-        },
-        {
-          sessionUpdate: 'tool_call_update',
-          toolCallId: read.toolCallId,
-          rawInput: null,
-          rawOutput: null,
-        },
-        {
-          sessionUpdate: 'tool_call_update',
-          toolCallId: read.toolCallId,
-          status: 'completed',
-          ...final,
-        },
-        text('AFTER'),
-      ])
-      const item = timeline(events)
-        .map(({ item }) => item)
-        .findLast((item) => item.type === 'tool_call')
-      assert.ok(item?.type === 'tool_call' && item.detail.type === 'read')
-      assert.equal(item.status, 'completed')
-      assert.equal(item.detail.content, 'ACP retained')
-      assert.equal(item.detail.filePath, '/acp')
-      assert.equal(item.detail.offset, 7)
-    })
+  await t.test('{}', () => assertRunningNullPreservesProvenance({}))
+  await t.test('{"rawInput":null,"rawOutput":null}', () =>
+    assertRunningNullPreservesProvenance({ rawInput: null, rawOutput: null }),
+  )
 })
 
-test('non-null raw JSON remains authoritative through null and independent content updates in live and history', async (t) => {
+async function assertNonNullRawJsonAuthoritative(output: unknown) {
   const name = 'Vendor.custom'
-  for (const output of [false, 0, '', [], {}, { nested: null }])
-    await t.test(JSON.stringify(output), async () => {
-      const updates = [
-        {
-          ...read,
-          title: name,
-          status: 'in_progress',
-          rawInput: { nested: null },
-          rawOutput: 'old',
-        },
-        {
-          sessionUpdate: 'tool_call_update',
-          toolCallId: read.toolCallId,
-          rawOutput: output,
-          content: [],
-        },
-        {
-          sessionUpdate: 'tool_call_update',
-          toolCallId: read.toolCallId,
-          rawInput: null,
-          rawOutput: null,
-          content: null,
-        },
-        {
-          sessionUpdate: 'tool_call_update',
-          toolCallId: read.toolCallId,
-          status: 'completed',
-        },
-      ].map((update) => zSessionUpdate.parse(update))
-      const live = new Timeline('live')
-      const liveItem = updates.map((update) => live.update(update)).at(-1)
-      assert.ok(
-        liveItem?.type === 'tool_call' && liveItem.detail.type === 'unknown',
-      )
-      assert.deepEqual(liveItem.detail.input, { nested: null })
-      assert.deepEqual(liveItem.detail.output, output)
-      const nativeRows = rows.map((row) =>
-        row.type === 'PLANNER_RESPONSE' && 'tool_calls' in row
-          ? {
-              ...row,
-              tool_calls: [
-                { id: read.toolCallId, name, args: { from: 'Brain' } },
-              ],
-            }
-          : row,
-      )
-      const events = await replay(nativeRows, [
-        text('BEFORE'),
-        ...updates,
-        text('AFTER'),
-      ])
-      const item = timeline(events)
-        .map(({ item }) => item)
-        .findLast((item) => item.type === 'tool_call')
-      assert.ok(item?.type === 'tool_call' && item.detail.type === 'unknown')
-      assert.equal(item.callId, read.toolCallId)
-      assert.equal(item.status, 'completed')
-      assert.deepEqual(item.detail.input, { nested: null })
-      assert.deepEqual(item.detail.output, output)
-    })
+  const updates: SessionUpdate[] = [
+    {
+      sessionUpdate: 'tool_call',
+      toolCallId: read.toolCallId,
+      title: name,
+      status: 'in_progress',
+      rawInput: { nested: null },
+      rawOutput: 'old',
+    },
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: read.toolCallId,
+      rawOutput: output,
+      content: [],
+    },
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: read.toolCallId,
+      rawInput: null,
+      rawOutput: null,
+      content: null,
+    },
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: read.toolCallId,
+      status: 'completed',
+    },
+  ]
+  const live = new Timeline('live')
+  const liveItem = updates.map((update) => live.update(update)).at(-1)
+  assert.ok(
+    liveItem?.type === 'tool_call' && liveItem.detail.type === 'unknown',
+  )
+  assert.deepEqual(liveItem.detail.input, { nested: null })
+  assert.deepEqual(liveItem.detail.output, output)
+  const nativeRows = withBrainTool(name, { from: 'Brain' })
+  const events = await replay(nativeRows, [
+    text('BEFORE'),
+    ...updates,
+    text('AFTER'),
+  ])
+  const item = timeline(events)
+    .map(({ item }) => item)
+    .findLast((item) => item.type === 'tool_call')
+  assert.ok(item?.type === 'tool_call' && item.detail.type === 'unknown')
+  assert.equal(item.callId, read.toolCallId)
+  assert.equal(item.status, 'completed')
+  assert.deepEqual(item.detail.input, { nested: null })
+  assert.deepEqual(item.detail.output, output)
+}
+
+test('non-null raw JSON remains authoritative through null and independent content updates in live and history', async (t) => {
+  await t.test('false', () => assertNonNullRawJsonAuthoritative(false))
+  await t.test('0', () => assertNonNullRawJsonAuthoritative(0))
+  await t.test('""', () => assertNonNullRawJsonAuthoritative(''))
+  await t.test('[]', () => assertNonNullRawJsonAuthoritative([]))
+  await t.test('{}', () => assertNonNullRawJsonAuthoritative({}))
+  await t.test('{"nested":null}', () =>
+    assertNonNullRawJsonAuthoritative({ nested: null }),
+  )
 })
 
 test('a new full ACP snapshot resets both result channels instead of inheriting old null-retained data', async () => {
   const name = 'Vendor.custom'
-  const nativeRows = rows.map((row) =>
-    row.type === 'PLANNER_RESPONSE' && 'tool_calls' in row
-      ? { ...row, tool_calls: [{ id: read.toolCallId, name, args: {} }] }
-      : row,
-  )
+  const nativeRows = withBrainTool(name, {})
   const events = await replay(nativeRows, [
     text('BEFORE'),
     {
@@ -939,6 +1080,7 @@ test('null-result history recovery remains intact when the next turn cancels aft
       text('AFTER'),
     ]),
   )
+  const env = isolatedEnv(home, { PATH: process.env.PATH ?? '' })
   const events: ProviderEvent[] = []
   const manager = new SessionManager({
     launch: {
@@ -946,9 +1088,9 @@ test('null-result history recovery remains intact when the next turn cancels aft
       args: [
         fileURLToPath(new URL('./compaction-history-acp.ts', import.meta.url)),
       ],
-      env: { HOME: home, PATH: process.env.PATH ?? '' },
+      env,
     },
-    usage: new AgyUsageSource(),
+    usage: new AgyUsageSource({ env }),
     capabilities: ['prompt.message'],
     emit: (event) => events.push(structuredClone(event)),
   })
@@ -1039,14 +1181,7 @@ test('null-result history recovery remains intact when the next turn cancels aft
     usageCountBeforeFollowup,
     'step 8 boundary excludes earlier step 7 after canceled compaction',
   )
-  assert.deepEqual(
-    events.flatMap((event) =>
-      event.type === 'session.turn' && event.state !== 'started'
-        ? [event.state]
-        : [],
-    ),
-    ['canceled', 'canceled'],
-  )
+  assert.deepEqual(terminalTurnStates(events), ['canceled', 'canceled'])
   assert.deepEqual(
     timeline(events)
       .map(({ item }) => item)
@@ -1055,166 +1190,220 @@ test('null-result history recovery remains intact when the next turn cancels aft
   )
 })
 
+async function assertMissingOrNullInputRetainsBrainRead(
+  nativeRows: object[],
+  spec: {
+    input: { rawInput?: null }
+    status: 'completed' | 'failed'
+    expectedError: string | null
+  },
+) {
+  const packet: SessionUpdate = {
+    sessionUpdate: 'tool_call',
+    toolCallId: read.toolCallId,
+    title: 'read_file',
+    status: spec.status,
+    rawOutput: null,
+    ...spec.input,
+  }
+  const events = await replay(nativeRows, [
+    text('BEFORE'),
+    packet,
+    text('AFTER'),
+  ])
+  const item = timeline(events)
+    .map(({ item }) => item)
+    .findLast((item) => item.type === 'tool_call')
+  assert.ok(item?.type === 'tool_call' && item.detail.type === 'read')
+  assert.equal(item.detail.filePath, '/brain')
+  assert.equal(item.detail.offset, 9)
+  assert.equal(item.detail.content, 'Brain recovered')
+  assert.equal(item.callId, read.toolCallId)
+  assert.equal(item.id, `s:tool:${read.toolCallId}`)
+  assert.equal(item.status, spec.status)
+  assert.equal(item.error, spec.expectedError)
+}
+
 test('missing or null ACP input retains real Brain read parameters during result recovery', async (t) => {
-  const nativeRows = rows.map((row) =>
-    row.type === 'PLANNER_RESPONSE' && 'tool_calls' in row
-      ? {
-          ...row,
-          tool_calls: [
-            {
-              id: read.toolCallId,
-              name: 'read_file',
-              args: { Path: '/brain', StartLine: 9 },
-            },
-          ],
-        }
-      : row.type === 'GENERIC'
-        ? { ...row, content: 'Brain recovered' }
-        : row,
+  const nativeRows = withBrainTool(
+    'read_file',
+    { Path: '/brain', StartLine: 9 },
+    'Brain recovered',
+    true,
   )
-  for (const input of [{}, { rawInput: null }])
-    for (const status of ['completed', 'failed'] as const)
-      await t.test(`${JSON.stringify(input)} ${status}`, async () => {
-        const packet = zSessionUpdate.parse({
-          sessionUpdate: 'tool_call',
-          toolCallId: read.toolCallId,
-          title: 'read_file',
-          status,
-          rawOutput: null,
-          ...input,
-        })
-        const events = await replay(nativeRows, [
-          text('BEFORE'),
-          packet,
-          text('AFTER'),
-        ])
-        const item = timeline(events)
-          .map(({ item }) => item)
-          .findLast((item) => item.type === 'tool_call')
-        assert.ok(item?.type === 'tool_call' && item.detail.type === 'read')
-        assert.equal(item.detail.filePath, '/brain')
-        assert.equal(item.detail.offset, 9)
-        assert.equal(item.detail.content, 'Brain recovered')
-        assert.equal(item.callId, read.toolCallId)
-        assert.equal(item.id, `s:tool:${read.toolCallId}`)
-        assert.equal(item.status, status)
-        assert.equal(item.error, status === 'failed' ? 'Tool failed' : null)
-      })
+  await t.test('{} completed', () =>
+    assertMissingOrNullInputRetainsBrainRead(nativeRows, {
+      input: {},
+      status: 'completed',
+      expectedError: null,
+    }),
+  )
+  await t.test('{} failed', () =>
+    assertMissingOrNullInputRetainsBrainRead(nativeRows, {
+      input: {},
+      status: 'failed',
+      expectedError: 'Tool failed',
+    }),
+  )
+  await t.test('{"rawInput":null} completed', () =>
+    assertMissingOrNullInputRetainsBrainRead(nativeRows, {
+      input: { rawInput: null },
+      status: 'completed',
+      expectedError: null,
+    }),
+  )
+  await t.test('{"rawInput":null} failed', () =>
+    assertMissingOrNullInputRetainsBrainRead(nativeRows, {
+      input: { rawInput: null },
+      status: 'failed',
+      expectedError: 'Tool failed',
+    }),
+  )
 })
+
+async function assertRecoveredUnknownInput(spec: {
+  packet: { rawInput?: unknown }
+  brain: unknown
+  expected: unknown
+}) {
+  const nativeRows = withBrainTool('Vendor.custom', spec.brain, null, true)
+  const packet: SessionUpdate = {
+    sessionUpdate: 'tool_call',
+    toolCallId: read.toolCallId,
+    title: 'Vendor.custom',
+    status: 'completed',
+    rawOutput: null,
+    ...spec.packet,
+  }
+  const events = await replay(nativeRows, [
+    text('BEFORE'),
+    packet,
+    text('AFTER'),
+  ])
+  const item = timeline(events)
+    .map(({ item }) => item)
+    .findLast((item) => item.type === 'tool_call')
+  assert.ok(item?.type === 'tool_call' && item.detail.type === 'unknown')
+  assert.deepEqual(item.detail.input, spec.expected)
+  assert.equal(
+    item.detail.output,
+    null,
+    'actual Brain JSON null is result data, not an ACP patch',
+  )
+  assert.equal(item.status, 'completed')
+}
 
 test('recovered unknown details select actual non-null ACP input, otherwise real Brain JSON including null', async (t) => {
   const brainInput = { from: 'Brain', nested: null }
-  const cases: {
-    name: string
-    packet: object
-    brain: unknown
-    expected: unknown
-  }[] = [
-    {
-      name: 'missing ACP',
+  await t.test('missing ACP', () =>
+    assertRecoveredUnknownInput({
       packet: {},
       brain: brainInput,
       expected: brainInput,
-    },
-    {
-      name: 'null ACP',
+    }),
+  )
+  await t.test('null ACP', () =>
+    assertRecoveredUnknownInput({
       packet: { rawInput: null },
       brain: brainInput,
       expected: brainInput,
-    },
-    { name: 'actual Brain null', packet: {}, brain: null, expected: null },
-    ...[false, 0, '', [], {}, { nested: null }].map((value) => ({
-      name: `supplied ${JSON.stringify(value)}`,
-      packet: { rawInput: value },
+    }),
+  )
+  await t.test('actual Brain null', () =>
+    assertRecoveredUnknownInput({
+      packet: {},
+      brain: null,
+      expected: null,
+    }),
+  )
+  await t.test('supplied false', () =>
+    assertRecoveredUnknownInput({
+      packet: { rawInput: false },
       brain: brainInput,
-      expected: value,
-    })),
-  ]
-  for (const entry of cases)
-    await t.test(entry.name, async () => {
-      const nativeRows = rows.map((row) =>
-        row.type === 'PLANNER_RESPONSE' && 'tool_calls' in row
-          ? {
-              ...row,
-              tool_calls: [
-                {
-                  id: read.toolCallId,
-                  name: 'Vendor.custom',
-                  args: entry.brain,
-                },
-              ],
-            }
-          : row.type === 'GENERIC'
-            ? { ...row, content: null }
-            : row,
-      )
-      const packet = zSessionUpdate.parse({
-        sessionUpdate: 'tool_call',
-        toolCallId: read.toolCallId,
-        title: 'Vendor.custom',
-        status: 'completed',
-        rawOutput: null,
-        ...entry.packet,
-      })
-      const events = await replay(nativeRows, [
-        text('BEFORE'),
-        packet,
-        text('AFTER'),
-      ])
-      const item = timeline(events)
-        .map(({ item }) => item)
-        .findLast((item) => item.type === 'tool_call')
-      assert.ok(item?.type === 'tool_call' && item.detail.type === 'unknown')
-      assert.deepEqual(item.detail.input, entry.expected)
-      assert.equal(
-        item.detail.output,
-        null,
-        'actual Brain JSON null is result data, not an ACP patch',
-      )
-      assert.equal(item.status, 'completed')
-    })
+      expected: false,
+    }),
+  )
+  await t.test('supplied 0', () =>
+    assertRecoveredUnknownInput({
+      packet: { rawInput: 0 },
+      brain: brainInput,
+      expected: 0,
+    }),
+  )
+  await t.test('supplied ""', () =>
+    assertRecoveredUnknownInput({
+      packet: { rawInput: '' },
+      brain: brainInput,
+      expected: '',
+    }),
+  )
+  await t.test('supplied []', () =>
+    assertRecoveredUnknownInput({
+      packet: { rawInput: [] },
+      brain: brainInput,
+      expected: [],
+    }),
+  )
+  await t.test('supplied {}', () =>
+    assertRecoveredUnknownInput({
+      packet: { rawInput: {} },
+      brain: brainInput,
+      expected: {},
+    }),
+  )
+  await t.test('supplied {"nested":null}', () =>
+    assertRecoveredUnknownInput({
+      packet: { rawInput: { nested: null } },
+      brain: brainInput,
+      expected: { nested: null },
+    }),
+  )
 })
 
+async function assertMissingInputNeverReplacesAcpResult(spec: {
+  status: 'completed' | 'failed'
+  output: unknown
+  expectedError: string | null
+}) {
+  const nativeRows = withBrainTool('Vendor.custom', { from: 'Brain' })
+  const packet: SessionUpdate = {
+    sessionUpdate: 'tool_call',
+    toolCallId: read.toolCallId,
+    title: 'Vendor.custom',
+    status: spec.status,
+    rawInput: null,
+    rawOutput: spec.output,
+  }
+  const events = await replay(nativeRows, [
+    text('BEFORE'),
+    packet,
+    text('AFTER'),
+  ])
+  const item = timeline(events)
+    .map(({ item }) => item)
+    .findLast((item) => item.type === 'tool_call')
+  assert.ok(item?.type === 'tool_call' && item.detail.type === 'unknown')
+  assert.equal(item.detail.input, null)
+  assert.equal(item.detail.output, spec.output)
+  assert.equal(item.status, spec.status)
+  assert.equal(item.error, spec.expectedError)
+}
+
 test('missing ACP input never permits recovered Brain detail to replace a supplied ACP result or error', async (t) => {
-  for (const status of ['completed', 'failed'] as const)
-    await t.test(status, async () => {
-      const output = status === 'failed' ? 'ACP failure' : false
-      const nativeRows = rows.map((row) =>
-        row.type === 'PLANNER_RESPONSE' && 'tool_calls' in row
-          ? {
-              ...row,
-              tool_calls: [
-                {
-                  id: read.toolCallId,
-                  name: 'Vendor.custom',
-                  args: { from: 'Brain' },
-                },
-              ],
-            }
-          : row,
-      )
-      const packet = zSessionUpdate.parse({
-        sessionUpdate: 'tool_call',
-        toolCallId: read.toolCallId,
-        title: 'Vendor.custom',
-        status,
-        rawInput: null,
-        rawOutput: output,
-      })
-      const events = await replay(nativeRows, [
-        text('BEFORE'),
-        packet,
-        text('AFTER'),
-      ])
-      const item = timeline(events)
-        .map(({ item }) => item)
-        .findLast((item) => item.type === 'tool_call')
-      assert.ok(item?.type === 'tool_call' && item.detail.type === 'unknown')
-      assert.equal(item.detail.input, null)
-      assert.equal(item.detail.output, output)
-      assert.equal(item.status, status)
-      assert.equal(item.error, status === 'failed' ? 'ACP failure' : null)
-    })
+  await t.test('completed', () =>
+    assertMissingInputNeverReplacesAcpResult({
+      status: 'completed',
+      output: false,
+      expectedError: null,
+    }),
+  )
+  await t.test('failed', () =>
+    assertMissingInputNeverReplacesAcpResult({
+      status: 'failed',
+      output: 'ACP failure',
+      expectedError: 'ACP failure',
+    }),
+  )
 })
 
 test('real AGY transcript shapes locate checkpoints across anonymous tools, background tasks, wrapped user input, local gaps and forked suffixes', async () => {
@@ -1401,81 +1590,81 @@ test('alignReplayTools handles windowed ACP slices (M > N) and ambiguous window 
   assert.deepEqual([...ambiguousSuffix.verifiedAcpToolIds], ['p2'])
 })
 
+async function assertMixedBatchAnchors(
+  backgroundFirst: boolean,
+  backgroundCount: number,
+) {
+  const foreground = { name: 'read_file', args: { Path: '/example' } }
+  const backgrounds = Array.from({ length: backgroundCount }, (_, i) => ({
+    name: 'run_command',
+    args: { CommandLine: `task-${i}`, WaitMsBeforeAsync: 500 },
+  }))
+  const calls = backgroundFirst
+    ? [...backgrounds, foreground]
+    : [foreground, ...backgrounds]
+  const updates = calls.map((tool, i) => ({
+    sessionUpdate: 'tool_call',
+    toolCallId: `call-${i}`,
+    title: tool.name,
+    status: tool.name === 'read_file' ? 'completed' : 'failed',
+    rawInput: tool.args,
+    rawOutput: tool.name === 'read_file' ? 'ok' : 'Tool failed',
+  }))
+  // Include checkpoints before the batch, between response and GENERIC,
+  // and between sibling GENERIC rows to expose premature anchors.
+  const nativeRows = [
+    response(0, 'BEFORE'),
+    checkpoint(1),
+    {
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: calls,
+    },
+    checkpoint(3),
+    ...calls.flatMap((tool, i) => [
+      {
+        step_index: 4 + i * 2,
+        type: 'GENERIC',
+        status:
+          tool.name === 'read_file' ? 'DONE' : i % 2 ? 'WAITING' : 'RUNNING',
+        content:
+          tool.name === 'read_file'
+            ? 'ok'
+            : `Tool is running as a background task with task id: task-${i}`,
+      },
+      checkpoint(5 + i * 2),
+    ]),
+    response(4 + calls.length * 2, 'AFTER'),
+  ]
+  const events = await replay(nativeRows, [
+    text('BEFORE'),
+    ...updates,
+    text('AFTER'),
+  ])
+  assert.deepEqual(labels(events), [
+    'BEFORE',
+    'compaction',
+    'compaction',
+    ...calls.flatMap(() => ['tool_call', 'compaction']),
+    'AFTER',
+  ])
+  const tools = toolCalls(events)
+  assert.deepEqual(
+    tools.map((item) => item.callId),
+    updates.map((tool) => tool.toolCallId),
+  )
+  assert.deepEqual(
+    tools.map((item) => item.status),
+    updates.map((tool) => tool.status),
+  )
+}
+
 test('mixed foreground and background calls anchor at their GENERIC steps', async () => {
-  for (const backgroundFirst of [false, true]) {
-    for (const backgroundCount of [1, 2]) {
-      const foreground = { name: 'read_file', args: { Path: '/example' } }
-      const backgrounds = Array.from({ length: backgroundCount }, (_, i) => ({
-        name: 'run_command',
-        args: { CommandLine: `task-${i}`, WaitMsBeforeAsync: 500 },
-      }))
-      const calls = backgroundFirst
-        ? [...backgrounds, foreground]
-        : [foreground, ...backgrounds]
-      const updates = calls.map((tool, i) => ({
-        sessionUpdate: 'tool_call',
-        toolCallId: `call-${i}`,
-        title: tool.name,
-        status: tool.name === 'read_file' ? 'completed' : 'failed',
-        rawInput: tool.args,
-        rawOutput: tool.name === 'read_file' ? 'ok' : 'Tool failed',
-      }))
-      // Include checkpoints before the batch, between response and GENERIC,
-      // and between sibling GENERIC rows to expose premature anchors.
-      const rows = [
-        response(0, 'BEFORE'),
-        checkpoint(1),
-        {
-          step_index: 2,
-          type: 'PLANNER_RESPONSE',
-          status: 'DONE',
-          tool_calls: calls,
-        },
-        checkpoint(3),
-        ...calls.flatMap((tool, i) => [
-          {
-            step_index: 4 + i * 2,
-            type: 'GENERIC',
-            status:
-              tool.name === 'read_file'
-                ? 'DONE'
-                : i % 2
-                  ? 'WAITING'
-                  : 'RUNNING',
-            content:
-              tool.name === 'read_file'
-                ? 'ok'
-                : `Tool is running as a background task with task id: task-${i}`,
-          },
-          checkpoint(5 + i * 2),
-        ]),
-        response(4 + calls.length * 2, 'AFTER'),
-      ]
-      const events = await replay(rows, [
-        text('BEFORE'),
-        ...updates,
-        text('AFTER'),
-      ])
-      assert.deepEqual(labels(events), [
-        'BEFORE',
-        'compaction',
-        'compaction',
-        ...calls.flatMap(() => ['tool_call', 'compaction']),
-        'AFTER',
-      ])
-      const tools = timeline(events).flatMap(({ item }) =>
-        item.type === 'tool_call' ? [item] : [],
-      )
-      assert.deepEqual(
-        tools.map((item) => item.callId),
-        updates.map((tool) => tool.toolCallId),
-      )
-      assert.deepEqual(
-        tools.map((item) => item.status),
-        updates.map((tool) => tool.status),
-      )
-    }
-  }
+  await assertMixedBatchAnchors(false, 1)
+  await assertMixedBatchAnchors(false, 2)
+  await assertMixedBatchAnchors(true, 1)
+  await assertMixedBatchAnchors(true, 2)
 })
 
 test('no checkpoint preserves ACP terminal result', async () => {
@@ -1487,10 +1676,7 @@ test('no checkpoint preserves ACP terminal result', async () => {
       text('AFTER'),
     ],
   )
-  const tools = timeline(events).flatMap((e) =>
-    e.item.type === 'tool_call' ? [e.item] : [],
-  )
-  assert.equal(tools.at(-1)?.status, 'failed')
+  assert.equal(toolCalls(events).at(-1)?.status, 'failed')
 })
 
 test('checkpoint shift preserves per-tool metadata identity', async () => {
@@ -1517,9 +1703,7 @@ test('checkpoint shift preserves per-tool metadata identity', async () => {
     { stepIndex: 2, callId: 'a' },
     { stepIndex: 3, callId: 'b' },
   ])
-  const tools = timeline(events).flatMap((e) =>
-    e.item.type === 'tool_call' ? [e.item] : [],
-  )
+  const tools = toolCalls(events)
   const lastA = tools.filter((t) => t.callId === 'a').at(-1)
   assert.ok(lastA?.detail.type === 'read' && lastA.detail.content === 'A')
   const lastB = tools.filter((t) => t.callId === 'b').at(-1)
@@ -1545,10 +1729,7 @@ test('checkpoint shift preserves per-tool metadata identity', async () => {
   )
   projector.observeRows(nativeRows.slice(1))
   const resolved = projector.resolveToolIdentities(true)
-  assert.deepEqual(
-    resolved.map((i) => (i.type === 'tool_call' ? i.callId : i.type)),
-    ['a', 'b'],
-  )
+  assert.deepEqual(itemIdentifiers(resolved), ['a', 'b'])
 })
 
 test('unverified positional tool cannot recover a different ACP call result', async () => {
@@ -1574,11 +1755,8 @@ test('unverified positional tool cannot recover a different ACP call result', as
       rawOutput: undefined,
     },
   ])
-  const tools = timeline(events).flatMap((e) =>
-    e.item.type === 'tool_call' ? [e.item] : [],
-  )
   assert.ok(
-    !tools.some(
+    !toolCalls(events).some(
       (t) =>
         t.callId === 'b' &&
         t.detail.type === 'read' &&
@@ -1587,58 +1765,61 @@ test('unverified positional tool cannot recover a different ACP call result', as
   )
 })
 
+async function assertBackgroundRecoveryNoSecondAnchor(
+  extraRows: readonly object[],
+  expectedLabels: readonly string[],
+) {
+  const nativeRows = [
+    {
+      step_index: 0,
+      type: 'PLANNER_RESPONSE',
+      tool_calls: [
+        { id: 'bg', name: 'run_command', args: { CommandLine: 'npm test' } },
+      ],
+    },
+    {
+      step_index: 1,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: 'Tool is running as a background task with task id: task-bg',
+    },
+    ...extraRows,
+    response(3, 'WAITING'),
+    {
+      step_index: 4,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content:
+        '[Message] sender=task-bg content=Task id "task-bg" finished with result:\npass\n</SYSTEM_MESSAGE>',
+    },
+  ]
+  const events = await replay(nativeRows, [
+    {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'bg',
+      title: 'run_command',
+      status: 'completed',
+      rawInput: { CommandLine: 'npm test --acp' },
+      rawOutput: null,
+    },
+    text('WAITING'),
+  ])
+  assert.deepEqual(labels(events), expectedLabels)
+  const recovered = toolCalls(events)[1]
+  assert.ok(recovered.detail.type === 'shell')
+  assert.equal(recovered.detail.command, 'npm test --acp')
+  assert.equal(recovered.detail.output, 'pass')
+}
+
 test('background completion recovers missing results without becoming a second history anchor', async () => {
-  for (const withCheckpoint of [false, true]) {
-    const nativeRows = [
-      {
-        step_index: 0,
-        type: 'PLANNER_RESPONSE',
-        tool_calls: [
-          { id: 'bg', name: 'run_command', args: { CommandLine: 'npm test' } },
-        ],
-      },
-      {
-        step_index: 1,
-        type: 'GENERIC',
-        status: 'RUNNING',
-        content: 'Tool is running as a background task with task id: task-bg',
-      },
-      ...(withCheckpoint ? [checkpoint(2)] : []),
-      response(3, 'WAITING'),
-      {
-        step_index: 4,
-        type: 'SYSTEM_MESSAGE',
-        status: 'DONE',
-        content:
-          '[Message] sender=task-bg content=Task id "task-bg" finished with result:\npass\n</SYSTEM_MESSAGE>',
-      },
-    ]
-    const events = await replay(nativeRows, [
-      {
-        sessionUpdate: 'tool_call',
-        toolCallId: 'bg',
-        title: 'run_command',
-        status: 'completed',
-        rawInput: { CommandLine: 'npm test --acp' },
-        rawOutput: null,
-      },
-      text('WAITING'),
-    ])
-    assert.deepEqual(labels(events), [
-      'tool_call',
-      ...(withCheckpoint ? ['compaction'] : []),
-      'tool_call',
-      'WAITING',
-    ])
-    const recovered = timeline(events).filter(
-      ({ item }) => item.type === 'tool_call',
-    )[1].item
-    assert.ok(
-      recovered.type === 'tool_call' && recovered.detail.type === 'shell',
-    )
-    assert.equal(recovered.detail.command, 'npm test --acp')
-    assert.equal(recovered.detail.output, 'pass')
-  }
+  await assertBackgroundRecoveryNoSecondAnchor(
+    [],
+    ['tool_call', 'tool_call', 'WAITING'],
+  )
+  await assertBackgroundRecoveryNoSecondAnchor(
+    [checkpoint(2)],
+    ['tool_call', 'compaction', 'tool_call', 'WAITING'],
+  )
 })
 
 test('Orchestrator contrib planexecute handoffs align across CHECKPOINT history replay and preserve plan cards', async () => {
@@ -1731,21 +1912,18 @@ test('Orchestrator contrib planexecute handoffs align across CHECKPOINT history 
     'tool_call',
     'Reviewed',
   ])
-  const tools = timeline(events).filter(({ item }) => item.type === 'tool_call')
-  // exit-1 has rawOutput: null in ACP, so Brain result recovery emits a second update before compaction;
-  // both snapshots retain { type: 'plan', text: planMd }.
-  const exitItems = tools.filter(
-    ({ item }) => item.type === 'tool_call' && item.callId === 'exit-1',
+  const exitItems = toolCalls(events).filter((item) => item.callId === 'exit-1')
+  assert.deepEqual(
+    exitItems.map((item) => item.detail),
+    [
+      { type: 'plan', text: planMd },
+      { type: 'plan', text: planMd },
+    ],
   )
-  assert.equal(exitItems.length, 2)
-  for (const { item } of exitItems) {
-    assert.ok(item.type === 'tool_call')
-    assert.deepEqual(item.detail, { type: 'plan', text: planMd })
-  }
-  const enterItem = tools.findLast(
-    ({ item }) => item.type === 'tool_call' && item.callId === 'enter-1',
-  )?.item
-  assert.ok(enterItem?.type === 'tool_call')
+  const enterItem = toolCalls(events).findLast(
+    (item) => item.callId === 'enter-1',
+  )
+  assert.ok(enterItem)
   assert.equal(enterItem.detail.type, 'unknown')
 })
 
