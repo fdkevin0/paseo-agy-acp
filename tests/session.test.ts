@@ -19,7 +19,7 @@ import {
 } from '@getpaseo/plugin/server/provider'
 import { readSubagents } from '../server/brain.ts'
 import { createProvider } from '../server/provider.ts'
-import { SessionManager } from '../server/session.ts'
+import { SessionManager, streamsLiveWakeups } from '../server/session.ts'
 import { SubagentRegistry } from '../server/subagents.ts'
 import { connectAcp } from '../server/transport.ts'
 import { AgyUsageSource } from '../server/usage.ts'
@@ -118,6 +118,17 @@ function onceOnEvent(
     }
   }
 }
+
+test('live wakeup streaming starts at the agy 1.5.10 release', () => {
+  assert.equal(streamsLiveWakeups(undefined), false)
+  assert.equal(streamsLiveWakeups('dev'), false)
+  assert.equal(streamsLiveWakeups('1.5.9'), false)
+  assert.equal(streamsLiveWakeups('1.5.10-rc.1'), false)
+  assert.equal(streamsLiveWakeups('1.5.10'), true)
+  assert.equal(streamsLiveWakeups('v1.5.12+build.3'), true)
+  assert.equal(streamsLiveWakeups('1.10.0'), true)
+  assert.equal(streamsLiveWakeups('2.0.0'), true)
+})
 
 test(
   'protocol disconnection kills an active child and shutdown waits for it',

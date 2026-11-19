@@ -183,6 +183,15 @@ function effectiveLaunch(
       }
 }
 
+/** agy 1.5.10 streams Reactive Wakeup output over ACP after `session/prompt` returns; unknown versions use the legacy Brain path. */
+export function streamsLiveWakeups(version: string | undefined): boolean {
+  const match = version?.match(/^v?(\d+)\.(\d+)\.(\d+)(-[^+]*)?(\+.*)?$/)
+  if (!match) return false
+  const [, major, minor, patch, prerelease] = match
+  const order = Number(major) - 1 || Number(minor) - 5 || Number(patch) - 10
+  return order > 0 || (order === 0 && !prerelease)
+}
+
 function sessionParams(cwd: string, config?: ProviderSessionConfig) {
   return {
     cwd,
@@ -1151,8 +1160,8 @@ async function createSession(
     void transport.stopped.then(() => transports.delete(transport))
     return transport
   }
-  function initializeRuntime(transport: ReturnType<typeof connectAcp>) {
-    return transport.request(
+  async function initializeRuntime(transport: ReturnType<typeof connectAcp>) {
+    const initialized = await transport.request(
       transport.rpc.initialize({
         protocolVersion: PROTOCOL_VERSION,
         clientInfo: { name: 'paseo-agy-acp', version: PACKAGE_VERSION },
@@ -1163,6 +1172,10 @@ async function createSession(
         },
       }),
     )
+    return {
+      ...initialized,
+      liveWakeups: streamsLiveWakeups(initialized.agentInfo?.version),
+    }
   }
   let currentTransport = startRuntime(state.skipPermissions)
   try {
@@ -2098,18 +2111,7 @@ async function promptSession(
   try {
     await session.waitForRuntimeReady(turnAbort.signal)
     turnAbort.signal.throwIfAborted()
-    const version = session.initialized.agentInfo?.version.match(
-      /^v?(\d+)\.(\d+)\.(\d+)(-|$|\+)/,
-    )
-    if (version) {
-      const [, major, minor, patch, suffix] = version
-      liveWakeups =
-        Number(major) > 1 ||
-        (major === '1' &&
-          (Number(minor) > 5 ||
-            (minor === '5' &&
-              (Number(patch) > 10 || (patch === '10' && suffix !== '-')))))
-    }
+    liveWakeups = session.initialized.liveWakeups
     hadPendingReplay = session.state.wakeup.pendingReplay
     prevCarried = session.state.wakeup.carriedUsage
     initialTransport = session.transport
