@@ -246,6 +246,14 @@ export class BrainTranscriptProjector {
     return this.observedSlots
   }
 
+  /** Read immediately after projecting a planner row, in that row's tool order. */
+  plannerToolCallIds(prefixIds: readonly (string | undefined)[]): string[] {
+    return this.pending.flatMap(({ callId, slotIndex }) => {
+      const id = callId || prefixIds[slotIndex]
+      return id ? [id] : []
+    })
+  }
+
   private effectiveStepIndex(slotIndex: number, stepIndex: number): number {
     return this.observedSlots[slotIndex]?.stepIndex ?? stepIndex
   }

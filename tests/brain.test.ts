@@ -4241,6 +4241,61 @@ test('orphan trailing GENERIC(DONE) after complete PLANNER_RESPONSE does not un-
   }
 })
 
+test('a verified wakeup call keeps its ID when its input repeats a foreground call', async (t) => {
+  const f = await fixture()
+  t.after(f.close)
+  const repeated = { CommandLine: 'echo repeated' }
+  const snapshots = new Map([
+    ['fg', { toolCallId: 'fg', title: 'Command', rawInput: repeated }],
+    ['post', { toolCallId: 'post', title: 'Command', rawInput: repeated }],
+  ])
+  await f.put(parent, [
+    { step_index: 1, type: 'USER_INPUT', content: 'run and wait' },
+    {
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        { name: 'run_command', args: { CommandLine: 'echo other' } },
+      ],
+    },
+    { step_index: 3, type: 'GENERIC', status: 'DONE', content: 'other output' },
+    done(4, 'Waiting for inbox.'),
+    message(5, 'inbox', 'Continue after the response'),
+    {
+      step_index: 6,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: 'run_command', args: repeated }],
+    },
+    {
+      step_index: 7,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: 'wakeup output',
+    },
+    { ...done(8, 'Finished.'), input_tokens: 42, output_tokens: 1 },
+  ])
+  const items: ProviderTimelineItem[] = []
+  const result = await settleBrainTurn(
+    f.root,
+    parent,
+    'p',
+    (item) => items.push(item),
+    {
+      acpToolCallIds: ['fg', 'post'],
+      foregroundAcp: [
+        { type: 'tool_call', callId: 'fg' },
+        { type: 'assistant_message', text: 'Waiting for inbox.' },
+      ],
+      toolSnapshot: (id) => snapshots.get(id),
+    },
+  )
+  assert.deepEqual(completedToolOutputs(items), [['post', 'wakeup output']])
+  assert.equal(result.status, 'completed')
+  assert.equal(result.wakeupUsage?.inputTokens, 42)
+})
+
 test(
   'an ACP post-response tool frame ahead of Brain cannot re-bill the in-RPC wakeup',
   { timeout: 5000 },
@@ -4255,23 +4310,18 @@ test(
       return obs.dispose()
     })
     const { foreground, wakeup, answer } = recordedWakeup
+    const toolStarts = [
+      foreground.updates[2],
+      wakeup.updates[3],
+      wakeup.updates[5],
+      wakeup.updates[9],
+    ]
     const snapshots = new Map(
-      [...foreground.updates, ...wakeup.updates].flatMap((update) =>
-        update.sessionUpdate === 'tool_call' &&
-        update.toolCallId &&
-        update.title
-          ? [
-              [
-                update.toolCallId,
-                {
-                  toolCallId: update.toolCallId,
-                  title: update.title,
-                  rawInput: update.rawInput,
-                },
-              ] as const,
-            ]
-          : [],
-      ),
+      toolStarts.map(({ sessionUpdate, toolCallId, title, rawInput }) => {
+        assert.equal(sessionUpdate, 'tool_call')
+        assert.ok(toolCallId && title)
+        return [toolCallId, { toolCallId, title, rawInput }] as const
+      }),
     )
     await f.put(parent, [
       ...foreground.rows,
@@ -4279,10 +4329,11 @@ test(
       { ...done(8, 'Reads finished.'), input_tokens: 40, output_tokens: 1 },
       message(9, 'second-inbox-message', 'Continue after the response'),
     ])
+    const items: ProviderTimelineItem[] = []
     const usage = new Map<number, number>()
     let wakeupInput: number | undefined
     const running = alive(
-      settleBrainTurn(f.root, parent, 'p', () => {}, {
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
         signal: abort.signal,
         observation: obs,
         acpToolCallIds: ['call_1', 'call_2', 'call_3', 'call_4'],
@@ -4307,6 +4358,7 @@ test(
     )
     await tracker.waitFor(9)
     assert.equal(usage.get(8), 0)
+    assert.deepEqual(items.filter(isTerminalToolCall), [])
     await appendFile(
       f.path(parent),
       encode([
@@ -4319,8 +4371,33 @@ test(
     const result = await running
     assert.equal(result.status, 'completed')
     assert.equal(result.wakeupUsage?.inputTokens, 4814)
+    assert.deepEqual(
+      items
+        .filter(isTerminalToolCall)
+        .map(({ callId }) => callId)
+        .filter((id) => id === 'call_2' || id === 'call_3'),
+      ['call_2', 'call_3'],
+    )
   },
 )
+
+test('declining native elicitation does not suppress a non-reader observation fault', async (t) => {
+  const f = await fixture()
+  t.after(f.close)
+  await f.put(parent, [{ step_index: 1, type: 'USER_INPUT', content: 'work' }])
+  const fault = Object.assign(new Error('step callback failed'), {
+    code: 'EBUSY',
+  })
+  await assert.rejects(
+    settleBrainTurn(f.root, parent, 'p', () => {}, {
+      isWakeupQuestionDeclined: () => true,
+      onStep: () => {
+        throw fault
+      },
+    }),
+    fault,
+  )
+})
 
 async function assertCachedWakeupBilled(
   root: string,

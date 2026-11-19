@@ -489,25 +489,10 @@ export type ForegroundAcpSegment =
 
 export type ForegroundCursor = { index: number; offset: number }
 
-export type ForegroundMatchableItem = Extract<
-  ProviderTimelineItem,
-  { type: 'reasoning' | 'assistant_message' | 'tool_call' }
->
-
-function isMatchableForegroundItem(
-  item: ProviderTimelineItem,
-): item is ForegroundMatchableItem {
-  return (
-    item.type === 'reasoning' ||
-    item.type === 'assistant_message' ||
-    (item.type === 'tool_call' && item.status === 'running')
-  )
-}
-
 export function advanceForegroundCursor(
   segments: readonly ForegroundAcpSegment[],
   cursor: ForegroundCursor,
-  item: ForegroundMatchableItem,
+  item: ForegroundAcpSegment,
   allowSkip: boolean,
 ): ForegroundCursor | undefined {
   if (item.type === 'tool_call') {
@@ -608,7 +593,7 @@ class ForegroundReconciler {
   /** Advance reconciliation state for one ingested row and return whether it belongs to post-RPC wakeup. */
   reconcile(
     row: Record<string, unknown>,
-    items: readonly ProviderTimelineItem[],
+    items: readonly ForegroundAcpSegment[],
     nodeWokeUp: boolean,
   ): boolean {
     if (this.phase === 'post_rpc_wakeup') return true
@@ -625,10 +610,9 @@ class ForegroundReconciler {
   }
 
   private advanceForegroundMatchables(
-    items: readonly ProviderTimelineItem[],
+    items: readonly ForegroundAcpSegment[],
   ): void {
     for (const item of items) {
-      if (!isMatchableForegroundItem(item)) continue
       const next = advanceForegroundCursor(
         this.foregroundAcp,
         this.cursor,
@@ -643,18 +627,17 @@ class ForegroundReconciler {
   }
 
   private isPlannerRowCoveredByAcp(
-    items: readonly ProviderTimelineItem[],
+    items: readonly ForegroundAcpSegment[],
   ): boolean {
-    const matchable = items.filter(isMatchableForegroundItem)
-    if (matchable.length === 0) {
+    if (items.length === 0) {
       return this.cursor.index < this.foregroundAcp.length
     }
     let next: ForegroundCursor | undefined = this.cursor
-    for (let i = 0; i < matchable.length && next; i++) {
+    for (let i = 0; i < items.length && next; i++) {
       next = advanceForegroundCursor(
         this.foregroundAcp,
         next,
-        matchable[i],
+        items[i],
         i === 0 && this.sawRetrySinceMatch,
       )
     }
@@ -889,6 +872,7 @@ export async function settleBrainTurn(
     )
       onItem(item, timestamp, { rawOutput: node.projector.toolRawOutput(item) })
   }
+  let foregroundPrefixIds: readonly (string | undefined)[] = []
   const resolveLiveTools = (rows: readonly Record<string, unknown>[]) => {
     const slots = node.projector.observeRows(rows)
     const snapshots = new Map<string, Readonly<ToolCall>>()
@@ -899,24 +883,22 @@ export async function settleBrainTurn(
     const align = (ids: readonly string[]) =>
       alignReplayTools([], inbox.stepCallIds, subagents, ids, snapshots, slots)
     const turn = align(acpToolCallIds)
-    // The wire can already have post-response calls while Brain still ends in the RPC.
-    // Prove the foreground prefix independently so a longer ACP stream cannot hide it.
-    const foreground = align(
-      foregroundToolIds.slice(0, slots.filter((slot) => !slot.invalid).length),
-    )
-    const alignedIds = slots.map(({ slot }) => {
-      const foregroundId = foreground.alignedIds[slot]
-      if (foregroundId && foreground.verifiedAcpToolIds.has(foregroundId))
-        return foregroundId
-      const turnId = turn.alignedIds[slot]
-      return turnId && !foreground.verifiedAcpToolIds.has(turnId)
-        ? turnId
-        : undefined
-    })
-    node.projector.bindLiveToolCallIds(
-      alignedIds,
-      new Set([...foreground.verifiedAcpToolIds, ...turn.verifiedAcpToolIds]),
-    )
+    node.projector.bindLiveToolCallIds(turn.alignedIds, turn.verifiedAcpToolIds)
+    // ACP can send post-response calls while Brain still ends inside the RPC.
+    // Verify the positional foreground prefix for billing only; it cannot bind tool identity.
+    foregroundPrefixIds = []
+    const count = slots.filter((slot) => !slot.invalid).length
+    const prefix = foregroundToolIds.slice(0, count)
+    if (
+      count < acpToolCallIds.length &&
+      prefix.length === count &&
+      prefix.every((id, i) => id === acpToolCallIds[i])
+    ) {
+      const foreground = align(prefix)
+      foregroundPrefixIds = foreground.alignedIds.map((id) =>
+        id && foreground.verifiedAcpToolIds.has(id) ? id : undefined,
+      )
+    }
     const resolved = node.projector.resolveToolIdentities()
     if (resolved.length) foldVersion++
     for (const item of resolved) emitLiveTool(item)
@@ -1000,7 +982,17 @@ export async function settleBrainTurn(
         read.observedAtByStep?.get(stepIndex) ?? observedAt,
       )
       const usage = extractStepUsage(row)
-      const postRpcStep = fgReconciler.reconcile(row, items, node.wokeUp)
+      const matchables: ForegroundAcpSegment[] = items.filter(
+        (item) =>
+          item.type === 'reasoning' || item.type === 'assistant_message',
+      )
+      if (row.type === 'PLANNER_RESPONSE') {
+        for (const callId of node.projector.plannerToolCallIds(
+          foregroundPrefixIds,
+        ))
+          matchables.push({ type: 'tool_call', callId })
+      }
+      const postRpcStep = fgReconciler.reconcile(row, matchables, node.wokeUp)
       stream.wokeUp ||= fgReconciler.postRpc
       if (usage && postRpcStep && row.status === 'DONE')
         wakeupSteps.set(stepIndex, usage)
@@ -1022,7 +1014,8 @@ export async function settleBrainTurn(
     }
   }
   const deferReaderFault = () =>
-    stream.hasReaderFault && isWaitingOnQuestion?.()
+    stream.hasReaderFault &&
+    (isWakeupQuestionDeclined?.() || isWaitingOnQuestion?.())
   try {
     await stream.attach(consume)
     if (ownsObservation) stream.start()
@@ -1039,15 +1032,15 @@ export async function settleBrainTurn(
           throw signal.reason
         return finish('canceled')
       }
+      if (stream.error && !deferReaderFault()) throw stream.error
+      if (!stream.acceptsRows())
+        throw new Error('Brain observation stopped during turn')
+      if (isWakeupQuestionDeclined?.()) return finish('canceled')
       if (stream.error) {
-        if (!deferReaderFault()) throw stream.error
         // A native question can remain pending long enough for transient I/O to recover.
         await stream.wait(revision, signal)
         continue
       }
-      if (!stream.acceptsRows())
-        throw new Error('Brain observation stopped during turn')
-      if (isWakeupQuestionDeclined?.()) return finish('canceled')
       if (initial) {
         if (
           stream.missing &&

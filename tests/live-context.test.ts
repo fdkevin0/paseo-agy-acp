@@ -942,6 +942,28 @@ test(
 )
 
 test(
+  'declining native elicitation cancels despite an unresolved reader fault',
+  { timeout: 5000 },
+  async (t) => {
+    const { h, obs, reader, error, question, running } =
+      await recordedQuestionWithReaderFault(t)
+    reader.impl = async () => {
+      throw error
+    }
+    await assert.rejects(obs.poll(), /recorded question reader unavailable/)
+    assert.deepEqual(h.turns(), [])
+    await h.manager.handle({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: question.request.id,
+      response: { behavior: 'deny' },
+    })
+    await assert.rejects(obs.poll(), /recorded question reader unavailable/)
+    await assertFaultedQuestionTerminated(h, obs, running, 'canceled')
+  },
+)
+
+test(
   'interrupt cancels native elicitation despite an unresolved reader fault',
   { timeout: 5000 },
   async (t) => {
