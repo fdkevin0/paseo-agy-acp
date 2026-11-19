@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
+import { EventEmitter, once } from 'node:events'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { setTimeout as delay } from 'node:timers/promises'
-import { test } from 'node:test'
-import type { ProviderEvent } from '@getpaseo/plugin/server/provider'
+import { test, type TestContext } from 'node:test'
+import type {
+  ProviderEvent,
+  ProviderTimelineItem,
+} from '@getpaseo/plugin/server/provider'
 import {
   hasActiveBackgroundWork,
   settleBrainTurn,
@@ -23,6 +26,7 @@ import {
   type InboxState,
 } from '../server/brain-io.ts'
 import { Timeline } from '../server/mapping.ts'
+import { flushObs, writeBrainTranscript, writeFileAtomic } from './helpers.ts'
 
 const id = '11111111-1111-4111-8111-111111111111'
 const inbox: InboxState = {
@@ -47,6 +51,48 @@ const quiet = (step_index: number) => ({
   status: 'DONE',
   thinking: 'No further reply required',
 })
+
+function assertRetryWarningAccepted(row: Record<string, unknown>) {
+  assert.equal(isRetryWarning(row), true)
+  const projector = new BrainTranscriptProjector('p')
+  projector.project({
+    step_index: 0,
+    type: 'PLANNER_RESPONSE',
+    tool_calls: [{ id: 'pending', name: 'run_command', args: {} }],
+  })
+  assert.deepEqual(projector.project(row), [])
+  assert.equal(projector.hasPending(), true)
+}
+
+function assertRetryWarningRejected(row: Record<string, unknown>) {
+  assert.equal(isRetryWarning(row), false)
+  assert.equal(new BrainTranscriptProjector('p').project(row)[0].type, 'error')
+}
+
+function trackAll(timeline: Timeline, items: readonly ProviderTimelineItem[]) {
+  for (const item of items) timeline.track(item)
+}
+
+function assertProgressReleasesRetry(
+  t: TestContext,
+  progressRow: Record<string, unknown>,
+) {
+  const node = new BrainNode(id)
+  node.ingest({
+    step_index: 1,
+    type: 'PLANNER_RESPONSE',
+    tool_calls: [{ id: 'pending', name: 'run_command', args: {} }],
+  })
+  node.ingest(warning(2))
+  node.ingest(progressRow)
+  assert.equal(node.retryPending(), false)
+  t.mock.timers.tick(RETRY_IDLE_TIMEOUT_MS + 1)
+  assert.equal(
+    node.failure(),
+    undefined,
+    'a recovered turn must not retain the retry deadline',
+  )
+}
 
 test('quiet DONE completes normally and after a warning, while incomplete steps and trailing errors do not', () => {
   const node = new BrainNode(id)
@@ -114,115 +160,106 @@ test('quiet foreground completion still establishes Reactive Wakeup ownership', 
 })
 
 test('retry classification accepts only observed system warning forms and explicit attempt prefixes', () => {
-  const positives = [
-    warning(1),
-    {
-      ...warning(1),
-      content:
-        'Error: API error (attempt 2): request failed: synthetic unavailable',
-    },
-    {
-      ...warning(1),
-      error:
-        'model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again',
-    },
-    {
-      ...warning(1),
-      error:
-        'The stream was interrupted. Please continue the task you were working on.',
-    },
-    {
-      step_index: 1,
-      source: 'SYSTEM',
-      type: 'ERROR_MESSAGE',
-      status: 'DONE',
-      content: null,
-      error:
-        'Your previous response contained an improperly formatted function call: Tool name must not be empty.\nRetries remaining: 3',
-    },
-    {
-      ...warning(1),
-      error:
-        'Your previous response contained an improperly formatted function call: invalid JSON arguments\nRetries remaining: 2',
-    },
-    {
-      ...warning(1),
-      error:
-        'Your previous response was blocked by content safety filters:\r\nRetries remaining: 1',
-    },
-    {
-      ...warning(1),
-      source: null,
-      error:
-        'Your previous response was blocked by content safety filters\nPlease provide a response that complies with content safety guidelines.\nRetries remaining: 2',
-    },
-    {
-      ...warning(1),
-      error:
-        'Your previous response was cut off because it exceeded the output token limit\nPlease continue.\nRetries remaining: 2',
-    },
-    {
-      ...warning(1),
-      error:
-        'Your previous response encountered a generation error\nPlease try again.\nRetries remaining: 1',
-    },
-    {
-      ...warning(1),
-      error:
-        'There was a problem. \nError Message: invalid tool arguments \nRetries remaining: 2',
-    },
-    {
-      ...warning(1),
-      error:
-        'There was a problem parsing the tool call. \nError Message: unexpected EOF \nGuidance: check JSON syntax \nRetries remaining: 1',
-    },
-  ]
-  for (const row of positives) {
-    assert.equal(isRetryWarning(row), true)
-    const projector = new BrainTranscriptProjector('p')
-    projector.project({
-      step_index: 0,
-      type: 'PLANNER_RESPONSE',
-      tool_calls: [{ id: 'pending', name: 'run_command', args: {} }],
-    })
-    assert.deepEqual(projector.project(row), [])
-    assert.equal(projector.hasPending(), true)
-  }
-  const negatives = [
-    { ...warning(1), status: 'ERROR' },
-    { ...warning(1), source: 'MODEL' },
-    { ...warning(1), error: 'API error (attempt 0): invalid' },
-    { ...warning(1), error: 'API error (attempt 1):' },
-    { ...warning(1), error: 'quoted API error (attempt 1): network' },
-    { ...warning(1), error: 'generic::unavailable: please try again' },
-    {
-      ...warning(1),
-      error: 'model output error: generic::unavailable: please try again',
-    },
-    { ...warning(1), error: 'request failed: connection reset' },
-    {
-      ...warning(1),
-      error:
-        'Your previous response contained an improperly formatted function call: invalid JSON\nRetries remaining: 0',
-    },
-    {
-      ...warning(1),
-      error:
-        'Your previous response contained an improperly formatted function call: invalid JSON\nRetries remaining: 2 extra',
-    },
-    {
-      ...warning(1),
-      error:
-        'Quoted: Your previous response was blocked by content safety filters:\nRetries remaining: 2',
-    },
-  ]
-  for (const row of negatives) {
-    assert.equal(isRetryWarning(row), false)
-    assert.equal(
-      new BrainTranscriptProjector('p').project(row)[0].type,
-      'error',
-    )
-  }
+  assertRetryWarningAccepted(warning(1))
+  assertRetryWarningAccepted({
+    ...warning(1),
+    content:
+      'Error: API error (attempt 2): request failed: synthetic unavailable',
+  })
+  assertRetryWarningAccepted({
+    ...warning(1),
+    error:
+      'model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again',
+  })
+  assertRetryWarningAccepted({
+    ...warning(1),
+    error:
+      'The stream was interrupted. Please continue the task you were working on.',
+  })
+  assertRetryWarningAccepted({
+    step_index: 1,
+    source: 'SYSTEM',
+    type: 'ERROR_MESSAGE',
+    status: 'DONE',
+    content: null,
+    error:
+      'Your previous response contained an improperly formatted function call: Tool name must not be empty.\nRetries remaining: 3',
+  })
+  assertRetryWarningAccepted({
+    ...warning(1),
+    error:
+      'Your previous response contained an improperly formatted function call: invalid JSON arguments\nRetries remaining: 2',
+  })
+  assertRetryWarningAccepted({
+    ...warning(1),
+    error:
+      'Your previous response was blocked by content safety filters:\r\nRetries remaining: 1',
+  })
+  assertRetryWarningAccepted({
+    ...warning(1),
+    source: null,
+    error:
+      'Your previous response was blocked by content safety filters\nPlease provide a response that complies with content safety guidelines.\nRetries remaining: 2',
+  })
+  assertRetryWarningAccepted({
+    ...warning(1),
+    error:
+      'Your previous response was cut off because it exceeded the output token limit\nPlease continue.\nRetries remaining: 2',
+  })
+  assertRetryWarningAccepted({
+    ...warning(1),
+    error:
+      'Your previous response encountered a generation error\nPlease try again.\nRetries remaining: 1',
+  })
+  assertRetryWarningAccepted({
+    ...warning(1),
+    error:
+      'There was a problem. \nError Message: invalid tool arguments \nRetries remaining: 2',
+  })
+  assertRetryWarningAccepted({
+    ...warning(1),
+    error:
+      'There was a problem parsing the tool call. \nError Message: unexpected EOF \nGuidance: check JSON syntax \nRetries remaining: 1',
+  })
+
+  assertRetryWarningRejected({ ...warning(1), status: 'ERROR' })
+  assertRetryWarningRejected({ ...warning(1), source: 'MODEL' })
+  assertRetryWarningRejected({
+    ...warning(1),
+    error: 'API error (attempt 0): invalid',
+  })
+  assertRetryWarningRejected({ ...warning(1), error: 'API error (attempt 1):' })
+  assertRetryWarningRejected({
+    ...warning(1),
+    error: 'quoted API error (attempt 1): network',
+  })
+  assertRetryWarningRejected({
+    ...warning(1),
+    error: 'generic::unavailable: please try again',
+  })
+  assertRetryWarningRejected({
+    ...warning(1),
+    error: 'model output error: generic::unavailable: please try again',
+  })
+  assertRetryWarningRejected({
+    ...warning(1),
+    error: 'request failed: connection reset',
+  })
+  assertRetryWarningRejected({
+    ...warning(1),
+    error:
+      'Your previous response contained an improperly formatted function call: invalid JSON\nRetries remaining: 0',
+  })
+  assertRetryWarningRejected({
+    ...warning(1),
+    error:
+      'Your previous response contained an improperly formatted function call: invalid JSON\nRetries remaining: 2 extra',
+  })
+  assertRetryWarningRejected({
+    ...warning(1),
+    error:
+      'Quoted: Your previous response was blocked by content safety filters:\nRetries remaining: 2',
+  })
 })
 
 test('distinct attempts refresh bounded retry silence; duplicate replay cannot prolong it', (t) => {
@@ -276,7 +313,7 @@ test('superseded unconfirmed tool calls end canceled rather than becoming succes
     type: 'PLANNER_RESPONSE',
     tool_calls: [{ id: 'old', name: 'run_command', args: {} }],
   })
-  for (const item of first) timeline.track(item)
+  trackAll(timeline, first)
   projector.project(warning(2))
   const replacement = projector.project({
     step_index: 3,
@@ -289,50 +326,33 @@ test('superseded unconfirmed tool calls end canceled rather than becoming succes
   assert.ok(canceled?.type === 'tool_call')
   assert.equal(canceled.status, 'canceled')
   assert.equal(canceled.id, first[0].id)
-  for (const item of replacement) timeline.track(item)
-  for (const item of projector.project({
-    step_index: 4,
-    type: 'GENERIC',
-    status: 'DONE',
-    content: 'confirmed result',
-  }))
-    timeline.track(item)
+  trackAll(timeline, replacement)
+  trackAll(
+    timeline,
+    projector.project({
+      step_index: 4,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: 'confirmed result',
+    }),
+  )
   assert.deepEqual(timeline.terminalize('completed'), [])
 })
 
 test('confirmed model or correlated tool progress releases retry state; unrelated results do not', (t) => {
   t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
-  for (const progress of ['model', 'tool'] as const) {
-    const node = new BrainNode(id)
-    node.ingest({
-      step_index: 1,
-      type: 'PLANNER_RESPONSE',
-      tool_calls: [{ id: 'pending', name: 'run_command', args: {} }],
-    })
-    node.ingest(warning(2))
-    node.ingest(
-      progress === 'model'
-        ? {
-            step_index: 3,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            tool_calls: [{ id: 'new', name: 'run_command', args: {} }],
-          }
-        : {
-            step_index: 3,
-            type: 'GENERIC',
-            status: 'DONE',
-            content: 'confirmed tool result',
-          },
-    )
-    assert.equal(node.retryPending(), false)
-    t.mock.timers.tick(RETRY_IDLE_TIMEOUT_MS + 1)
-    assert.equal(
-      node.failure(),
-      undefined,
-      'a recovered turn must not retain the retry deadline',
-    )
-  }
+  assertProgressReleasesRetry(t, {
+    step_index: 3,
+    type: 'PLANNER_RESPONSE',
+    status: 'DONE',
+    tool_calls: [{ id: 'new', name: 'run_command', args: {} }],
+  })
+  assertProgressReleasesRetry(t, {
+    step_index: 3,
+    type: 'GENERIC',
+    status: 'DONE',
+    content: 'confirmed tool result',
+  })
   const unrelated = new BrainNode(id)
   unrelated.ingest(warning(1))
   unrelated.ingest({
@@ -467,26 +487,18 @@ test('observedAt anchors timestamp-less retry warnings, clamps future mtimeMs, s
   )
 })
 
-test('initial transcript reads anchor timestamp-less retry warnings to file mtimeMs and O_TRUNC rewrites preserve retryObservedAt', async () => {
+test('initial transcript reads anchor timestamp-less retry warnings to file mtimeMs and O_TRUNC rewrites preserve retryObservedAt', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'brain-retry-mtime-'))
   const parentId = '11111111-1111-4111-8111-111111111111'
   const childId = '22222222-2222-4222-8222-222222222222'
   const liveChildId = '33333333-3333-4333-8333-333333333333'
   let handle: BrainWatchHandle | undefined
 
-  const transcriptPath = (sessionId: string) =>
-    join(root, sessionId, '.system_generated/logs/transcript_full.jsonl')
-  const writeTranscript = async (
+  const writeTranscript = (
     sessionId: string,
     rows: readonly Record<string, unknown>[],
-  ) => {
-    const dir = join(root, sessionId, '.system_generated/logs')
-    await mkdir(dir, { recursive: true })
-    await writeFile(
-      join(dir, 'transcript_full.jsonl'),
-      rows.map((r) => JSON.stringify(r)).join('\n') + '\n',
-    )
-  }
+    mtime?: Date,
+  ) => writeBrainTranscript(root, sessionId, rows, mtime)
 
   try {
     await writeTranscript(parentId, [
@@ -525,9 +537,8 @@ test('initial transcript reads anchor timestamp-less retry warnings to file mtim
       },
       warning(1, 1),
     ]
-    await writeTranscript(childId, childRows)
     const expiredDate = new Date(Date.now() - 20 * 60_000)
-    await utimes(transcriptPath(childId), expiredDate, expiredDate)
+    await writeTranscript(childId, childRows, expiredDate)
 
     assert.equal(await hasActiveBackgroundWork(root, parentId), false)
 
@@ -557,6 +568,7 @@ test('initial transcript reads anchor timestamp-less retry warnings to file mtim
     assert.match(settled.error ?? '', /attempt 1/)
 
     // Live retry warning: O_TRUNC rewrite mid-window must not extend the retry deadline.
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() })
     await writeTranscript(liveChildId, childRows)
     const liveEvents: ProviderEvent[] = []
     handle = watchBrain(
@@ -564,18 +576,20 @@ test('initial transcript reads anchor timestamp-less retry warnings to file mtim
       liveChildId,
       'live-child',
       (e) => liveEvents.push(e),
-      10,
+      60_000,
       undefined,
       undefined,
       undefined,
-      200,
+      10_000,
     )
     await handle.ready
     assert.equal(handle.isRunning(), true)
-    await delay(40)
+    t.mock.timers.tick(6_000)
     await writeTranscript(liveChildId, childRows)
-    const deadline = Date.now() + 2000
-    while (handle.isRunning() && Date.now() < deadline) await delay(10)
+    await handle.flush()
+    assert.equal(handle.isRunning(), true)
+    t.mock.timers.tick(4_100)
+    await handle.flush()
     assert.equal(handle.isRunning(), false)
     assert.ok(
       liveEvents.some((e) => e.type === 'session.turn' && e.state === 'failed'),
@@ -589,20 +603,8 @@ test('initial transcript reads anchor timestamp-less retry warnings to file mtim
 test('BrainTurnObservation pre-attach buffering preserves mtimeMs across multi-turn preamble reads', async () => {
   const root = await mkdtemp(join(tmpdir(), 'brain-retry-obs-'))
   const sessionId = '44444444-4444-4444-8444-444444444444'
-  const filePath = join(
-    root,
-    sessionId,
-    '.system_generated/logs/transcript_full.jsonl',
-  )
-  const writeRows = async (rows: readonly Record<string, unknown>[]) => {
-    await mkdir(join(root, sessionId, '.system_generated/logs'), {
-      recursive: true,
-    })
-    await writeFile(
-      filePath,
-      rows.map((r) => JSON.stringify(r)).join('\n') + '\n',
-    )
-  }
+  const writeRows = (rows: readonly Record<string, unknown>[], mtime?: Date) =>
+    writeBrainTranscript(root, sessionId, rows, mtime)
 
   let observation: BrainTurnObservation | undefined
   try {
@@ -626,14 +628,16 @@ test('BrainTurnObservation pre-attach buffering preserves mtimeMs across multi-t
     await observation.poll()
 
     // Turn 1 arrives and is buffered BEFORE settleBrainTurn calls attach().
-    await writeRows([
-      { step_index: 0, type: 'USER_INPUT', content: 'turn 0' },
-      quiet(1),
-      { step_index: 2, type: 'USER_INPUT', content: 'turn 1' },
-      warning(3, 1),
-    ])
     const expiredDate = new Date(Date.now() - 20 * 60_000)
-    await utimes(filePath, expiredDate, expiredDate)
+    await writeRows(
+      [
+        { step_index: 0, type: 'USER_INPUT', content: 'turn 0' },
+        quiet(1),
+        { step_index: 2, type: 'USER_INPUT', content: 'turn 1' },
+        warning(3, 1),
+      ],
+      expiredDate,
+    )
     await observation.poll()
 
     const settled = await settleBrainTurn(root, sessionId, 'p', () => {}, {
@@ -650,28 +654,27 @@ test('BrainTurnObservation pre-attach buffering preserves mtimeMs across multi-t
   }
 })
 
-test('settleChildren handles ENOENT -> appeared and torn initial reads without prematurely latching initialReadDone', async () => {
+test('settleChildren handles ENOENT -> appeared and torn initial reads without prematurely latching initialReadDone', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'brain-retry-torn-'))
   const parentId = '55555555-5555-4555-8555-555555555555'
   const childId = '66666666-6666-4666-8666-666666666666'
   const tornChildId = '77777777-7777-4777-8777-777777777777'
   let handle: BrainWatchHandle | undefined
+  let obs: BrainTurnObservation | undefined
+  const abort = new AbortController()
+  let settlePromise:
+    Promise<Awaited<ReturnType<typeof settleBrainTurn>>> | undefined
 
   const transcriptPath = (sessionId: string) =>
     join(root, sessionId, '.system_generated/logs/transcript_full.jsonl')
-  const writeTranscript = async (
+  const writeTranscript = (
     sessionId: string,
     rows: readonly Record<string, unknown>[],
-  ) => {
-    const dir = join(root, sessionId, '.system_generated/logs')
-    await mkdir(dir, { recursive: true })
-    await writeFile(
-      transcriptPath(sessionId),
-      rows.map((r) => JSON.stringify(r)).join('\n') + '\n',
-    )
-  }
+    mtime?: Date,
+  ) => writeBrainTranscript(root, sessionId, rows, mtime)
 
   try {
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() })
     // 1. settleChildren: child starts as ENOENT, then appears with warning + O_TRUNC rewrite.
     await writeTranscript(parentId, [
       { step_index: 0, type: 'USER_INPUT', content: 'start' },
@@ -701,13 +704,29 @@ test('settleChildren handles ENOENT -> appeared and torn initial reads without p
       }),
     )
 
-    const settlePromise = settleBrainTurn(root, parentId, 'p', () => {}, {
+    const stepEvents = new EventEmitter()
+    const step3Seen = once(stepEvents, '3')
+    obs = new BrainTurnObservation(
+      root,
+      parentId,
+      'p',
+      -1,
+      { isCurrent: () => true, onUsage: () => {}, onItem: () => {} },
+      60_000,
+    )
+    settlePromise = settleBrainTurn(root, parentId, 'p', () => {}, {
       minStepIndex: -1,
-      pollIntervalMs: 10,
-      retryTimeoutMs: 120,
+      retryTimeoutMs: 10_000,
+      observation: obs,
+      signal: abort.signal,
+      onStep: (step) => {
+        stepEvents.emit(String(step))
+      },
     })
 
-    await delay(25)
+    await step3Seen
+    // First poll runs while childId is ENOENT.
+    await flushObs(obs)
     const childRows = [
       {
         step_index: 0,
@@ -717,26 +736,31 @@ test('settleChildren handles ENOENT -> appeared and torn initial reads without p
       warning(1, 1),
     ]
     await writeTranscript(childId, childRows)
-    await delay(40)
+    await flushObs(obs)
+    t.mock.timers.tick(6_000)
     await writeTranscript(childId, childRows)
+    await flushObs(obs)
+    t.mock.timers.tick(4_100)
+    await flushObs(obs)
 
     const settled = await settlePromise
+    settlePromise = undefined
     assert.equal(settled.status, 'failed')
     assert.equal(settled.stalled, true)
     assert.match(settled.error ?? '', new RegExp(`Subagent ${childId} failed`))
 
     // 2. watchBrain: torn initial read (no trailing newline -> rows: []) must not latch initialReadDone.
-    await mkdir(join(root, tornChildId, '.system_generated/logs'), {
-      recursive: true,
-    })
+    const expiredDate = new Date(Date.now() - 20 * 60_000)
     const line0 = JSON.stringify({
       step_index: 0,
       type: 'SYSTEM_MESSAGE',
       content: `<SYSTEM_MESSAGE>\n[Message] sender=${parentId} priority=MESSAGE_PRIORITY_HIGH content=work\n</SYSTEM_MESSAGE>`,
     })
-    await writeFile(transcriptPath(tornChildId), line0.slice(0, 20))
-    const expiredDate = new Date(Date.now() - 20 * 60_000)
-    await utimes(transcriptPath(tornChildId), expiredDate, expiredDate)
+    await writeFileAtomic(
+      transcriptPath(tornChildId),
+      line0.slice(0, 20),
+      expiredDate,
+    )
 
     const events: ProviderEvent[] = []
     handle = watchBrain(
@@ -744,7 +768,7 @@ test('settleChildren handles ENOENT -> appeared and torn initial reads without p
       tornChildId,
       'torn-child',
       (e) => events.push(e),
-      10,
+      60_000,
     )
     await handle.ready
     assert.equal(
@@ -753,10 +777,8 @@ test('settleChildren handles ENOENT -> appeared and torn initial reads without p
       'torn initial read with rows: [] must not latch initialReadDone',
     )
 
-    await writeTranscript(tornChildId, childRows)
-    await utimes(transcriptPath(tornChildId), expiredDate, expiredDate)
-    const deadline = Date.now() + 2000
-    while (handle.isRunning() && Date.now() < deadline) await delay(10)
+    await writeTranscript(tornChildId, childRows, expiredDate)
+    await handle.flush()
     assert.equal(handle.isRunning(), false)
     assert.ok(
       events.some(
@@ -769,6 +791,9 @@ test('settleChildren handles ENOENT -> appeared and torn initial reads without p
       ),
     )
   } finally {
+    abort.abort()
+    await settlePromise?.catch(() => undefined)
+    await obs?.dispose()
     handle?.()
     await rm(root, { recursive: true, force: true })
   }
@@ -804,20 +829,11 @@ test('BrainTurnObservation pre-attach buffering tracks observedAt per step witho
   const root = await mkdtemp(join(tmpdir(), 'brain-retry-per-step-'))
   const s1 = '88888888-8888-4888-8888-888888888888'
   const s2 = '99999999-9999-4999-8999-999999999999'
-  const transcriptPath = (sessionId: string) =>
-    join(root, sessionId, '.system_generated/logs/transcript_full.jsonl')
-  const writeRows = async (
+  const writeRows = (
     sessionId: string,
     rows: readonly Record<string, unknown>[],
-  ) => {
-    await mkdir(join(root, sessionId, '.system_generated/logs'), {
-      recursive: true,
-    })
-    await writeFile(
-      transcriptPath(sessionId),
-      rows.map((r) => JSON.stringify(r)).join('\n') + '\n',
-    )
-  }
+    mtime?: Date,
+  ) => writeBrainTranscript(root, sessionId, rows, mtime)
 
   let obs1: BrainTurnObservation | undefined
   let obs2: BrainTurnObservation | undefined
@@ -825,10 +841,11 @@ test('BrainTurnObservation pre-attach buffering tracks observedAt per step witho
     const expiredDate = new Date(Date.now() - 20 * 60_000)
 
     // Case 1: Poll 1 reads aged USER_INPUT (20m ago); Poll 2 appends fresh warning -> must NOT immediately expire.
-    await writeRows(s1, [
-      { step_index: 0, type: 'USER_INPUT', content: 'start' },
-    ])
-    await utimes(transcriptPath(s1), expiredDate, expiredDate)
+    await writeRows(
+      s1,
+      [{ step_index: 0, type: 'USER_INPUT', content: 'start' }],
+      expiredDate,
+    )
     obs1 = new BrainTurnObservation(
       root,
       s1,
@@ -845,17 +862,21 @@ test('BrainTurnObservation pre-attach buffering tracks observedAt per step witho
     ])
     await obs1.poll()
 
-    obs1.start()
+    const stepEvents = new EventEmitter()
+    const step1Seen = once(stepEvents, '1')
     let settled1: { status: string } | undefined
     const p1 = settleBrainTurn(root, s1, 'p1', () => {}, {
       minStepIndex: -1,
-      pollIntervalMs: 10,
       observation: obs1,
+      onStep: (step) => {
+        stepEvents.emit(String(step))
+      },
     }).then((res) => {
       settled1 = res
       return res
     })
-    await delay(50)
+    await step1Seen
+    await flushObs(obs1)
     assert.equal(
       settled1,
       undefined,
@@ -866,15 +887,16 @@ test('BrainTurnObservation pre-attach buffering tracks observedAt per step witho
       warning(1, 1),
       quiet(2),
     ])
+    await flushObs(obs1)
     const result1 = await p1
     assert.equal(result1.status, 'completed')
 
     // Case 2: Poll 1 reads aged warning (20m ago); Poll 2 appends fresh RUNNING row -> still expires immediately.
-    await writeRows(s2, [
-      { step_index: 0, type: 'USER_INPUT', content: 'start' },
-      warning(1, 1),
-    ])
-    await utimes(transcriptPath(s2), expiredDate, expiredDate)
+    await writeRows(
+      s2,
+      [{ step_index: 0, type: 'USER_INPUT', content: 'start' }, warning(1, 1)],
+      expiredDate,
+    )
     obs2 = new BrainTurnObservation(
       root,
       s2,
@@ -913,18 +935,11 @@ test('BrainTurnObservation preserves retry observedAt across pre-attach empty O_
   const s2 = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
   const transcriptPath = (sessionId: string) =>
     join(root, sessionId, '.system_generated/logs/transcript_full.jsonl')
-  const writeRows = async (
+  const writeRows = (
     sessionId: string,
     rows: readonly Record<string, unknown>[],
-  ) => {
-    await mkdir(join(root, sessionId, '.system_generated/logs'), {
-      recursive: true,
-    })
-    await writeFile(
-      transcriptPath(sessionId),
-      rows.map((r) => JSON.stringify(r)).join('\n') + '\n',
-    )
-  }
+    mtime?: Date,
+  ) => writeBrainTranscript(root, sessionId, rows, mtime)
 
   let obs1: BrainTurnObservation | undefined
   let obs2: BrainTurnObservation | undefined
@@ -936,8 +951,7 @@ test('BrainTurnObservation preserves retry observedAt across pre-attach empty O_
       { step_index: 0, type: 'USER_INPUT', content: 'start' },
       warning(1, 1),
     ]
-    await writeRows(s1, rows1)
-    await utimes(transcriptPath(s1), expiredDate, expiredDate)
+    await writeRows(s1, rows1, expiredDate)
     obs1 = new BrainTurnObservation(
       root,
       s1,
@@ -964,8 +978,7 @@ test('BrainTurnObservation preserves retry observedAt across pre-attach empty O_
     assert.match(settled1.error ?? '', /attempt 1/)
 
     // Case 2: Aged warning -> truncated empty -> mutated warning at same step -> refreshes deadline.
-    await writeRows(s2, rows1)
-    await utimes(transcriptPath(s2), expiredDate, expiredDate)
+    await writeRows(s2, rows1, expiredDate)
     obs2 = new BrainTurnObservation(
       root,
       s2,
@@ -985,17 +998,21 @@ test('BrainTurnObservation preserves retry observedAt across pre-attach empty O_
     ])
     await obs2.poll()
 
-    obs2.start()
+    const stepEvents = new EventEmitter()
+    const step1Seen = once(stepEvents, '1')
     let settled2: { status: string } | undefined
     const p2 = settleBrainTurn(root, s2, 'p2', () => {}, {
       minStepIndex: -1,
-      pollIntervalMs: 10,
       observation: obs2,
+      onStep: (step) => {
+        stepEvents.emit(String(step))
+      },
     }).then((res) => {
       settled2 = res
       return res
     })
-    await delay(50)
+    await step1Seen
+    await flushObs(obs2)
     assert.equal(
       settled2,
       undefined,
@@ -1006,6 +1023,7 @@ test('BrainTurnObservation preserves retry observedAt across pre-attach empty O_
       warning(1, 2),
       quiet(2),
     ])
+    await flushObs(obs2)
     const result2 = await p2
     assert.equal(result2.status, 'completed')
   } finally {

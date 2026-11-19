@@ -15,7 +15,7 @@ import {
 import { promptUsage } from '../server/mapping.ts'
 import { SessionManager } from '../server/session.ts'
 import { AgyUsageSource } from '../server/usage.ts'
-import { createEventCollector } from './helpers.ts'
+import { createEventCollector, isolatedEnv } from './helpers.ts'
 
 function encodeVarint(value: number): Buffer {
   const bytes: number[] = []
@@ -214,19 +214,22 @@ function setupUsageManager(
     hasActiveBackgroundWork?: ConstructorParameters<
       typeof SessionManager
     >[0]['hasActiveBackgroundWork']
+    backgroundProbeTimeoutMs?: number
   },
 ) {
   const { events, emit, wait } = createEventCollector()
+  const env = isolatedEnv(home)
   const manager = new SessionManager({
     launch: {
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-acp.ts', import.meta.url))],
-      env: { HOME: home, PATH: process.env.PATH ?? '' },
+      env,
     },
-    usage: new AgyUsageSource(),
+    usage: new AgyUsageSource({ env }),
     capabilities: ['prompt.message', 'session.configure'],
     emit,
     hasActiveBackgroundWork: options?.hasActiveBackgroundWork,
+    backgroundProbeTimeoutMs: options?.backgroundProbeTimeoutMs,
   })
   t.after(async () => {
     await manager.close()
@@ -661,6 +664,7 @@ async function runCancelSnapshotFollowsInterruptTest(
     { step_index: 3, type: 'GENERIC', status: 'CANCELED' },
   ]
   const { events, wait, manager, latestUsage } = setupUsageManager(t, home, {
+    backgroundProbeTimeoutMs: 2000,
     hasActiveBackgroundWork: async (brainRoot, nativeId) => {
       await writeFile(
         join(

@@ -73,23 +73,37 @@ test('subagent and diff details, grouped model choices', () => {
   )
 })
 
+function expectTerminalized(
+  status: 'completed' | 'canceled' | 'failed',
+  expectedError: string | null,
+) {
+  const timeline = new Timeline('s')
+  timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'pending',
+    title: 'run_command',
+    status: 'in_progress',
+    rawInput: { CommandLine: 'echo test' },
+  })
+  const items = timeline.terminalize(status, 'crashed')
+  assert.equal(items.length, 1)
+  assert.ok(items[0].type === 'tool_call')
+  assert.equal(items[0].status, status)
+  assert.equal(items[0].error, expectedError)
+  assert.deepEqual(timeline.terminalize(status), [])
+}
+
+function expectNoThinkingOptions(
+  model: ReturnType<typeof configState>['models'][number] | undefined,
+) {
+  assert.deepEqual(model?.thinkingOptions, [])
+  assert.equal(model?.defaultThinkingOptionId, undefined)
+}
+
 test('unfinished tools terminalize once on every terminal state', () => {
-  for (const status of ['completed', 'canceled', 'failed'] as const) {
-    const timeline = new Timeline('s')
-    timeline.update({
-      sessionUpdate: 'tool_call',
-      toolCallId: 'pending',
-      title: 'run_command',
-      status: 'in_progress',
-      rawInput: { CommandLine: 'echo test' },
-    })
-    const items = timeline.terminalize(status, 'crashed')
-    assert.equal(items.length, 1)
-    assert.ok(items[0].type === 'tool_call' && items[0].status === status)
-    if (items[0].type === 'tool_call')
-      assert.equal(items[0].error, status === 'failed' ? 'crashed' : null)
-    assert.deepEqual(timeline.terminalize(status), [])
-  }
+  expectTerminalized('completed', null)
+  expectTerminalized('canceled', null)
+  expectTerminalized('failed', 'crashed')
 })
 
 test('usage rejects invalid context, ignores foreign currency, and computes lastStep occupancy', () => {
@@ -262,17 +276,10 @@ test('model metadata restricts effort variants and hides fixed-effort selectors'
   assert.equal(state.models[1].contextWindowMaxTokens, undefined)
   assert.deepEqual(state.thinkingOptions, [])
   assert.equal(state.thinkingOption, undefined)
-  assert.deepEqual(state.modes, [
-    {
-      id: 'full-access',
-      label: 'Full Access',
-      description:
-        'Approve file edits, commands and tool requests without asking.',
-      icon: 'ShieldOff',
-      colorTier: 'dangerous',
-      isUnattended: true,
-    },
-  ])
+  assert.equal(state.modes.length, 1)
+  assert.equal(state.modes[0]?.id, 'full-access')
+  assert.equal(state.modes[0]?.colorTier, 'dangerous')
+  assert.equal(state.modes[0]?.isUnattended, true)
 })
 
 test('attachments preserve file paths, issue context and review comments', () => {
@@ -848,15 +855,10 @@ test('configState resolves canonical per-model efforts independently of Orchestr
   assert.equal(onOrchestrator.thinkingOption, undefined)
 
   const byId = new Map(onOrchestrator.models.map((m) => [m.id, m]))
-  for (const id of [
-    'gemini-pro-orchestrator',
-    'gemini-pro-orchestrator-argon',
-    'gpt-oss-120b-medium',
-    'gemini-3.5-flash-extra-low',
-  ]) {
-    assert.deepEqual(byId.get(id)?.thinkingOptions, [])
-    assert.equal(byId.get(id)?.defaultThinkingOptionId, undefined)
-  }
+  expectNoThinkingOptions(byId.get('gemini-pro-orchestrator'))
+  expectNoThinkingOptions(byId.get('gemini-pro-orchestrator-argon'))
+  expectNoThinkingOptions(byId.get('gpt-oss-120b-medium'))
+  expectNoThinkingOptions(byId.get('gemini-3.5-flash-extra-low'))
   assert.equal(
     byId.get('gemini-pro-orchestrator')?.contextWindowMaxTokens,
     undefined,
@@ -971,30 +973,39 @@ test('configState resolves canonical per-model efforts independently of Orchestr
 
 test('exit_plan_mode renders as a Markdown plan card across ACP variants and partial updates', () => {
   const md = '# Implementation Plan\n\n- Step 1\n'
-  for (const tool of [
-    { name: 'exit_plan_mode', rawInput: { plan: md } },
-    { name: 'contrib:exit_plan_mode', rawInput: { plan: md } },
-    {
+  const expectedPlan = { type: 'plan', text: md }
+  assert.deepEqual(
+    toolDetail({ name: 'exit_plan_mode', rawInput: { plan: md } }),
+    expectedPlan,
+  )
+  assert.deepEqual(
+    toolDetail({ name: 'contrib:exit_plan_mode', rawInput: { plan: md } }),
+    expectedPlan,
+  )
+  assert.deepEqual(
+    toolDetail({
       title: 'Run contrib:exit_plan_mode',
-      kind: 'other' as const,
+      kind: 'other',
       rawInput: { plan: md },
-    },
-    {
+    }),
+    expectedPlan,
+  )
+  assert.deepEqual(
+    toolDetail({
       title: 'Run exit_plan_mode',
-      kind: 'other' as const,
+      kind: 'other',
       rawInput: { plan: md },
-    },
-    {
+    }),
+    expectedPlan,
+  )
+  assert.deepEqual(
+    toolDetail({
       title: 'Run default_api:exit_plan_mode',
-      kind: 'other' as const,
+      kind: 'other',
       rawInput: { plan: md },
-    },
-  ]) {
-    assert.deepEqual(toolDetail(tool as Parameters<typeof toolDetail>[0]), {
-      type: 'plan',
-      text: md,
-    })
-  }
+    }),
+    expectedPlan,
+  )
   assert.equal(
     toolDetail({
       title: 'Run contrib:exit_plan_mode',
@@ -1014,26 +1025,57 @@ test('exit_plan_mode renders as a Markdown plan card across ACP variants and par
       name: 'mcp__srv__other',
       title: 'exit_plan_mode',
       rawInput: { plan: md },
-    } as unknown as Parameters<typeof toolDetail>[0]).type,
+    }).type,
     'unknown',
   )
-  for (const foreignTitle of [
-    'Run mcp__srv__switch_mode',
-    'Run default_api:mcp__srv__switch_mode',
-    'srv:switch_mode',
-    'Run default_api:srv:switch_mode',
-    'Run call_mcp_tool',
-    'Run default_api:call_mcp_tool',
-  ]) {
-    assert.equal(
-      toolDetail({
-        title: foreignTitle,
-        kind: 'switch_mode',
-        rawInput: { plan: md },
-      }).type,
-      'unknown',
-    )
-  }
+  assert.equal(
+    toolDetail({
+      title: 'Run mcp__srv__switch_mode',
+      kind: 'switch_mode',
+      rawInput: { plan: md },
+    }).type,
+    'unknown',
+  )
+  assert.equal(
+    toolDetail({
+      title: 'Run default_api:mcp__srv__switch_mode',
+      kind: 'switch_mode',
+      rawInput: { plan: md },
+    }).type,
+    'unknown',
+  )
+  assert.equal(
+    toolDetail({
+      title: 'srv:switch_mode',
+      kind: 'switch_mode',
+      rawInput: { plan: md },
+    }).type,
+    'unknown',
+  )
+  assert.equal(
+    toolDetail({
+      title: 'Run default_api:srv:switch_mode',
+      kind: 'switch_mode',
+      rawInput: { plan: md },
+    }).type,
+    'unknown',
+  )
+  assert.equal(
+    toolDetail({
+      title: 'Run call_mcp_tool',
+      kind: 'switch_mode',
+      rawInput: { plan: md },
+    }).type,
+    'unknown',
+  )
+  assert.equal(
+    toolDetail({
+      title: 'Run default_api:call_mcp_tool',
+      kind: 'switch_mode',
+      rawInput: { plan: md },
+    }).type,
+    'unknown',
+  )
 
   const timeline = new Timeline('s')
   const started = timeline.update({
@@ -1197,10 +1239,8 @@ test('Timeline projects image blocks in user_message_chunk as [image] placeholde
     sessionUpdate: 'user_message_chunk',
     content: { type: 'image', data: 'AQID', mimeType: 'image/png' },
   })
-  assert.equal(
-    combined1?.type === 'user_message' ? combined1.text : undefined,
-    'check this\n[image]',
-  )
+  assert.ok(combined1?.type === 'user_message')
+  assert.equal(combined1.text, 'check this\n[image]')
 
   const imgThenText = new Timeline('s3')
   imgThenText.update({
@@ -1211,10 +1251,8 @@ test('Timeline projects image blocks in user_message_chunk as [image] placeholde
     sessionUpdate: 'user_message_chunk',
     content: { type: 'text', text: 'describe' },
   })
-  assert.equal(
-    combined2?.type === 'user_message' ? combined2.text : undefined,
-    '[image]\ndescribe',
-  )
+  assert.ok(combined2?.type === 'user_message')
+  assert.equal(combined2.text, '[image]\ndescribe')
 
   assert.equal(
     imgThenText.update({

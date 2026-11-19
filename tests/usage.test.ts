@@ -12,10 +12,11 @@ import {
   utimes,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { hashAccountKey } from '@getpaseo/plugin/server/usage'
 import { AgyUsageSource, parseUsage, readLoggedEmail } from '../server/usage.ts'
+import { isolatedEnv, waitUntil } from './helpers.ts'
 
 const groups = ['Gemini Models', 'Claude and GPT models'].map((name) => ({
   name,
@@ -203,12 +204,11 @@ test('keychain logins without a token file support cold global discovery, accoun
     await writeFile(fixture, envelope(groups))
     await symlink(fixture, join(symlinkTokenDir, 'antigravity-oauth-token'))
 
-    const baseEnv = {
-      HOME: home,
-      PATH: `${binDir}${delimiter}${process.env.PATH ?? ''}`,
+    const baseEnv = isolatedEnv(home, {
+      PATH: binDir,
       AGY_USAGE_FIXTURE: fixture,
       AGY_USAGE_ARGS: argsLog,
-    }
+    })
     const usage = new AgyUsageSource({ env: baseEnv })
 
     // Symlinked legacy token files must never pass hasTokenFile().
@@ -257,12 +257,11 @@ test('keychain logins without a token file support cold global discovery, accoun
     const sessionScope = {
       kind: 'session' as const,
       provider: 'agy',
-      env: {
-        HOME: sessionHome,
-        PATH: baseEnv.PATH,
+      env: isolatedEnv(sessionHome, {
+        PATH: binDir,
         AGY_USAGE_FIXTURE: fixture,
         AGY_USAGE_ARGS: argsLog,
-      },
+      }),
     }
     const [sessionAccount] = await usage.discover(sessionScope)
     assert.equal(sessionAccount.key, hashAccountKey(sessionDir))
@@ -339,7 +338,14 @@ test('keychain logins without a token file support cold global discovery, accoun
     })
     const hungPid = Number(await readFile(pidFile, 'utf8'))
     assert.ok(Number.isInteger(hungPid) && hungPid > 0)
-    assert.throws(() => process.kill(hungPid, 0), { code: 'ESRCH' })
+    await waitUntil(() => {
+      try {
+        process.kill(hungPid, 0)
+        return false
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === 'ESRCH'
+      }
+    })
   } finally {
     await rm(home, { recursive: true, force: true })
   }
@@ -352,8 +358,8 @@ test('usage discovers account scopes and maps windows, tier and failures through
   const fixture = join(root, 'quota.json')
   const argsLog = join(root, 'args.json')
   const script = fileURLToPath(new URL('./mock-usage.ts', import.meta.url))
-  const isolatedEnv = { HOME: home, PATH: process.env.PATH ?? '' }
-  const usage = new AgyUsageSource({ env: isolatedEnv })
+  const baseEnv = isolatedEnv(home)
+  const usage = new AgyUsageSource({ env: baseEnv })
   const launch = {
     command: process.execPath,
     args: [
@@ -364,7 +370,10 @@ test('usage discovers account scopes and maps windows, tier and failures through
       '.gemini',
       '--app-data-dir=antigravity-cli',
     ],
-    env: { HOME: home, AGY_USAGE_FIXTURE: fixture, AGY_USAGE_ARGS: argsLog },
+    env: isolatedEnv(home, {
+      AGY_USAGE_FIXTURE: fixture,
+      AGY_USAGE_ARGS: argsLog,
+    }),
   }
   try {
     await mkdir(dir, { recursive: true })
@@ -523,7 +532,7 @@ test('usage discovers account scopes and maps windows, tier and failures through
     // account that still answers, because keychain logins never write that file.
     assert.equal((await usage.fetch(account.input)).status, 'available')
     // A known launch can use an OS-backed login store instead of the token file.
-    const fresh = new AgyUsageSource({ env: isolatedEnv })
+    const fresh = new AgyUsageSource({ env: baseEnv })
     fresh.remember(launch, {}, home)
     const [known] = await fresh.discover(scope)
     await writeFile(fixture, envelope(groups))
@@ -538,9 +547,7 @@ test('default usage launch adds no ACP directory flags and keeps the session HOM
   const dir = join(home, '.gemini/antigravity-cli')
   const fixture = join(home, 'quota.json')
   const argsLog = join(home, 'args.json')
-  const usage = new AgyUsageSource({
-    env: { HOME: home, PATH: process.env.PATH ?? '' },
-  })
+  const usage = new AgyUsageSource({ env: isolatedEnv(home) })
   try {
     await mkdir(dir, { recursive: true })
     await writeFile(join(dir, 'antigravity-oauth-token'), 'fixture-token')
@@ -548,7 +555,10 @@ test('default usage launch adds no ACP directory flags and keeps the session HOM
     usage.remember({
       command: process.execPath,
       args: [fileURLToPath(new URL('./mock-usage.ts', import.meta.url)), 'acp'],
-      env: { HOME: home, AGY_USAGE_FIXTURE: fixture, AGY_USAGE_ARGS: argsLog },
+      env: isolatedEnv(home, {
+        AGY_USAGE_FIXTURE: fixture,
+        AGY_USAGE_ARGS: argsLog,
+      }),
     })
     const [account] = await usage.discover({
       kind: 'session',
@@ -576,9 +586,7 @@ test('deleted workspaces fall back only when quota account paths are cwd indepen
     await writeFile(fixture, envelope(groups))
     const fetchFromDeletedWorkspace = async (args: string[]) => {
       await mkdir(workspace, { recursive: true })
-      const usage = new AgyUsageSource({
-        env: { HOME: root, PATH: process.env.PATH ?? '' },
-      })
+      const usage = new AgyUsageSource({ env: isolatedEnv(root) })
       const dir = usage.remember(
         {
           command: process.execPath,
@@ -587,11 +595,10 @@ test('deleted workspaces fall back only when quota account paths are cwd indepen
             'acp',
             ...args,
           ],
-          env: {
-            HOME: root,
+          env: isolatedEnv(root, {
             AGY_USAGE_FIXTURE: fixture,
             AGY_USAGE_ARGS: argsLog,
-          },
+          }),
         },
         {},
         workspace,
@@ -628,7 +635,7 @@ test('in-flight discover never overwrites or deletes a concurrent remember()', a
   const fixture = join(root, 'quota.json')
   const argsLog = join(root, 'args.json')
   const script = fileURLToPath(new URL('./mock-usage.ts', import.meta.url))
-  const usage = new AgyUsageSource({ env: { HOME: root, PATH: '' } })
+  const usage = new AgyUsageSource({ env: isolatedEnv(root) })
   try {
     await mkdir(dirA, { recursive: true })
     await mkdir(dirB, { recursive: true })

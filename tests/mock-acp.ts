@@ -8,7 +8,13 @@ import {
   type SessionNotification,
 } from '@agentclientprotocol/sdk/unstable'
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs'
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+} from 'node:fs'
 import { join } from 'node:path'
 import { WritableStream } from 'node:stream/web'
 import { Readable, Writable } from 'node:stream'
@@ -165,7 +171,7 @@ function sendCommands(sessionId: string) {
         ],
       },
     })
-  }, 20)
+  }, 0)
 }
 connection = agent()
   .onRequest(methods.agent.initialize, async ({ params }) => {
@@ -620,7 +626,14 @@ connection = agent()
         const rows: object[] = [
           { step_index: step, type: 'USER_INPUT', content: text },
         ]
-        if (text !== 'usage-empty')
+        if (text === 'usage-empty' || text.startsWith('usage-stream:'))
+          rows.push({
+            step_index: step + 1,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'No counters',
+          })
+        else
           rows.push({
             step_index: step + 1,
             type: 'PLANNER_RESPONSE',
@@ -628,13 +641,6 @@ connection = agent()
             content: 'Synthetic usage regression',
             input_tokens: 70207,
             output_tokens: 256,
-          })
-        if (text === 'usage-empty')
-          rows.push({
-            step_index: step + 1,
-            type: 'PLANNER_RESPONSE',
-            status: 'DONE',
-            content: 'No counters',
           })
         appendFileSync(
           join(dir, 'transcript_full.jsonl'),
@@ -788,7 +794,7 @@ connection = agent()
       }
       if (text === 'after-background') {
         const logs = join(
-          process.env.HOME ?? '/tmp',
+          process.env.HOME!,
           '.gemini/antigravity-cli/brain',
           sessionId,
           '.system_generated/logs',
@@ -865,7 +871,7 @@ connection = agent()
       }
       if (text === 'in-rpc-continuation') {
         const sys = join(
-          process.env.HOME ?? '/tmp',
+          process.env.HOME!,
           '.gemini/antigravity-cli/brain',
           sessionId,
           '.system_generated',
@@ -1016,7 +1022,7 @@ connection = agent()
       }
       if (text === 'after-in-rpc-continuation') {
         const logs = join(
-          process.env.HOME ?? '/tmp',
+          process.env.HOME!,
           '.gemini/antigravity-cli/brain',
           sessionId,
           '.system_generated/logs',
@@ -1099,7 +1105,7 @@ connection = agent()
       }
       if (text === 'background') {
         const sys = join(
-          process.env.HOME ?? '/tmp',
+          process.env.HOME!,
           '.gemini/antigravity-cli/brain',
           sessionId,
           '.system_generated',
@@ -1356,7 +1362,7 @@ connection = agent()
         const base = wokenStepBase
         wokenStepBase += 20
         const logs = join(
-          process.env.HOME ?? '/tmp',
+          process.env.HOME!,
           '.gemini/antigravity-cli/brain',
           sessionId,
           '.system_generated/logs',
@@ -1509,7 +1515,7 @@ connection = agent()
         const base = wokenStepBase
         wokenStepBase += 20
         const sys = join(
-          process.env.HOME ?? '/tmp',
+          process.env.HOME!,
           '.gemini/antigravity-cli/brain',
           sessionId,
           '.system_generated',
@@ -1602,57 +1608,59 @@ connection = agent()
             .map((r) => JSON.stringify(r) + '\n')
             .join(''),
         )
-        setTimeout(() => {
-          void (async () => {
-            // Send elicitation/create after Brain's onQuestion has already popped the card.
-            const pendingResponse = elicit({
-              message: 'The agent has a question.',
-              requestedSchema: {
-                type: 'object',
-                properties: {
-                  q1: {
-                    type: 'string',
-                    title: 'Which option?',
-                    oneOf: [
-                      { const: '1', title: '(Recommended) Option 1' },
-                      { const: '2', title: 'Option 2' },
-                    ],
-                  },
+        void (async () => {
+          // Wait for the test harness to confirm Brain's onQuestion has already popped the card.
+          const gatePath = join(process.env.HOME!, 'question-opened')
+          const deadline = Date.now() + 5000
+          while (!existsSync(gatePath) && Date.now() < deadline)
+            await new Promise((resolve) => setTimeout(resolve, 5))
+          const pendingResponse = elicit({
+            message: 'The agent has a question.',
+            requestedSchema: {
+              type: 'object',
+              properties: {
+                q1: {
+                  type: 'string',
+                  title: 'Which option?',
+                  oneOf: [
+                    { const: '1', title: '(Recommended) Option 1' },
+                    { const: '2', title: 'Option 2' },
+                  ],
                 },
               },
-            })
-            await client.sessionUpdate({
-              sessionId,
-              update: {
-                sessionUpdate: 'available_commands_update',
-                availableCommands: [
-                  { name: 'elicit-dispatched', description: 'sync' },
-                ],
+            },
+          })
+          await client.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: 'available_commands_update',
+              availableCommands: [
+                { name: 'elicit-dispatched', description: 'sync' },
+              ],
+            },
+          })
+          const response = await pendingResponse
+          appendFileSync(
+            file,
+            [
+              {
+                step_index: base + 7,
+                type: 'GENERIC',
+                status: 'DONE',
+                content:
+                  'Created At: 2026-11-10T18:59:59+08:00\nCompleted At: 2026-11-10T19:00:05+08:00\nA1: (Recommended) Option 1',
               },
-            })
-            const response = await pendingResponse
-            appendFileSync(
-              file,
-              [
-                {
-                  step_index: base + 7,
-                  type: 'GENERIC',
-                  status: 'DONE',
-                  content:
-                    'Created At: 2026-11-10T18:59:59+08:00\nCompleted At: 2026-11-10T19:00:05+08:00\nA1: (Recommended) Option 1',
-                },
-                {
-                  step_index: base + 8,
-                  type: 'PLANNER_RESPONSE',
-                  status: 'DONE',
-                  content: `Native woken:${JSON.stringify(response)}`,
-                },
-              ]
-                .map((r) => JSON.stringify(r) + '\n')
-                .join(''),
-            )
-          })()
-        }, 30)
+              {
+                step_index: base + 8,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                content: `Native woken:${JSON.stringify(response)}`,
+              },
+            ]
+              .map((r) => JSON.stringify(r) + '\n')
+              .join(''),
+          )
+        })()
         return { stopReason: 'end_turn' as const }
       }
       if (text === 'woken-question') {
@@ -1660,7 +1668,7 @@ connection = agent()
         wokenStepBase += 20
         wokenQuestions.set(sessionId, base)
         const sys = join(
-          process.env.HOME ?? '/tmp',
+          process.env.HOME!,
           '.gemini/antigravity-cli/brain',
           sessionId,
           '.system_generated',
@@ -1789,7 +1797,7 @@ connection = agent()
         wokenQuestions.delete(sessionId)
         const base = wokenBase
         const logs = join(
-          process.env.HOME ?? '/tmp',
+          process.env.HOME!,
           '.gemini/antigravity-cli/brain',
           sessionId,
           '.system_generated/logs',
@@ -1959,7 +1967,7 @@ connection = agent()
       }
       if (text === 'wait') {
         if (process.env.AGY_TEST_CANCEL_DELAY)
-          await new Promise((resolve) => setTimeout(resolve, 100))
+          await new Promise((resolve) => setTimeout(resolve, 30))
         await new Promise<void>((resolve) => {
           if (canceled.has(sessionId)) resolve()
           else cancels.set(sessionId, resolve)

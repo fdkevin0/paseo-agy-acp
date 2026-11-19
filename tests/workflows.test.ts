@@ -7,9 +7,10 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { test, type TestContext } from 'node:test'
+import { isolatedEnv } from './helpers.ts'
 
 const workflow = readFileSync(
   new URL('../.github/workflows/release.yml', import.meta.url),
@@ -53,7 +54,7 @@ function fixture(t: TestContext, version = '1.2.3') {
   }
   return {
     root,
-    run(name: string, env: NodeJS.ProcessEnv = {}) {
+    run(name: string, env: Record<string, string> = {}) {
       const output = join(root, 'output')
       const calls = join(root, 'calls')
       writeFileSync(output, '')
@@ -65,9 +66,8 @@ function fixture(t: TestContext, version = '1.2.3') {
           cwd: root,
           encoding: 'utf8',
           timeout: 10_000,
-          env: {
-            ...process.env,
-            PATH: `${join(root, 'bin')}:${process.env.PATH}`,
+          env: isolatedEnv(root, {
+            PATH: `${join(root, 'bin')}:${dirname(process.execPath)}:/usr/bin:/bin`,
             GITHUB_OUTPUT: output,
             CALLS_FILE: calls,
             GITHUB_REF_TYPE: 'tag',
@@ -78,7 +78,7 @@ function fixture(t: TestContext, version = '1.2.3') {
             CREATE_EXIT: '0',
             NPM_EXIT: '0',
             ...env,
-          },
+          }),
         },
       )
       assert.ifError(result.error)
@@ -93,74 +93,86 @@ function fixture(t: TestContext, version = '1.2.3') {
 
 const preflight = 'Validate release tag and check npm registry'
 
+function assertTagRejected(
+  run: ReturnType<typeof fixture>['run'],
+  env: Record<string, string>,
+) {
+  const result = run(preflight, env)
+  assert.notEqual(result.status, 0)
+  assert.match(result.stdout, /Run this workflow on the existing v1\.2\.3 tag/)
+  assert.equal(result.output, '')
+  assert.equal(result.calls, '')
+}
+
+function assertVersionRejected(t: TestContext, version: string) {
+  const result = fixture(t, version).run(preflight)
+  assert.notEqual(result.status, 0)
+  assert.match(result.stdout, /stable versions only/)
+  assert.equal(result.calls, '')
+  assert.equal(result.output, '')
+}
+
+function assertVersionAccepted(t: TestContext, version: string) {
+  const result = fixture(t, version).run(preflight)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.output, 'published=false\n')
+}
+
+function assertRegistryStatus(
+  run: ReturnType<typeof fixture>['run'],
+  status: string,
+  published: string,
+) {
+  const result = run(preflight, { HTTP_STATUS: status })
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.output, `published=${published}\n`)
+  assert.equal(
+    result.calls,
+    'curl --silent --show-error --max-time 30 --output /dev/null --write-out %{http_code} https://registry.npmjs.org/@fdkevin/paseo-agy-acp/1.2.3\n',
+  )
+}
+
+function assertRegistryError(
+  run: ReturnType<typeof fixture>['run'],
+  env: Record<string, string>,
+) {
+  const result = run(preflight, env)
+  assert.notEqual(result.status, 0)
+  assert.equal(result.output, '')
+}
+
 test('release preflight rejects branch dispatch and tag mismatches before contacting npm', (t) => {
   const { run } = fixture(t)
-  for (const env of [
-    { GITHUB_REF_TYPE: 'branch', GITHUB_REF_NAME: 'main' },
-    { GITHUB_REF_NAME: 'v9.9.9' },
-    { GITHUB_REF_NAME: '1.2.3' },
-  ]) {
-    const result = run(preflight, env)
-    assert.notEqual(result.status, 0)
-    assert.match(
-      result.stdout,
-      /Run this workflow on the existing v1\.2\.3 tag/,
-    )
-    assert.equal(result.output, '')
-    assert.equal(result.calls, '')
-  }
+  assertTagRejected(run, { GITHUB_REF_TYPE: 'branch', GITHUB_REF_NAME: 'main' })
+  assertTagRejected(run, { GITHUB_REF_NAME: 'v9.9.9' })
+  assertTagRejected(run, { GITHUB_REF_NAME: '1.2.3' })
 })
 
 test('release preflight accepts stable semver only', (t) => {
-  for (const version of [
-    '1.2.3-rc.1',
-    '1.2.3+build',
-    '01.2.3',
-    '1.02.3',
-    '1.2.03',
-    '1.2',
-  ]) {
-    const { run } = fixture(t, version)
-    const result = run(preflight)
-    assert.notEqual(result.status, 0)
-    assert.match(result.stdout, /stable versions only/)
-    assert.equal(result.calls, '')
-    assert.equal(result.output, '')
-  }
-  for (const version of ['0.0.0', '1.2.3', '10.20.30']) {
-    const result = fixture(t, version).run(preflight)
-    assert.equal(result.status, 0, result.stderr)
-    assert.equal(result.output, 'published=false\n')
-  }
+  assertVersionRejected(t, '1.2.3-rc.1')
+  assertVersionRejected(t, '1.2.3+build')
+  assertVersionRejected(t, '01.2.3')
+  assertVersionRejected(t, '1.02.3')
+  assertVersionRejected(t, '1.2.03')
+  assertVersionRejected(t, '1.2')
+
+  assertVersionAccepted(t, '0.0.0')
+  assertVersionAccepted(t, '1.2.3')
+  assertVersionAccepted(t, '10.20.30')
 })
 
 test('only registry 404 allows publication; HTTP errors and timeouts fail closed', (t) => {
   const { run } = fixture(t)
-  for (const [status, published] of [
-    ['200', 'true'],
-    ['404', 'false'],
-  ]) {
-    const result = run(preflight, { HTTP_STATUS: status })
-    assert.equal(result.status, 0, result.stderr)
-    assert.equal(result.output, `published=${published}\n`)
-    assert.equal(
-      result.calls,
-      'curl --silent --show-error --max-time 30 --output /dev/null --write-out %{http_code} https://registry.npmjs.org/@fdkevin/paseo-agy-acp/1.2.3\n',
-    )
-  }
-  for (const env of [
-    { HTTP_STATUS: '301' },
-    { HTTP_STATUS: '401' },
-    { HTTP_STATUS: '403' },
-    { HTTP_STATUS: '429' },
-    { HTTP_STATUS: '500' },
-    { HTTP_STATUS: '000', CURL_EXIT: '28' },
-    { HTTP_STATUS: '404', CURL_EXIT: '7' },
-  ]) {
-    const result = run(preflight, env)
-    assert.notEqual(result.status, 0)
-    assert.equal(result.output, '')
-  }
+  assertRegistryStatus(run, '200', 'true')
+  assertRegistryStatus(run, '404', 'false')
+
+  assertRegistryError(run, { HTTP_STATUS: '301' })
+  assertRegistryError(run, { HTTP_STATUS: '401' })
+  assertRegistryError(run, { HTTP_STATUS: '403' })
+  assertRegistryError(run, { HTTP_STATUS: '429' })
+  assertRegistryError(run, { HTTP_STATUS: '500' })
+  assertRegistryError(run, { HTTP_STATUS: '000', CURL_EXIT: '28' })
+  assertRegistryError(run, { HTTP_STATUS: '404', CURL_EXIT: '7' })
 })
 
 test('npm manifest preparation removes only build and remains repeatable', (t) => {

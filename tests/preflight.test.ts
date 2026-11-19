@@ -120,6 +120,8 @@ test('providerStatus accepts version >= 1.5.3 and caches result', async () => {
     assert.equal(status.available, true)
     assert.equal(status.diagnostic, undefined)
 
+    await rm(fakeBin)
+
     const cachedStatus = await providerStatus({
       command: fakeBin,
       args: [],

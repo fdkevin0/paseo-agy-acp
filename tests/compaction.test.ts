@@ -6,7 +6,6 @@ import { test } from 'node:test'
 import type { ProviderEvent } from '@getpaseo/plugin/server/provider'
 import { watchBrain } from '../server/brain.ts'
 import { StepDedupe } from '../server/brain-io.ts'
-import { waitUntil } from './helpers.ts'
 
 const native = '11111111-1111-4111-8111-111111111111'
 const checkpoint = (content: string) => ({
@@ -64,7 +63,7 @@ test('watcher emits one completion per checkpoint and preserves proven deletion/
     native,
     's',
     (event) => events.push(event),
-    5,
+    60_000,
   )
   const compactions = () =>
     events.filter(
@@ -82,16 +81,19 @@ test('watcher emits one completion per checkpoint and preserves proven deletion/
     await watcher.ready
     assert.equal(compactions().length, 1)
     await put([first, checkpoint('summary B'), marker('revised')])
-    await waitUntil(() => saw('revised'))
+    await watcher.flush()
+    assert.equal(saw('revised'), true)
     assert.equal(
       compactions().length,
       1,
       'the host must not need to deduplicate provider ids',
     )
     await put([first, marker('deleted')])
-    await waitUntil(() => saw('deleted'))
+    await watcher.flush()
+    assert.equal(saw('deleted'), true)
     await put([first, checkpoint('summary B'), marker('reused')])
-    await waitUntil(() => saw('reused'))
+    await watcher.flush()
+    assert.equal(saw('reused'), true)
     assert.equal(
       compactions().length,
       2,

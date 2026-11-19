@@ -534,12 +534,17 @@ const REWRITE_PROBE_BYTES = 4096
  * changes the reader re-checks the first bytes and the bytes just before its offset.
  */
 export class TranscriptReader {
+  private readonly openFile: typeof open
   private identity = ''
   private offset = 0
   private remainder = ''
   private snapshotStepIndices?: Set<number>
   private head = Buffer.alloc(0)
   private tail = Buffer.alloc(0)
+
+  constructor(openFile: typeof open = open) {
+    this.openFile = openFile
+  }
 
   private clearCursor(identity = '') {
     this.identity = identity
@@ -599,7 +604,7 @@ export class TranscriptReader {
 
   private async readOnce(root: string, nativeId: string) {
     const path = await resolveTranscriptPath(root, nativeId)
-    const file = await open(path, 'r')
+    const file = await this.openFile(path, 'r')
     const rows: Record<string, unknown>[] = []
     try {
       const stat = await file.stat()

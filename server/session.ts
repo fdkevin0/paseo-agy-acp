@@ -111,6 +111,12 @@ interface SessionOptions {
   stallTimeoutMs?: number
   retryTimeoutMs?: number
   cancelConvergenceTimeoutMs?: number
+  backgroundProbeTimeoutMs?: number
+  observationPollIntervalMs?: number
+  connectAcp?: typeof connectAcp
+  createObservation?: (
+    ...args: ConstructorParameters<typeof BrainTurnObservation>
+  ) => BrainTurnObservation
   createTranscriptReader?: () => TranscriptReader
   readSubagents?: typeof readSubagents
   hasActiveBackgroundWork?: typeof hasActiveBackgroundWork
@@ -1114,7 +1120,7 @@ async function createSession(
   function startRuntime(skipPermissions: boolean) {
     const isStale = () =>
       transport !== currentTransport || retiring.has(transport)
-    const transport = connectAcp(
+    const transport = (options.connectAcp ?? connectAcp)(
       effectiveLaunch(launch, skipPermissions),
       cwd,
       config?.env ?? {},
@@ -1361,6 +1367,8 @@ async function createSession(
       stallTimeoutMs: options.stallTimeoutMs,
       retryTimeoutMs: options.retryTimeoutMs,
       cancelConvergenceTimeoutMs: options.cancelConvergenceTimeoutMs,
+      observationPollIntervalMs: options.observationPollIntervalMs,
+      createObservation: options.createObservation,
       createTranscriptReader: options.createTranscriptReader,
       state,
       get initialized() {
@@ -1542,7 +1550,7 @@ async function createSession(
                 },
               ).catch(() => true),
             ]).then(([, activeBg]) => canceling.length > 0 || activeBg),
-            200,
+            options.backgroundProbeTimeoutMs ?? 200,
             () => true,
           )
           if (state.closing) return
@@ -2092,7 +2100,11 @@ async function promptSession(
     )
     session.state.lastKnownStepIndex = minStepIndex
     turnAbort.signal.throwIfAborted()
-    observation = new BrainTurnObservation(
+    observation = (
+      session.createObservation ??
+      ((...args: ConstructorParameters<typeof BrainTurnObservation>) =>
+        new BrainTurnObservation(...args))
+    )(
       session.brainRoot,
       nativeId,
       session.id,
@@ -2116,7 +2128,7 @@ async function promptSession(
             : Math.max(session.state.lastKnownStepIndex, index)
         },
       },
-      undefined,
+      session.observationPollIntervalMs,
       session.createTranscriptReader?.(),
       session.state.runtimeEpoch?.afterStepIndex ?? -1,
     )

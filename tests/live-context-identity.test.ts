@@ -6,6 +6,8 @@ import {
   BrainTurnObservation,
   type BrainRead,
 } from '../server/brain-observer.ts'
+import { TranscriptReader } from '../server/brain-io.ts'
+import { sequenceDouble } from './helpers.ts'
 
 const planner = (step_index: number, id?: string) => ({
   step_index,
@@ -23,33 +25,49 @@ const metadata = (step: number, id: string) => ({
   stepCallIds: new Map([[step, id]]),
 })
 
-test('raw checkpoint observation reconciles only confirmed snapshot deletion before step reuse', async (t) => {
-  const items: unknown[] = []
-  const observer = new BrainTurnObservation('', '', 's', -1, {
-    isCurrent: () => true,
-    onUsage: () => {},
-    onItem: (item) => items.push(item),
-  })
-  const cp = { step_index: 2, type: 'CHECKPOINT', status: 'DONE' }
-  let read: BrainRead = {
-    rows: [cp],
-    reset: true,
-    snapshotStepIndices: new Set([2]),
+class ScriptedTranscriptReader extends TranscriptReader {
+  private readonly next: () => Promise<BrainRead>
+  constructor(reads: readonly BrainRead[]) {
+    super()
+    this.next = sequenceDouble(reads.map((read) => async () => read))
   }
-  t.mock.method(observer.reader, 'read', async () => read)
+  override read(): ReturnType<TranscriptReader['read']> {
+    return this.next()
+  }
+}
+
+test('raw checkpoint observation reconciles only confirmed snapshot deletion before step reuse', async () => {
+  const items: unknown[] = []
+  const cp = { step_index: 2, type: 'CHECKPOINT', status: 'DONE' }
+  const reader = new ScriptedTranscriptReader([
+    { rows: [cp], reset: true, snapshotStepIndices: new Set([2]) },
+    { rows: [], reset: true },
+    { rows: [cp], reset: false },
+    { rows: [], reset: false, snapshotStepIndices: new Set([1]) },
+    { rows: [cp], reset: false },
+  ])
+  const observer = new BrainTurnObservation(
+    '',
+    '',
+    's',
+    -1,
+    {
+      isCurrent: () => true,
+      onUsage: () => {},
+      onItem: (item) => items.push(item),
+    },
+    200,
+    reader,
+  )
   await observer.poll()
-  read = { rows: [], reset: true }
   await observer.poll()
-  read = { rows: [cp], reset: false }
   await observer.poll()
   assert.equal(
     items.length,
     1,
     'unconfirmed empty/torn replay retains identity',
   )
-  read = { rows: [], reset: false, snapshotStepIndices: new Set([1]) }
   await observer.poll()
-  read = { rows: [cp], reset: false }
   await observer.poll()
   assert.equal(
     items.length,
@@ -59,125 +77,201 @@ test('raw checkpoint observation reconciles only confirmed snapshot deletion bef
   await observer.dispose()
 })
 
-for (const source of ['tool_id', 'step_metadata', 'acp', 'fallback'] as const) {
-  test(`deferred ${source} emissions retain their provenance through compaction history`, () => {
-    const p = new BrainTranscriptProjector('s')
-    const ids: string[] = []
-    p.bindToolCallIds(ids)
-    p.resolveToolIdentities(true)
-    const items = p.project(
-      planner(1, source === 'tool_id' ? 'native' : undefined),
-    )
-    items.push(
-      ...p.project({
-        step_index: 2,
-        type: 'GENERIC',
-        status: 'DONE',
-        content: 'result',
-      }),
-    )
-    if (source === 'step_metadata') p.syncMetadata(metadata(2, 'native'), [])
-    if (source === 'acp') ids.push('native')
-    items.push(...p.resolveToolIdentities(source !== 'fallback'))
-    const tools = items.filter((item) => item.type === 'tool_call')
-    assert.deepEqual(
-      tools.map((item) => item.status),
-      ['running', 'completed'],
-    )
-    const trusted = source === 'tool_id' || source === 'step_metadata'
-    for (const item of tools)
-      assert.equal(
-        p.nativeToolIdentitySource(item),
-        trusted ? source : undefined,
-      )
-    items.push(
-      ...p.project({ step_index: 3, type: 'CHECKPOINT', status: 'DONE' }),
-    )
-    // A later genuinely native occurrence of the same literal cannot bless an earlier positional ID.
-    if (!trusted) items.push(...p.project(planner(4, tools[0].callId)))
-    const merged = mergeCompactionHistory(
-      [{ item: tools[1], resultProvided: true }],
-      items.map((item) => ({
-        item,
-        nativeToolIdentitySource: p.nativeToolIdentitySource(item),
-      })),
-    )
-    assert.equal(
-      merged.filter(({ item }) => item.type === 'compaction').length,
-      trusted ? 1 : 0,
-    )
-    assert.equal(
-      merged.filter(({ item }) => item.type === 'notification').length,
-      trusted ? 0 : 1,
-    )
+function assertDeferredProvenance(spec: {
+  toolId?: string
+  bindIdentity: (p: BrainTranscriptProjector, ids: string[]) => void
+  holdForLateIds: boolean
+  expectedSource: 'tool_id' | 'step_metadata' | undefined
+  afterCheckpoint: (
+    p: BrainTranscriptProjector,
+    items: ReturnType<BrainTranscriptProjector['project']>,
+    callId: string,
+  ) => void
+  expectedCompactions: number
+  expectedNotifications: number
+}) {
+  const p = new BrainTranscriptProjector('s')
+  const ids: string[] = []
+  p.bindToolCallIds(ids)
+  p.resolveToolIdentities(true)
+  const items = p.project(planner(1, spec.toolId))
+  items.push(
+    ...p.project({
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: 'result',
+    }),
+  )
+  spec.bindIdentity(p, ids)
+  items.push(...p.resolveToolIdentities(spec.holdForLateIds))
+  const tools = items.filter((item) => item.type === 'tool_call')
+  assert.deepEqual(
+    tools.map((item) => item.status),
+    ['running', 'completed'],
+  )
+  assert.deepEqual(
+    tools.map((item) => p.nativeToolIdentitySource(item)),
+    [spec.expectedSource, spec.expectedSource],
+  )
+  items.push(
+    ...p.project({ step_index: 3, type: 'CHECKPOINT', status: 'DONE' }),
+  )
+  spec.afterCheckpoint(p, items, tools[0].callId)
+  const merged = mergeCompactionHistory(
+    [{ item: tools[1], resultProvided: true }],
+    items.map((item) => ({
+      item,
+      nativeToolIdentitySource: p.nativeToolIdentitySource(item),
+    })),
+  )
+  assert.equal(
+    merged.filter(({ item }) => item.type === 'compaction').length,
+    spec.expectedCompactions,
+  )
+  assert.equal(
+    merged.filter(({ item }) => item.type === 'notification').length,
+    spec.expectedNotifications,
+  )
+}
+
+test('deferred tool_id emissions retain their provenance through compaction history', () => {
+  assertDeferredProvenance({
+    toolId: 'native',
+    bindIdentity: () => {},
+    holdForLateIds: true,
+    expectedSource: 'tool_id',
+    afterCheckpoint: () => {},
+    expectedCompactions: 1,
+    expectedNotifications: 0,
   })
+})
+
+test('deferred step_metadata emissions retain their provenance through compaction history', () => {
+  assertDeferredProvenance({
+    bindIdentity: (p) => p.syncMetadata(metadata(2, 'native'), []),
+    holdForLateIds: true,
+    expectedSource: 'step_metadata',
+    afterCheckpoint: () => {},
+    expectedCompactions: 1,
+    expectedNotifications: 0,
+  })
+})
+
+test('deferred acp emissions retain their provenance through compaction history', () => {
+  assertDeferredProvenance({
+    bindIdentity: (_p, ids) => ids.push('native'),
+    holdForLateIds: true,
+    expectedSource: undefined,
+    // A later genuinely native occurrence of the same literal cannot bless an earlier positional ID.
+    afterCheckpoint: (p, items, callId) =>
+      items.push(...p.project(planner(4, callId))),
+    expectedCompactions: 0,
+    expectedNotifications: 1,
+  })
+})
+
+test('deferred fallback emissions retain their provenance through compaction history', () => {
+  assertDeferredProvenance({
+    bindIdentity: () => {},
+    holdForLateIds: false,
+    expectedSource: undefined,
+    // A later genuinely native occurrence of the same literal cannot bless an earlier positional ID.
+    afterCheckpoint: (p, items, callId) =>
+      items.push(...p.project(planner(4, callId))),
+    expectedCompactions: 0,
+    expectedNotifications: 1,
+  })
+})
+
+function assertSupersededSource(spec: {
+  toolId?: string
+  bindIdentity: (p: BrainTranscriptProjector, ids: string[]) => void
+  holdForLateIds: boolean
+  expectedSource: 'tool_id' | 'step_metadata' | undefined
+}) {
+  const p = new BrainTranscriptProjector('s')
+  const ids: string[] = []
+  p.bindToolCallIds(ids)
+  p.resolveToolIdentities(true)
+  const emitted = p.project(planner(1, spec.toolId))
+  emitted.push(...p.project(planner(3, 'next')))
+  spec.bindIdentity(p, ids)
+  emitted.push(...p.resolveToolIdentities(spec.holdForLateIds))
+  const canceled = emitted.filter(
+    (item) => item.type === 'tool_call' && item.status === 'canceled',
+  )
+  assert.equal(canceled.length, 1)
+  assert.equal(p.nativeToolIdentitySource(canceled[0]), spec.expectedSource)
 }
 
 test('superseded terminal emissions inherit each pending identity source, including delayed slots', () => {
-  for (const source of [
-    'tool_id',
-    'step_metadata',
-    'acp',
-    'fallback',
-  ] as const) {
-    const p = new BrainTranscriptProjector('s')
-    const ids: string[] = []
-    p.bindToolCallIds(ids)
-    p.resolveToolIdentities(true)
-    const emitted = p.project(
-      planner(1, source === 'tool_id' ? 'native' : undefined),
-    )
-    emitted.push(...p.project(planner(3, 'next')))
-    if (source === 'step_metadata') p.syncMetadata(metadata(2, 'native'), [])
-    if (source === 'acp') ids.push('native')
-    emitted.push(...p.resolveToolIdentities(source !== 'fallback'))
-    const canceled = emitted.filter(
-      (item) => item.type === 'tool_call' && item.status === 'canceled',
-    )
-    assert.equal(canceled.length, 1)
-    assert.equal(
-      p.nativeToolIdentitySource(canceled[0]),
-      source === 'tool_id' || source === 'step_metadata' ? source : undefined,
-    )
-  }
+  assertSupersededSource({
+    toolId: 'native',
+    bindIdentity: () => {},
+    holdForLateIds: true,
+    expectedSource: 'tool_id',
+  })
+  assertSupersededSource({
+    bindIdentity: (p) => p.syncMetadata(metadata(2, 'native'), []),
+    holdForLateIds: true,
+    expectedSource: 'step_metadata',
+  })
+  assertSupersededSource({
+    bindIdentity: (_p, ids) => ids.push('native'),
+    holdForLateIds: true,
+    expectedSource: undefined,
+  })
+  assertSupersededSource({
+    bindIdentity: () => {},
+    holdForLateIds: false,
+    expectedSource: undefined,
+  })
 })
 
-for (const output of [
-  null,
-  { content: [{ type: 'text', text: 'real tool content' }], nested: null },
-])
-  test(`deferred Brain JSON ${output === null ? 'null' : 'content'} remains data across late ACP identity`, () => {
-    const p = new BrainTranscriptProjector('s'),
-      ids: string[] = []
-    p.bindToolCallIds(ids)
-    p.resolveToolIdentities(true)
-    assert.deepEqual(
-      p.project({
-        step_index: 1,
-        type: 'PLANNER_RESPONSE',
-        status: 'DONE',
-        tool_calls: [{ name: 'Vendor.custom', args: { nested: null } }],
-      }),
-      [],
-    )
-    assert.deepEqual(
-      p.project({
-        step_index: 2,
-        type: 'GENERIC',
-        status: 'DONE',
-        content: output,
-      }),
-      [],
-    )
-    ids.push('late-acp-id')
-    const items = p.resolveToolIdentities(true)
-    assert.equal(items.length, 2)
-    const item = items.at(-1)
-    assert.ok(item?.type === 'tool_call' && item.detail.type === 'unknown')
-    assert.equal(item.callId, 'late-acp-id')
-    assert.equal(item.status, 'completed')
-    assert.deepEqual(item.detail.input, { nested: null })
-    assert.deepEqual(item.detail.output, output)
-    assert.equal(p.nativeToolIdentitySource(item), undefined)
-    assert.deepEqual(p.resolveToolIdentities(false), [])
+function assertDeferredBrainJson(output: unknown) {
+  const p = new BrainTranscriptProjector('s')
+  const ids: string[] = []
+  p.bindToolCallIds(ids)
+  p.resolveToolIdentities(true)
+  assert.deepEqual(
+    p.project({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: 'Vendor.custom', args: { nested: null } }],
+    }),
+    [],
+  )
+  assert.deepEqual(
+    p.project({
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: output,
+    }),
+    [],
+  )
+  ids.push('late-acp-id')
+  const items = p.resolveToolIdentities(true)
+  assert.equal(items.length, 2)
+  const item = items.at(-1)
+  assert.ok(item?.type === 'tool_call' && item.detail.type === 'unknown')
+  assert.equal(item.callId, 'late-acp-id')
+  assert.equal(item.status, 'completed')
+  assert.deepEqual(item.detail.input, { nested: null })
+  assert.deepEqual(item.detail.output, output)
+  assert.equal(p.nativeToolIdentitySource(item), undefined)
+  assert.deepEqual(p.resolveToolIdentities(false), [])
+}
+
+test('deferred Brain JSON null remains data across late ACP identity', () => {
+  assertDeferredBrainJson(null)
+})
+
+test('deferred Brain JSON content remains data across late ACP identity', () => {
+  assertDeferredBrainJson({
+    content: [{ type: 'text', text: 'real tool content' }],
+    nested: null,
   })
+})

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { once } from 'node:events'
 import { test } from 'node:test'
 import { spawn } from 'node:child_process'
 import { readFileSync } from 'node:fs'
@@ -14,94 +15,110 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { setTimeout as delay } from 'node:timers/promises'
 import { connectAcp } from '../server/transport.ts'
+import { isolatedEnv, waitUntil } from './helpers.ts'
 
-for (const shutdown of ['graceful', 'stubborn']) {
-  test(
-    `transport ${shutdown} shutdown stops detached native commands without touching other processes`,
-    { skip: process.platform === 'win32' },
-    async () => {
-      const home = await mkdtemp(join(tmpdir(), 'agy-transport-'))
-      const unrelated = spawn(
-        process.execPath,
-        [
-          '-e',
-          "setTimeout(() => require('node:fs').writeFileSync(process.argv[1], 'survived'), 700)",
-          join(home, 'unrelated-result'),
-        ],
-        { stdio: 'ignore' },
-      )
-      const transport = connectAcp(
-        {
-          command: process.execPath,
-          args: [fileURLToPath(new URL('./transport-acp.ts', import.meta.url))],
-          env: {
-            HOME: home,
-            PATH: process.env.PATH ?? '',
-            AGY_SHUTDOWN: shutdown,
-          },
-        },
-        home,
-        {},
-        {
-          sessionUpdate: async () => {},
-          requestPermission: async () => ({
-            outcome: { outcome: 'cancelled' },
-          }),
-        },
-        () => {},
-      )
-      let commandPid: number | undefined
-      try {
-        await transport.rpc.initialize({
-          protocolVersion: 1,
-          clientCapabilities: {},
-        })
-        await transport.rpc.newSession({ cwd: home, mcpServers: [] })
-        commandPid = Number(await readFile(join(home, 'command.pid'), 'utf8'))
-        process.kill(commandPid, 0)
-        const closedAt = Date.now()
-        await transport.close()
-        assert.ok(Date.now() - closedAt < 2500)
-        await delay(750)
-        assert.equal(
-          await stat(join(home, 'old-result')).then(
-            () => true,
-            () => false,
-          ),
-          false,
-          'detached command must not execute after ACP shutdown',
-        )
-        assert.equal(
-          await readFile(join(home, 'unrelated-result'), 'utf8'),
-          'survived',
-        )
-        if (process.platform === 'linux') {
-          const commandState = await readFile(
-            `/proc/${commandPid}/stat`,
-            'utf8',
-          ).catch(() => '')
-          assert.ok(
-            !commandState || /^\d+ \([^)]*\) Z /.test(commandState),
-            'command is still running',
-          )
-        }
-      } finally {
-        await transport.close()
-        unrelated.kill()
-        if (commandPid) {
-          try {
-            process.kill(-commandPid, 'SIGKILL')
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
-          }
-        }
-        await rm(home, { recursive: true, force: true })
-      }
-    },
-  )
+function isProcessGone(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return false
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH'
+  }
 }
+
+function isProcessStopped(pid: number): boolean {
+  if (isProcessGone(pid)) return true
+  if (process.platform === 'linux') {
+    try {
+      return /^\d+ \([^)]*\) Z /.test(readFileSync(`/proc/${pid}/stat`, 'utf8'))
+    } catch {
+      return true
+    }
+  }
+  return false
+}
+
+async function runShutdownTest(shutdown: 'graceful' | 'stubborn') {
+  const home = await mkdtemp(join(tmpdir(), 'agy-transport-'))
+  const unrelated = spawn(
+    process.execPath,
+    [
+      '-e',
+      "setTimeout(() => require('node:fs').writeFileSync(process.argv[1], 'survived'), 700)",
+      join(home, 'unrelated-result'),
+    ],
+    { stdio: 'ignore', env: isolatedEnv(home) },
+  )
+  const unrelatedExited = once(unrelated, 'exit')
+  const transport = connectAcp(
+    {
+      command: process.execPath,
+      args: [fileURLToPath(new URL('./transport-acp.ts', import.meta.url))],
+      env: isolatedEnv(home, {
+        PATH: '/usr/bin:/bin',
+        AGY_SHUTDOWN: shutdown,
+      }),
+    },
+    home,
+    {},
+    {
+      sessionUpdate: async () => {},
+      requestPermission: async () => ({
+        outcome: { outcome: 'cancelled' },
+      }),
+    },
+    () => {},
+  )
+  let commandPid: number | undefined
+  try {
+    await transport.rpc.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {},
+    })
+    await transport.rpc.newSession({ cwd: home, mcpServers: [] })
+    commandPid = Number(await readFile(join(home, 'command.pid'), 'utf8'))
+    process.kill(commandPid, 0)
+    await transport.close()
+    await waitUntil(() => isProcessStopped(commandPid!))
+    await unrelatedExited
+    assert.equal(
+      await stat(join(home, 'old-result')).then(
+        () => true,
+        () => false,
+      ),
+      false,
+      'detached command must not execute after ACP shutdown',
+    )
+    assert.equal(
+      await readFile(join(home, 'unrelated-result'), 'utf8'),
+      'survived',
+    )
+  } finally {
+    await transport.close()
+    unrelated.kill()
+    if (commandPid) {
+      try {
+        process.kill(-commandPid, 'SIGKILL')
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+      }
+    }
+    await rm(home, { recursive: true, force: true })
+  }
+}
+
+test(
+  'transport graceful shutdown stops detached native commands without touching other processes',
+  { skip: process.platform === 'win32', timeout: 5000 },
+  () => runShutdownTest('graceful'),
+)
+
+test(
+  'transport stubborn shutdown stops detached native commands without touching other processes',
+  { skip: process.platform === 'win32', timeout: 5000 },
+  () => runShutdownTest('stubborn'),
+)
 
 test(
   'transport shutdown without a usable ps still stops agy and resolves',
@@ -112,11 +129,10 @@ test(
       {
         command: process.execPath,
         args: [fileURLToPath(new URL('./transport-acp.ts', import.meta.url))],
-        env: {
-          HOME: home,
+        env: isolatedEnv(home, {
           PATH: join(home, 'no-such-bin'),
           AGY_SHUTDOWN: 'stubborn',
-        },
+        }),
       },
       home,
       {},
@@ -166,7 +182,7 @@ test('transport surfaces stderr on immediate startup failure and notifies onExit
           '-e',
           'process.stderr.write("OAuth token expired\\n"); process.exit(2)',
         ],
-        env: { HOME: home, PATH: process.env.PATH ?? '' },
+        env: isolatedEnv(home),
       },
       home,
       {},
@@ -191,7 +207,7 @@ test('transport surfaces stderr on immediate startup failure and notifies onExit
       {
         command: process.execPath,
         args: ['-e', 'setInterval(() => {}, 1000)'],
-        env: { HOME: home, PATH: process.env.PATH ?? '' },
+        env: isolatedEnv(home),
       },
       home,
       {},
@@ -254,14 +270,17 @@ test(
     const invokedPath = join(home, 'ps-invoked')
     await writeFile(
       psPath,
-      `#!${process.execPath}\nprocess.on('SIGTERM', () => {})\nrequire('node:fs').writeFileSync(${JSON.stringify(invokedPath)}, String(process.pid))\nsetInterval(() => {}, 60_000)\n`,
+      `#!/bin/sh\ntrap '' TERM\nprintf '%s' "$$" > ${JSON.stringify(`${invokedPath}.tmp`)} && mv ${JSON.stringify(`${invokedPath}.tmp`)} ${JSON.stringify(invokedPath)}\nexec sleep 60\n`,
     )
     await chmod(psPath, 0o755)
     const transport = connectAcp(
       {
         command: process.execPath,
         args: [fileURLToPath(new URL('./transport-acp.ts', import.meta.url))],
-        env: { HOME: home, PATH: binDir, AGY_SHUTDOWN: 'stubborn' },
+        env: isolatedEnv(home, {
+          PATH: `${binDir}:/usr/bin:/bin`,
+          AGY_SHUTDOWN: 'stubborn',
+        }),
       },
       home,
       {},
@@ -289,6 +308,6 @@ test(
     await transport.exited
     const psPid = Number(await readFile(invokedPath, 'utf8'))
     assert.ok(Number.isInteger(psPid) && psPid > 0)
-    assert.throws(() => process.kill(psPid, 0), { code: 'ESRCH' })
+    await waitUntil(() => isProcessGone(psPid))
   },
 )

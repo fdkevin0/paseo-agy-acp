@@ -16,7 +16,9 @@
     "npm-shrinkwrap.json"
   ],
   "scripts": {
-    "test": "node --test tests/*.test.ts",
+    "test": "npm run test:unit",
+    "test:unit": "node --test tests/*.test.ts",
+    "test:live": "node --test tests/live/*.test.ts",
     "check": "tsc --noEmit",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

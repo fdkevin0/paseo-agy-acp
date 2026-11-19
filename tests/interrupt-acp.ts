@@ -83,10 +83,6 @@ const rows = (value: object[], append = true) => {
   else writeFileSync(transcript, text)
 }
 log('start', { fullAccess })
-process.stdin.on('end', () => {
-  log('exit')
-  process.exit(0)
-})
 let connection!: AgentConnection
 let probeLatePermissionOnCancel = false
 let cancelHang: (() => void) | undefined
@@ -278,7 +274,7 @@ connection = agent()
           sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: 'OLD_RESULT' },
         })
-      }, 700)
+      }, 3000)
       await update({
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'WAITING' },
@@ -339,9 +335,12 @@ connection = agent()
           sourceMetadata: {
             tool: {
               conversationId: nativeId,
-              name: 'invoke_subagent',
               stepIndex: 1,
-              toolCall: { id: 'inv-stale' },
+              toolCall: {
+                id: 'inv-stale',
+                name: 'invoke_subagent',
+                argumentsJson: '{}',
+              },
             },
           },
         }),
@@ -594,3 +593,7 @@ connection = agent()
   .connect(
     ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin)),
   )
+void connection.closed.then(() => {
+  log('exit')
+  process.exit(0)
+})
