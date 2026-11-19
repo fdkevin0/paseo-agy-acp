@@ -1,85 +1,113 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { BrainTurnObservation } from '../server/brain-observer.ts'
+import { TranscriptReader } from '../server/brain-io.ts'
+import {
+  BrainTurnObservation,
+  type BrainRead,
+} from '../server/brain-observer.ts'
+import { sequenceDouble } from './helpers.ts'
+
+type ReadHandler = () => Promise<BrainRead>
+
+class ScriptedTranscriptReader extends TranscriptReader {
+  reads = 0
+  private readonly nextRead: ReadHandler
+
+  constructor(handlers: readonly ReadHandler[]) {
+    super()
+    this.nextRead = sequenceDouble(handlers)
+  }
+
+  override async read(): Promise<BrainRead> {
+    this.reads++
+    return this.nextRead()
+  }
+}
 
 const busy = (message: string) =>
   Object.assign(new Error(message), { code: 'EBUSY' })
-const observation = () =>
-  new BrainTurnObservation('', '', 's', -1, {
-    isCurrent: () => true,
-    onUsage: () => {},
-    onItem: () => {},
-  })
 
-test('a successful reader observation clears only the preceding I/O fault', async (t) => {
-  const o = observation(),
-    error = busy('temporary read fault')
-  let reads = 0
-  t.mock.method(o.reader, 'read', async () => {
-    if (++reads === 1) throw error
-    return { rows: [], reset: false }
-  })
+const observation = (reader: TranscriptReader, onItem: () => void = () => {}) =>
+  new BrainTurnObservation(
+    '',
+    '',
+    's',
+    -1,
+    {
+      isCurrent: () => true,
+      onUsage: () => {},
+      onItem,
+    },
+    undefined,
+    reader,
+  )
+
+test('a successful reader observation clears only the preceding I/O fault', async () => {
+  const error = busy('temporary read fault')
+  const reader = new ScriptedTranscriptReader([
+    async () => {
+      throw error
+    },
+    async () => ({ rows: [], reset: false }),
+  ])
+  const o = observation(reader)
   await assert.rejects(o.poll(), (actual) => actual === error)
   assert.equal(o.error, error)
   await o.poll()
   assert.equal(o.error, undefined)
-  assert.equal(reads, 2)
+  assert.equal(reader.reads, 2)
   await o.dispose()
 })
 
-test('persistent reader I/O exposes its latest diagnostic and stops reading on disposal', async (t) => {
-  const o = observation(),
-    first = busy('first read fault'),
-    latest = busy('latest read fault')
-  let reads = 0
-  t.mock.method(o.reader, 'read', async () => {
-    throw ++reads === 1 ? first : latest
-  })
+test('persistent reader I/O exposes its latest diagnostic and stops reading on disposal', async () => {
+  const first = busy('first read fault')
+  const latest = busy('latest read fault')
+  const reader = new ScriptedTranscriptReader([
+    async () => {
+      throw first
+    },
+    async () => {
+      throw latest
+    },
+  ])
+  const o = observation(reader)
   await assert.rejects(o.poll(), (actual) => actual === first)
   await assert.rejects(o.poll(), (actual) => actual === latest)
   assert.equal(o.error, latest)
   await o.dispose()
   await o.poll()
-  assert.equal(reads, 2)
+  assert.equal(reader.reads, 2)
   assert.equal(o.error, latest)
 })
 
-test('an errno-shaped publication failure remains fatal instead of being cleared by another read', async (t) => {
-  const error = busy('publisher failed'),
-    o = new BrainTurnObservation('', '', 's', -1, {
-      isCurrent: () => true,
-      onUsage: () => {},
-      onItem: () => {
-        throw error
-      },
-    })
-  let reads = 0
-  t.mock.method(o.reader, 'read', async () => {
-    reads++
-    return {
+test('an errno-shaped publication failure remains fatal instead of being cleared by another read', async () => {
+  const error = busy('publisher failed')
+  const reader = new ScriptedTranscriptReader([
+    async () => ({
       rows: [{ step_index: 1, type: 'CHECKPOINT', status: 'DONE' }],
       reset: false,
-    }
+    }),
+  ])
+  const o = observation(reader, () => {
+    throw error
   })
   await assert.rejects(o.poll(), (actual) => actual === error)
   await assert.rejects(o.poll(), (actual) => actual === error)
   assert.equal(o.error, error)
   assert.equal(
-    reads,
+    reader.reads,
     1,
     'a partly applied callback cannot be retried with an empty cursor',
   )
   await o.dispose()
 })
 
-test('an errno-shaped handoff failure cannot become a recoverable reader failure', async (t) => {
-  const o = observation(),
-    error = busy('fold failed')
-  let reads = 0
-  t.mock.method(o.reader, 'read', async () => {
-    reads++
-    return { rows: [], reset: false }
-  })
+test('an errno-shaped handoff failure cannot become a recoverable reader failure', async () => {
+  const error = busy('fold failed')
+  const reader = new ScriptedTranscriptReader([
+    async () => ({ rows: [], reset: false }),
+  ])
+  const o = observation(reader)
   await o.poll()
   await assert.rejects(
     o.attach(async () => {
@@ -89,21 +117,22 @@ test('an errno-shaped handoff failure cannot become a recoverable reader failure
   )
   await assert.rejects(o.poll(), (actual) => actual === error)
   assert.equal(o.error, error)
-  assert.equal(reads, 1)
+  assert.equal(reader.reads, 1)
   await o.dispose()
 })
 
-test('malformed committed data stays fatal even if a later cursor read would be empty', async (t) => {
-  const o = observation(),
-    error = new SyntaxError('invalid complete transcript record')
-  let reads = 0
-  t.mock.method(o.reader, 'read', async () => {
-    if (++reads === 1) throw error
-    return { rows: [], reset: false }
-  })
+test('malformed committed data stays fatal even if a later cursor read would be empty', async () => {
+  const error = new SyntaxError('invalid complete transcript record')
+  const reader = new ScriptedTranscriptReader([
+    async () => {
+      throw error
+    },
+    async () => ({ rows: [], reset: false }),
+  ])
+  const o = observation(reader)
   await assert.rejects(o.poll(), (actual) => actual === error)
   await assert.rejects(o.poll(), (actual) => actual === error)
   assert.equal(o.error, error)
-  assert.equal(reads, 1)
+  assert.equal(reader.reads, 1)
   await o.dispose()
 })

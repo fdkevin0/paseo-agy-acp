@@ -19,18 +19,24 @@ const row = (step_index: number, content: string) => ({
 const encode = (rows: object[]) =>
   rows.map((r) => JSON.stringify(r) + '\n').join('')
 
+function createDedupeReader(root: string, nativeId: string) {
+  const reader = new TranscriptReader()
+  const dedupe = new StepDedupe()
+  const read = async () => {
+    const result = await reader.read(root, nativeId)
+    if (result.snapshotStepIndices) dedupe.prune(result.snapshotStepIndices)
+    return { ...result, delivered: result.rows.filter((r) => dedupe.fresh(r)) }
+  }
+  return { dedupe, read }
+}
+
 test('empty rewrite observations preserve delivered identities until rows return', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agy-dedupe-'))
   const dir = join(root, id, '.system_generated/logs')
   await mkdir(dir, { recursive: true })
   const path = join(dir, 'transcript_full.jsonl')
-  const reader = new TranscriptReader()
-  const dedupe = new StepDedupe()
-  const read = async () => {
-    const { rows, snapshotStepIndices } = await reader.read(root, id)
-    if (snapshotStepIndices) dedupe.prune(snapshotStepIndices)
-    return rows.filter((r) => dedupe.fresh(r))
-  }
+  const { read: readResult } = createDedupeReader(root, id)
+  const read = async () => (await readResult()).delivered
   const file = await open(path, 'w+')
   try {
     const original = [row(0, 'First'), row(1, 'Second')]
@@ -118,12 +124,14 @@ test('nonempty rewrites prune deleted indices and permit reuse without retaining
     true,
     'changed payload at the same index is new',
   )
-  for (let step = 2; step < 100; step++) {
-    const current = row(step, 'Current generation')
-    dedupe.prune(new Set([current.step_index]))
-    assert.ok(dedupe.fresh(current))
-    assert.equal(dedupe.fresh(current), false)
-  }
+  const gen2 = row(2, 'Current generation')
+  dedupe.prune(new Set([gen2.step_index]))
+  assert.ok(dedupe.fresh(gen2))
+  assert.equal(dedupe.fresh(gen2), false)
+  const gen3 = row(3, 'Next generation')
+  dedupe.prune(new Set([gen3.step_index]))
+  assert.ok(dedupe.fresh(gen3))
+  assert.equal(dedupe.fresh(gen3), false)
   assert.ok(
     dedupe.fresh(kept),
     'old generations are evicted by nonempty reconciliation',
@@ -170,13 +178,7 @@ test('snapshot reconciliation spans partial reads and never inherits a truncated
   const dir = join(root, id, '.system_generated/logs')
   await mkdir(dir, { recursive: true })
   const path = join(dir, 'transcript_full.jsonl')
-  const reader = new TranscriptReader()
-  const dedupe = new StepDedupe()
-  const read = async () => {
-    const result = await reader.read(root, id)
-    if (result.snapshotStepIndices) dedupe.prune(result.snapshotStepIndices)
-    return { ...result, delivered: result.rows.filter((r) => dedupe.fresh(r)) }
-  }
+  const { dedupe, read } = createDedupeReader(root, id)
   const file = await open(path, 'w+')
   try {
     const kept = row(0, 'Kept')

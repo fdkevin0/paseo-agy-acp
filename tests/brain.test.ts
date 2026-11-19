@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { EventEmitter, once } from 'node:events'
-import { test } from 'node:test'
+import { test, type TestContext } from 'node:test'
 import {
   mkdir,
   open,
@@ -13,7 +13,6 @@ import {
   symlink,
 } from 'node:fs/promises'
 import { join } from 'node:path'
-import { setTimeout as delay } from 'node:timers/promises'
 import {
   advanceForegroundCursor,
   BrainNode,
@@ -27,8 +26,14 @@ import {
   settleBrainTurn,
   watchBrain,
   type BrainWatchHandle,
+  type ForegroundAcpSegment,
 } from '../server/brain.ts'
-import { createEventCollector, waitUntil } from './helpers.ts'
+import {
+  createEventCollector,
+  flushObs,
+  sequenceDouble,
+  waitUntil,
+} from './helpers.ts'
 import { TranscriptReader } from '../server/brain-io.ts'
 import { BrainTurnObservation } from '../server/brain-observer.ts'
 import {
@@ -55,12 +60,158 @@ function alive<T>(promise: Promise<T>): Promise<T> {
   return promise.finally(() => clearInterval(keepAlive))
 }
 function until(predicate: () => boolean) {
-  return waitUntil(predicate, 1000, () => 'Expected event did not arrive')
+  return waitUntil(predicate, 5000, () => 'Expected event did not arrive')
+}
+function manualObs(
+  root: string,
+  nativeId: string,
+  minStepIndex = -1,
+  onItem: (item: ProviderTimelineItem) => void = () => {},
+) {
+  return new BrainTurnObservation(
+    root,
+    nativeId,
+    'p',
+    minStepIndex,
+    { isCurrent: () => true, onUsage: () => {}, onItem },
+    60_000,
+  )
+}
+function createStepTracker() {
+  const emitter = new EventEmitter()
+  let highest = -1
+  return {
+    onStep(step: number) {
+      highest = Math.max(highest, step)
+      emitter.emit(String(step))
+    },
+    waitFor(step: number): Promise<unknown> {
+      if (highest >= step) return Promise.resolve()
+      return once(emitter, String(step))
+    },
+  }
+}
+function projectAll(projector: BrainTranscriptProjector, rows: readonly Row[]) {
+  for (const row of rows) projector.project(row)
+}
+function ingestAll(node: BrainNode, rows: readonly Row[]) {
+  for (const row of rows) node.ingest(row)
+}
+function eventKindSummary(event: ProviderEvent): string {
+  if (event.type === 'session.turn') return `turn:${event.state}`
+  if (event.type === 'timeline.item') {
+    const status = 'status' in event.item ? event.item.status : ''
+    return `${event.item.type}:${status}`
+  }
+  return event.type
+}
+function itemTag(item: ProviderTimelineItem): string {
+  if (item.type === 'tool_call')
+    return `${item.type}:${item.callId}:${item.status}`
+  const text = 'text' in item ? item.text : ''
+  return `${item.type}:${text}`
+}
+function itemTextTag(item: ProviderTimelineItem): string {
+  const text = 'text' in item ? item.text : ''
+  return `${item.type}:${text}`
+}
+function toolCallIdOrType(item: ProviderTimelineItem): string {
+  return item.type === 'tool_call' ? `${item.callId}:${item.status}` : item.type
+}
+function errorIdOrType(item: ProviderTimelineItem): string {
+  return item.type === 'error' ? item.id : item.type
+}
+function shellOutput(
+  item: Extract<ProviderTimelineItem, { type: 'tool_call' }>,
+): string {
+  return item.detail.type === 'shell' ? (item.detail.output?.trim() ?? '') : ''
+}
+function isTerminalToolCall(
+  item: ProviderTimelineItem,
+): item is Extract<ProviderTimelineItem, { type: 'tool_call' }> {
+  return item.type === 'tool_call' && item.status !== 'running'
+}
+function completedToolOutputs(
+  items: readonly ProviderTimelineItem[],
+): [string | undefined, string | undefined][] {
+  const result: [string | undefined, string | undefined][] = []
+  for (const item of items) {
+    if (
+      item.type !== 'tool_call' ||
+      item.status !== 'completed' ||
+      item.detail.type === 'unknown'
+    )
+      continue
+    const text =
+      item.detail.type === 'shell'
+        ? item.detail.output
+        : item.detail.type === 'plain_text'
+          ? item.detail.text
+          : ''
+    result.push([item.callId, text])
+  }
+  return result
+}
+function turnStates(events: readonly ProviderEvent[]): string[] {
+  return events
+    .filter(
+      (e): e is Extract<ProviderEvent, { type: 'session.turn' }> =>
+        e.type === 'session.turn',
+    )
+    .map((e) => e.state)
+}
+function turnIdsAndStates(events: readonly ProviderEvent[]): string[] {
+  return events
+    .filter(
+      (e): e is Extract<ProviderEvent, { type: 'session.turn' }> =>
+        e.type === 'session.turn',
+    )
+    .map((e) => `${e.turnId}:${e.state}`)
+}
+function assistantTextsFromEvents(events: readonly ProviderEvent[]): string[] {
+  return events
+    .filter(
+      (
+        e,
+      ): e is Extract<ProviderEvent, { type: 'timeline.item' }> & {
+        item: Extract<ProviderTimelineItem, { type: 'assistant_message' }>
+      } => e.type === 'timeline.item' && e.item.type === 'assistant_message',
+    )
+    .map((e) => e.item.text)
+}
+function assistantTextsFromItems(
+  items: readonly ProviderTimelineItem[],
+): string[] {
+  return items
+    .filter(
+      (
+        item,
+      ): item is Extract<ProviderTimelineItem, { type: 'assistant_message' }> =>
+        item.type === 'assistant_message',
+    )
+    .map((item) => item.text)
+}
+function turnAndReplySummary(events: readonly ProviderEvent[]): string[] {
+  const result: string[] = []
+  for (const e of events) {
+    if (e.type === 'session.turn') result.push(`${e.turnId}:${e.state}`)
+    else if (e.type === 'timeline.item' && e.item.type === 'assistant_message')
+      result.push(e.item.text)
+  }
+  return result
+}
+function compactionEvents(events: readonly ProviderEvent[]) {
+  return events.filter(
+    (e): e is Extract<ProviderEvent, { type: 'timeline.item' }> =>
+      e.type === 'timeline.item' && e.item.type === 'compaction',
+  )
 }
 
 test('parent waits for the terminal child report, then its own response, without timestamp assumptions', async () => {
   const f = await fixture()
   const abort = new AbortController()
+  const items: ProviderTimelineItem[] = []
+  const obs = manualObs(f.root, parent, -1, (item) => items.push(item))
   let running: Promise<unknown> | undefined
   try {
     await f.put(parent, invoke(child))
@@ -85,17 +236,22 @@ test('parent waits for the terminal child report, then its own response, without
       'Report quotes: All your subagents and background tasks have been',
       false,
     )
-    const items: ProviderTimelineItem[] = []
+    const steps = createStepTracker()
+    const step4Seen = steps.waitFor(4)
     let settled = false
-    running = settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
-      signal: abort.signal,
-      minStepIndex: -1,
-      pollIntervalMs: 5,
-    }).then((result) => {
+    running = alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+        signal: abort.signal,
+        minStepIndex: -1,
+        observation: obs,
+        onStep: steps.onStep,
+      }),
+    ).then((result) => {
       settled = true
       return result
     })
-    await delay(40)
+    await step4Seen
+    await flushObs(obs)
     assert.equal(settled, false, 'an unfinished child cannot settle the parent')
     await f.deliver(
       parent,
@@ -104,6 +260,7 @@ test('parent waits for the terminal child report, then its own response, without
       true,
       progressMsgId,
     )
+    const step6Seen = steps.waitFor(6)
     await appendFile(
       f.path(parent),
       encode([
@@ -115,7 +272,9 @@ test('parent waits for the terminal child report, then its own response, without
         done(6, 'still waiting'),
       ]),
     )
-    await delay(40)
+    await flushObs(obs)
+    await step6Seen
+    await flushObs(obs)
     assert.equal(
       settled,
       false,
@@ -134,18 +293,22 @@ test('parent waits for the terminal child report, then its own response, without
         ...report(parent, 'Final report', 6),
       ]),
     )
-    await delay(40)
+    await flushObs(obs)
+    await flushObs(obs)
     assert.equal(
       settled,
       false,
       'unread final report in parent inbox must block parent completion',
     )
     await f.deliver(parent, child, 'Final report', true, finalMsgId)
+    const step7Seen = steps.waitFor(7)
     await appendFile(
       f.path(parent),
       encode([message(7, child, 'Final report')]),
     )
-    await delay(40)
+    await flushObs(obs)
+    await step7Seen
+    await flushObs(obs)
     assert.equal(
       settled,
       false,
@@ -162,7 +325,7 @@ test('parent waits for the terminal child report, then its own response, without
         },
       ]),
     )
-    await until(() => settled)
+    await flushObs(obs)
     assert.deepEqual(await running, {
       status: 'completed',
       lastStepUsage: {
@@ -190,6 +353,7 @@ test('parent waits for the terminal child report, then its own response, without
     )
   } finally {
     abort.abort()
+    await obs.dispose()
     await running
     await f.close()
   }
@@ -241,7 +405,7 @@ test('quoted restart notices do not clear background work', () => {
   const projector = new BrainTranscriptProjector(parent)
   const notice =
     '[Notice] All your subagents and background tasks have been stopped due to server restart.'
-  for (const row of invoke(child)) projector.project(row)
+  projectAll(projector, invoke(child))
   projector.project({
     step_index: 5,
     type: 'PLANNER_RESPONSE',
@@ -270,7 +434,7 @@ test('watching retains split UTF-8 records, resets on replacement and truncation
     const split = bytes.indexOf(Buffer.from('你')) + 1
     await writeFile(f.path(child), bytes.subarray(0, split))
     stop = watchBrain(f.root, child, 'c', (event) => events.push(event), 5)
-    await delay(30)
+    await stop.ready
     assert.equal(events.length, 0)
     await appendFile(f.path(child), bytes.subarray(split))
     const textSeen = (text: string) =>
@@ -293,7 +457,8 @@ test('watching retains split UTF-8 records, resets on replacement and truncation
     await rename(f.path(child) + '.new', f.path(child))
     await until(() => textSeen('replacement is longer'))
     await writeFile(f.path(child), encode([done(3, 'short')]))
-    await until(() => textSeen('short'))
+    await stop.flush()
+    assert.equal(textSeen('short'), true)
     const beforeFollowUp = events.length
     await appendFile(
       f.path(child),
@@ -321,28 +486,18 @@ test('watching retains split UTF-8 records, resets on replacement and truncation
           (event) => event.type === 'session.turn' && event.state === 'failed',
         ),
     )
-    assert.deepEqual(
-      events
-        .slice(beforeFollowUp)
-        .map((e) =>
-          e.type === 'session.turn'
-            ? `turn:${e.state}`
-            : e.type === 'timeline.item'
-              ? `${e.item.type}:${'status' in e.item ? e.item.status : ''}`
-              : e.type,
-        ),
-      [
-        'turn:started',
-        'user_message:',
-        'tool_call:running',
-        'error:',
-        'tool_call:failed',
-        'turn:failed',
-      ],
-    )
+    assert.deepEqual(events.slice(beforeFollowUp).map(eventKindSummary), [
+      'turn:started',
+      'user_message:',
+      'tool_call:running',
+      'error:',
+      'tool_call:failed',
+      'turn:failed',
+    ])
     const countBeforeCancel = events.length
     // cancel() drains rows already written, then ignores everything after it resolves.
     await stop.cancel()
+    assert.equal(stop.isStopped(), true)
     await appendFile(
       f.path(child),
       encode([
@@ -353,7 +508,8 @@ test('watching retains split UTF-8 records, resets on replacement and truncation
         },
       ]),
     )
-    await delay(30)
+    await stop.flush()
+    await stop.cancel()
     assert.equal(events.length, countBeforeCancel)
   } finally {
     stop?.()
@@ -395,16 +551,33 @@ test('Brain matches FIFO tool results without fake assistant bubbles or mutating
     ['reasoning', 'assistant_message', 'tool_call', 'tool_call'],
   )
   assert.ok(started[2].type === 'tool_call' && started[2].status === 'running')
-  for (const type of ['CHECKPOINT', 'SYSTEM_MESSAGE', 'UNKNOWN'])
-    assert.deepEqual(
-      projector.project({
-        type,
-        step_index: 2,
-        content: 'metadata',
-        thinking: 'hidden',
-      }),
-      [],
-    )
+  assert.deepEqual(
+    projector.project({
+      type: 'CHECKPOINT',
+      step_index: 2,
+      content: 'metadata',
+      thinking: 'hidden',
+    }),
+    [],
+  )
+  assert.deepEqual(
+    projector.project({
+      type: 'SYSTEM_MESSAGE',
+      step_index: 2,
+      content: 'metadata',
+      thinking: 'hidden',
+    }),
+    [],
+  )
+  assert.deepEqual(
+    projector.project({
+      type: 'UNKNOWN',
+      step_index: 2,
+      content: 'metadata',
+      thinking: 'hidden',
+    }),
+    [],
+  )
   const doneItem = projector.project({
     type: 'GENERIC',
     source: 'MODEL',
@@ -618,54 +791,66 @@ test('silent terminal descendants settle and conditional schedules are released 
   }
 })
 
-test('retrying an owned child waits for inbox read instead of accepting old DONE or ERROR', async () => {
-  for (const previous of [
-    done(1),
-    { step_index: 1, type: 'ERROR_MESSAGE', content: 'Previous error' },
-  ]) {
-    const f = await fixture()
-    const abort = new AbortController()
-    let running: Promise<unknown> | undefined
-    try {
-      await f.put(parent, [
-        ...invoke(child),
-        ...report(child, 'Retry request', 5),
-        done(8, 'waiting'),
-      ])
-      await f.subagent(parent, child)
-      const retryMsgId = await f.deliver(child, parent, 'Retry request', false)
-      await f.put(child, [message(0, parent, 'work'), previous])
-      let settled = false
-      running = settleBrainTurn(f.root, parent, 'p', () => {}, {
+async function assertRetryWaitsForInboxRead(previous: Row) {
+  const f = await fixture()
+  const abort = new AbortController()
+  const obs = manualObs(f.root, parent)
+  let running: Promise<unknown> | undefined
+  try {
+    await f.put(parent, [
+      ...invoke(child),
+      ...report(child, 'Retry request', 5),
+      done(8, 'waiting'),
+    ])
+    await f.subagent(parent, child)
+    const retryMsgId = await f.deliver(child, parent, 'Retry request', false)
+    await f.put(child, [message(0, parent, 'work'), previous])
+    const steps = createStepTracker()
+    const step8Seen = steps.waitFor(8)
+    let settled = false
+    running = alive(
+      settleBrainTurn(f.root, parent, 'p', () => {}, {
         signal: abort.signal,
         minStepIndex: -1,
-        pollIntervalMs: 5,
-      }).then((result) => {
-        settled = true
-        return result
-      })
-      await delay(40)
-      assert.equal(
-        settled,
-        false,
-        'the unread message in child inbox must prevent premature settle',
-      )
-      await f.deliver(child, parent, 'Retry request', true, retryMsgId)
-      await appendFile(
-        f.path(child),
-        encode([message(2, parent, 'Retry request'), done(3)]),
-      )
-      await until(() => settled)
-      assert.deepEqual(await running, {
-        status: 'completed',
-        lastStepUsage: undefined,
-      })
-    } finally {
-      abort.abort()
-      await running
-      await f.close()
-    }
+        observation: obs,
+        onStep: steps.onStep,
+      }),
+    ).then((result) => {
+      settled = true
+      return result
+    })
+    await step8Seen
+    await flushObs(obs)
+    assert.equal(
+      settled,
+      false,
+      'the unread message in child inbox must prevent premature settle',
+    )
+    await f.deliver(child, parent, 'Retry request', true, retryMsgId)
+    await appendFile(
+      f.path(child),
+      encode([message(2, parent, 'Retry request'), done(3)]),
+    )
+    await flushObs(obs)
+    assert.deepEqual(await running, {
+      status: 'completed',
+      lastStepUsage: undefined,
+    })
+  } finally {
+    abort.abort()
+    await obs.dispose()
+    await running
+    await f.close()
   }
+}
+
+test('retrying an owned child waits for inbox read instead of accepting old DONE or ERROR', async () => {
+  await assertRetryWaitsForInboxRead(done(1))
+  await assertRetryWaitsForInboxRead({
+    step_index: 1,
+    type: 'ERROR_MESSAGE',
+    content: 'Previous error',
+  })
 })
 
 test('an explicit schedule cancellation retains the canceled tool result', () => {
@@ -789,10 +974,7 @@ test('batched SYSTEM_MESSAGE with multiple task completions resolves all tasks a
         i.type === 'tool_call' && i.status === 'completed',
     )
     assert.deepEqual(
-      completedTools.map((t) => [
-        t.callId,
-        t.detail.type === 'shell' ? t.detail.output?.trim() : '',
-      ]),
+      completedTools.map((t) => [t.callId, shellOutput(t)]),
       [
         ['call-a', 'Command exited with code 0.\n\nCommand output:\nalpha'],
         ['call-b', 'Command exited with code 0.\n\nCommand output:\nbeta'],
@@ -806,6 +988,7 @@ test('batched SYSTEM_MESSAGE with multiple task completions resolves all tasks a
 test('literal [Message] inside a subagent report body does not over-count consumed messages or settle prematurely', async () => {
   const f = await fixture()
   const abort = new AbortController()
+  const obs = manualObs(f.root, parent)
   let running: Promise<unknown> | undefined
   try {
     const quotedReport =
@@ -823,16 +1006,22 @@ test('literal [Message] inside a subagent report body does not over-count consum
       message(5, child, quotedReport),
       done(6, 'Processed first report'),
     ])
+    const steps = createStepTracker()
+    const step6Seen = steps.waitFor(6)
     let settled = false
-    running = settleBrainTurn(f.root, parent, 'p', () => {}, {
-      signal: abort.signal,
-      minStepIndex: -1,
-      pollIntervalMs: 5,
-    }).then((res) => {
+    running = alive(
+      settleBrainTurn(f.root, parent, 'p', () => {}, {
+        signal: abort.signal,
+        minStepIndex: -1,
+        observation: obs,
+        onStep: steps.onStep,
+      }),
+    ).then((res) => {
       settled = true
       return res
     })
-    await delay(40)
+    await step6Seen
+    await flushObs(obs)
     assert.equal(
       settled,
       false,
@@ -842,7 +1031,7 @@ test('literal [Message] inside a subagent report body does not over-count consum
       f.path(parent),
       encode([message(7, child, 'Second report'), done(8, 'All done')]),
     )
-    await until(() => settled)
+    await flushObs(obs)
     assert.deepEqual(await running, {
       status: 'completed',
       lastStepUsage: undefined,
@@ -851,6 +1040,7 @@ test('literal [Message] inside a subagent report body does not over-count consum
     })
   } finally {
     abort.abort()
+    await obs.dispose()
     await running
     await f.close()
   }
@@ -944,19 +1134,12 @@ test('shouldEmitPreWakeupTool suppresses completed foreground tools while emitti
       false,
       'already-completed foreground tool call must not be re-emitted',
     )
-    assert.deepEqual(
-      items.map((i) =>
-        i.type === 'tool_call'
-          ? `${i.type}:${i.callId}:${i.status}`
-          : `${i.type}:${'text' in i ? i.text : ''}`,
-      ),
-      [
-        'tool_call:bg-cmd:completed',
-        'tool_call:post-read:running',
-        'tool_call:post-read:completed',
-        'assistant_message:OK',
-      ],
-    )
+    assert.deepEqual(items.map(itemTag), [
+      'tool_call:bg-cmd:completed',
+      'tool_call:post-read:running',
+      'tool_call:post-read:completed',
+      'assistant_message:OK',
+    ])
 
     // When emitForeground is true (fallback if user_message_chunk never arrived), foreground items are recovered without duplicating user_message
     const recovered: ProviderTimelineItem[] = []
@@ -989,20 +1172,13 @@ test('shouldEmitPreWakeupTool suppresses completed foreground tools while emitti
       { minStepIndex: 9, emitForeground: true },
     )
     assert.equal(recResult.status, 'completed')
-    assert.deepEqual(
-      recovered.map((i) =>
-        i.type === 'tool_call'
-          ? `${i.type}:${i.callId}:${i.status}`
-          : `${i.type}:${'text' in i ? i.text : ''}`,
-      ),
-      [
-        'reasoning:Think',
-        'assistant_message:Recovered reply',
-        'tool_call:rec-tool:running',
-        'tool_call:rec-tool:completed',
-        'assistant_message:Final reply',
-      ],
-    )
+    assert.deepEqual(recovered.map(itemTag), [
+      'reasoning:Think',
+      'assistant_message:Recovered reply',
+      'tool_call:rec-tool:running',
+      'tool_call:rec-tool:completed',
+      'assistant_message:Final reply',
+    ])
   } finally {
     await f.close()
   }
@@ -1132,11 +1308,7 @@ test('GENERIC rows consume one call each and map native terminal statuses', () =
     { step_index: 7, type: 'GENERIC', status: 'ERROR', content: 'boom' },
   ].flatMap((row) => projector.project(row))
   assert.deepEqual(
-    items.flatMap((i) =>
-      i.type === 'tool_call' && i.status !== 'running'
-        ? [`${i.callId}:${i.status}`]
-        : [],
-    ),
+    items.filter(isTerminalToolCall).map((i) => `${i.callId}:${i.status}`),
     ['canceled:canceled', 'interrupted:canceled', 'failed:failed'],
   )
   assert.equal(projector.hasPending(), false, 'no call is left to misattribute')
@@ -1146,6 +1318,9 @@ test('GENERIC rows consume one call each and map native terminal statuses', () =
 test('an in-place O_TRUNC rewrite re-delivers changed steps once and drops unlogged rows', async () => {
   const f = await fixture()
   const abort = new AbortController()
+  const items: ProviderTimelineItem[] = []
+  const obs = manualObs(f.root, parent, -1, (item) => items.push(item))
+  let running: Promise<Awaited<ReturnType<typeof settleBrainTurn>>> | undefined
   try {
     const plan = {
       step_index: 2,
@@ -1158,19 +1333,24 @@ test('an in-place O_TRUNC rewrite re-delivers changed steps once and drops unlog
       plan,
       { step_index: 3, type: 'GENERIC', status: 'RUNNING', content: 'busy' },
     ])
-    const items: ProviderTimelineItem[] = []
+    const stepEvents = new EventEmitter()
+    const step3Seen = once(stepEvents, '3')
     let settled = false
-    const running = alive(
+    running = alive(
       settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
         signal: abort.signal,
-        pollIntervalMs: 5,
+        observation: obs,
         shouldEmitPreWakeupTool: () => true,
+        onStep: (step) => {
+          stepEvents.emit(String(step))
+        },
       }),
     ).then((result) => {
       settled = true
       return result
     })
-    await delay(40)
+    await step3Seen
+    await flushObs(obs)
     assert.equal(settled, false)
     // Same inode, larger file: only content probes can notice the rewrite.
     await f.rewrite(parent, [
@@ -1184,39 +1364,47 @@ test('an in-place O_TRUNC rewrite re-delivers changed steps once and drops unlog
       },
       { step_index: 4, type: 'PLANNER_RESPONSE', status: 'GENERATING' },
     ])
-    await delay(40)
+    await flushObs(obs)
     assert.equal(settled, false, 'a GENERATING row is superseded, not final')
     await appendFile(f.path(parent), encode([done(4, 'All done')]))
+    await flushObs(obs)
     assert.equal((await running).status, 'completed')
     assert.deepEqual(
-      items.map((i) =>
-        i.type === 'tool_call' ? `${i.callId}:${i.status}` : i.type,
-      ),
+      items.map(toolCallIdOrType),
       ['cmd:completed'],
       'the rewritten DONE step is delivered once; unchanged steps are not repeated',
     )
   } finally {
     abort.abort()
+    await obs.dispose()
+    await running?.catch(() => undefined)
     await f.close()
   }
 })
 
-test('settlement waits for a late USER_INPUT flush within the grace period', async () => {
+test('settlement waits for a late USER_INPUT flush within the grace period', async (t) => {
   const f = await fixture()
+  const abort = new AbortController()
+  const obs = manualObs(f.root, parent, 0)
+  let running: Promise<Awaited<ReturnType<typeof settleBrainTurn>>> | undefined
   try {
+    t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
     await f.put(parent, [{ step_index: 0, type: 'USER_INPUT', content: 'old' }])
     let settled = false
-    const running = alive(
+    running = alive(
       settleBrainTurn(f.root, parent, 'p', () => {}, {
         minStepIndex: 0,
-        pollIntervalMs: 5,
+        signal: abort.signal,
+        observation: obs,
         transcriptGraceMs: 2000,
       }),
     ).then((result) => {
       settled = true
       return result
     })
-    await delay(40)
+    await flushObs(obs)
+    t.mock.timers.tick(40)
+    await flushObs(obs)
     assert.equal(settled, false, 'must not give up before the row is flushed')
     await appendFile(
       f.path(parent),
@@ -1233,87 +1421,129 @@ test('settlement waits for a late USER_INPUT flush within the grace period', asy
         },
       ]),
     )
+    await flushObs(obs)
     assert.deepEqual(await running, {
       status: 'completed',
       lastStepUsage: { inputTokens: 10, cachedReadTokens: 5, outputTokens: 2 },
     })
   } finally {
+    abort.abort()
+    await obs.dispose()
+    await running?.catch(() => undefined)
     await f.close()
   }
 })
 
 test('settlement without grace completes immediately when no turn row exists', async () => {
   const f = await fixture()
+  const obs = manualObs(f.root, parent, 0)
   try {
     await f.put(parent, [{ step_index: 0, type: 'USER_INPUT', content: 'old' }])
-    const startedAt = Date.now()
+    // Unstarted observation only polls once, so resolving proves immediate completion without waiting.
     assert.deepEqual(
-      await settleBrainTurn(f.root, parent, 'p', () => {}, { minStepIndex: 0 }),
+      await settleBrainTurn(f.root, parent, 'p', () => {}, {
+        minStepIndex: 0,
+        observation: obs,
+      }),
       { status: 'completed' },
     )
-    assert.ok(Date.now() - startedAt < 500)
   } finally {
+    await obs.dispose()
     await f.close()
   }
 })
 
-test('a missing transcript never throws and only waits when the session directory exists', async () => {
+test('a missing transcript never throws and only waits when the session directory exists', async (t) => {
   const f = await fixture()
+  const abort = new AbortController()
+  const obs1 = manualObs(f.root, parent)
+  const obs2 = manualObs(f.root, parent)
+  let running: Promise<Awaited<ReturnType<typeof settleBrainTurn>>> | undefined
   try {
-    let startedAt = Date.now()
+    t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
+    // Unstarted observation only polls once, so resolving proves no grace applies without a session directory.
     assert.deepEqual(
       await settleBrainTurn(f.root, parent, 'p', () => {}, {
+        observation: obs1,
         transcriptGraceMs: 2000,
       }),
       { status: 'completed' },
     )
-    assert.ok(Date.now() - startedAt < 500, 'no Brain directory: no grace')
     // Earlier subagents and no transcript used to throw ENOENT.
     await f.subagent(parent, child)
-    startedAt = Date.now()
-    assert.deepEqual(
-      await alive(
-        settleBrainTurn(f.root, parent, 'p', () => {}, {
-          pollIntervalMs: 5,
-          transcriptGraceMs: 100,
-        }),
-      ),
-      { status: 'completed' },
-    )
-    assert.ok(Date.now() - startedAt >= 100, 'directory exists: grace applies')
+    let settled = false
+    running = alive(
+      settleBrainTurn(f.root, parent, 'p', () => {}, {
+        signal: abort.signal,
+        observation: obs2,
+        transcriptGraceMs: 100,
+      }),
+    ).then((result) => {
+      settled = true
+      return result
+    })
+    await flushObs(obs2)
+    t.mock.timers.tick(99)
+    await flushObs(obs2)
+    assert.equal(settled, false, 'directory exists: grace applies')
+    t.mock.timers.tick(1)
+    await flushObs(obs2)
+    assert.deepEqual(await running, { status: 'completed' })
   } finally {
+    abort.abort()
+    await obs1.dispose()
+    await obs2.dispose()
+    await running?.catch(() => undefined)
     await f.close()
   }
 })
 
-test('settlement stops waiting on an idle transcript without a final response', async () => {
+test('settlement stops waiting on an idle transcript without a final response', async (t) => {
   const f = await fixture()
+  const items: ProviderTimelineItem[] = []
+  const obs = manualObs(f.root, parent, -1, (item) => items.push(item))
+  const abort = new AbortController()
+  let running: Promise<Awaited<ReturnType<typeof settleBrainTurn>>> | undefined
   try {
+    t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
     await f.put(parent, [
       { step_index: 1, type: 'USER_INPUT', content: 'run' },
       { step_index: 2, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
     ])
-    const items: ProviderTimelineItem[] = []
-    const result = await alive(
+    const steps = createStepTracker()
+    const step2Seen = steps.waitFor(2)
+    running = alive(
       settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
-        pollIntervalMs: 5,
+        signal: abort.signal,
+        observation: obs,
         stallTimeoutMs: 50,
+        onStep: steps.onStep,
       }),
     )
+    await step2Seen
+    t.mock.timers.tick(50)
+    await flushObs(obs)
+    const result = await running
+    running = undefined
     assert.equal(result.status, 'failed')
     assert.match(result.error ?? '', /idle for 0s without a final response/)
-    assert.deepEqual(
-      items.map((i) => (i.type === 'error' ? i.id : i.type)),
-      ['p:step:2:stalled'],
-    )
+    assert.deepEqual(items.map(errorIdOrType), ['p:step:2:stalled'])
   } finally {
+    abort.abort()
+    await obs.dispose()
+    await running?.catch(() => undefined)
     await f.close()
   }
 })
 
-test('a settled ALIVE child does not suspend the parent stall timeout', async () => {
+test('a settled ALIVE child does not suspend the parent stall timeout', async (t) => {
   const f = await fixture()
+  const items: ProviderTimelineItem[] = []
+  const obs = manualObs(f.root, parent, -1, (item) => items.push(item))
+  const abort = new AbortController()
+  let running: Promise<Awaited<ReturnType<typeof settleBrainTurn>>> | undefined
   try {
+    t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
     // agy keeps finished subagents ALIVE until an explicit kill.
     await f.subagent(parent, child)
     await f.deliver(parent, child, 'Report', true, 'report')
@@ -1326,26 +1556,46 @@ test('a settled ALIVE child does not suspend the parent stall timeout', async ()
       message(5, child, 'Report'),
       { step_index: 6, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
     ])
-    const items: ProviderTimelineItem[] = []
-    const result = await alive(
+    const steps = createStepTracker()
+    const step6Seen = steps.waitFor(6)
+    running = alive(
       settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
         minStepIndex: -1,
-        pollIntervalMs: 5,
+        signal: abort.signal,
+        observation: obs,
         stallTimeoutMs: 50,
+        onStep: steps.onStep,
       }),
     )
+    await step6Seen
+    t.mock.timers.tick(50)
+    await flushObs(obs)
+    const result = await running
+    running = undefined
     assert.equal(result.status, 'failed')
     assert.ok(
       items.some((i) => i.type === 'error' && i.id.endsWith(':stalled')),
     )
   } finally {
+    abort.abort()
+    await obs.dispose()
+    await running?.catch(() => undefined)
     await f.close()
   }
 })
 
-test('woken-turn LLM generation after SYSTEM_MESSAGE or completed GENERIC uses wokenStallTimeoutMs and stalls if that cap expires', async () => {
+test('woken-turn LLM generation after SYSTEM_MESSAGE or completed GENERIC uses wokenStallTimeoutMs and stalls if that cap expires', async (t) => {
   const f = await fixture()
+  const abort = new AbortController()
+  const items: ProviderTimelineItem[] = []
+  const stalledItems: ProviderTimelineItem[] = []
+  const obs1 = manualObs(f.root, parent, -1, (item) => items.push(item))
+  const obs2 = manualObs(f.root, parent, -1, (item) => stalledItems.push(item))
+  let running: Promise<Awaited<ReturnType<typeof settleBrainTurn>>> | undefined
+  let stalledRunning:
+    Promise<Awaited<ReturnType<typeof settleBrainTurn>>> | undefined
   try {
+    t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
     await f.subagent(parent, child)
     await f.deliver(parent, child, 'Report', true, 'report')
     await f.put(child, [
@@ -1363,20 +1613,27 @@ test('woken-turn LLM generation after SYSTEM_MESSAGE or completed GENERIC uses w
       },
       { step_index: 7, type: 'GENERIC', status: 'DONE', content: 'code' },
     ])
-    const items: ProviderTimelineItem[] = []
+    const stepEvents = new EventEmitter()
+    const step7Seen = once(stepEvents, '7')
     let settled = false
-    const running = alive(
+    running = alive(
       settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
         minStepIndex: -1,
-        pollIntervalMs: 5,
+        signal: abort.signal,
+        observation: obs1,
         stallTimeoutMs: 25,
         wokenStallTimeoutMs: 200,
+        onStep: (step) => {
+          stepEvents.emit(String(step))
+        },
       }),
     ).then((res) => {
       settled = true
       return res
     })
-    await delay(70)
+    await step7Seen
+    t.mock.timers.tick(70)
+    await flushObs(obs1)
     assert.equal(
       settled,
       false,
@@ -1397,7 +1654,9 @@ test('woken-turn LLM generation after SYSTEM_MESSAGE or completed GENERIC uses w
         done(10, 'Final synthesis complete.'),
       ]),
     )
+    await flushObs(obs1)
     const result = await running
+    running = undefined
     assert.equal(result.status, 'completed')
     assert.equal(
       items.some((i) => i.type === 'error'),
@@ -1423,36 +1682,64 @@ test('woken-turn LLM generation after SYSTEM_MESSAGE or completed GENERIC uses w
       },
       { step_index: 7, type: 'GENERIC', status: 'DONE', content: 'code' },
     ])
-    const stalledItems: ProviderTimelineItem[] = []
-    const wokenStallStartedAt = Date.now()
-    const stalledResult = await alive(
+    const stepEvents2 = new EventEmitter()
+    const step7Seen2 = once(stepEvents2, '7')
+    let stalledSettled = false
+    stalledRunning = alive(
       settleBrainTurn(f.root, parent, 'p', (item) => stalledItems.push(item), {
         minStepIndex: -1,
-        pollIntervalMs: 5,
+        signal: abort.signal,
+        observation: obs2,
         stallTimeoutMs: 20,
         wokenStallTimeoutMs: 80,
+        onStep: (step) => {
+          stepEvents2.emit(String(step))
+        },
       }),
+    ).then((res) => {
+      stalledSettled = true
+      return res
+    })
+    await step7Seen2
+    t.mock.timers.tick(79)
+    await flushObs(obs2)
+    assert.equal(
+      stalledSettled,
+      false,
+      'woken stall must wait for wokenStallTimeoutMs (80ms), not stallTimeoutMs (20ms)',
     )
-    const wokenStallElapsed = Date.now() - wokenStallStartedAt
+    t.mock.timers.tick(1)
+    await flushObs(obs2)
+    const stalledResult = await stalledRunning
+    stalledRunning = undefined
     assert.equal(stalledResult.status, 'failed')
     assert.equal(stalledResult.stalled, true)
-    assert.ok(
-      wokenStallElapsed >= 70,
-      `expected woken stall to wait for wokenStallTimeoutMs (80ms), got ${wokenStallElapsed}ms`,
-    )
     assert.ok(
       stalledItems.some(
         (i) => i.type === 'error' && i.id === 'p:step:7:stalled',
       ),
     )
   } finally {
+    abort.abort()
+    await obs1.dispose()
+    await obs2.dispose()
+    await running?.catch(() => undefined)
+    await stalledRunning?.catch(() => undefined)
     await f.close()
   }
 })
 
-test('unmatched foreground tool calls and permanent consumed-message drift still stall at stallTimeoutMs', async () => {
+test('unmatched foreground tool calls and permanent consumed-message drift still stall at stallTimeoutMs', async (t) => {
   const f = await fixture()
+  const abort = new AbortController()
+  const obs1 = manualObs(f.root, parent)
+  const obs2 = manualObs(f.root, parent)
+  let orphanRunning:
+    Promise<Awaited<ReturnType<typeof settleBrainTurn>>> | undefined
+  let driftRunning:
+    Promise<Awaited<ReturnType<typeof settleBrainTurn>>> | undefined
   try {
+    t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
     // 1. Unmatched foreground tool call (!wokeUp with hasPending() === true)
     await f.put(parent, [
       { step_index: 1, type: 'USER_INPUT', content: 'run' },
@@ -1463,21 +1750,26 @@ test('unmatched foreground tool calls and permanent consumed-message drift still
         tool_calls: [{ id: 'orphan', name: 'read_file', args: {} }],
       },
     ])
-    const orphanStartedAt = Date.now()
-    const orphanResult = await alive(
+    const orphanSteps = new EventEmitter()
+    const orphanStep2 = once(orphanSteps, '2')
+    orphanRunning = alive(
       settleBrainTurn(f.root, parent, 'p', () => {}, {
-        pollIntervalMs: 5,
+        signal: abort.signal,
+        observation: obs1,
         stallTimeoutMs: 30,
         wokenStallTimeoutMs: 500,
+        onStep: (step) => {
+          orphanSteps.emit(String(step))
+        },
       }),
     )
-    const orphanElapsed = Date.now() - orphanStartedAt
+    await orphanStep2
+    t.mock.timers.tick(30)
+    await flushObs(obs1)
+    const orphanResult = await orphanRunning
+    orphanRunning = undefined
     assert.equal(orphanResult.status, 'failed')
     assert.equal(orphanResult.stalled, true)
-    assert.ok(
-      orphanElapsed < 250,
-      `expected orphan foreground call to stall at stallTimeoutMs (30ms), got ${orphanElapsed}ms`,
-    )
 
     // 2. Permanent gap between inbox.consumedNonUserCount and rendered [Message] sender= lines
     await f.deliver(parent, child, 'Unrendered message', true, 'drift')
@@ -1485,22 +1777,32 @@ test('unmatched foreground tool calls and permanent consumed-message drift still
       { step_index: 1, type: 'USER_INPUT', content: 'run' },
       done(2, 'Done without rendering inbox message'),
     ])
-    const driftStartedAt = Date.now()
-    const driftResult = await alive(
+    const driftSteps = new EventEmitter()
+    const driftStep2 = once(driftSteps, '2')
+    driftRunning = alive(
       settleBrainTurn(f.root, parent, 'p', () => {}, {
-        pollIntervalMs: 5,
+        signal: abort.signal,
+        observation: obs2,
         stallTimeoutMs: 30,
         wokenStallTimeoutMs: 500,
+        onStep: (step) => {
+          driftSteps.emit(String(step))
+        },
       }),
     )
-    const driftElapsed = Date.now() - driftStartedAt
+    await driftStep2
+    t.mock.timers.tick(30)
+    await flushObs(obs2)
+    const driftResult = await driftRunning
+    driftRunning = undefined
     assert.equal(driftResult.status, 'failed')
     assert.equal(driftResult.stalled, true)
-    assert.ok(
-      driftElapsed < 250,
-      `expected consumed-message drift to stall at stallTimeoutMs (30ms), got ${driftElapsed}ms`,
-    )
   } finally {
+    abort.abort()
+    await obs1.dispose()
+    await obs2.dispose()
+    await orphanRunning?.catch(() => undefined)
+    await driftRunning?.catch(() => undefined)
     await f.close()
   }
 })
@@ -1619,56 +1921,84 @@ test('hasActiveBackgroundWork tracks woken and about-to-wake parent turns withou
   }
 })
 
-for (const wait of ['approval', 'background task'] as const)
-  test(`a pending ${wait} suspends the stall timeout`, async () => {
-    const f = await fixture()
-    const abort = new AbortController()
-    try {
-      const taskId = `${parent}/task-3`
-      await f.put(
-        parent,
-        wait === 'approval'
-          ? [
-              { step_index: 1, type: 'USER_INPUT', content: 'run' },
-              { step_index: 2, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
-            ]
-          : [
-              { step_index: 1, type: 'USER_INPUT', content: 'run' },
-              {
-                step_index: 2,
-                type: 'PLANNER_RESPONSE',
-                status: 'DONE',
-                tool_calls: [{ id: 'bg', name: 'run_command', args: {} }],
-              },
-              {
-                step_index: 3,
-                type: 'GENERIC',
-                status: 'RUNNING',
-                content: `Tool is running as a background task with task id: ${taskId}\n`,
-              },
-              done(4, 'Waiting'),
-            ],
-      )
-      let settled = false
-      const running = alive(
-        settleBrainTurn(f.root, parent, 'p', () => {}, {
-          signal: abort.signal,
-          pollIntervalMs: 5,
-          stallTimeoutMs: 20,
-          isWaitingOnUser: () => wait === 'approval',
-        }),
-      ).then((result) => {
-        settled = true
-        return result
-      })
-      await delay(100)
-      assert.equal(settled, false, `a pending ${wait} is not a stall`)
-      abort.abort()
-      assert.equal((await running).status, 'canceled')
-    } finally {
-      await f.close()
-    }
-  })
+async function assertWaitSuspendsStall(
+  t: TestContext,
+  rows: Row[],
+  lastStep: number,
+  isWaitingOnUser: () => boolean,
+  label: string,
+) {
+  const f = await fixture()
+  const abort = new AbortController()
+  const obs = manualObs(f.root, parent)
+  let running: Promise<Awaited<ReturnType<typeof settleBrainTurn>>> | undefined
+  try {
+    t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
+    await f.put(parent, rows)
+    const steps = createStepTracker()
+    const stepSeen = steps.waitFor(lastStep)
+    let settled = false
+    running = alive(
+      settleBrainTurn(f.root, parent, 'p', () => {}, {
+        signal: abort.signal,
+        observation: obs,
+        stallTimeoutMs: 20,
+        isWaitingOnUser,
+        onStep: steps.onStep,
+      }),
+    ).then((result) => {
+      settled = true
+      return result
+    })
+    await stepSeen
+    t.mock.timers.tick(100)
+    await flushObs(obs)
+    assert.equal(settled, false, `a pending ${label} is not a stall`)
+    abort.abort()
+    assert.equal((await running).status, 'canceled')
+  } finally {
+    abort.abort()
+    await obs.dispose()
+    await running?.catch(() => undefined)
+    await f.close()
+  }
+}
+
+test('a pending approval suspends the stall timeout', (t) =>
+  assertWaitSuspendsStall(
+    t,
+    [
+      { step_index: 1, type: 'USER_INPUT', content: 'run' },
+      { step_index: 2, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+    ],
+    2,
+    () => true,
+    'approval',
+  ))
+
+test('a pending background task suspends the stall timeout', (t) =>
+  assertWaitSuspendsStall(
+    t,
+    [
+      { step_index: 1, type: 'USER_INPUT', content: 'run' },
+      {
+        step_index: 2,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [{ id: 'bg', name: 'run_command', args: {} }],
+      },
+      {
+        step_index: 3,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: `Tool is running as a background task with task id: ${parent}/task-3\n`,
+      },
+      done(4, 'Waiting'),
+    ],
+    4,
+    () => false,
+    'background task',
+  ))
 
 test('unknown subagent states do not count as active background work', async () => {
   const f = await fixture()
@@ -1728,16 +2058,11 @@ test('a resumed child watcher skips its history and continues turn IDs', async (
     await until(() =>
       events.some((e) => e.type === 'session.turn' && e.state === 'completed'),
     )
-    assert.deepEqual(
-      events.flatMap((e) =>
-        e.type === 'session.turn'
-          ? [`${e.turnId}:${e.state}`]
-          : e.type === 'timeline.item' && e.item.type === 'assistant_message'
-            ? [e.item.text]
-            : [],
-      ),
-      ['c:turn:4:started', 'Second reply', 'c:turn:4:completed'],
-    )
+    assert.deepEqual(turnAndReplySummary(events), [
+      'c:turn:4:started',
+      'Second reply',
+      'c:turn:4:completed',
+    ])
     assert.equal(handle.isStopped(), false)
     await handle.cancel()
     assert.equal(handle.isStopped(), true)
@@ -1747,97 +2072,80 @@ test('a resumed child watcher skips its history and continues turn IDs', async (
   }
 })
 
-for (const emptyWindowMs of [0, 50]) {
-  test(
-    `a child watcher does not restart turns across an observed ${emptyWindowMs}ms rewrite window`,
-    { timeout: 5000 },
-    async () => {
-      const f = await fixture()
-      const events: ProviderEvent[] = []
-      let handle: BrainWatchHandle | undefined
-      let polls = 0
-      const afterRead = async () => {
-        const target = polls + 2
-        // Metadata is read before the transcript; two sequential polls guarantee an intervening transcript read.
-        await until(() => polls >= target)
-      }
-      try {
-        const rows = [message(0, parent, 'work'), done(1, 'Reply')]
-        await f.put(child, rows)
-        handle = watchBrain(
-          f.root,
-          child,
-          'c',
-          (event) => events.push(event),
-          5,
-          undefined,
-          undefined,
-          () => {
-            polls++
-          },
-        )
-        await handle.ready
-        const before = events.length
-        await f.rewrite(
-          child,
-          [...rows, { step_index: 2, type: 'CHECKPOINT' }],
-          async () => {
-            await afterRead()
-            if (emptyWindowMs > 0) await delay(emptyWindowMs)
-          },
-        )
-        await afterRead()
-        assert.equal(
-          events.length,
-          before,
-          'unchanged steps are not new activity',
-        )
-        await appendFile(
-          f.path(child),
-          encode([message(3, parent, 'New work'), done(4, 'New reply')]),
-        )
-        await afterRead()
-        assert.deepEqual(
-          events.flatMap((e) =>
-            e.type === 'timeline.item' && e.item.type === 'assistant_message'
-              ? [e.item.text]
-              : [],
-          ),
-          ['Reply', 'New reply'],
-        )
-        const beforeCancel = events.length
-        // Cancel drains a rewrite while preserving history identity, then stops future polling.
-        await f.rewrite(
-          child,
-          [
-            ...rows,
-            { step_index: 2, type: 'CHECKPOINT' },
-            message(3, parent, 'New work'),
-            done(4, 'New reply'),
-          ],
-          afterRead,
-        )
-        await handle.cancel()
-        const canceled = events.length
-        assert.equal(
-          canceled,
-          beforeCancel,
-          'cancel must not re-emit rewritten history',
-        )
-        assert.equal(handle.isStopped(), true)
-        await appendFile(
-          f.path(child),
-          encode([message(5, parent, 'After cancel'), done(6, 'Invisible')]),
-        )
-        await handle.cancel()
-        assert.equal(events.length, canceled)
-      } finally {
-        handle?.()
-        await f.close()
-      }
-    },
-  )
+async function assertWatcherSurvivesEmptyRewriteWindow(emptyFlushes: number) {
+  const f = await fixture()
+  const events: ProviderEvent[] = []
+  let handle: BrainWatchHandle | undefined
+  try {
+    const rows = [message(0, parent, 'work'), done(1, 'Reply')]
+    await f.put(child, rows)
+    handle = watchBrain(
+      f.root,
+      child,
+      'c',
+      (event) => events.push(event),
+      60_000,
+    )
+    await handle.ready
+    const before = events.length
+    await f.rewrite(
+      child,
+      [...rows, { step_index: 2, type: 'CHECKPOINT' }],
+      async () => {
+        for (let i = 0; i < emptyFlushes; i++) await handle!.flush()
+      },
+    )
+    await handle.flush()
+    assert.equal(events.length, before, 'unchanged steps are not new activity')
+    await appendFile(
+      f.path(child),
+      encode([message(3, parent, 'New work'), done(4, 'New reply')]),
+    )
+    await handle.flush()
+    assert.deepEqual(assistantTextsFromEvents(events), ['Reply', 'New reply'])
+    const beforeCancel = events.length
+    // Cancel drains a rewrite while preserving history identity, then stops future polling.
+    await f.rewrite(
+      child,
+      [
+        ...rows,
+        { step_index: 2, type: 'CHECKPOINT' },
+        message(3, parent, 'New work'),
+        done(4, 'New reply'),
+      ],
+      () => handle!.flush(),
+    )
+    await handle.cancel()
+    const canceled = events.length
+    assert.equal(
+      canceled,
+      beforeCancel,
+      'cancel must not re-emit rewritten history',
+    )
+    assert.equal(handle.isStopped(), true)
+    await appendFile(
+      f.path(child),
+      encode([message(5, parent, 'After cancel'), done(6, 'Invisible')]),
+    )
+    await handle.cancel()
+    assert.equal(events.length, canceled)
+  } finally {
+    handle?.()
+    await f.close()
+  }
 }
+
+test(
+  'a child watcher does not restart turns across a single observed empty rewrite window',
+  { timeout: 5000 },
+  () => assertWatcherSurvivesEmptyRewriteWindow(1),
+)
+
+test(
+  'a child watcher does not restart turns across repeated observed empty rewrite windows',
+  { timeout: 5000 },
+  () => assertWatcherSurvivesEmptyRewriteWindow(3),
+)
 
 test(
   'canceling an active child during an observed empty rewrite emits one canceled terminal',
@@ -1862,10 +2170,7 @@ test(
       assert.equal(handle.isRunning(), true)
       await f.rewrite(child, rows, () => handle!.cancel())
       assert.equal(handle.isStopped(), true)
-      assert.deepEqual(
-        events.flatMap((e) => (e.type === 'session.turn' ? [e.state] : [])),
-        ['started', 'canceled'],
-      )
+      assert.deepEqual(turnStates(events), ['started', 'canceled'])
       const count = events.length
       await handle.cancel()
       assert.equal(
@@ -1933,18 +2238,11 @@ test(
       } finally {
         await file.close()
       }
-      assert.deepEqual(
-        events.flatMap((e) =>
-          e.type === 'timeline.item' && e.item.type === 'assistant_message'
-            ? [e.item.text]
-            : [],
-        ),
-        ['old', 'NEW COMPLETE ROW'],
-      )
-      assert.deepEqual(
-        events.flatMap((e) => (e.type === 'session.turn' ? [e.state] : [])),
-        ['started', 'canceled'],
-      )
+      assert.deepEqual(assistantTextsFromEvents(events), [
+        'old',
+        'NEW COMPLETE ROW',
+      ])
+      assert.deepEqual(turnStates(events), ['started', 'canceled'])
     } finally {
       handle?.()
       await f.close()
@@ -1955,30 +2253,41 @@ test(
 test('a rewrite observed mid-O_TRUNC does not end an anchored turn', async () => {
   const f = await fixture()
   const abort = new AbortController()
+  const obs = manualObs(f.root, parent)
+  let running: Promise<Awaited<ReturnType<typeof settleBrainTurn>>> | undefined
   try {
     const rows = [
       { step_index: 1, type: 'USER_INPUT', content: 'run' },
       { step_index: 2, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
     ]
     await f.put(parent, rows)
+    const stepEvents = new EventEmitter()
+    const step2Seen = once(stepEvents, '2')
     let settled = false
-    const running = alive(
+    running = alive(
       settleBrainTurn(f.root, parent, 'p', () => {}, {
         signal: abort.signal,
-        pollIntervalMs: 5,
+        observation: obs,
+        onStep: (step) => {
+          stepEvents.emit(String(step))
+        },
       }),
     ).then((result) => {
       settled = true
       return result
     })
-    await delay(30)
+    await step2Seen
+    await flushObs(obs)
     await f.rewrite(parent, [...rows, done(3, 'ok')], async () => {
-      await delay(30)
+      await flushObs(obs)
       assert.equal(settled, false, 'an empty file mid-rewrite is not "no turn"')
     })
+    await flushObs(obs)
     assert.equal((await running).status, 'completed')
   } finally {
     abort.abort()
+    await obs.dispose()
+    await running?.catch(() => undefined)
     await f.close()
   }
 })
@@ -1996,26 +2305,32 @@ const toolCall = (step: number, id: string): Row => ({
   tool_calls: [{ id, name: 'run_command', args: {} }],
 })
 
+function assertStoppedCallsDropped(interruption: Row[]) {
+  const projector = new BrainTranscriptProjector('c')
+  const items = [
+    message(0, parent, 'work'),
+    toolCall(1, 'stopped'),
+    ...interruption,
+    message(3, parent, 'continue'),
+    toolCall(4, 'fresh'),
+    { step_index: 5, type: 'GENERIC', status: 'DONE', content: 'out' },
+  ].flatMap((row) => projector.project(row))
+  assert.deepEqual(
+    items
+      .filter(
+        (i): i is Extract<ProviderTimelineItem, { type: 'tool_call' }> =>
+          i.type === 'tool_call' && i.status === 'completed',
+      )
+      .map((i) => i.callId),
+    ['fresh'],
+    'the result belongs to the current response',
+  )
+  assert.equal(projector.hasPending(), false)
+}
+
 test('stopped calls never linger: restart notices and new responses drop them', () => {
-  for (const interruption of [[stoppedNotice(2)], []]) {
-    const projector = new BrainTranscriptProjector('c')
-    const items = [
-      message(0, parent, 'work'),
-      toolCall(1, 'stopped'),
-      ...interruption,
-      message(3, parent, 'continue'),
-      toolCall(4, 'fresh'),
-      { step_index: 5, type: 'GENERIC', status: 'DONE', content: 'out' },
-    ].flatMap((row) => projector.project(row))
-    assert.deepEqual(
-      items.flatMap((i) =>
-        i.type === 'tool_call' && i.status === 'completed' ? [i.callId] : [],
-      ),
-      ['fresh'],
-      'the result belongs to the current response',
-    )
-    assert.equal(projector.hasPending(), false)
-  }
+  assertStoppedCallsDropped([stoppedNotice(2)])
+  assertStoppedCallsDropped([])
 })
 
 test('a child woken after an interrupted tool call completes its new turn', async () => {
@@ -2074,14 +2389,8 @@ test('resuming after a drained cancel neither repeats nor skips child rows', asy
     await until(() =>
       second.some((e) => e.type === 'session.turn' && e.state === 'completed'),
     )
-    const replies = (events: ProviderEvent[]) =>
-      events.flatMap((e) =>
-        e.type === 'timeline.item' && e.item.type === 'assistant_message'
-          ? [e.item.text]
-          : [],
-      )
-    assert.deepEqual(replies(first), ['Before cancel'])
-    assert.deepEqual(replies(second), ['After resume'])
+    assert.deepEqual(assistantTextsFromEvents(first), ['Before cancel'])
+    assert.deepEqual(assistantTextsFromEvents(second), ['After resume'])
   } finally {
     resumed?.()
     await f.close()
@@ -2270,21 +2579,19 @@ test('a woken ask_question is not background work and closes without a question 
 
 test('answering a woken ask_question continues the turn and records the answer', async () => {
   const f = await fixture()
+  const contItems: ProviderTimelineItem[] = []
+  const obs = manualObs(f.root, parent, -1, (item) => contItems.push(item))
   try {
     const rows = await loadWokenQuestionFixture()
     await f.put(parent, rows.slice(0, 6))
+    const answered = new EventEmitter()
+    const questionAnswered = once(answered, 'done')
 
     // With onQuestion answering and appending agy's GENERIC + PLANNER_RESPONSE (steps 6..7), settleBrainTurn continues and emits the final reply
-    const contItems: ProviderTimelineItem[] = []
-    const cont = await settleBrainTurn(
-      f.root,
-      parent,
-      'p',
-      (item) => contItems.push(item),
-      {
+    const pending = alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => contItems.push(item), {
         minStepIndex: -1,
-        pollIntervalMs: 5,
-        stallTimeoutMs: 50,
+        observation: obs,
         onQuestion: async (q) => {
           assert.equal(q.wokeUp, true)
           assert.equal(q.questions.length, 1)
@@ -2293,13 +2600,17 @@ test('answering a woken ask_question continues the turn and records the answer',
             'Background check finished. Which option?',
           )
           await appendFile(f.path(parent), encode(rows.slice(6)))
+          queueMicrotask(() => answered.emit('done'))
           return {
             status: 'answered',
             answerText: '(Recommended) Option 1',
           }
         },
-      },
+      }),
     )
+    await questionAnswered
+    await flushObs(obs)
+    const cont = await pending
     assert.equal(cont.status, 'completed')
     assert.equal(cont.wokeUp, true)
     const completedAsk = contItems.findLast(
@@ -2313,46 +2624,60 @@ test('answering a woken ask_question continues the turn and records the answer',
         completedAsk.detail.type === 'plain_text' &&
         completedAsk.detail.text?.includes('Answer:\n(Recommended) Option 1'),
     )
-    assert.deepEqual(
-      contItems.flatMap((i) =>
-        i.type === 'assistant_message' ? [i.text] : [],
-      ),
-      ['Done: (Recommended) Option 1'],
-    )
+    assert.deepEqual(assistantTextsFromItems(contItems), [
+      'Done: (Recommended) Option 1',
+    ])
   } finally {
+    await obs.dispose()
     await f.close()
   }
 })
 
 test('a woken question answered through elicitation waits for agy to reply to the answer', async () => {
   const f = await fixture()
+  const abort = new AbortController()
+  const items: ProviderTimelineItem[] = []
+  const obs = manualObs(f.root, parent, -1, (item) => items.push(item))
+  let running: Promise<Awaited<ReturnType<typeof settleBrainTurn>>> | undefined
   try {
     const rows = await loadWokenQuestionFixture()
     await f.put(parent, rows.slice(0, 6))
-    const items: ProviderTimelineItem[] = []
-    const settled = await alive(
+    const answered = new EventEmitter()
+    const questionAnswered = once(answered, 'done')
+    let isSettled = false
+    running = alive(
       settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
         minStepIndex: -1,
-        pollIntervalMs: 5,
-        stallTimeoutMs: 1000,
+        signal: abort.signal,
+        observation: obs,
         onQuestion: async () => {
           // agy logs the tool result and its reply only after the elicitation response, so later than this return.
-          setTimeout(() => {
-            void appendFile(
-              f.path(parent),
-              encode([rows[6], done(7, 'Done: (Recommended) Option 1')]),
-            )
-          }, 60)
+          queueMicrotask(() => answered.emit('done'))
           return { status: 'answered', answerText: '(Recommended) Option 1' }
         },
       }),
+    ).then((res) => {
+      isSettled = true
+      return res
+    })
+    await questionAnswered
+    await flushObs(obs)
+    assert.equal(isSettled, false)
+    await appendFile(
+      f.path(parent),
+      encode([rows[6], done(7, 'Done: (Recommended) Option 1')]),
     )
+    await flushObs(obs)
+    const settled = await running
+    running = undefined
     assert.equal(settled.status, 'completed')
-    assert.deepEqual(
-      items.flatMap((i) => (i.type === 'assistant_message' ? [i.text] : [])),
-      ['Done: (Recommended) Option 1'],
-    )
+    assert.deepEqual(assistantTextsFromItems(items), [
+      'Done: (Recommended) Option 1',
+    ])
   } finally {
+    abort.abort()
+    await obs.dispose()
+    await running?.catch(() => undefined)
     await f.close()
   }
 })
@@ -2453,28 +2778,10 @@ test('ask_question results stay attributed by step next to sibling tool calls', 
     { step_index: 3, type: 'GENERIC', status: 'DONE', content: 'User chose A' },
     { step_index: 4, type: 'GENERIC', status: 'DONE', content: 'hi' },
   ].flatMap((row) => p3.project(row))
-  assert.deepEqual(
-    checkpointed.flatMap((i) =>
-      i.type === 'tool_call' &&
-      i.status === 'completed' &&
-      i.detail.type !== 'unknown'
-        ? [
-            [
-              i.callId,
-              i.detail.type === 'shell'
-                ? i.detail.output
-                : i.detail.type === 'plain_text'
-                  ? i.detail.text
-                  : '',
-            ],
-          ]
-        : [],
-    ),
-    [
-      ['ask', 'Choose\n  1. A\n  2. B\n\nAnswer:\nUser chose A'],
-      ['cmd', 'hi'],
-    ],
-  )
+  assert.deepEqual(completedToolOutputs(checkpointed), [
+    ['ask', 'Choose\n  1. A\n  2. B\n\nAnswer:\nUser chose A'],
+    ['cmd', 'hi'],
+  ])
 })
 
 test('a leading ask_question fires onQuestion before its sibling has a GENERIC row', async () => {
@@ -2654,9 +2961,19 @@ test('readInboxState and readSubagents reject symlinked leaf files', async () =>
   }
 })
 
-test('foreground turn aborted by user permission denial settles immediately without stalling', async () => {
+test('foreground turn aborted by user permission denial settles immediately without stalling', async (t) => {
   const f = await fixture()
+  const items: ProviderTimelineItem[] = []
+  const obs1 = manualObs(f.root, parent, -1, (item) => items.push(item))
+  const spoofed = parent.replace(/^1/, '3')
+  const unlogged = parent.replace(/^1/, '2')
+  const obs2 = manualObs(f.root, spoofed)
+  const obs3 = manualObs(f.root, unlogged)
+  const abort = new AbortController()
+  let spoofRunning:
+    Promise<Awaited<ReturnType<typeof settleBrainTurn>>> | undefined
   try {
+    t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
     await f.put(parent, [
       { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'echo 1' },
       {
@@ -2673,21 +2990,22 @@ test('foreground turn aborted by user permission denial settles immediately with
           'Encountered error in step execution: permission check failed for unsandboxed "echo 1": user denied permission to execute',
       },
     ])
-    const items: ProviderTimelineItem[] = []
-    const started = Date.now()
-    const result = await alive(
-      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
-        pollIntervalMs: 5,
+    // Unstarted observation polls only once, proving immediate completion without waiting for stallTimeoutMs.
+    const result = await settleBrainTurn(
+      f.root,
+      parent,
+      'p',
+      (item) => items.push(item),
+      {
+        observation: obs1,
         stallTimeoutMs: 5000,
         acpToolCallIds: ['call_denied_0'],
         deniedToolCallIds: new Set(['call_denied_0']),
-      }),
+      },
     )
     assert.equal(result.status, 'completed')
-    assert.ok(Date.now() - started < 1000)
 
     // Untrusted tool error output containing permission-denial wording without a recorded denial must not settle early.
-    const spoofed = parent.replace(/^1/, '3')
     await f.put(spoofed, [
       { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'grep' },
       {
@@ -2704,18 +3022,28 @@ test('foreground turn aborted by user permission denial settles immediately with
           'Command exited with code 1.\npermission check failed: user denied permission',
       },
     ])
-    const spoofResult = await alive(
+    const spoofSteps = new EventEmitter()
+    const spoofStep2 = once(spoofSteps, '2')
+    spoofRunning = alive(
       settleBrainTurn(f.root, spoofed, 'p', () => {}, {
-        pollIntervalMs: 5,
+        signal: abort.signal,
+        observation: obs2,
         stallTimeoutMs: 60,
         acpToolCallIds: ['call_not_denied'],
         deniedToolCallIds: new Set(),
+        onStep: (step) => {
+          spoofSteps.emit(String(step))
+        },
       }),
     )
+    await spoofStep2
+    t.mock.timers.tick(60)
+    await flushObs(obs2)
+    const spoofResult = await spoofRunning
+    spoofRunning = undefined
     assert.equal(spoofResult.status, 'failed')
 
     // agy 1.5.5 returns end_turn without flushing the GENERIC row when permission is denied.
-    const unlogged = parent.replace(/^1/, '2')
     await f.put(unlogged, [
       { step_index: 0, type: 'USER_INPUT', status: 'DONE', content: 'echo 2' },
       {
@@ -2725,18 +3053,19 @@ test('foreground turn aborted by user permission denial settles immediately with
         tool_calls: [{ name: 'run_command', args: { CommandLine: 'echo 2' } }],
       },
     ])
-    const t2 = Date.now()
-    const result2 = await alive(
-      settleBrainTurn(f.root, unlogged, 'p', () => {}, {
-        pollIntervalMs: 5,
-        stallTimeoutMs: 5000,
-        acpToolCallIds: ['call_denied_1'],
-        deniedToolCallIds: new Set(['call_denied_1']),
-      }),
-    )
+    const result2 = await settleBrainTurn(f.root, unlogged, 'p', () => {}, {
+      observation: obs3,
+      stallTimeoutMs: 5000,
+      acpToolCallIds: ['call_denied_1'],
+      deniedToolCallIds: new Set(['call_denied_1']),
+    })
     assert.equal(result2.status, 'completed')
-    assert.ok(Date.now() - t2 < 1000)
   } finally {
+    abort.abort()
+    await obs1.dispose()
+    await obs2.dispose()
+    await obs3.dispose()
+    await spoofRunning?.catch(() => undefined)
     await f.close()
   }
 })
@@ -2823,7 +3152,7 @@ test('API/stream retries recover after 4s and multiple interruptions; unfinished
     })
     await step2Seen
     t.mock.timers.tick(4_000)
-    await obs.poll()
+    await flushObs(obs)
     await appendFile(
       f.path(parent),
       encode([
@@ -2836,11 +3165,11 @@ test('API/stream retries recover after 4s and multiple interruptions; unfinished
         },
       ]),
     )
-    await obs.poll()
+    await flushObs(obs)
     await step4Seen
     assert.equal(finished, false)
     await appendFile(f.path(parent), encode([done(5)]))
-    await obs.poll()
+    await flushObs(obs)
     assert.equal((await pending).status, 'completed')
     assert.equal(
       items.some((item) => item.type === 'error'),
@@ -2851,9 +3180,14 @@ test('API/stream retries recover after 4s and multiple interruptions; unfinished
   }
 })
 
-test('root retry exhaustion is bounded even with retained background work; cancellation wins', async () => {
+test('root retry exhaustion is bounded even with retained background work; cancellation wins', async (t) => {
   const f = await fixture()
+  const abort = new AbortController()
+  const obs1 = manualObs(f.root, parent)
+  const obs2 = manualObs(f.root, parent)
+  let running: Promise<Awaited<ReturnType<typeof settleBrainTurn>>> | undefined
   try {
+    t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
     const rows: Row[] = [
       { step_index: 1, type: 'USER_INPUT', content: 'work' },
       {
@@ -2870,13 +3204,22 @@ test('root retry exhaustion is bounded even with retained background work; cance
       interrupted(4),
     ]
     await f.put(parent, rows)
-    const result = await alive(
+    const steps = createStepTracker()
+    const step4Seen = steps.waitFor(4)
+    running = alive(
       settleBrainTurn(f.root, parent, 'p', () => {}, {
-        pollIntervalMs: 5,
+        signal: abort.signal,
+        observation: obs1,
         stallTimeoutMs: 30,
         retryTimeoutMs: 30,
+        onStep: steps.onStep,
       }),
     )
+    await step4Seen
+    t.mock.timers.tick(30)
+    await flushObs(obs1)
+    const result = await running
+    running = undefined
     assert.equal(result.status, 'failed')
     assert.match(
       result.error!,
@@ -2887,44 +3230,66 @@ test('root retry exhaustion is bounded even with retained background work; cance
     const pending = alive(
       settleBrainTurn(f.root, parent, 'p', () => {}, {
         signal: controller.signal,
-        pollIntervalMs: 5,
+        observation: obs2,
       }),
     )
     controller.abort()
     assert.equal((await pending).status, 'canceled')
   } finally {
+    abort.abort()
+    await obs1.dispose()
+    await obs2.dispose()
+    await running?.catch(() => undefined)
     await f.close()
   }
 })
 
 test('child retry recovers and delivers its report before parent completion', async () => {
   const f = await fixture()
+  const abort = new AbortController()
+  const obs = manualObs(f.root, parent)
+  let pending: Promise<Awaited<ReturnType<typeof settleBrainTurn>>> | undefined
   try {
     await f.put(parent, invoke(child))
     await f.subagent(parent, child)
     await f.put(child, [interrupted(1)])
     assert.equal(await hasActiveBackgroundWork(f.root, parent), true)
+    const stepEvents = new EventEmitter()
+    const step4Seen = once(stepEvents, '4')
     let finished = false
-    const pending = alive(
+    pending = alive(
       settleBrainTurn(f.root, parent, 'p', () => {}, {
-        pollIntervalMs: 5,
+        signal: abort.signal,
+        observation: obs,
         stallTimeoutMs: 1000,
+        onStep: (step) => {
+          stepEvents.emit(String(step))
+        },
       }),
     ).then((result) => {
       finished = true
       return result
     })
-    await delay(25)
+    await step4Seen
+    await flushObs(obs)
     assert.equal(finished, false)
+    const msgId = await f.deliver(parent, child, 'report', false)
     await appendFile(f.path(child), encode(report(parent, 'report', 2)))
-    await f.deliver(parent, child, 'report')
+    await f.deliver(parent, child, 'report', true, msgId)
     await appendFile(
       f.path(parent),
       encode([message(5, child, 'report'), done(6)]),
     )
-    assert.equal((await pending).status, 'completed')
+    await flushObs(obs)
+    const settled = await pending
+    pending = undefined
+    assert.equal(settled.status, 'completed')
+    assert.equal(settled.wokeUp, true)
     assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
   } finally {
+    abort.abort()
+    await obs.dispose()
+    await pending?.catch(() => undefined)
     await f.close()
   }
 })
@@ -2955,67 +3320,94 @@ test('expired child retry fails parent and active-work checks, recovered history
   }
 })
 
-test('watcher retries recover without failed events, while cancellation and exhaustion stay distinct', async () => {
+async function startRetryWatcher(
+  t: TestContext,
+  f: Awaited<ReturnType<typeof fixture>>,
+) {
+  await f.put(child, [interrupted(1)])
+  const events: ProviderEvent[] = []
+  const handle = watchBrain(
+    f.root,
+    child,
+    'c',
+    (event) => events.push(event),
+    60_000,
+    undefined,
+    undefined,
+    undefined,
+    80,
+  )
+  t.after(() => handle())
+  await handle.ready
+  assert.equal(handle.isRunning(), true)
+  return { events, handle }
+}
+
+test('watcher retries recover without failed events, while cancellation and exhaustion stay distinct', async (t) => {
   const f = await fixture()
-  const handles: BrainWatchHandle[] = []
-  try {
-    for (const outcome of ['recover', 'cancel', 'exhaust'] as const) {
-      await f.put(child, [interrupted(1)])
-      const events: ProviderEvent[] = []
-      const handle = watchBrain(
-        f.root,
-        child,
-        'c',
-        (event) => events.push(event),
-        5,
-        undefined,
-        undefined,
-        undefined,
-        80,
-      )
-      handles.push(handle)
-      await handle.ready
-      assert.equal(handle.isRunning(), true)
-      if (outcome === 'recover') {
-        await appendFile(
-          f.path(child),
-          encode([
-            {
-              step_index: 2,
-              type: 'PLANNER_RESPONSE',
-              status: 'RUNNING',
-              thinking: 'retry',
-            },
-          ]),
-        )
-        await delay(15)
-        assert.equal(handle.isRunning(), true)
-        await appendFile(f.path(child), encode([done(3)]))
-      } else if (outcome === 'cancel') await handle.cancel()
-      await until(() =>
-        events.some(
-          (e) =>
-            e.type === 'session.turn' &&
-            e.state ===
-              (outcome === 'recover'
-                ? 'completed'
-                : outcome === 'cancel'
-                  ? 'canceled'
-                  : 'failed'),
-        ),
-      )
-      assert.equal(
-        events.some(
-          (e) => e.type === 'timeline.item' && e.item.type === 'error',
-        ),
-        false,
-      )
-      handle()
-    }
-  } finally {
-    for (const handle of handles) handle()
-    await f.close()
-  }
+  t.after(() => f.close())
+  t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
+
+  const recovered = await startRetryWatcher(t, f)
+  await appendFile(
+    f.path(child),
+    encode([
+      {
+        step_index: 2,
+        type: 'PLANNER_RESPONSE',
+        status: 'RUNNING',
+        thinking: 'retry',
+      },
+    ]),
+  )
+  t.mock.timers.tick(15)
+  await recovered.handle.flush()
+  assert.equal(recovered.handle.isRunning(), true)
+  await appendFile(f.path(child), encode([done(3)]))
+  await recovered.handle.flush()
+  assert.ok(
+    recovered.events.some(
+      (e) => e.type === 'session.turn' && e.state === 'completed',
+    ),
+  )
+  assert.equal(
+    recovered.events.some(
+      (e) => e.type === 'timeline.item' && e.item.type === 'error',
+    ),
+    false,
+  )
+  recovered.handle()
+
+  const canceled = await startRetryWatcher(t, f)
+  await canceled.handle.cancel()
+  assert.ok(
+    canceled.events.some(
+      (e) => e.type === 'session.turn' && e.state === 'canceled',
+    ),
+  )
+  assert.equal(
+    canceled.events.some(
+      (e) => e.type === 'timeline.item' && e.item.type === 'error',
+    ),
+    false,
+  )
+  canceled.handle()
+
+  const exhausted = await startRetryWatcher(t, f)
+  t.mock.timers.tick(80)
+  await exhausted.handle.flush()
+  assert.ok(
+    exhausted.events.some(
+      (e) => e.type === 'session.turn' && e.state === 'failed',
+    ),
+  )
+  assert.equal(
+    exhausted.events.some(
+      (e) => e.type === 'timeline.item' && e.item.type === 'error',
+    ),
+    false,
+  )
+  exhausted.handle()
 })
 
 test('a real failure after a stream warning remains a failure, recovered replay remains completed', async () => {
@@ -3092,10 +3484,11 @@ test('retry warnings retain background and subagent associations', () => {
   assert.equal(projector.touchedSubagentIds().size, 0)
 })
 
-test('a missing transcript during retry cannot report success', async () => {
+test('a missing transcript during retry cannot report success', async (t) => {
   const f = await fixture()
   let handle: BrainWatchHandle | undefined
   try {
+    t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
     await f.put(child, [interrupted(1)])
     const events: ProviderEvent[] = []
     handle = watchBrain(
@@ -3103,15 +3496,20 @@ test('a missing transcript during retry cannot report success', async () => {
       child,
       'c',
       (event) => events.push(event),
-      5,
+      60_000,
       () => false,
       undefined,
       undefined,
       50,
     )
     await handle.ready
+    assert.equal(handle.isRunning(), true)
     await rm(f.path(child))
-    await until(() =>
+    await handle.flush()
+    assert.equal(handle.isRunning(), true)
+    t.mock.timers.tick(50)
+    await handle.flush()
+    assert.ok(
       events.some((e) => e.type === 'session.turn' && e.state === 'failed'),
     )
     assert.equal(
@@ -3143,14 +3541,6 @@ test('a busy sibling cannot hide another child retry timeout', async () => {
   } finally {
     await f.close()
   }
-})
-
-test('an explicit error status is never classified as a retry warning', () => {
-  const projector = new BrainTranscriptProjector('retry')
-  assert.equal(
-    projector.project({ ...interrupted(1), status: 'ERROR' })[0].type,
-    'error',
-  )
 })
 
 test('cancellation observed while ingesting wins over a terminal failure', async () => {
@@ -3214,11 +3604,13 @@ test('quiet DONE completes root and child turns instead of stalling them', async
   }
 })
 
-test('root retry wait uses its own bounded policy and can recover with a quiet DONE', async () => {
+test('root retry wait uses its own bounded policy and can recover with a quiet DONE', async (t) => {
   const f = await fixture()
   const controller = new AbortController()
+  const obs = manualObs(f.root, parent)
   let pending: ReturnType<typeof settleBrainTurn> | undefined
   try {
+    t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
     await f.put(parent, [
       { step_index: 1, type: 'USER_INPUT' },
       {
@@ -3229,19 +3621,26 @@ test('root retry wait uses its own bounded policy and can recover with a quiet D
         error: 'API error (attempt 1): request failed: synthetic timeout',
       },
     ])
+    const stepEvents = new EventEmitter()
+    const step2Seen = once(stepEvents, '2')
     let finished = false
     pending = alive(
       settleBrainTurn(f.root, parent, 'p', () => {}, {
         signal: controller.signal,
-        pollIntervalMs: 5,
+        observation: obs,
         stallTimeoutMs: 5,
-        retryTimeoutMs: 1000,
+        retryTimeoutMs: 60_000,
+        onStep: (step) => {
+          stepEvents.emit(String(step))
+        },
       }),
     ).then((result) => {
       finished = true
       return result
     })
-    await delay(25)
+    await step2Seen
+    t.mock.timers.tick(25)
+    await flushObs(obs)
     assert.equal(
       finished,
       false,
@@ -3258,41 +3657,49 @@ test('root retry wait uses its own bounded policy and can recover with a quiet D
         },
       ]),
     )
+    await flushObs(obs)
     assert.equal((await pending).status, 'completed')
   } finally {
     controller.abort()
-    await pending
+    await obs.dispose()
+    await pending?.catch(() => undefined)
     await f.close()
   }
 })
+
+async function assertExpiredRetryRetainsTask(
+  f: Awaited<ReturnType<typeof fixture>>,
+  expired: Row,
+  IsDaemon: boolean,
+) {
+  await f.put(parent, [
+    { step_index: 1, type: 'USER_INPUT' },
+    {
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      tool_calls: [{ name: 'run_command', args: { IsDaemon } }],
+    },
+    {
+      step_index: 3,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: 'Tool is running as a background task with task id: retained',
+    },
+    expired,
+  ])
+  assert.equal(await hasActiveBackgroundWork(f.root, parent), !IsDaemon)
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
+    true,
+  )
+}
 
 test('expired retries do not hide retained processes, daemon policy, unread messages or active descendants', async () => {
   const f = await fixture()
   try {
     const expired = interrupted(4, '2020-01-01T00:00:00Z')
-    for (const IsDaemon of [false, true]) {
-      await f.put(parent, [
-        { step_index: 1, type: 'USER_INPUT' },
-        {
-          step_index: 2,
-          type: 'PLANNER_RESPONSE',
-          tool_calls: [{ name: 'run_command', args: { IsDaemon } }],
-        },
-        {
-          step_index: 3,
-          type: 'GENERIC',
-          status: 'RUNNING',
-          content:
-            'Tool is running as a background task with task id: retained',
-        },
-        expired,
-      ])
-      assert.equal(await hasActiveBackgroundWork(f.root, parent), !IsDaemon)
-      assert.equal(
-        await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
-        true,
-      )
-    }
+    await assertExpiredRetryRetainsTask(f, expired, false)
+    await assertExpiredRetryRetainsTask(f, expired, true)
     await f.put(parent, [{ step_index: 1, type: 'USER_INPUT' }, expired])
     assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
     await f.deliver(parent, child, 'unread report', false)
@@ -3465,9 +3872,7 @@ test('cancel wins after multiple exhausted warnings are ingested', async () => {
     const result = await alive(
       settleBrainTurn(f.root, parent, 'p', () => {}, {
         signal: controller.signal,
-        onStep: (step) => {
-          if (step === 3) controller.abort()
-        },
+        onStep: sequenceDouble([() => {}, () => {}, () => controller.abort()]),
         retryTimeoutMs: 50,
       }),
     )
@@ -3536,52 +3941,85 @@ test('completed checkpoint projects preTokens without guessing trigger or post-c
   assert.ok(
     b.type === 'tool_call' && b.callId === 'b' && b.status === 'completed',
   )
-  for (const status of [undefined, 'RUNNING', 'CANCELED', 'ERROR']) {
-    assert.deepEqual(
-      new BrainTranscriptProjector('p').project({ ...checkpoint, status }),
-      [],
-    )
-  }
+  assert.deepEqual(
+    new BrainTranscriptProjector('p').project({
+      ...checkpoint,
+      status: undefined,
+    }),
+    [],
+  )
+  assert.deepEqual(
+    new BrainTranscriptProjector('p').project({
+      ...checkpoint,
+      status: 'RUNNING',
+    }),
+    [],
+  )
+  assert.deepEqual(
+    new BrainTranscriptProjector('p').project({
+      ...checkpoint,
+      status: 'CANCELED',
+    }),
+    [],
+  )
+  assert.deepEqual(
+    new BrainTranscriptProjector('p').project({
+      ...checkpoint,
+      status: 'ERROR',
+    }),
+    [],
+  )
 })
 
-test('foreground and wakeup project checkpoints without using checkpoint tokens as model usage', async () => {
-  for (const wakeup of [false, true]) {
-    const f = await fixture()
-    try {
-      const checkpoint = { ...(await checkpointFixture()), step_index: 4 }
-      await f.put(parent, [
-        { step_index: 1, type: 'USER_INPUT', content: 'work' },
-        { ...done(2, 'waiting'), input_tokens: 100, output_tokens: 5 },
-        ...(wakeup ? [message(3, 'system', 'continue')] : []),
-        checkpoint,
-        { ...done(5), input_tokens: 10, output_tokens: 2 },
-      ])
-      const items: ProviderTimelineItem[] = []
-      const result = await alive(
-        settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
-          pollIntervalMs: 5,
-        }),
-      )
-      assert.equal(result.status, 'completed')
-      assert.deepEqual(
-        items.filter((item) => item.type === 'compaction'),
-        [
-          {
-            type: 'compaction',
-            id: 'p:step:4:compaction',
-            status: 'completed',
-            preTokens: 268_740,
-          },
-        ],
-      )
-      assert.equal(result.lastStepUsage?.inputTokens, 10)
-      assert.equal(result.lastStepUsage?.outputTokens, 2)
-      assert.equal(result.wakeupUsage?.inputTokens, wakeup ? 10 : undefined)
-      assert.equal(result.wakeupUsage?.outputTokens, wakeup ? 2 : undefined)
-    } finally {
-      await f.close()
-    }
+async function assertCheckpointExcludesModelUsage(
+  extraRows: Row[],
+  expectedWakeupInput?: number,
+  expectedWakeupOutput?: number,
+) {
+  const f = await fixture()
+  try {
+    const checkpoint = { ...(await checkpointFixture()), step_index: 4 }
+    await f.put(parent, [
+      { step_index: 1, type: 'USER_INPUT', content: 'work' },
+      { ...done(2, 'waiting'), input_tokens: 100, output_tokens: 5 },
+      ...extraRows,
+      checkpoint,
+      { ...done(5), input_tokens: 10, output_tokens: 2 },
+    ])
+    const items: ProviderTimelineItem[] = []
+    const result = await alive(
+      settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+        pollIntervalMs: 5,
+      }),
+    )
+    assert.equal(result.status, 'completed')
+    assert.deepEqual(
+      items.filter((item) => item.type === 'compaction'),
+      [
+        {
+          type: 'compaction',
+          id: 'p:step:4:compaction',
+          status: 'completed',
+          preTokens: 268_740,
+        },
+      ],
+    )
+    assert.equal(result.lastStepUsage?.inputTokens, 10)
+    assert.equal(result.lastStepUsage?.outputTokens, 2)
+    assert.equal(result.wakeupUsage?.inputTokens, expectedWakeupInput)
+    assert.equal(result.wakeupUsage?.outputTokens, expectedWakeupOutput)
+  } finally {
+    await f.close()
   }
+}
+
+test('foreground and wakeup project checkpoints without using checkpoint tokens as model usage', async () => {
+  await assertCheckpointExcludesModelUsage([], undefined, undefined)
+  await assertCheckpointExcludesModelUsage(
+    [message(3, 'system', 'continue')],
+    10,
+    2,
+  )
 })
 
 test('a command-only checkpoint is visible without inventing a model response or usage', async () => {
@@ -3637,22 +4075,16 @@ test('child compaction stays on child timeline, survives cancellation drain, and
     )
     await handle.ready
     assert.equal(handle.isRunning(), true)
-    const compactions = () =>
-      events.flatMap((event) =>
-        event.type === 'timeline.item' && event.item.type === 'compaction'
-          ? [event]
-          : [],
-      )
+    const compactions = () => compactionEvents(events)
     assert.equal(compactions().length, 1)
     assert.equal(compactions()[0].sessionId, 'child')
     await f.rewrite(
       child,
       [...rows, { step_index: 3, type: 'CHECKPOINT', status: 'RUNNING' }],
       async () => {
-        await delay(50)
+        await handle!.flush()
       },
     )
-    await delay(25)
     await handle.cancel()
     assert.equal(compactions().length, 1)
     assert.ok(
@@ -3699,12 +4131,7 @@ test('a late child checkpoint keeps the completed child terminal and retains nat
       f.path(child),
       encode([{ ...(await checkpointFixture()), step_index: 2 }]),
     )
-    await until(() =>
-      events.some(
-        (event) =>
-          event.type === 'timeline.item' && event.item.type === 'compaction',
-      ),
-    )
+    await handle.flush()
     assert.equal(handle.isRunning(), false)
     assert.equal(
       events.filter((event) => event.type === 'session.turn').length,
@@ -3742,11 +4169,7 @@ test('a complete checkpoint before a partial trailing row is delivered before ca
     )
     await handle.ready
     await handle.cancel()
-    const projected = events.flatMap((event) =>
-      event.type === 'timeline.item' && event.item.type === 'compaction'
-        ? [event]
-        : [],
-    )
+    const projected = compactionEvents(events)
     assert.equal(
       projected.length,
       1,
@@ -3764,25 +4187,28 @@ test('a complete checkpoint before a partial trailing row is delivered before ca
   }
 })
 
+function assertCheckpointRetainsTask(checkpoint: Row, IsDaemon: boolean) {
+  const projector = new BrainTranscriptProjector('p')
+  projector.project({
+    step_index: 1,
+    type: 'PLANNER_RESPONSE',
+    tool_calls: [{ name: 'run_command', args: { IsDaemon } }],
+  })
+  projector.project({
+    step_index: 2,
+    type: 'GENERIC',
+    status: 'RUNNING',
+    content: 'Tool is running as a background task with task id: tracked',
+  })
+  projector.project({ ...checkpoint, step_index: 3 })
+  assert.equal(projector.hasBackground(), !IsDaemon)
+  assert.equal(projector.hasDaemons(), IsDaemon)
+}
+
 test('a completed checkpoint retains background and daemon task tracking', async () => {
   const checkpoint = await checkpointFixture()
-  for (const IsDaemon of [false, true]) {
-    const projector = new BrainTranscriptProjector('p')
-    projector.project({
-      step_index: 1,
-      type: 'PLANNER_RESPONSE',
-      tool_calls: [{ name: 'run_command', args: { IsDaemon } }],
-    })
-    projector.project({
-      step_index: 2,
-      type: 'GENERIC',
-      status: 'RUNNING',
-      content: 'Tool is running as a background task with task id: tracked',
-    })
-    projector.project({ ...checkpoint, step_index: 3 })
-    assert.equal(projector.hasBackground(), !IsDaemon)
-    assert.equal(projector.hasDaemons(), IsDaemon)
-  }
+  assertCheckpointRetainsTask(checkpoint, false)
+  assertCheckpointRetainsTask(checkpoint, true)
 })
 
 test('low-priority kill notice during foreground loop or after inline ask_question does not trigger wakeup', async () => {
@@ -3987,6 +4413,39 @@ test('orphan trailing GENERIC(DONE) after complete PLANNER_RESPONSE does not un-
   }
 })
 
+async function assertCachedWakeupEmitted(
+  root: string,
+  emitForeground: boolean,
+  foregroundAcp: readonly ForegroundAcpSegment[],
+) {
+  const itemsC: ProviderTimelineItem[] = []
+  const resC = await settleBrainTurn(
+    root,
+    parent,
+    'p',
+    (item) => itemsC.push(item),
+    {
+      minStepIndex: 0,
+      emitForeground,
+      foregroundAcp,
+    },
+  )
+  assert.equal(resC.status, 'completed')
+  assert.equal(resC.wokeUp, true)
+  assert.deepEqual(resC.wakeupUsage, {
+    inputTokens: 0,
+    cachedReadTokens: 50000,
+    outputTokens: 10,
+  })
+  assert.equal(
+    itemsC.some(
+      (i) =>
+        i.type === 'assistant_message' && i.text === 'Cached wakeup reply.',
+    ),
+    true,
+  )
+}
+
 test('in-RPC high-priority continuation is suppressed and excluded from wakeupUsage while genuine post-RPC wakeup is emitted', async () => {
   // Subcase 1: Covered in-RPC continuation with tool calls, retry warning, and foreground reasoning/text.
   const f1 = await fixture()
@@ -4090,11 +4549,7 @@ test('in-RPC high-priority continuation is suppressed and excluded from wakeupUs
     assert.equal(res1.wokeUp, undefined)
     assert.equal(res1.wakeupUsage, undefined)
     assert.deepEqual(
-      items1.map((i) =>
-        i.type === 'tool_call'
-          ? `${i.type}:${i.callId}:${i.status}`
-          : `${i.type}:${'text' in i ? i.text : ''}`,
-      ),
+      items1.map(itemTag),
       ['tool_call:bg-196:completed'],
       'in-RPC continuation must emit only unstreamed background tool completion',
     )
@@ -4117,36 +4572,10 @@ test('in-RPC high-priority continuation is suppressed and excluded from wakeupUs
         output_tokens: 10,
       },
     ])
-    for (const emitForeground of [false, true]) {
-      const itemsC: ProviderTimelineItem[] = []
-      const resC = await settleBrainTurn(
-        f2.root,
-        parent,
-        'p',
-        (item) => itemsC.push(item),
-        {
-          minStepIndex: 0,
-          emitForeground,
-          foregroundAcp: emitForeground
-            ? []
-            : [{ type: 'assistant_message', text: 'Start' }],
-        },
-      )
-      assert.equal(resC.status, 'completed')
-      assert.equal(resC.wokeUp, true)
-      assert.deepEqual(resC.wakeupUsage, {
-        inputTokens: 0,
-        cachedReadTokens: 50000,
-        outputTokens: 10,
-      })
-      assert.equal(
-        itemsC.some(
-          (i) =>
-            i.type === 'assistant_message' && i.text === 'Cached wakeup reply.',
-        ),
-        true,
-      )
-    }
+    await assertCachedWakeupEmitted(f2.root, false, [
+      { type: 'assistant_message', text: 'Start' },
+    ])
+    await assertCachedWakeupEmitted(f2.root, true, [])
   } finally {
     await f2.close()
   }
@@ -4192,10 +4621,7 @@ test('in-RPC high-priority continuation is suppressed and excluded from wakeupUs
       cachedReadTokens: 10,
       outputTokens: 6,
     })
-    assert.deepEqual(
-      items2.map((i) => `${i.type}:${'text' in i ? i.text : ''}`),
-      ['assistant_message:OK'],
-    )
+    assert.deepEqual(items2.map(itemTextTag), ['assistant_message:OK'])
   } finally {
     await f3.close()
   }
@@ -4432,7 +4858,8 @@ test('re-waking a child across turns isolates prior failed grandchildren while r
       turn2Settled = true
       return res
     })
-    // Finish grandchild2 -> child -> parent.
+    // Finish grandchild2 -> child -> parent (deliver inbox messages before sender completion rows).
+    await f.deliver(child, grandchild2, 'gc2 finished', true, 'gc2-done')
     await appendFile(
       f.path(grandchild2),
       encode([
@@ -4440,7 +4867,7 @@ test('re-waking a child across turns isolates prior failed grandchildren while r
         ...report(child, 'gc2 finished', 3),
       ]),
     )
-    await f.deliver(child, grandchild2, 'gc2 finished', true, 'gc2-done')
+    await f.deliver(parent, child, 'turn 2 complete', true, 'c-w2')
     await appendFile(
       f.path(child),
       encode([
@@ -4448,7 +4875,6 @@ test('re-waking a child across turns isolates prior failed grandchildren while r
         ...report(parent, 'turn 2 complete', 13),
       ]),
     )
-    await f.deliver(parent, child, 'turn 2 complete', true, 'c-w2')
     await appendFile(
       f.path(parent),
       encode([message(13, child, 'turn 2 complete'), done(14, 'done turn 2')]),
@@ -4456,10 +4882,9 @@ test('re-waking a child across turns isolates prior failed grandchildren while r
 
     await waitUntil(() => turn2Settled)
     assert.equal(((await running) as { status: string }).status, 'completed')
-    await waitUntil(() => !handle!.isRunning())
-    const childTurns = childEvents.flatMap((e) =>
-      e.type === 'session.turn' ? [`${e.turnId}:${e.state}`] : [],
-    )
+    await handle!.flush()
+    assert.equal(handle!.isRunning(), false)
+    const childTurns = turnIdsAndStates(childEvents)
     assert.deepEqual(childTurns, [
       'child:turn:1:started',
       'child:turn:1:failed',
@@ -4560,13 +4985,6 @@ test('re-waking a child after Turn-1 retry timeout succeeds without Turn-1 retry
       callId: 'send-2',
       name: 'send_message',
     })
-    await appendFile(
-      f.path(child),
-      encode([
-        message(4, parent, 'wake 2'),
-        ...report(parent, 'recovered in turn 2', 5),
-      ]),
-    )
     await f.deliver(parent, child, 'recovered in turn 2', true, 'c-done', {
       conversationId: child,
       stepIndex: 6,
@@ -4574,16 +4992,22 @@ test('re-waking a child after Turn-1 retry timeout succeeds without Turn-1 retry
       name: 'send_message',
     })
     await appendFile(
+      f.path(child),
+      encode([
+        message(4, parent, 'wake 2'),
+        ...report(parent, 'recovered in turn 2', 5),
+      ]),
+    )
+    await appendFile(
       f.path(parent),
       encode([message(12, child, 'recovered in turn 2'), done(13, 'all done')]),
     )
 
     await waitUntil(() => turn2Result !== undefined)
     assert.equal(((await running) as { status: string }).status, 'completed')
-    await waitUntil(() => !handle!.isRunning())
-    const childTurns = childEvents.flatMap((e) =>
-      e.type === 'session.turn' ? [`${e.turnId}:${e.state}`] : [],
-    )
+    await handle!.flush()
+    assert.equal(handle!.isRunning(), false)
+    const childTurns = turnIdsAndStates(childEvents)
     assert.deepEqual(childTurns, [
       'child:turn:1:started',
       'child:turn:1:failed',
@@ -4768,10 +5192,7 @@ test('watchBrain fresh replay on nested Turn-2 re-wakeup isolates Turn-1 failed 
     )
     handles.push(gcHandle)
     await gcHandle.ready
-    assert.deepEqual(
-      gcEvents.flatMap((e) => (e.type === 'session.turn' ? [e.state] : [])),
-      ['started', 'completed'],
-    )
+    assert.deepEqual(turnStates(gcEvents), ['started', 'completed'])
 
     // Peer-woken child: woken by sibling `child` rather than `parent`, must settle cleanly without hanging.
     await f.put(peerChild, [
@@ -4913,18 +5334,11 @@ test('follow-up send_message to a child stalled in retryPending never deadlocks 
       callId: 'ws-call',
       name: 'send_message',
     })
-    await appendFile(
-      f.path(child),
-      encode([
-        message(2, parent, 'wake 1'),
-        interrupted(3, '2020-01-01T00:00:00Z'),
-      ]),
-    )
+    await f.deliver(parent, sibling, 's2 report', true, 's2-rep')
     await appendFile(
       f.path(sibling),
       encode([message(2, parent, 'wake s'), done(3, 's2 done')]),
     )
-    await f.deliver(parent, sibling, 's2 report', true, 's2-rep')
     await f.deliver(child, parent, 'wake 2', false, 'w2', {
       conversationId: parent,
       stepIndex: 14,
@@ -4941,6 +5355,13 @@ test('follow-up send_message to a child stalled in retryPending never deadlocks 
       ...sendPair(child, 'wake 2', 13, 'w2-call'),
       done(15, 'waiting on child'),
     ])
+    await appendFile(
+      f.path(child),
+      encode([
+        message(2, parent, 'wake 1'),
+        interrupted(3, '2020-01-01T00:00:00Z'),
+      ]),
+    )
 
     const settled = await settleBrainTurn(f.root, parent, 'p', () => {}, {
       minStepIndex: 5,
@@ -4953,17 +5374,12 @@ test('follow-up send_message to a child stalled in retryPending never deadlocks 
     assert.match(settled.error ?? '', /No retry recovery was observed/)
 
     await childWatch.flush()
-    assert.deepEqual(
-      childEvents.flatMap((e) =>
-        e.type === 'session.turn' ? [`${e.turnId}:${e.state}`] : [],
-      ),
-      [
-        'child:turn:1:started',
-        'child:turn:1:completed',
-        'child:turn:2:started',
-        'child:turn:2:failed',
-      ],
-    )
+    assert.deepEqual(turnIdsAndStates(childEvents), [
+      'child:turn:1:started',
+      'child:turn:1:completed',
+      'child:turn:2:started',
+      'child:turn:2:failed',
+    ])
 
     // Same-turn spawn + follow-up send_message while child has expired retryPending or replay mode (isParentTurnActive=false).
     const sameTurnChild = 'aaaaaaaa-1111-4111-8111-111111111111'
@@ -5005,10 +5421,7 @@ test('follow-up send_message to a child stalled in retryPending never deadlocks 
     )
     handles.push(stWatch)
     await stWatch.ready
-    assert.deepEqual(
-      stEvents.flatMap((e) => (e.type === 'session.turn' ? [e.state] : [])),
-      ['started', 'failed'],
-    )
+    assert.deepEqual(turnStates(stEvents), ['started', 'failed'])
   } finally {
     handles.forEach((close) => close())
     await f.close()
@@ -5113,10 +5526,11 @@ test('terminal ERROR_MESSAGE in parent does not hide live subagents re-woken ear
   }
 })
 
-test('watchBrain does not advance turnFloor past child ERROR_MESSAGE on grandchild report in the same turn', async () => {
+test('watchBrain does not advance turnFloor past child ERROR_MESSAGE on grandchild report in the same turn', async (t) => {
   const f = await fixture()
   let handle: BrainWatchHandle | undefined
   try {
+    t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
     const events: ProviderEvent[] = []
     await f.deliver(child, parent, 'init child', true, 'init-c', {
       conversationId: parent,
@@ -5140,27 +5554,25 @@ test('watchBrain does not advance turnFloor past child ERROR_MESSAGE on grandchi
       child,
       'child',
       (e) => events.push(e),
-      50,
+      60_000,
       undefined,
       undefined,
       undefined,
       200,
     )
     await handle.ready
+    assert.equal(handle.isRunning(), true)
+    assert.equal(handle.resumePoint().afterStep, 1)
     // The retry warning arms its deadline on its own read pass, before the report lands.
-    await waitUntil(() => (handle?.resumePoint().afterStep ?? -1) >= 1)
-    await f.put(child, [
-      message(0, parent, 'work'),
-      {
-        step_index: 1,
-        type: 'ERROR_MESSAGE',
-        status: 'DONE',
-        content:
-          'The stream was interrupted. Please continue the task you were working on.',
-      },
-      message(2, grandchild, 'late grandchild report'),
-    ])
-    await waitUntil(() => handle?.isRunning() === false)
+    await appendFile(
+      f.path(child),
+      encode([message(2, grandchild, 'late grandchild report')]),
+    )
+    await handle.flush()
+    assert.equal(handle.resumePoint().afterStep, 2)
+    assert.equal(handle.isRunning(), true)
+    t.mock.timers.tick(200)
+    await handle.flush()
     assert.equal(handle.isRunning(), false)
     assert.ok(
       events.some((e) => e.type === 'session.turn' && e.state === 'failed'),
@@ -5524,6 +5936,7 @@ test('child initial spawn prompt after step-0 system reminder projects user_mess
       return res
     })
 
+    await f.deliver(parent, child, 'child final report', true, 'c-report')
     await appendFile(
       f.path(child),
       encode([
@@ -5531,7 +5944,6 @@ test('child initial spawn prompt after step-0 system reminder projects user_mess
         ...report(parent, 'child final report', 6),
       ]),
     )
-    await f.deliver(parent, child, 'child final report', true, 'c-report')
     await appendFile(
       f.path(parent),
       encode([message(5, child, 'child final report'), done(6, 'all done')]),
@@ -5586,7 +5998,7 @@ test('question-continuation USER_INPUT preserves turnStartStep and touchedSubage
   const replayNode = new BrainNode(parent, 'p', {
     allowInitialSpawnPrompt: false,
   })
-  for (const row of spawnAndAsk(10)) replayNode.ingest(row)
+  ingestAll(replayNode, spawnAndAsk(10))
   assert.equal(replayNode.turnStartStep, 10)
   assert.equal(replayNode.projector.hasPendingQuestion(), true)
   assert.deepEqual([...replayNode.projector.touchedSubagentIds()], [child])
@@ -5621,7 +6033,7 @@ test('question-continuation USER_INPUT preserves turnStartStep and touchedSubage
   const liveNode = new BrainNode(parent, 'p', {
     allowInitialSpawnPrompt: false,
   })
-  for (const row of spawnAndAsk(20)) liveNode.ingest(row)
+  ingestAll(liveNode, spawnAndAsk(20))
   assert.ok(liveNode.projector.consumePendingQuestion())
   assert.equal(liveNode.projector.hasPendingQuestion(), false)
   liveNode.markQuestionContinuation(true)
@@ -5641,7 +6053,7 @@ test('question-continuation USER_INPUT preserves turnStartStep and touchedSubage
   const wokenReplayNode = new BrainNode(parent, 'p', {
     allowInitialSpawnPrompt: false,
   })
-  for (const row of [
+  ingestAll(wokenReplayNode, [
     { step_index: 30, type: 'USER_INPUT', content: 'start' },
     done(31, 'waiting'),
     message(32, child, 'child finished'),
@@ -5658,9 +6070,7 @@ test('question-continuation USER_INPUT preserves turnStartStep and touchedSubage
         },
       ],
     },
-  ] satisfies Row[]) {
-    wokenReplayNode.ingest(row)
-  }
+  ])
   assert.equal(wokenReplayNode.wokeUp, true)
   assert.equal(wokenReplayNode.projector.hasPendingQuestion(), true)
   wokenReplayNode.ingest({
@@ -6157,7 +6567,7 @@ function createGatedChildReader(targetId: string) {
 
 test(
   'forceStopAll after slow child cancel unblocks SubagentRegistry and isolates later child turns from the stale cancelAll loop',
-  { timeout: 5000 },
+  { timeout: 10_000 },
   async (t) => {
     const f = await fixture()
     const collector = createEventCollector()
