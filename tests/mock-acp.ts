@@ -18,7 +18,10 @@ import {
 import { join } from 'node:path'
 import { WritableStream } from 'node:stream/web'
 import { Readable, Writable } from 'node:stream'
+import recordedWakeup from './fixtures/agy-1.5.12-wakeup.json' with { type: 'json' }
+
 let nativeId = ''
+let afterPromptResponse: (() => Promise<void>) | undefined
 if (process.env.AGY_TEST_PID_FILE)
   writeFileSync(process.env.AGY_TEST_PID_FILE, String(process.pid))
 function log(method: string) {
@@ -117,7 +120,21 @@ stream.writable = new WritableStream({
       message.method === 'session/request_permission'
     )
       message = { ...message, params: { sessionId: nativeId, options: null } }
-    return output.write(message)
+    const afterResponse =
+      'result' in message &&
+      typeof message.result === 'object' &&
+      message.result !== null &&
+      'stopReason' in message.result
+        ? afterPromptResponse
+        : undefined
+    if (afterResponse) afterPromptResponse = undefined
+    return output.write(message).then(() => {
+      void afterResponse?.().catch((error) => {
+        console.error(error)
+        process.exitCode = 1
+        process.stdin.destroy()
+      })
+    })
   },
 })
 let connection!: AgentConnection
@@ -348,6 +365,45 @@ connection = agent()
     async ({ params: { sessionId, prompt } }) => {
       const text = prompt.map((c) => (c.type === 'text' ? c.text : '')).join('')
       if (process.env.AGY_TEST_LOG_ELICITATION_CAP) log(`prompt:${text}`)
+      if (text === 'recorded-wakeup' || text === 'recorded-next') {
+        const sendUpdates = async (
+          updates:
+            | typeof recordedWakeup.foreground.updates
+            | typeof recordedWakeup.wakeup.updates
+            | typeof recordedWakeup.answer.updates,
+        ) => {
+          for (const update of updates)
+            await output.write({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: { sessionId, update },
+            })
+        }
+        const phase =
+          text === 'recorded-wakeup'
+            ? recordedWakeup.foreground
+            : recordedWakeup.next
+        writeSessionTranscript(sessionId, phase.rows)
+        await sendUpdates(phase.updates)
+        if (text === 'recorded-wakeup') {
+          afterPromptResponse = async () => {
+            // This notification batch starts only after the sole prompt RPC returns.
+            writeSessionTranscript(sessionId, recordedWakeup.wakeup.rows)
+            await sendUpdates(recordedWakeup.wakeup.updates)
+            const answer = await client.createElicitation({
+              ...recordedWakeup.wakeup.question,
+              sessionId,
+            })
+            if (answer.action !== 'accept') return
+            await sendUpdates(recordedWakeup.answer.updates)
+            writeSessionTranscript(sessionId, recordedWakeup.answer.rows)
+          }
+        }
+        return phase.response as {
+          stopReason: 'end_turn'
+          usage: typeof phase.response.usage
+        }
+      }
       const continuation = pendingBrainContinuation.get(sessionId)
       if (continuation) {
         pendingBrainContinuation.delete(sessionId)

@@ -903,6 +903,62 @@ test(
   },
 )
 
+test(
+  'recorded agy wakeup streams once and bills only the turn that produced it',
+  { timeout: 5000 },
+  async (t) => {
+    const h = await harness(t, { agyVersion: '1.5.12' })
+    const running = h.prompt('recorded-wakeup')
+    await h.wait(() =>
+      h.permissions().some((event) => event.request.kind === 'question'),
+    )
+    const question = h
+      .permissions()
+      .find((event) => event.request.kind === 'question')
+    assert.ok(question)
+    await h.manager.handle({
+      type: 'session.permission',
+      sessionId: 's',
+      permissionId: question.request.id,
+      response: {
+        behavior: 'allow',
+        updatedInput: { answers: { 'Choose between one and two:': 'one' } },
+      },
+    })
+    await running
+    assert.deepEqual(h.turns(), ['completed'])
+    const items = h.events
+      .filter((event) => event.type === 'timeline.item')
+      .map((event) => event.item)
+    const replies = items.filter((item) => item.type === 'assistant_message')
+    assert.deepEqual(
+      replies.map((item) => item.text),
+      ['started', '\n\nfinal: one'],
+    )
+    assert.equal(new Set(replies.map((item) => item.id)).size, 2)
+    assert.deepEqual(
+      [...new Set(h.toolCalls().map((item) => item.callId))],
+      ['call_1', 'call_2', 'call_3', 'call_4'],
+    )
+    assert.match(
+      JSON.stringify(
+        h.toolCalls().findLast((item) => item.callId === 'call_2')?.detail,
+      ),
+      /alpha/,
+    )
+    assert.match(
+      JSON.stringify(
+        h.toolCalls().findLast((item) => item.callId === 'call_3')?.detail,
+      ),
+      /beta/,
+    )
+    assert.equal(h.latest().inputTokens, 34262)
+    await h.prompt('recorded-next')
+    assert.deepEqual(h.turns(), ['completed', 'completed'])
+    assert.equal(h.latest().inputTokens, 2156)
+  },
+)
+
 async function liveWakeupQuestion(t: TestContext) {
   const h = await harness(t, {
     agyVersion: '1.5.10',
