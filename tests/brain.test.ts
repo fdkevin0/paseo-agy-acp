@@ -4594,6 +4594,24 @@ test('anonymous live ask_question GENERIC(DONE) resumes foreground_active instea
   assert.equal(node.wokeUp, false)
 })
 
+test('pure [plan review due] notice resumes foreground_active from foreground_idle without entering woken', () => {
+  const node = new BrainNode(parent, 'p', { allowInitialSpawnPrompt: false })
+  node.ingest({ step_index: 1, type: 'USER_INPUT', content: 'implement plan' })
+  node.ingest(done(2, 'Finished implementing.'))
+  assert.equal(node.promptPhase, 'foreground_idle')
+  node.ingest({
+    step_index: 3,
+    type: 'SYSTEM_MESSAGE',
+    content:
+      '<SYSTEM_MESSAGE>\n[plan review due] Review the completed work.\n</SYSTEM_MESSAGE>',
+  })
+  assert.equal(node.promptPhase, 'foreground_active')
+  assert.equal(node.wokeUp, false)
+  node.ingest(message(4, 'task-bg', 'Background update during review'))
+  assert.equal(node.promptPhase, 'foreground_active')
+  assert.equal(node.wokeUp, false)
+})
+
 test('declining native elicitation does not suppress a non-reader observation fault', async (t) => {
   const f = await fixture()
   t.after(f.close)

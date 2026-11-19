@@ -244,6 +244,12 @@ async function harness(
         ? [event]
         : [],
     )
+  const assistantMessages = () =>
+    events.flatMap((event) =>
+      event.type === 'timeline.item' && event.item.type === 'assistant_message'
+        ? [event.item]
+        : [],
+    )
   const toolCalls = () =>
     events.flatMap((event) =>
       event.type === 'timeline.item' && event.item.type === 'tool_call'
@@ -315,6 +321,7 @@ async function harness(
     latest,
     turns,
     compactions,
+    assistantMessages,
     toolCalls,
     permissions,
     wait,
@@ -700,11 +707,7 @@ test(
     })
     await running
     assert.deepEqual(h.turns(), ['completed'])
-    const replies = h.events.flatMap((event) =>
-      event.type === 'timeline.item' && event.item.type === 'assistant_message'
-        ? [event.item]
-        : [],
-    )
+    const replies = h.assistantMessages()
     assert.equal(new Set(replies.map((item) => item.id)).size, 2)
     assert.equal(replies.at(-1)?.text, '\n\nWakeup finished.')
     const tools = h.toolCalls()

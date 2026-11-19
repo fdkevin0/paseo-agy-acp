@@ -36,7 +36,7 @@ Paseo compiles the TypeScript plugin; no separate build output is required. Git/
 | `index.server.ts`                                                         | Register the provider and shared usage source.                                                    |
 | `server/common.ts`                                                        | Shared primitives (`record`, `cleanToolName`, `setBounded`, `formatErrorMessage`, env).           |
 | `server/provider.ts`                                                      | Provider contract, capability negotiation, bounded catalog cache and pending tracking.            |
-| `server/session.ts`                                                       | Session manager, notifications, prompts, woken question continuations and lifecycle.              |
+| `server/session.ts`                                                       | Session manager, notifications, prompts, permissions/elicitations and lifecycle.                  |
 | `server/subagents.ts`                                                     | Subagent ownership cache, multi-level subsession linking and child Brain watchers.                |
 | `server/questions.ts`                                                     | Normalize `elicitation/create` schemas and `ask_question` calls into `QuestionCard`s.             |
 | `server/permissions.ts`                                                   | Classify permission requests, MCP `toolPolicy` preapprovals and option selection.                 |
