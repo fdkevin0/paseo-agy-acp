@@ -1,6 +1,6 @@
 {
   "name": "@fdkevin/paseo-agy-acp",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "files": [
     "paseo-plugin.json",
     "icon.png",
