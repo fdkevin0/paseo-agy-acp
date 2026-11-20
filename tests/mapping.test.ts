@@ -145,7 +145,6 @@ test('usage rejects invalid context, ignores foreign currency, and computes last
   }
   assert.deepEqual(
     promptUsage(usage, {
-      contextWindowMaxTokens: 512_000,
       lastStep: { inputTokens: 40, cachedReadTokens: 20, outputTokens: 9 },
     }),
     {
@@ -153,7 +152,6 @@ test('usage rejects invalid context, ignores foreign currency, and computes last
       outputTokens: 9,
       cachedInputTokens: 40,
       contextWindowUsedTokens: 69,
-      contextWindowMaxTokens: 512_000,
     },
   )
   assert.deepEqual(promptUsage(usage, { preserveContext: true }), {

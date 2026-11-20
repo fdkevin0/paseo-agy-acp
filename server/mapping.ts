@@ -660,7 +660,6 @@ export function promptUsage(
   usage?: Usage | null,
   options?: {
     preserveContext?: boolean
-    contextWindowMaxTokens?: number
     lastStep?: StepUsage
     wakeup?: StepUsage
   },
@@ -701,12 +700,7 @@ export function promptUsage(
     outputTokens: output,
     cachedInputTokens: cacheRead,
     ...(used !== undefined && used > 0 && !options?.preserveContext
-      ? {
-          contextWindowUsedTokens: used,
-          ...(options?.contextWindowMaxTokens !== undefined
-            ? { contextWindowMaxTokens: options.contextWindowMaxTokens }
-            : {}),
-        }
+      ? { contextWindowUsedTokens: used }
       : {}),
   }
 }
