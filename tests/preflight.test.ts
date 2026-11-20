@@ -5,6 +5,8 @@ import {
   mkdir,
   writeFile,
   readFile,
+  rename,
+  chmod,
   access,
   symlink,
   rm,
@@ -16,6 +18,7 @@ import {
   dataDirectory,
   providerStatus,
   removeSessionArtifacts,
+  resolveCatalogCacheKey,
 } from '../server/preflight.ts'
 
 const id = '11111111-1111-4111-8111-111111111111'
@@ -33,6 +36,10 @@ test('catalog key is environment-order independent and includes launch differenc
   assert.notEqual(
     catalogCacheKey(launch),
     catalogCacheKey({ ...launch, env: { A: 'changed', B: 'b' } }),
+  )
+  assert.notEqual(
+    catalogCacheKey(launch, '1.5.11'),
+    catalogCacheKey(launch, '1.5.12'),
   )
   assert.equal(
     dataDirectory({
@@ -107,27 +114,35 @@ test('status reports missing executable clearly', async () => {
   assert.match(status.diagnostic ?? '', /Cannot run agy/)
 })
 
-test('providerStatus accepts version >= 1.5.10 and caches result', async () => {
+test('providerStatus accepts version >= 1.5.10, coalesces concurrent probes, caches unchanged binaries, and invalidates on removal', async () => {
   const tmp = await mkdtemp(join(tmpdir(), 'agy-version-ok-'))
   const fakeBin = join(tmp, 'fake-agy')
-  await writeFile(fakeBin, '#!/bin/sh\necho "agy 1.5.10"\n', { mode: 0o755 })
+  const log = join(tmp, 'calls')
+  const launch = { command: fakeBin, args: [], env: {} }
+  await writeFile(
+    fakeBin,
+    `#!/bin/sh\necho call >> "${log}"\necho "agy 1.5.10"\n`,
+    { mode: 0o755 },
+  )
   try {
-    const status = await providerStatus({
-      command: fakeBin,
-      args: [],
-      env: {},
-    })
-    assert.equal(status.available, true)
-    assert.equal(status.diagnostic, undefined)
+    const [first, second] = await Promise.all([
+      providerStatus(launch),
+      providerStatus(launch),
+    ])
+    assert.equal(first.available, true)
+    assert.equal(first.diagnostic, undefined)
+    assert.equal(second.available, true)
+    assert.equal(await readFile(log, 'utf8'), 'call\n')
+
+    const cachedStatus = await providerStatus(launch)
+    assert.equal(cachedStatus.available, true)
+    assert.equal(await readFile(log, 'utf8'), 'call\n')
 
     await rm(fakeBin)
 
-    const cachedStatus = await providerStatus({
-      command: fakeBin,
-      args: [],
-      env: {},
-    })
-    assert.equal(cachedStatus.available, true)
+    const removed = await providerStatus(launch)
+    assert.equal(removed.available, false)
+    assert.match(removed.diagnostic ?? '', /Cannot run agy/)
   } finally {
     await rm(tmp, { recursive: true, force: true })
   }
@@ -193,6 +208,111 @@ test('providerStatus rejects 1.5.10 pre-release builds and dataDirectory ignores
       ),
       '/tmp/home-test/.gemini/antigravity-cli',
     )
+  } finally {
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+async function writeExecutable(path: string, script: string): Promise<void> {
+  const staged = `${path}.next`
+  await writeFile(staged, script, { mode: 0o755 })
+  await rename(staged, path)
+}
+
+test('resolveCatalogCacheKey fingerprints the executable without spawning it and tracks upgrades via path or symlink', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'agy-catalog-key-'))
+  const log = join(tmp, 'spawns')
+  const v1 = join(tmp, 'agy-1.5.11')
+  const v2 = join(tmp, 'agy-1.5.12')
+  const binDir = join(tmp, 'bin')
+  const dirShadow = join(tmp, 'shadow')
+  const linked = join(binDir, 'agy')
+  try {
+    await mkdir(binDir)
+    await mkdir(join(dirShadow, 'agy'), { recursive: true })
+    await writeExecutable(v1, `#!/bin/sh\necho ran >> "${log}"\necho 1.5.11\n`)
+    await writeExecutable(v2, `#!/bin/sh\necho ran >> "${log}"\necho 1.5.12\n`)
+    await symlink(v1, linked)
+
+    const launch = { command: linked, args: ['acp'], env: {} }
+    const key1 = await resolveCatalogCacheKey(launch)
+    assert.notEqual(key1, catalogCacheKey(launch))
+    await assert.rejects(access(log))
+
+    // Repointing a Homebrew-style symlink changes the fingerprint immediately.
+    await rm(linked)
+    await symlink(v2, linked)
+    const key2 = await resolveCatalogCacheKey(launch)
+    assert.notEqual(key2, key1)
+    assert.notEqual(key2, catalogCacheKey(launch))
+
+    // Replacing the target binary atomically changes the fingerprint immediately.
+    await writeExecutable(v2, `#!/bin/sh\necho ran >> "${log}"\necho 1.5.13\n`)
+    const key3 = await resolveCatalogCacheKey(launch)
+    assert.notEqual(key3, key2)
+    await assert.rejects(access(log))
+
+    // Bare command lookup resolves through launch.env.PATH and skips directories.
+    const pathLaunch = {
+      command: 'agy',
+      args: ['acp'],
+      env: { PATH: `${dirShadow}:${binDir}` },
+    }
+    const pathKey1 = await resolveCatalogCacheKey(pathLaunch)
+    assert.notEqual(pathKey1, catalogCacheKey(pathLaunch))
+    await writeExecutable(v2, `#!/bin/sh\necho ran >> "${log}"\necho 1.5.14\n`)
+    assert.notEqual(await resolveCatalogCacheKey(pathLaunch), pathKey1)
+
+    // Missing or non-executable binaries fall back to the base cache key.
+    await chmod(v2, 0o644)
+    assert.equal(await resolveCatalogCacheKey(launch), catalogCacheKey(launch))
+
+    const fallbackLaunch = {
+      command: '/nonexistent/agy-catalog-key',
+      args: ['acp'],
+      env: {},
+    }
+    assert.equal(
+      await resolveCatalogCacheKey(fallbackLaunch),
+      catalogCacheKey(fallbackLaunch),
+    )
+  } finally {
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('providerStatus invalidates cached availability immediately on binary downgrade, corruption, chmod, or removal', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'agy-status-invalidate-'))
+  const fakeBin = join(tmp, 'fake-agy')
+  const launch = { command: fakeBin, args: ['acp'], env: {} }
+  try {
+    await writeExecutable(fakeBin, '#!/bin/sh\necho "1.5.12"\n')
+    assert.equal((await providerStatus(launch)).available, true)
+
+    await writeExecutable(fakeBin, '#!/bin/sh\necho "1.5.9"\n')
+    const downgraded = await providerStatus(launch)
+    assert.equal(downgraded.available, false)
+    assert.match(downgraded.diagnostic ?? '', /too old; requires >=1\.5\.10/)
+
+    await writeExecutable(fakeBin, '#!/bin/sh\necho "1.5.12"\n')
+    assert.equal((await providerStatus(launch)).available, true)
+    await writeExecutable(fakeBin, '#!/bin/sh\necho "unparseable"\n')
+    const unparseable = await providerStatus(launch)
+    assert.equal(unparseable.available, false)
+    assert.match(
+      unparseable.diagnostic ?? '',
+      /Could not determine agy version/,
+    )
+
+    await writeExecutable(fakeBin, '#!/bin/sh\necho "1.5.12"\n')
+    assert.equal((await providerStatus(launch)).available, true)
+    await writeExecutable(fakeBin, '#!/bin/sh\nexit 1\n')
+    assert.equal((await providerStatus(launch)).available, false)
+
+    await writeExecutable(fakeBin, '#!/bin/sh\necho "1.5.12"\n')
+    assert.equal((await providerStatus(launch)).available, true)
+    await chmod(fakeBin, 0o644)
+    assert.equal((await providerStatus(launch)).available, false)
   } finally {
     await rm(tmp, { recursive: true, force: true })
   }
