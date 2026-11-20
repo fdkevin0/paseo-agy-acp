@@ -734,7 +734,7 @@ connection = agent()
         const rows: object[] = [
           { step_index: step, type: 'USER_INPUT', content: text },
         ]
-        if (text === 'usage-empty' || text.startsWith('usage-stream:'))
+        if (text === 'usage-empty' || text.startsWith('usage-stream'))
           rows.push({
             step_index: step + 1,
             type: 'PLANNER_RESPONSE',
@@ -767,6 +767,33 @@ connection = agent()
               sessionUpdate: 'usage_update',
               used: Number(rawUsed),
               size: Number(rawSize),
+            },
+          })
+        }
+        if (text.startsWith('usage-stream-wait:')) {
+          const [, rawUsed, rawSize] = text.split(':')
+          await client.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: 'usage_update',
+              used: Number(rawUsed),
+              size: Number(rawSize),
+            },
+          })
+          await client.requestPermission({
+            sessionId,
+            toolCall: { toolCallId: 'usage-barrier', title: 'usage-barrier' },
+            options: [{ optionId: 'yes', name: 'Allow', kind: 'allow_once' }],
+          })
+        }
+        if (text.startsWith('usage-switch-model:')) {
+          const [, nextModel] = text.split(':')
+          configOptions[0].currentValue = nextModel
+          await client.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: 'config_option_update',
+              configOptions,
             },
           })
         }

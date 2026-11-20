@@ -52,19 +52,11 @@ function encodeGenMetadataMaxContext(maxTokens: number): Buffer {
   )
 }
 
-function encodeExecutorMetadataMaxTokens(maxTokens: number): Buffer {
-  return encodeProtoField(
-    10,
-    encodeProtoField(2, encodeProtoField(5, maxTokens)),
-  )
-}
-
 function writeConversationDb(
   home: string,
   nativeId: string,
   entries: {
     gen?: Array<{ idx: number; data: Uint8Array }>
-    exe?: Array<{ idx: number; data: Uint8Array }>
   },
 ) {
   const convDir = join(home, '.gemini/antigravity-cli/conversations')
@@ -74,17 +66,10 @@ function writeConversationDb(
     db.exec(
       'CREATE TABLE IF NOT EXISTS gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)',
     )
-    db.exec(
-      'CREATE TABLE IF NOT EXISTS executor_metadata (idx INTEGER PRIMARY KEY, data BLOB)',
-    )
     const insGen = db.prepare(
       'INSERT OR REPLACE INTO gen_metadata (idx, data) VALUES (?, ?)',
     )
     ;(entries.gen ?? []).forEach((row) => insGen.run(row.idx, row.data))
-    const insExe = db.prepare(
-      'INSERT OR REPLACE INTO executor_metadata (idx, data) VALUES (?, ?)',
-    )
-    ;(entries.exe ?? []).forEach((row) => insExe.run(row.idx, row.data))
   } finally {
     db.close()
   }
@@ -226,7 +211,7 @@ function setupUsageManager(
       env,
     },
     usage: new AgyUsageSource({ env }),
-    capabilities: ['prompt.message', 'session.configure'],
+    capabilities: ['prompt.message', 'session.configure', 'permission'],
     emit,
     hasActiveBackgroundWork: options?.hasActiveBackgroundWork,
     backgroundProbeTimeoutMs: options?.backgroundProbeTimeoutMs,
@@ -355,7 +340,7 @@ test('persisted session restoration reads SQLite compaction window for persisted
   )
 })
 
-test('two-stage transition locks SQLite compaction window after Turn 1 and isolates model switches', async (t) => {
+test('SQLite compaction window resolves live on usage_update, syncs on model switch, and isolates models', async (t) => {
   const home = await mkdtemp(join(tmpdir(), 'agy-context-two-stage-'))
   const { events, manager, latestUsage } = setupUsageManager(t, home)
   await openFreshUsageSession(manager, home)
@@ -367,17 +352,17 @@ test('two-stage transition locks SQLite compaction window after Turn 1 and isola
     gen: [{ idx: 0, data: encodeGenMetadataMaxContext(512_000) }],
   })
 
-  // Turn 1: streaming uses native interface size (1,048,576); turn settlement locks SQLite limit (512,000).
+  // Turn 1: live usage_update resolves SQLite max_context_tokens (512,000) immediately instead of raw interface size (1,048,576).
   const turn1Start = events.length
   await sendUsagePrompt(manager, 'p1', 'usage-stream:15000:1048576')
   const turn1Windows = events
     .slice(turn1Start)
     .filter((e) => e.type === 'session.usage')
     .map((e) => e.usage.contextWindowMaxTokens)
-  assert.deepEqual(turn1Windows, [1_048_576, 512_000])
+  assert.deepEqual(turn1Windows, [512_000, 512_000])
   assert.equal(latestUsage().contextWindowUsedTokens, 15_000)
 
-  // Turn 2: same model uses learned 512,000 from streaming through settlement despite native size staying 1,048,576.
+  // Turn 2: same model keeps learned 512,000 from streaming through settlement despite native size staying 1,048,576.
   const turn2Start = events.length
   await sendUsagePrompt(manager, 'p2', 'usage-stream:28000:1048576')
   const turn2Windows = events
@@ -387,13 +372,20 @@ test('two-stage transition locks SQLite compaction window after Turn 1 and isola
   assert.deepEqual(turn2Windows, [512_000, 512_000])
   assert.equal(latestUsage().contextWindowUsedTokens, 28_000)
 
-  // Switch to model-b before any new SQLite row is written: must show model-b's interface size, never model-a's 512,000.
+  // Switch to model-b before any new SQLite row is written: clears test's 512,000 immediately and falls back to model-b's interface size.
+  const switchToBStart = events.length
   await manager.handle({
     type: 'session.configure',
     requestId: 'model-b',
     sessionId: 's',
     changes: { model: 'model-b' },
   })
+  const switchToBWindows = events
+    .slice(switchToBStart)
+    .filter((e) => e.type === 'session.usage')
+    .map((e) => e.usage.contextWindowMaxTokens)
+  assert.deepEqual(switchToBWindows, [undefined])
+
   const turn3Start = events.length
   await sendUsagePrompt(manager, 'p3', 'usage-stream:30000:1000000')
   const turn3Windows = events
@@ -402,7 +394,7 @@ test('two-stage transition locks SQLite compaction window after Turn 1 and isola
     .map((e) => e.usage.contextWindowMaxTokens)
   assert.deepEqual(turn3Windows, [1_000_000, 1_000_000])
 
-  // New SQLite row from model-b (idx=1 > cursor 0) updates model-b to 256,000.
+  // New SQLite row from model-b (idx=1 > cursor 0) updates model-b immediately on streaming usage_update to 256,000.
   writeConversationDb(home, nativeId, {
     gen: [{ idx: 1, data: encodeGenMetadataMaxContext(256_000) }],
   })
@@ -412,15 +404,22 @@ test('two-stage transition locks SQLite compaction window after Turn 1 and isola
     .slice(turn4Start)
     .filter((e) => e.type === 'session.usage')
     .map((e) => e.usage.contextWindowMaxTokens)
-  assert.deepEqual(turn4Windows, [1_000_000, 256_000])
+  assert.deepEqual(turn4Windows, [256_000, 256_000])
 
-  // Switching back to test retains test's 512,000 immediately on streaming.
+  // Switching back to test publishes test's 512,000 immediately and retains it on streaming.
+  const switchBackStart = events.length
   await manager.handle({
     type: 'session.configure',
     requestId: 'model-test-back',
     sessionId: 's',
     changes: { model: 'test' },
   })
+  const switchBackWindows = events
+    .slice(switchBackStart)
+    .filter((e) => e.type === 'session.usage')
+    .map((e) => e.usage.contextWindowMaxTokens)
+  assert.deepEqual(switchBackWindows, [512_000])
+
   const turn5Start = events.length
   await sendUsagePrompt(manager, 'p5', 'usage-stream:40000:1048576')
   const turn5Windows = events
@@ -430,43 +429,155 @@ test('two-stage transition locks SQLite compaction window after Turn 1 and isola
   assert.deepEqual(turn5Windows, [512_000, 512_000])
 })
 
-test('SQLite compaction reader falls back to executor_metadata and rejects symlink escapes', async (t) => {
-  const home = await mkdtemp(join(tmpdir(), 'agy-sqlite-reader-'))
+test('turn settlement upgrades compaction window when SQLite flushes after streaming usage_update', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-context-settle-upgrade-'))
+  const { events, wait, manager, latestUsage } = setupUsageManager(t, home)
+  await openFreshUsageSession(manager, home)
+  const opened = events.find((e) => e.type === 'session.opened')
+  assert.ok(opened?.type === 'session.opened' && opened.persistence)
+  const nativeId = (opened.persistence.data as { sessionId: string }).sessionId
+
+  const turnStart = events.length
+  const running = sendUsagePrompt(
+    manager,
+    'p1',
+    'usage-stream-wait:15000:1048576',
+  )
+  await wait((e) => e.type === 'session.usage')
+  const permission = await wait((e) => e.type === 'session.permission')
+  assert.equal(permission.type, 'session.permission')
+  assert.equal(latestUsage().contextWindowMaxTokens, 1_048_576)
+
+  // SQLite flushes only after streaming usage_update already published native interface size.
+  writeConversationDb(home, nativeId, {
+    gen: [{ idx: 0, data: encodeGenMetadataMaxContext(512_000) }],
+  })
+  await manager.handle({
+    type: 'session.permission',
+    sessionId: 's',
+    permissionId: permission.request.id,
+    response: { behavior: 'allow', selectedActionId: 'yes' },
+  })
+  await running
+
+  const turnWindows = events
+    .slice(turnStart)
+    .filter((e) => e.type === 'session.usage')
+    .map((e) => e.usage.contextWindowMaxTokens)
+  assert.deepEqual(turnWindows, [1_048_576, 512_000])
+  assert.equal(latestUsage().contextWindowUsedTokens, 15_000)
+})
+
+test('persisted history replay clears prior-model compaction window when opened with a different model', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-context-replay-switch-'))
+  const archivedNative = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+  writeConversationDb(home, archivedNative, {
+    gen: [{ idx: 0, data: encodeGenMetadataMaxContext(200_000) }],
+  })
+  const { events, manager } = setupUsageManager(t, home)
+  await manager.handle({
+    type: 'session.open',
+    requestId: 'open-replay-switched',
+    sessionId: 'replayed-switched',
+    history: 'replay',
+    config: {
+      cwd: home,
+      env: { AGY_TEST_LOAD_USAGE: '1' },
+      mcpServers: {},
+      settings: {},
+      persist: true,
+      model: 'gpt-oss-120b-medium',
+    },
+    persistence: { version: 1, data: { sessionId: archivedNative } },
+  })
+  const switchedUsage = events
+    .filter((e) => e.type === 'session.usage')
+    .filter((e) => e.sessionId === 'replayed-switched')
+    .map((e) => e.usage.contextWindowMaxTokens)
+  assert.deepEqual(switchedUsage, [200_000, 200_000, undefined])
+})
+
+test('unsolicited config_option_update model switch advances SQLite cursor and syncs live capacity', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-context-native-switch-'))
+  const { events, manager } = setupUsageManager(t, home)
+  await openFreshUsageSession(manager, home)
+  const opened = events.find((e) => e.type === 'session.opened')
+  assert.ok(opened?.type === 'session.opened' && opened.persistence)
+  const nativeId = (opened.persistence.data as { sessionId: string }).sessionId
+
+  // Run a turn on default model `test` with native size 1,048,576 (no DB row yet).
+  await sendUsagePrompt(manager, 'p1', 'usage-stream:12000:1048576')
+  // Now DB row idx=0 is written for `test` before an unsolicited native config_option_update switches to `model-b`.
+  writeConversationDb(home, nativeId, {
+    gen: [{ idx: 0, data: encodeGenMetadataMaxContext(512_000) }],
+  })
+  const switchStart = events.length
+  await sendUsagePrompt(manager, 'p2', 'usage-switch-model:model-b')
+  const switchWindows = events
+    .slice(switchStart)
+    .filter((e) => e.type === 'session.usage')
+    .map((e) => e.usage.contextWindowMaxTokens)
+  assert.equal(switchWindows.at(-1), undefined)
+
+  // Subsequent turn on `model-b` must not inherit `test`'s idx=0 row (512,000); falls back to `model-b`'s native size.
+  const modelBStart = events.length
+  await sendUsagePrompt(manager, 'p3', 'usage-stream:20000:1000000')
+  const modelBWindows = events
+    .slice(modelBStart)
+    .filter((e) => e.type === 'session.usage')
+    .map((e) => e.usage.contextWindowMaxTokens)
+  assert.deepEqual(modelBWindows, [1_000_000, 1_000_000])
+})
+
+test('SQLite compaction reader orders strictly by idx DESC across large payloads and trailing incomplete rows', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-sqlite-order-'))
   t.after(() => rm(home, { recursive: true, force: true }))
   const brainRoot = join(home, '.gemini/antigravity-cli/brain')
   await mkdir(brainRoot, { recursive: true })
-  const idExe = '22222222-2222-4222-8222-222222222222'
-  writeConversationDb(home, idExe, {
-    gen: [{ idx: 0, data: encodeProtoField(1, encodeProtoField(2, 1)) }],
-    exe: [{ idx: 0, data: encodeExecutorMetadataMaxTokens(256_000) }],
-  })
-  assert.deepEqual(await readConversationCompactionWindow(brainRoot, idExe), {
-    maxTokens: 256_000,
-    genIdx: 0,
-    exeIdx: 0,
-  })
-
-  const idLargeGen = '33333333-3333-4333-8333-333333333333'
-  writeConversationDb(home, idLargeGen, {
+  const idOrder = '77777777-7777-4777-8777-777777777777'
+  writeConversationDb(home, idOrder, {
     gen: [
+      { idx: 0, data: encodeGenMetadataMaxContext(1_000_000) },
       {
-        idx: 0,
+        idx: 1,
         data: Buffer.concat([
           encodeProtoField(99, Buffer.alloc(40_000, 0x41)),
           encodeGenMetadataMaxContext(512_000),
         ]),
       },
+      { idx: 2, data: encodeProtoField(1, encodeProtoField(2, 1)) },
+      { idx: 3, data: encodeProtoField(1, encodeProtoField(2, 2)) },
     ],
   })
+  assert.deepEqual(await readConversationCompactionWindow(brainRoot, idOrder), {
+    maxTokens: 512_000,
+    genIdx: 3,
+  })
+})
+
+test('SQLite compaction reader handles missing/corrupt DBs and rejects symlink escapes', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-sqlite-reader-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const brainRoot = join(home, '.gemini/antigravity-cli/brain')
+  await mkdir(brainRoot, { recursive: true })
+  const idMissing = '22222222-2222-4222-8222-222222222222'
   assert.deepEqual(
-    await readConversationCompactionWindow(brainRoot, idLargeGen),
-    { maxTokens: 512_000, genIdx: 0, exeIdx: -1 },
+    await readConversationCompactionWindow(brainRoot, idMissing),
+    { genIdx: -1 },
+  )
+
+  const convDir = join(home, '.gemini/antigravity-cli/conversations')
+  await mkdir(convDir, { recursive: true })
+  const idCorrupt = '99999999-9999-4999-8999-999999999999'
+  await writeFile(join(convDir, `${idCorrupt}.db`), 'not-sqlite')
+  assert.deepEqual(
+    await readConversationCompactionWindow(brainRoot, idCorrupt),
+    { genIdx: -1 },
   )
 
   const escapedTarget = join(home, 'outside.db')
   await writeFile(escapedTarget, 'not-a-session-db')
   const idSymlinkDb = '44444444-4444-4444-8444-444444444444'
-  const convDir = join(home, '.gemini/antigravity-cli/conversations')
   await symlink(escapedTarget, join(convDir, `${idSymlinkDb}.db`))
   await assert.rejects(
     readConversationCompactionWindow(brainRoot, idSymlinkDb),
@@ -507,7 +618,7 @@ test('SQLite compaction reader falls back to executor_metadata and rejects symli
     join(escapedConvHome, '.gemini/antigravity-cli/conversations'),
   )
   await assert.rejects(
-    readConversationCompactionWindow(escapedConvBrain, idExe),
+    readConversationCompactionWindow(escapedConvBrain, idMissing),
     { name: 'BrainEscapeError' },
   )
 })

@@ -934,100 +934,63 @@ async function resolveConversationDbPath(
 }
 
 const GEN_MAX_CONTEXT_TOKENS_PATH = [1, 9, 10, 4] as const
-const EXECUTOR_MAX_TOKEN_LIMIT_PATH = [10, 2, 5] as const
+const SQLITE_BUSY_TIMEOUT_MS = 50
 
-/** Read effective server-side auto-compaction window from conversations/<nativeId>.db after cursor indices. */
+/** Read server-issued max_context_tokens from conversations/<nativeId>.db gen_metadata after minGenIdx. */
 export async function readConversationCompactionWindow(
   brainRoot: string,
   nativeId: string,
   minGenIdx = -1,
-  minExeIdx = -1,
-): Promise<{ maxTokens?: number; genIdx: number; exeIdx: number }> {
-  if (!sessionIdPattern.test(nativeId))
-    return { genIdx: minGenIdx, exeIdx: minExeIdx }
+): Promise<{ maxTokens?: number; genIdx: number }> {
+  if (!sessionIdPattern.test(nativeId)) return { genIdx: minGenIdx }
   let dbPath: string
   try {
     dbPath = await resolveConversationDbPath(brainRoot, nativeId)
   } catch (error) {
     if (error instanceof BrainEscapeError) throw error
-    return { genIdx: minGenIdx, exeIdx: minExeIdx }
+    return { genIdx: minGenIdx }
   }
   let genIdx = minGenIdx
-  let exeIdx = minExeIdx
-  let maxTokens: number | undefined
   let db: DatabaseSync | undefined
   try {
-    db = new DatabaseSync(dbPath, { readOnly: true })
-    try {
-      const maxGenRow = db
-        .prepare('SELECT idx FROM gen_metadata ORDER BY idx DESC LIMIT 1')
-        .get() as { idx?: unknown } | undefined
+    db = new DatabaseSync(dbPath, {
+      readOnly: true,
+      timeout: SQLITE_BUSY_TIMEOUT_MS,
+    })
+    const hasTable = db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gen_metadata'",
+      )
+      .get()
+    if (hasTable === undefined) return { genIdx }
+    // Single snapshot-atomic query strictly ordered by idx DESC:
+    // - Prevents cross-query WAL snapshot splits between max(idx) and row data.
+    // - Avoids size-prioritized ordering that would skip the full latest row for stale older rows.
+    const stmt = db.prepare(
+      'SELECT idx, data FROM gen_metadata WHERE idx > ? ORDER BY idx DESC',
+    )
+    for (const row of stmt.iterate(minGenIdx) as Iterable<{
+      idx?: unknown
+      data?: unknown
+    }>) {
       if (
-        maxGenRow &&
-        typeof maxGenRow.idx === 'number' &&
-        Number.isInteger(maxGenRow.idx) &&
-        maxGenRow.idx >= 0
+        typeof row.idx === 'number' &&
+        Number.isInteger(row.idx) &&
+        row.idx >= 0
       ) {
-        genIdx = Math.max(minGenIdx, maxGenRow.idx)
+        genIdx = Math.max(genIdx, row.idx)
       }
-      if (genIdx > minGenIdx) {
-        const rows = db
-          .prepare(
-            'SELECT data FROM gen_metadata WHERE idx > ? ORDER BY CASE WHEN length(data) < 32768 THEN 0 ELSE 1 END, idx DESC LIMIT 2',
-          )
-          .all(minGenIdx) as Array<{ data?: unknown }>
-        for (const row of rows) {
-          if (row.data instanceof Uint8Array) {
-            const parsed = readProtoVarintPath(
-              row.data,
-              GEN_MAX_CONTEXT_TOKENS_PATH,
-            )
-            if (parsed !== undefined) {
-              maxTokens = parsed
-              break
-            }
-          }
-        }
-      }
-    } catch {
-      /* Ignore missing/locked gen_metadata while agy flushes steps. */
+      if (!(row.data instanceof Uint8Array)) continue
+      const maxTokens = readProtoVarintPath(
+        row.data,
+        GEN_MAX_CONTEXT_TOKENS_PATH,
+      )
+      if (maxTokens !== undefined) return { maxTokens, genIdx }
     }
-    try {
-      const maxExeRow = db
-        .prepare('SELECT idx FROM executor_metadata ORDER BY idx DESC LIMIT 1')
-        .get() as { idx?: unknown } | undefined
-      if (
-        maxExeRow &&
-        typeof maxExeRow.idx === 'number' &&
-        Number.isInteger(maxExeRow.idx) &&
-        maxExeRow.idx >= 0
-      ) {
-        exeIdx = Math.max(minExeIdx, maxExeRow.idx)
-      }
-      if (maxTokens === undefined && exeIdx > minExeIdx) {
-        const row = db
-          .prepare(
-            'SELECT data FROM executor_metadata WHERE idx > ? ORDER BY idx DESC LIMIT 1',
-          )
-          .get(minExeIdx) as { data?: unknown } | undefined
-        if (row?.data instanceof Uint8Array) {
-          maxTokens = readProtoVarintPath(
-            row.data,
-            EXECUTOR_MAX_TOKEN_LIMIT_PATH,
-          )
-        }
-      }
-    } catch {
-      /* Ignore missing/locked executor_metadata while agy flushes steps. */
-    }
+    return { genIdx }
   } catch {
-    /* Ignore transient SQLite open/read errors without failing the turn. */
+    return { genIdx }
   } finally {
     db?.close()
-  }
-  return {
-    ...(maxTokens !== undefined ? { maxTokens } : {}),
-    genIdx,
-    exeIdx,
   }
 }
