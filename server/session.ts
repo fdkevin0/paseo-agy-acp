@@ -4,7 +4,6 @@ import { z } from 'zod'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import {
-  PROTOCOL_VERSION,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
   type SessionNotification,
@@ -57,15 +56,14 @@ import {
 import { projectReplayHistory, type HistoryEntry } from './history.ts'
 import { SubagentRegistry } from './subagents.ts'
 import {
-  agyVersionDiagnostic,
   dataDirectory,
   hasLocalSessionArtifacts,
   removeSessionArtifacts,
   resolveSpawnCwd,
 } from './preflight.ts'
+import { initializeAcp } from './runtime.ts'
 import { connectAcp } from './transport.ts'
 import {
-  PACKAGE_VERSION,
   definedProcessEnv,
   formatErrorMessage,
   record,
@@ -1144,25 +1142,9 @@ async function createSession(
     void transport.stopped.then(() => transports.delete(transport))
     return transport
   }
-  async function initializeRuntime(transport: ReturnType<typeof connectAcp>) {
-    const initialized = await transport.request(
-      transport.rpc.initialize({
-        protocolVersion: PROTOCOL_VERSION,
-        clientInfo: { name: 'paseo-agy-acp', version: PACKAGE_VERSION },
-        clientCapabilities: {
-          fs: { readTextFile: false, writeTextFile: false },
-          terminal: false,
-          elicitation: { form: {} },
-        },
-      }),
-    )
-    const diagnostic = agyVersionDiagnostic(initialized.agentInfo?.version)
-    if (diagnostic) throw new Error(diagnostic)
-    return initialized
-  }
   let currentTransport = startRuntime(state.skipPermissions)
   try {
-    let currentInitialized = await initializeRuntime(currentTransport)
+    let currentInitialized = await initializeAcp(currentTransport)
     function canReloadSession() {
       return Boolean(
         currentInitialized.agentCapabilities?.sessionCapabilities?.resume ||
@@ -1212,7 +1194,7 @@ async function createSession(
       nativeMode: string | undefined,
     ): Promise<void> {
       try {
-        currentInitialized = await initializeRuntime(next)
+        currentInitialized = await initializeAcp(next)
         if (!isReloadAlive(next)) return
         if (!canReloadSession())
           throw new Error(

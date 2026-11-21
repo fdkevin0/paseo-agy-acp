@@ -12,19 +12,23 @@ import {
   appendFileSync,
   existsSync,
   mkdirSync,
+  unlinkSync,
   writeFileSync,
   readFileSync,
 } from 'node:fs'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { WritableStream } from 'node:stream/web'
 import { Readable, Writable } from 'node:stream'
 import recordedWakeup from './fixtures/agy-1.5.12-wakeup.json' with { type: 'json' }
 
 let nativeId = ''
+let lastSessionCwd = ''
 let afterPromptResponse: (() => Promise<void>) | undefined
 let finishRecordedReads: (() => Promise<void>) | undefined
 if (process.env.AGY_TEST_PID_FILE)
   writeFileSync(process.env.AGY_TEST_PID_FILE, String(process.pid))
+if (process.env.AGY_TEST_PID_LOG)
+  appendFileSync(process.env.AGY_TEST_PID_LOG, `${process.pid}\n`)
 function log(method: string) {
   if (process.env.AGY_TEST_LOG)
     appendFileSync(process.env.AGY_TEST_LOG, method + '\n')
@@ -100,14 +104,23 @@ stream.writable = new WritableStream({
       typeof message.result === 'object' &&
       'sessionId' in message.result
     ) {
+      const cwdTag =
+        process.env.AGY_TEST_CATALOG_BY_CWD && lastSessionCwd
+          ? basename(lastSessionCwd)
+          : undefined
       message = {
         ...message,
         result: {
           ...message.result,
-          models: { availableModels: [{ modelId: 'test-low' }] },
+          models: {
+            availableModels: [{ modelId: `${cwdTag ?? 'test'}-low` }],
+          },
           _meta: {
             antigravity: {
-              tier: { id: 'g1-ultra-tier', name: 'Google AI Ultra' },
+              tier: {
+                id: cwdTag ? `tier-${cwdTag}` : 'g1-ultra-tier',
+                name: cwdTag ? `Tier ${cwdTag}` : 'Google AI Ultra',
+              },
             },
           },
         },
@@ -222,17 +235,55 @@ connection = agent()
       throw new Error('probe unavailable')
     const previousId = nativeId || randomUUID()
     nativeId = randomUUID()
+    lastSessionCwd = params.cwd
+    if (process.env.AGY_TEST_ARTIFACTS_DIR) {
+      const conversationsDir = join(
+        process.env.AGY_TEST_ARTIFACTS_DIR,
+        'conversations',
+      )
+      const brainDir = join(
+        process.env.AGY_TEST_ARTIFACTS_DIR,
+        'brain',
+        nativeId,
+      )
+      mkdirSync(conversationsDir, { recursive: true })
+      mkdirSync(brainDir, { recursive: true })
+      for (const ext of ['.db', '.db-wal', '.db-shm'])
+        writeFileSync(join(conversationsDir, nativeId + ext), 'temp')
+    }
     const append = (
       params._meta?.antigravity as { systemPrompt?: { append?: string } }
     )?.systemPrompt?.append
     log(append ? `new:${append}` : 'new')
     if (process.env.AGY_TEST_STALE_EVENTS) await staleEvents(previousId)
     sendCommands(nativeId)
+    if (process.env.AGY_TEST_CATALOG_BY_CWD) {
+      const cwdTag = basename(params.cwd)
+      return {
+        sessionId: nativeId,
+        configOptions: configOptions.map((option) =>
+          option.id === 'model'
+            ? {
+                ...option,
+                currentValue: cwdTag,
+                options: [{ value: cwdTag, name: `Model ${cwdTag}` }],
+              }
+            : option,
+        ),
+      }
+    }
     return { sessionId: nativeId, configOptions }
   })
   .onRequest(methods.agent.session.close, async ({ params: { sessionId } }) => {
     log('close')
     if (process.env.AGY_TEST_STALE_EVENTS) await staleEvents(sessionId)
+    if (
+      process.env.AGY_TEST_CLOSE_ERROR_FLAG &&
+      existsSync(process.env.AGY_TEST_CLOSE_ERROR_FLAG)
+    ) {
+      unlinkSync(process.env.AGY_TEST_CLOSE_ERROR_FLAG)
+      throw new Error('close failed')
+    }
     if (process.env.AGY_TEST_CLOSE_ERROR) throw new Error('close failed')
     return {}
   })
@@ -335,16 +386,25 @@ connection = agent()
       return { configOptions }
     },
   )
-  .onRequest(methods.agent.session.list, async ({ params: { cwd } }) => ({
-    sessions: [
-      {
-        sessionId: 'native-test',
-        cwd: cwd ?? process.cwd(),
-        title: 'Test session',
-        _meta: { description: 'Last prompt preview' },
-      },
-    ],
-  }))
+  .onRequest(methods.agent.session.list, async ({ params: { cwd } }) => {
+    if (
+      process.env.AGY_TEST_CRASH_ON_LIST_FLAG &&
+      existsSync(process.env.AGY_TEST_CRASH_ON_LIST_FLAG)
+    ) {
+      unlinkSync(process.env.AGY_TEST_CRASH_ON_LIST_FLAG)
+      process.exit(1)
+    }
+    return {
+      sessions: [
+        {
+          sessionId: 'native-test',
+          cwd: cwd ?? process.cwd(),
+          title: 'Test session',
+          _meta: { description: 'Last prompt preview' },
+        },
+      ],
+    }
+  })
   .onRequest(
     methods.agent.session.setConfigOption,
     async ({ params: { configId, value } }) => {
