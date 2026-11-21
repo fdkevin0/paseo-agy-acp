@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os'
 import {
   catalogCacheKey,
   dataDirectory,
+  hasLocalSessionArtifacts,
   providerStatus,
   removeSessionArtifacts,
   resolveCatalogCacheKey,
@@ -100,6 +101,75 @@ test('catalog cleanup removes only its closed session and refuses symlinks', asy
       await readFile(join(externalApp, 'conversations', `${id}.db`), 'utf8'),
       'keep-external',
     )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('hasLocalSessionArtifacts detects local db or brain dir and refuses invalid IDs and symlinks', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-artifacts-'))
+  try {
+    const data = join(root, 'app')
+    const outside = join(root, 'outside')
+    await mkdir(join(outside, 'brain', id), { recursive: true })
+    await writeFile(join(outside, `${id}.db`), 'outside')
+
+    assert.equal(await hasLocalSessionArtifacts(data, id), false)
+
+    await mkdir(join(data, 'conversations'), { recursive: true })
+    await mkdir(join(data, 'brain'), { recursive: true })
+    assert.equal(await hasLocalSessionArtifacts(data, id), false)
+
+    // Detects regular conversation .db file.
+    await writeFile(join(data, 'conversations', `${id}.db`), 'db')
+    assert.equal(await hasLocalSessionArtifacts(data, id), true)
+    assert.equal(await hasLocalSessionArtifacts(data, 'not-a-uuid'), false)
+    assert.equal(await hasLocalSessionArtifacts(data, '../escape'), false)
+    await rm(join(data, 'conversations', `${id}.db`))
+    assert.equal(await hasLocalSessionArtifacts(data, id), false)
+
+    // Detects real brain/<id> directory.
+    await mkdir(join(data, 'brain', id))
+    assert.equal(await hasLocalSessionArtifacts(data, id), true)
+    await rm(join(data, 'brain', id), { recursive: true })
+    assert.equal(await hasLocalSessionArtifacts(data, id), false)
+
+    // Rejects wrong entry types (directory at .db, regular file at brain/<id>).
+    await mkdir(join(data, 'conversations', `${id}.db`))
+    await writeFile(join(data, 'brain', id), 'file')
+    assert.equal(await hasLocalSessionArtifacts(data, id), false)
+    await rm(join(data, 'conversations', `${id}.db`), { recursive: true })
+    await rm(join(data, 'brain', id))
+
+    // Refuses symlinked leaf .db and symlinked leaf brain/<id>.
+    await symlink(
+      join(outside, `${id}.db`),
+      join(data, 'conversations', `${id}.db`),
+    )
+    assert.equal(await hasLocalSessionArtifacts(data, id), false)
+    await rm(join(data, 'conversations', `${id}.db`))
+
+    await symlink(join(outside, 'brain', id), join(data, 'brain', id))
+    assert.equal(await hasLocalSessionArtifacts(data, id), false)
+    await rm(join(data, 'brain', id))
+
+    // Refuses symlinked conversations/ and brain/ directories.
+    await rm(join(data, 'conversations'), { recursive: true })
+    await symlink(outside, join(data, 'conversations'))
+    assert.equal(await hasLocalSessionArtifacts(data, id), false)
+    await rm(join(data, 'conversations'))
+
+    await rm(join(data, 'brain'), { recursive: true })
+    await symlink(join(outside, 'brain'), join(data, 'brain'))
+    assert.equal(await hasLocalSessionArtifacts(data, id), false)
+
+    // Refuses symlinked appData root.
+    const externalApp = join(root, 'external-app')
+    await mkdir(join(externalApp, 'conversations'), { recursive: true })
+    await writeFile(join(externalApp, 'conversations', `${id}.db`), 'db')
+    const linkedApp = join(root, 'linked-app')
+    await symlink(externalApp, linkedApp)
+    assert.equal(await hasLocalSessionArtifacts(linkedApp, id), false)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

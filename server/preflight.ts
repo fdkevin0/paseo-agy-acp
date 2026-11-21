@@ -234,6 +234,29 @@ async function realDirectory(path: string): Promise<boolean> {
   }
 }
 
+/** Whether a session has local conversation database or Brain directory artifacts. */
+export async function hasLocalSessionArtifacts(
+  appData: string,
+  sessionId: string,
+): Promise<boolean> {
+  if (!sessionIdPattern.test(sessionId) || !(await realDirectory(appData)))
+    return false
+  for (const [directory, name, kind] of [
+    [join(appData, 'conversations'), `${sessionId}.db`, 'file'],
+    [join(appData, 'brain'), sessionId, 'directory'],
+  ] as const) {
+    if (!(await realDirectory(directory))) continue
+    try {
+      const info = await lstat(join(directory, name))
+      if (kind === 'file' ? info.isFile() : info.isDirectory()) return true
+    } catch (error) {
+      if (isMissingOrNonDir(error)) continue
+      throw error
+    }
+  }
+  return false
+}
+
 /** Delete only the UUID returned by a disposable, never-prompted, now-closed session. */
 export async function removeSessionArtifacts(
   appData: string,

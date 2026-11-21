@@ -59,6 +59,7 @@ import { SubagentRegistry } from './subagents.ts'
 import {
   agyVersionDiagnostic,
   dataDirectory,
+  hasLocalSessionArtifacts,
   removeSessionArtifacts,
   resolveSpawnCwd,
 } from './preflight.ts'
@@ -108,6 +109,7 @@ interface SessionOptions {
   cancelConvergenceTimeoutMs?: number
   backgroundProbeTimeoutMs?: number
   observationPollIntervalMs?: number
+  commandWaitTimeoutMs?: number
   connectAcp?: typeof connectAcp
   createObservation?: (
     ...args: ConstructorParameters<typeof BrainTurnObservation>
@@ -119,6 +121,15 @@ interface SessionOptions {
 
 const SKIP_PERMISSIONS_FLAG = '--dangerously-skip-permissions'
 const TIER_CACHE_LIMIT = 100
+const LOAD_HISTORY_UPDATES = new Set<
+  SessionNotification['update']['sessionUpdate']
+>([
+  'user_message_chunk',
+  'agent_message_chunk',
+  'agent_thought_chunk',
+  'tool_call',
+  'tool_call_update',
+])
 
 function sessionRuntimeExitedError(failureError?: Error): Error {
   return new Error(
@@ -259,6 +270,7 @@ export class SessionManager {
         const params = sessionParams(input.config.cwd, input.config)
         session.state.persisted = Boolean(input.persistence)
         session.state.replay = input.history === 'replay'
+        let usedLoad = false
         if (input.persistence) {
           const canResume =
             input.history === 'skip' &&
@@ -268,6 +280,7 @@ export class SessionManager {
             )
           if (!canResume && !session.initialized.agentCapabilities?.loadSession)
             throw new Error('agy does not support session/load')
+          usedLoad = !canResume
           session.state.nativeId = data.sessionId as string
           session.state.metadata = {
             ...(await session.transport.request(
@@ -358,7 +371,22 @@ export class SessionManager {
         session.state.loading = false
         session.state.replay = true
         session.flushDeferredUsage()
-        await session.waitForCommands()
+        if (
+          !session.state.commandsReceived &&
+          !session.state.closing &&
+          !session.state.failed
+        ) {
+          const skipCommandWait =
+            Boolean(input.persistence) &&
+            usedLoad &&
+            sessionIdPattern.test(session.state.nativeId) &&
+            !session.state.sawLoadHistory &&
+            !(await hasLocalSessionArtifacts(
+              session.appData,
+              session.state.nativeId,
+            ).catch(() => true))
+          if (!skipCommandWait) await session.waitForCommands()
+        }
         if (this.closed || session.state.closing || session.state.failed)
           throw (
             session.state.failureError ??
@@ -509,7 +537,8 @@ async function createSession(
   const permissions = new Map<string, PendingPermission>()
   const mcpServerNames = Object.keys(config?.mcpServers ?? {})
   const timeline = new Timeline(id, mcpServerNames)
-  const brainRoot = join(dataDirectory(launch, config?.env, spawnCwd), 'brain')
+  const appData = dataDirectory(launch, config?.env, spawnCwd)
+  const brainRoot = join(appData, 'brain')
   const state = {
     nativeId: '',
     opened: false,
@@ -517,6 +546,8 @@ async function createSession(
     closing: false,
     silenced: false,
     closedEmitted: false,
+    commandsReceived: false,
+    sawLoadHistory: false,
     skipPermissions: config?.mode === FULL_ACCESS_MODE_ID,
     turnHadContextUsage: false,
     turnHadModelOutput: false,
@@ -669,7 +700,6 @@ async function createSession(
   }
   let usage: ProviderUsage = {}
   let deferredUsage = false
-  let commandsReceived = false
   let emittedCommands: string | undefined
   let commandWaiter: (() => void) | null = null
   let closing: Promise<void> | undefined
@@ -677,8 +707,10 @@ async function createSession(
     commandWaiter?.()
     commandWaiter = null
   }
-  async function waitForCommands(timeoutMs = 1000) {
-    if (commandsReceived || state.failed || state.closing) return
+  async function waitForCommands(
+    timeoutMs = options.commandWaitTimeoutMs ?? 1000,
+  ) {
+    if (state.commandsReceived || state.failed || state.closing) return
     let timer: NodeJS.Timeout | undefined
     try {
       await new Promise<void>((resolve) => {
@@ -819,7 +851,7 @@ async function createSession(
           commands: next,
         })
       }
-      commandsReceived = true
+      state.commandsReceived = true
       resolveCommands()
     } else if (u.sessionUpdate === 'usage_update') {
       const next = contextUsage(u)
@@ -840,6 +872,8 @@ async function createSession(
         deferredUsage = true
       }
     } else {
+      if (state.loading && LOAD_HISTORY_UPDATES.has(u.sessionUpdate))
+        state.sawLoadHistory = true
       if (isSuppressingReplay()) return
       if (u.sessionUpdate === 'user_message_chunk' && !state.loading) {
         state.turnToolCallIds = []
@@ -1334,6 +1368,7 @@ async function createSession(
       cwd,
       spawnCwd,
       config,
+      appData,
       brainRoot,
       stallTimeoutMs: options.stallTimeoutMs,
       retryTimeoutMs: options.retryTimeoutMs,
@@ -1574,14 +1609,13 @@ async function createSession(
                 { timeoutMs: 1500, fatalOnTimeout: false },
               )
               .catch(() => undefined)
-          const dir = dataDirectory(launch, config?.env, spawnCwd)
           await closingObservation?.dispose()
           const stopped = await currentTransport.close().then(
             () => true,
             () => false,
           )
           if (disposable && stopped)
-            await removeSessionArtifacts(dir, state.nativeId).catch(
+            await removeSessionArtifacts(appData, state.nativeId).catch(
               () => undefined,
             )
         })()

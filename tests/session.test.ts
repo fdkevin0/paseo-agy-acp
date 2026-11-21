@@ -12,6 +12,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import type { SessionNotification } from '@agentclientprotocol/sdk/unstable'
 import {
   PROVIDER_CAPABILITIES,
   type ProviderEvent,
@@ -3195,3 +3196,467 @@ test('settlement failure still publishes positive prompt result.usage', async ()
     await rm(home, { recursive: true, force: true })
   }
 })
+
+async function createCommandWaitHarness(
+  t: TestContext,
+  options: {
+    prefix: string
+    resumeCapable?: boolean
+    newSessionId?: string
+    loadNotifications?: readonly SessionNotification['update'][]
+  },
+) {
+  const home = await mkdtemp(join(tmpdir(), options.prefix))
+  const events: ProviderEvent[] = []
+  let activeClient!: Parameters<typeof connectAcp>[3]
+  let waitForCommandsCalls = 0
+  let notifyCommandWait!: () => void
+  const enteredCommandWait = new Promise<void>((resolve) => {
+    notifyCommandWait = resolve
+  })
+  const stubConnectAcp: typeof connectAcp = (_launch, _cwd, _env, client) => {
+    activeClient = client
+    let resolveStopped!: () => void
+    const stopped = new Promise<void>((resolve) => {
+      resolveStopped = resolve
+    })
+    let closed = false
+    const rpc = {
+      initialize: async () => ({
+        protocolVersion: 1,
+        agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
+        agentCapabilities: {
+          loadSession: true,
+          ...(options.resumeCapable
+            ? { sessionCapabilities: { resume: {} } }
+            : {}),
+        },
+      }),
+      newSession: async () => ({
+        sessionId:
+          options.newSessionId ?? '11111111-1111-4111-8111-111111111111',
+        configOptions: [],
+      }),
+      loadSession: async (params: { sessionId: string }) => {
+        for (const update of options.loadNotifications ?? []) {
+          void client.sessionUpdate({
+            sessionId: params.sessionId,
+            update,
+          })
+        }
+        return { configOptions: [] }
+      },
+      resumeSession: async () => ({ configOptions: [] }),
+      closeSession: async () => ({}),
+      setSessionConfigOption: async () => ({ configOptions: [] }),
+      listSessions: async () => ({ sessions: [] }),
+      prompt: async () => ({ stopReason: 'end_turn' as const }),
+      cancel: async () => {},
+    } as unknown as ReturnType<typeof connectAcp>['rpc']
+    return {
+      rpc,
+      exited: stopped,
+      stopped,
+      request: async <T>(op: Promise<T>) => op,
+      close: async () => {
+        closed = true
+        resolveStopped()
+      },
+      get closed() {
+        return closed
+      },
+      get tier() {
+        return undefined
+      },
+      get models() {
+        return undefined
+      },
+    }
+  }
+  class CommandWaitSessionManager extends SessionManager {
+    override async start(...args: Parameters<SessionManager['start']>) {
+      const session = await super.start(...args)
+      return new Proxy(session, {
+        get(target, prop, receiver) {
+          if (prop === 'waitForCommands') {
+            return (...waitArgs: Parameters<typeof target.waitForCommands>) => {
+              waitForCommandsCalls++
+              notifyCommandWait()
+              return target.waitForCommands(...waitArgs)
+            }
+          }
+          const value = Reflect.get(target, prop, receiver)
+          return typeof value === 'function' ? value.bind(target) : value
+        },
+      })
+    }
+  }
+  const manager = new CommandWaitSessionManager({
+    launch: {
+      command: 'agy',
+      args: ['acp'],
+      env: isolatedEnv(home),
+    },
+    usage: new AgyUsageSource({ env: isolatedEnv(home) }),
+    capabilities: ['prompt.message', 'prompt.command', 'session.persistence'],
+    emit: (event) => events.push(structuredClone(event)),
+    commandWaitTimeoutMs: 60_000,
+    connectAcp: stubConnectAcp,
+  })
+  t.after(async () => {
+    await manager.close()
+    await rm(home, { recursive: true, force: true })
+  })
+  return {
+    home,
+    appData: join(home, '.gemini/antigravity-cli'),
+    events,
+    manager,
+    enteredCommandWait,
+    get waitForCommandsCalls() {
+      return waitForCommandsCalls
+    },
+    sendCommands: (
+      sessionId: string,
+      availableCommands: Array<{ name: string; description: string }>,
+    ) =>
+      activeClient.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: 'available_commands_update',
+          availableCommands,
+        },
+      }),
+  }
+}
+
+const persistedTestId = '22222222-2222-4222-8222-222222222222'
+
+test(
+  'persisted UUID session/load without local artifacts or history skips command wait and forwards late commands',
+  { timeout: 2000 },
+  async (t) => {
+    const h = await createCommandWaitHarness(t, {
+      prefix: 'agy-skip-cmd-wait-',
+      loadNotifications: [
+        { sessionUpdate: 'session_info_update', title: 'Evicted session' },
+        { sessionUpdate: 'config_option_update', configOptions: [] },
+        { sessionUpdate: 'usage_update', used: 100, size: 1000 },
+      ],
+    })
+    await h.manager.handle({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'replay',
+      persistence: { version: 1, data: { sessionId: persistedTestId } },
+      config: {
+        cwd: h.home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    assert.equal(h.waitForCommandsCalls, 0)
+    assert.equal(
+      h.events.some((e) => e.type === 'session.ready'),
+      true,
+    )
+    assert.equal(
+      h.events.some((e) => e.type === 'session.commands'),
+      false,
+    )
+
+    await h.sendCommands(persistedTestId, [
+      { name: 'compact', description: 'Compact context' },
+    ])
+    const commandsEvent = h.events.find((e) => e.type === 'session.commands')
+    assert.deepEqual(commandsEvent, {
+      type: 'session.commands',
+      sessionId: 's',
+      commands: [
+        {
+          name: 'compact',
+          description: 'Compact context',
+          argumentHint: undefined,
+        },
+      ],
+    })
+  },
+)
+
+test(
+  'persisted UUID session/load with local conversation db still waits for available_commands_update',
+  { timeout: 2000 },
+  async (t) => {
+    const h = await createCommandWaitHarness(t, {
+      prefix: 'agy-wait-cmd-db-',
+    })
+    await mkdir(join(h.appData, 'conversations'), { recursive: true })
+    await writeFile(
+      join(h.appData, 'conversations', `${persistedTestId}.db`),
+      'db',
+    )
+    const opening = h.manager.handle({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'replay',
+      persistence: { version: 1, data: { sessionId: persistedTestId } },
+      config: {
+        cwd: h.home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    await h.enteredCommandWait
+    assert.equal(h.waitForCommandsCalls, 1)
+    assert.equal(
+      h.events.some((e) => e.type === 'session.ready'),
+      false,
+    )
+    await h.sendCommands(persistedTestId, [
+      { name: 'plan', description: 'Plan' },
+    ])
+    await opening
+    assert.ok(
+      h.events.findIndex((e) => e.type === 'session.commands') <
+        h.events.findIndex((e) => e.type === 'session.ready'),
+    )
+  },
+)
+
+test(
+  'persisted UUID session/load with local brain directory still waits for available_commands_update',
+  { timeout: 2000 },
+  async (t) => {
+    const h = await createCommandWaitHarness(t, {
+      prefix: 'agy-wait-cmd-brain-',
+    })
+    await mkdir(join(h.appData, 'brain', persistedTestId), { recursive: true })
+    const opening = h.manager.handle({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'replay',
+      persistence: { version: 1, data: { sessionId: persistedTestId } },
+      config: {
+        cwd: h.home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    await h.enteredCommandWait
+    assert.equal(h.waitForCommandsCalls, 1)
+    assert.equal(
+      h.events.some((e) => e.type === 'session.ready'),
+      false,
+    )
+    await h.sendCommands(persistedTestId, [])
+    await opening
+    assert.ok(
+      h.events.findIndex((e) => e.type === 'session.commands') <
+        h.events.findIndex((e) => e.type === 'session.ready'),
+    )
+  },
+)
+
+test(
+  'persisted UUID session/load with replayed history still waits for commands even without local artifacts',
+  { timeout: 2000 },
+  async (t) => {
+    const h = await createCommandWaitHarness(t, {
+      prefix: 'agy-wait-cmd-history-replay-',
+      loadNotifications: [
+        {
+          sessionUpdate: 'user_message_chunk',
+          content: { type: 'text', text: 'hello from fallback import' },
+        },
+      ],
+    })
+    const opening = h.manager.handle({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'replay',
+      persistence: { version: 1, data: { sessionId: persistedTestId } },
+      config: {
+        cwd: h.home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    await h.enteredCommandWait
+    assert.equal(h.waitForCommandsCalls, 1)
+    assert.equal(
+      h.events.some((e) => e.type === 'session.ready'),
+      false,
+    )
+    await h.sendCommands(persistedTestId, [])
+    await opening
+    assert.ok(
+      h.events.findIndex((e) => e.type === 'session.commands') <
+        h.events.findIndex((e) => e.type === 'session.ready'),
+    )
+  },
+)
+
+test(
+  'persisted UUID session/load with history skip still detects replayed history chunks and waits for commands',
+  { timeout: 2000 },
+  async (t) => {
+    const h = await createCommandWaitHarness(t, {
+      prefix: 'agy-wait-cmd-history-skip-',
+      loadNotifications: [
+        {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'suppressed replay chunk' },
+        },
+      ],
+    })
+    const opening = h.manager.handle({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'skip',
+      persistence: { version: 1, data: { sessionId: persistedTestId } },
+      config: {
+        cwd: h.home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    await h.enteredCommandWait
+    assert.equal(h.waitForCommandsCalls, 1)
+    assert.equal(
+      h.events.some((e) => e.type === 'session.ready'),
+      false,
+    )
+    await h.sendCommands(persistedTestId, [])
+    await opening
+    assert.ok(
+      h.events.findIndex((e) => e.type === 'session.commands') <
+        h.events.findIndex((e) => e.type === 'session.ready'),
+    )
+  },
+)
+
+test(
+  'persisted UUID session/resume still waits for available_commands_update',
+  { timeout: 2000 },
+  async (t) => {
+    const h = await createCommandWaitHarness(t, {
+      prefix: 'agy-wait-cmd-resume-',
+      resumeCapable: true,
+    })
+    const opening = h.manager.handle({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'skip',
+      persistence: { version: 1, data: { sessionId: persistedTestId } },
+      config: {
+        cwd: h.home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    await h.enteredCommandWait
+    assert.equal(h.waitForCommandsCalls, 1)
+    assert.equal(
+      h.events.some((e) => e.type === 'session.ready'),
+      false,
+    )
+    await h.sendCommands(persistedTestId, [])
+    await opening
+    assert.ok(
+      h.events.findIndex((e) => e.type === 'session.commands') <
+        h.events.findIndex((e) => e.type === 'session.ready'),
+    )
+  },
+)
+
+test(
+  'persisted non-UUID session/load still waits for available_commands_update',
+  { timeout: 2000 },
+  async (t) => {
+    const nonUuid = 'legacy-session-id'
+    const h = await createCommandWaitHarness(t, {
+      prefix: 'agy-wait-cmd-non-uuid-',
+    })
+    const opening = h.manager.handle({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'replay',
+      persistence: { version: 1, data: { sessionId: nonUuid } },
+      config: {
+        cwd: h.home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    await h.enteredCommandWait
+    assert.equal(h.waitForCommandsCalls, 1)
+    assert.equal(
+      h.events.some((e) => e.type === 'session.ready'),
+      false,
+    )
+    await h.sendCommands(nonUuid, [])
+    await opening
+    assert.ok(
+      h.events.findIndex((e) => e.type === 'session.commands') <
+        h.events.findIndex((e) => e.type === 'session.ready'),
+    )
+  },
+)
+
+test(
+  'new session/new still waits for available_commands_update',
+  { timeout: 2000 },
+  async (t) => {
+    const newId = '33333333-3333-4333-8333-333333333333'
+    const h = await createCommandWaitHarness(t, {
+      prefix: 'agy-wait-cmd-new-',
+      newSessionId: newId,
+    })
+    const opening = h.manager.handle({
+      type: 'session.open',
+      requestId: 'open',
+      sessionId: 's',
+      history: 'skip',
+      config: {
+        cwd: h.home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    await h.enteredCommandWait
+    assert.equal(h.waitForCommandsCalls, 1)
+    assert.equal(
+      h.events.some((e) => e.type === 'session.ready'),
+      false,
+    )
+    await h.sendCommands(newId, [])
+    await opening
+    assert.ok(
+      h.events.findIndex((e) => e.type === 'session.commands') <
+        h.events.findIndex((e) => e.type === 'session.ready'),
+    )
+  },
+)
