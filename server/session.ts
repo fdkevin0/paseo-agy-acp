@@ -2,7 +2,6 @@ import { BrainTurnObservation } from './brain-observer.ts'
 import type { AgyUsageSource } from './usage.ts'
 import { z } from 'zod'
 import { randomUUID } from 'node:crypto'
-import { stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   PROTOCOL_VERSION,
@@ -61,6 +60,7 @@ import {
   agyVersionDiagnostic,
   dataDirectory,
   removeSessionArtifacts,
+  resolveSpawnCwd,
 } from './preflight.ts'
 import { connectAcp } from './transport.ts'
 import {
@@ -194,6 +194,16 @@ function sessionParams(cwd: string, config?: ProviderSessionConfig) {
   }
 }
 
+/** Error whose `request.failed` event was already emitted before cleanup closed the session. */
+export class ReportedRequestError extends Error {
+  override readonly cause: unknown
+  constructor(cause: unknown) {
+    super(formatErrorMessage(cause))
+    this.name = 'ReportedRequestError'
+    this.cause = cause
+  }
+}
+
 /** Own native runtimes, session identities and their cancellation across a provider connection. */
 export class SessionManager {
   private sessions = new Map<string, Session>()
@@ -205,16 +215,35 @@ export class SessionManager {
     this.options = options
   }
 
-  async start(id: string, cwd: string, config?: ProviderSessionConfig) {
+  async start(
+    id: string,
+    cwd: string,
+    config?: ProviderSessionConfig,
+    startOptions?: { allowMissingCwd?: boolean },
+  ) {
     if (this.closed) throw new Error('Provider connection is closed')
-    return createSession(id, cwd, config, this.options, this.transports)
+    return createSession(
+      id,
+      cwd,
+      config,
+      this.options,
+      this.transports,
+      startOptions,
+    )
   }
 
   private async open(input: Open) {
     const { emit, capabilities } = this.options
     if (this.sessions.has(input.sessionId) || this.opening.has(input.sessionId))
       throw new Error('Session already open')
-    const starting = this.start(input.sessionId, input.config.cwd, input.config)
+    const starting = this.start(
+      input.sessionId,
+      input.config.cwd,
+      input.config,
+      {
+        allowMissingCwd: Boolean(input.persistence),
+      },
+    )
     this.opening.set(input.sessionId, starting)
     try {
       const session = await starting
@@ -275,7 +304,10 @@ export class SessionManager {
           )
         await session.drain()
         if (this.closed || session.state.closing || session.state.failed)
-          throw new Error('Session closed before open')
+          throw (
+            session.state.failureError ??
+            new Error('Session closed before open')
+          )
         session.state.opened = true
         emit({
           type: 'session.opened',
@@ -316,7 +348,11 @@ export class SessionManager {
         }
         session.state.turnToolCallIds = []
         session.state.turnForegroundAcp = []
-        await configureSession(session, input.config, { strictThinking: false })
+        await configureSession(
+          session,
+          input.config,
+          input.persistence ? 'restore' : 'open',
+        )
         await session.drain()
         if (input.persistence) await session.restoreUsage()
         session.state.loading = false
@@ -324,7 +360,10 @@ export class SessionManager {
         session.flushDeferredUsage()
         await session.waitForCommands()
         if (this.closed || session.state.closing || session.state.failed)
-          throw new Error('Session closed before ready')
+          throw (
+            session.state.failureError ??
+            new Error('Session closed before ready')
+          )
         session.state.ready = true
         emit({
           type: 'session.ready',
@@ -337,8 +376,16 @@ export class SessionManager {
         this.sessions.delete(input.sessionId)
         await session.close()
         if (wasOpened && !closedExternally && !session.state.closedEmitted) {
+          // Reject the open request before session.closed so Paseo surfaces the real error
+          // instead of replacing it with a generic "Provider session <id> closed".
+          emit({
+            type: 'request.failed',
+            requestId: input.requestId,
+            error: { message: formatErrorMessage(error) },
+          })
           session.state.closedEmitted = true
           emit({ type: 'session.closed', sessionId: input.sessionId })
+          throw new ReportedRequestError(error)
         }
         throw error
       }
@@ -452,16 +499,17 @@ async function createSession(
   config: ProviderSessionConfig | undefined,
   options: SessionOptions,
   transports: Set<ReturnType<typeof connectAcp>>,
+  startOptions?: { allowMissingCwd?: boolean },
 ) {
-  const cwdStat = await stat(cwd).catch(() => null)
-  if (!cwdStat?.isDirectory()) {
-    throw new Error(`Working directory does not exist: ${cwd}`)
-  }
   const { launch, capabilities, emit } = options
+  const spawnCwd = await resolveSpawnCwd(cwd, launch, {
+    env: config?.env,
+    allowMissingCwd: startOptions?.allowMissingCwd,
+  })
   const permissions = new Map<string, PendingPermission>()
   const mcpServerNames = Object.keys(config?.mcpServers ?? {})
   const timeline = new Timeline(id, mcpServerNames)
-  const brainRoot = join(dataDirectory(launch, config?.env, cwd), 'brain')
+  const brainRoot = join(dataDirectory(launch, config?.env, spawnCwd), 'brain')
   const state = {
     nativeId: '',
     opened: false,
@@ -1039,7 +1087,7 @@ async function createSession(
       transport !== currentTransport || retiring.has(transport)
     const transport = (options.connectAcp ?? connectAcp)(
       effectiveLaunch(launch, skipPermissions),
-      cwd,
+      spawnCwd,
       config?.env ?? {},
       {
         sessionUpdate: (notification) =>
@@ -1284,6 +1332,7 @@ async function createSession(
     return {
       id,
       cwd,
+      spawnCwd,
       config,
       brainRoot,
       stallTimeoutMs: options.stallTimeoutMs,
@@ -1525,7 +1574,7 @@ async function createSession(
                 { timeoutMs: 1500, fatalOnTimeout: false },
               )
               .catch(() => undefined)
-          const dir = dataDirectory(launch, config?.env, cwd)
+          const dir = dataDirectory(launch, config?.env, spawnCwd)
           await closingObservation?.dispose()
           const stopped = await currentTransport.close().then(
             () => true,
@@ -1599,22 +1648,36 @@ async function applyNativeConfigOption(
   return true
 }
 
+type ConfigurePolicy = 'strict' | 'open' | 'restore'
+
+function isKnownConfigChoice(
+  current: ReturnType<typeof configState>,
+  key: NativeConfigKey,
+  value: string,
+): boolean {
+  const choices =
+    key === 'model'
+      ? current.models
+      : key === 'mode'
+        ? current.modes
+        : current.thinkingOptions
+  return choices.some((o) => o.id === value)
+}
+
 async function configureSession(
   session: Session,
   changes: Pick<
     ProviderConfigChanges,
     'model' | 'mode' | 'thinkingOption' | 'settings'
   >,
-  options?: { strictThinking?: boolean },
+  policy: ConfigurePolicy = 'strict',
 ) {
   if (session.state.closing || session.state.failed)
     throw sessionRuntimeExitedError(session.state.failureError)
   if (changes.settings && Object.keys(changes.settings).length)
     throw new Error('Custom settings are not supported')
-  const strictThinking = options?.strictThinking ?? true
-  // Switching `model` dynamically adds or removes `thought_level` in `metadata.configOptions`
-  // via the native RPC, so `thought_level` must be re-evaluated after `model` is applied.
-  const allowMissingThinking = !strictThinking || changes.model != null
+  const isBestEffort = (key: NativeConfigKey) =>
+    policy === 'restore' || (policy === 'open' && key === 'thought_level')
   const entries = [
     ['model', changes.model],
     ['thought_level', changes.thinkingOption],
@@ -1622,14 +1685,21 @@ async function configureSession(
   ] as const
   const initial = configState(session.state.metadata)
   for (const [key, value] of entries) {
-    if (value == null) continue
+    if (value == null || isBestEffort(key)) continue
     if (key === 'mode' && value === FULL_ACCESS_MODE_ID) continue
-    if (key === 'thought_level' && allowMissingThinking) continue
+    // Switching `model` dynamically adds or removes `thought_level`, so re-evaluate it after `model`.
+    if (key === 'thought_level' && changes.model != null) continue
     if (value === selectedConfigValue(initial, key)) continue
     if (!isAdvertisedConfigOption(session.state.metadata, initial, key))
       throw new Error(`agy does not advertise ${key}`)
   }
-  if (changes.model != null && changes.model !== initial.model) {
+  const willSwitchModel =
+    changes.model != null &&
+    changes.model !== initial.model &&
+    (!isBestEffort('model') ||
+      (isAdvertisedConfigOption(session.state.metadata, initial, 'model') &&
+        isKnownConfigChoice(initial, 'model', changes.model)))
+  if (willSwitchModel) {
     await session.refreshCompactionWindow({ model: initial.model })
   }
   let mutated = false
@@ -1639,14 +1709,14 @@ async function configureSession(
       const current = configState(session.state.metadata)
       if (value === selectedConfigValue(current, key)) continue
       if (!isAdvertisedConfigOption(session.state.metadata, current, key)) {
-        if (key === 'thought_level' && allowMissingThinking) continue
+        if (
+          isBestEffort(key) ||
+          (key === 'thought_level' && changes.model != null)
+        )
+          continue
         throw new Error(`agy does not advertise ${key}`)
       }
-      if (
-        key === 'thought_level' &&
-        !strictThinking &&
-        !current.thinkingOptions.some((o) => o.id === value)
-      )
+      if (isBestEffort(key) && !isKnownConfigChoice(current, key, value))
         continue
       if (key === 'mode' && value === FULL_ACCESS_MODE_ID) {
         await session.relaunchForPermissions(true)
@@ -1685,7 +1755,7 @@ async function configureSession(
         session.state.metadata,
         key,
         value,
-        true,
+        !isBestEffort(key),
       )
       mutated ||= applied
     }
@@ -1742,6 +1812,8 @@ async function promptSession(
     throw sessionRuntimeExitedError(session.state.failureError)
   if (p.delivery === 'steer' || p.outputSchema)
     throw new Error('Steering and output schemas are not supported')
+  if (session.spawnCwd !== session.cwd)
+    throw new Error(`Working directory does not exist: ${session.cwd}`)
   const blocks: ContentBlock[] =
     p.input.type === 'command'
       ? [
