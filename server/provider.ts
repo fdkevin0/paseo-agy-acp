@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto'
 import {
   negotiateProviderCapabilities,
   requireProviderCapabilities,
@@ -14,12 +13,20 @@ import type {
   ProviderInput,
 } from '@getpaseo/plugin/server/provider'
 import {
+  dataDirectory,
   providerStatus,
+  removeSessionArtifacts,
   resolveCatalogCacheKey,
   resolveSpawnCwd,
 } from './preflight.ts'
 import { configState } from './mapping.ts'
-import { formatErrorMessage, record, setBounded } from './common.ts'
+import {
+  formatErrorMessage,
+  record,
+  sessionIdPattern,
+  setBounded,
+} from './common.ts'
+import { SharedControlRuntime } from './runtime.ts'
 import { AgyUsageSource } from './usage.ts'
 import { ReportedRequestError, SessionManager } from './session.ts'
 
@@ -71,6 +78,9 @@ export function createProvider(
         capabilities,
         emit,
       })
+      const controlRuntime = new SharedControlRuntime({
+        launch: connection.launch,
+      })
       const pending = new Set<Promise<void>>()
       const pendingCatalogs = new Map<string, Promise<ProviderCatalog>>()
       let closed = false
@@ -82,7 +92,7 @@ export function createProvider(
           let catalog = pendingCatalogs.get(cwd)
           if (!catalog) {
             const pendingCatalog = probeCatalog(
-              manager,
+              controlRuntime,
               connection.launch,
               cwd,
               usage,
@@ -106,7 +116,7 @@ export function createProvider(
             catalog: await catalog,
           })
         } else if (input.type === 'sessions')
-          await listSessions(manager, connection.launch, input, emit)
+          await listSessions(controlRuntime, connection.launch, input, emit)
         else await manager.handle(input)
       }
       return {
@@ -154,7 +164,7 @@ export function createProvider(
         },
         async close() {
           closed = true
-          await manager.close()
+          await Promise.all([manager.close(), controlRuntime.close()])
           await Promise.all([...pending])
           listeners.clear()
         },
@@ -164,59 +174,84 @@ export function createProvider(
 }
 
 async function probeCatalog(
-  manager: SessionManager,
+  controlRuntime: SharedControlRuntime,
   launch: ProviderLaunch | undefined,
   cwd: string,
   usage: AgyUsageSource,
 ): Promise<ProviderCatalog> {
-  const session = await manager.start(randomUUID(), cwd)
-  try {
-    const response = await session.transport.request(
-      session.transport.rpc.newSession({ cwd, mcpServers: [] }),
-    )
-    session.state.nativeId = response.sessionId
-    const dir = usage.remember(launch, {}, cwd)
-    if (session.transport.tier?.name)
-      setBounded(
-        usage.tiers,
-        dir,
-        session.transport.tier.name,
-        CATALOG_CACHE_LIMIT,
-      )
-    const config = configState({
-      ...response,
-      models: session.transport.models,
-    })
-    return {
-      models: config.models,
-      modes: config.modes,
-      thinkingOptions: config.thinkingOptions,
-      defaultModel: config.model,
-      defaultMode: config.mode,
-      defaultThinkingOption: config.thinkingOption,
-    }
-  } finally {
-    await session.close()
-  }
+  return controlRuntime.run(
+    cwd,
+    async (lease) => {
+      const { transport } = lease
+      let nativeId = ''
+      try {
+        const response = await transport.request(
+          transport.rpc.newSession({ cwd, mcpServers: [] }),
+        )
+        nativeId = response.sessionId
+        const dir = usage.remember(launch, {}, cwd)
+        if (transport.tier?.name)
+          setBounded(usage.tiers, dir, transport.tier.name, CATALOG_CACHE_LIMIT)
+        const config = configState({
+          ...response,
+          models: transport.models,
+        })
+        return {
+          models: config.models,
+          modes: config.modes,
+          thinkingOptions: config.thinkingOptions,
+          defaultModel: config.model,
+          defaultMode: config.mode,
+          defaultThinkingOption: config.thinkingOption,
+        }
+      } finally {
+        if (nativeId) {
+          let closeOk = false
+          try {
+            await transport.request(
+              transport.rpc.closeSession({ sessionId: nativeId }),
+              { timeoutMs: 1500, fatalOnTimeout: false },
+            )
+            closeOk = !transport.closed
+          } catch {
+            closeOk = false
+          }
+          let canCleanup = closeOk
+          if (!closeOk || !lease.reusable) {
+            canCleanup = await lease.retire().then(
+              () => true,
+              () => false,
+            )
+          }
+          if (canCleanup && sessionIdPattern.test(nativeId)) {
+            await removeSessionArtifacts(
+              dataDirectory(launch, {}, cwd),
+              nativeId,
+            ).catch(() => undefined)
+          }
+        }
+      }
+    },
+    { serialize: true },
+  )
 }
 
 async function listSessions(
-  manager: SessionManager,
+  controlRuntime: SharedControlRuntime,
   launch: ProviderLaunch | undefined,
   input: Extract<ProviderInput, { type: 'sessions' }>,
   emit: (event: ProviderEvent) => void,
 ) {
-  const session = await manager.start(
-    randomUUID(),
-    await resolveSpawnCwd(input.cwd, launch, { allowMissingCwd: true }),
-  )
-  try {
+  const spawnCwd = await resolveSpawnCwd(input.cwd, launch, {
+    allowMissingCwd: true,
+  })
+  const sessions = await controlRuntime.run(spawnCwd, async ({ transport }) => {
     const results = []
     let cursor: string | undefined
     const cursors = new Set<string>()
     do {
-      const response = await session.transport.request(
-        session.transport.rpc.listSessions({ cwd: input.cwd, cursor }),
+      const response = await transport.request(
+        transport.rpc.listSessions({ cwd: input.cwd, cursor }),
       )
       results.push(
         ...response.sessions
@@ -253,12 +288,11 @@ async function listSessions(
         throw new Error('Repeated ACP session list cursor')
       if (cursor) cursors.add(cursor)
     } while (cursor && results.length < (input.limit ?? 100))
-    emit({
-      type: 'sessions',
-      requestId: input.requestId,
-      sessions: results.slice(0, input.limit ?? 100),
-    })
-  } finally {
-    await session.close()
-  }
+    return results.slice(0, input.limit ?? 100)
+  })
+  emit({
+    type: 'sessions',
+    requestId: input.requestId,
+    sessions,
+  })
 }
