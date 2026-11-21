@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto'
-import { homedir } from 'node:os'
 import {
   negotiateProviderCapabilities,
   requireProviderCapabilities,
@@ -14,11 +13,15 @@ import type {
   ProviderEvent,
   ProviderInput,
 } from '@getpaseo/plugin/server/provider'
-import { providerStatus, resolveCatalogCacheKey } from './preflight.ts'
+import {
+  providerStatus,
+  resolveCatalogCacheKey,
+  resolveSpawnCwd,
+} from './preflight.ts'
 import { configState } from './mapping.ts'
 import { formatErrorMessage, record, setBounded } from './common.ts'
 import { AgyUsageSource } from './usage.ts'
-import { SessionManager } from './session.ts'
+import { ReportedRequestError, SessionManager } from './session.ts'
 
 const CATALOG_CACHE_LIMIT = 100
 
@@ -73,7 +76,9 @@ export function createProvider(
       let closed = false
       async function handle(input: ProviderInput) {
         if (input.type === 'catalog') {
-          const cwd = input.cwd ?? homedir()
+          const cwd = await resolveSpawnCwd(input.cwd, connection.launch, {
+            allowMissingCwd: true,
+          })
           let catalog = pendingCatalogs.get(cwd)
           if (!catalog) {
             const pendingCatalog = probeCatalog(
@@ -101,7 +106,7 @@ export function createProvider(
             catalog: await catalog,
           })
         } else if (input.type === 'sessions')
-          await listSessions(manager, input, emit)
+          await listSessions(manager, connection.launch, input, emit)
         else await manager.handle(input)
       }
       return {
@@ -128,6 +133,7 @@ export function createProvider(
             return task
           }
           const task = handle(input).catch((error) => {
+            if (error instanceof ReportedRequestError) return
             const message = formatErrorMessage(error)
             if ('requestId' in input)
               emit({
@@ -196,10 +202,14 @@ async function probeCatalog(
 
 async function listSessions(
   manager: SessionManager,
+  launch: ProviderLaunch | undefined,
   input: Extract<ProviderInput, { type: 'sessions' }>,
   emit: (event: ProviderEvent) => void,
 ) {
-  const session = await manager.start(randomUUID(), input.cwd ?? homedir())
+  const session = await manager.start(
+    randomUUID(),
+    await resolveSpawnCwd(input.cwd, launch, { allowMissingCwd: true }),
+  )
   try {
     const results = []
     let cursor: string | undefined

@@ -171,6 +171,55 @@ export function dataDirectory(
   return resolve(baseCwd, gemini, app)
 }
 
+async function isExistingDirectory(path: string): Promise<boolean> {
+  const info = await stat(path).catch(() => null)
+  return Boolean(info?.isDirectory())
+}
+
+/** Whether launching `agy` from a different cwd preserves executable and data paths. */
+export function isCwdIndependentLaunch(
+  cwd: string,
+  fallbackCwd: string,
+  launch?: ProviderLaunch,
+  env: Readonly<Record<string, string>> = {},
+  fallbackHome = homedir(),
+): boolean {
+  const cmd = launch?.command ?? 'agy'
+  if (!isAbsolute(cmd) && /[/\\]/.test(cmd)) return false
+  return (
+    dataDirectory(launch, env, fallbackCwd, fallbackHome) ===
+    dataDirectory(launch, env, cwd, fallbackHome)
+  )
+}
+
+/**
+ * Resolve an existing spawn directory, falling back to HOME only when allowed
+ * and the launch does not depend on relative executable or `--gemini-dir` paths.
+ */
+export async function resolveSpawnCwd(
+  cwd: string | undefined,
+  launch?: ProviderLaunch,
+  options?: {
+    env?: Readonly<Record<string, string>>
+    fallbackHome?: string
+    allowMissingCwd?: boolean
+  },
+): Promise<string> {
+  const env = options?.env ?? {}
+  const fallback =
+    env.HOME ?? launch?.env?.HOME ?? options?.fallbackHome ?? homedir()
+  const target = cwd ?? fallback
+  if (await isExistingDirectory(target)) return target
+  if (
+    options?.allowMissingCwd &&
+    cwd !== undefined &&
+    (await isExistingDirectory(fallback)) &&
+    isCwdIndependentLaunch(cwd, fallback, launch, env, options.fallbackHome)
+  )
+    return fallback
+  throw new Error(`Working directory does not exist: ${target}`)
+}
+
 function isMissingOrNonDir(error: unknown): boolean {
   const code = (error as NodeJS.ErrnoException | undefined)?.code
   return code === 'ENOENT' || code === 'ENOTDIR'

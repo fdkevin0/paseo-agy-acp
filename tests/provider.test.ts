@@ -846,15 +846,19 @@ test('missing transcript leaves context unknown and prompted sessions remain res
 
 test('failed probes clear pending catalog state, allow retries, and cannot replace remembered usage launches', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-failed-probe-'))
-  const missingCwd = join(home, 'missing')
-  const h = await harness({ HOME: home })
+  const failFlag = join(home, 'fail-probe')
+  await writeFile(failFlag, '1')
+  const h = await harness({
+    HOME: home,
+    AGY_TEST_FAIL_NEW_SESSION_FLAG: failFlag,
+  })
   try {
     await Promise.all(
       ['missing-a', 'missing-b'].map((requestId) =>
         h.provider.send({
           type: 'catalog',
           requestId,
-          cwd: missingCwd,
+          cwd: home,
         }),
       ),
     )
@@ -872,11 +876,11 @@ test('failed probes clear pending catalog state, allow retries, and cannot repla
       }),
       [],
     )
-    await mkdir(missingCwd)
+    await rm(failFlag)
     await h.provider.send({
       type: 'catalog',
       requestId: 'retry',
-      cwd: missingCwd,
+      cwd: home,
     })
     const recovered = await h.wait(
       (e) => e.type === 'catalog' && e.requestId === 'retry',
@@ -2007,6 +2011,169 @@ test('denied permission marks stranded tool card canceled and concurrent close c
     )
     assert.equal(toolItem.item.status, 'canceled')
     assert.equal(toolItem.item.error, null)
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('persisted session skips retired model/mode while failed post-opened session emits request.failed before session.closed', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-retired-model-'))
+  const h = await harness({ HOME: home, AGY_TEST_STRICT_MODEL: '1' })
+  try {
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-persisted-retired',
+      sessionId: 'persisted-retired',
+      config: {
+        ...h.config,
+        model: 'gemini-pro-orchestrator-g1-pro',
+        mode: 'legacy-removed-mode',
+      },
+      persistence: {
+        version: 1,
+        data: { sessionId: '11111111-1111-4111-8111-111111111111' },
+      },
+      history: 'replay',
+    })
+    await h.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 'persisted-retired',
+    )
+    const publishedConfig = h.events.findLast(
+      (e) => e.type === 'session.config' && e.sessionId === 'persisted-retired',
+    )
+    assert.ok(publishedConfig?.type === 'session.config')
+    assert.equal(publishedConfig.config.model, 'test')
+    assert.equal(publishedConfig.config.mode, 'default')
+
+    h.events.length = 0
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-new-unknown',
+      sessionId: 'new-unknown',
+      config: {
+        ...h.config,
+        persist: false,
+        model: 'gemini-pro-orchestrator-g1-pro',
+      },
+      history: 'skip',
+    })
+    await h.wait(
+      (e) => e.type === 'session.closed' && e.sessionId === 'new-unknown',
+    )
+    const failedIndex = h.events.findIndex(
+      (e) => e.type === 'request.failed' && e.requestId === 'open-new-unknown',
+    )
+    const closedIndex = h.events.findIndex(
+      (e) => e.type === 'session.closed' && e.sessionId === 'new-unknown',
+    )
+    assert.notEqual(failedIndex, -1)
+    assert.ok(
+      failedIndex < closedIndex,
+      'request.failed must precede session.closed so Paseo surfaces the real error',
+    )
+    assert.equal(
+      h.events.filter(
+        (e) =>
+          e.type === 'request.failed' && e.requestId === 'open-new-unknown',
+      ).length,
+      1,
+    )
+    const failedEvent = h.events[failedIndex]
+    assert.ok(failedEvent?.type === 'request.failed')
+    assert.match(
+      failedEvent.error.message,
+      /Unknown model ID: gemini-pro-orchestrator-g1-pro/,
+    )
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('missing cwd falls back for catalog, sessions, and persisted replay while blocking prompts', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-missing-cwd-fallback-'))
+  const missingCwd = join(home, 'deleted-worktree')
+  const log = join(home, 'calls')
+  const h = await harness({
+    HOME: home,
+    AGY_TEST_LOG: log,
+    AGY_TEST_LOG_CWD: '1',
+  })
+  try {
+    await h.provider.send({
+      type: 'catalog',
+      requestId: 'cat-missing',
+      cwd: missingCwd,
+    })
+    const catalog = await h.wait(
+      (e) => e.type === 'catalog' && e.requestId === 'cat-missing',
+    )
+    assert.ok(catalog.type === 'catalog' && catalog.catalog.models.length > 0)
+
+    await h.provider.send({
+      type: 'sessions',
+      requestId: 'list-missing',
+      cwd: missingCwd,
+    })
+    const listed = await h.wait(
+      (e) => e.type === 'sessions' && e.requestId === 'list-missing',
+    )
+    assert.ok(listed.type === 'sessions' && listed.sessions.length === 1)
+    assert.equal(listed.sessions[0].cwd, missingCwd)
+
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-archived',
+      sessionId: 'archived',
+      config: { ...h.config, cwd: missingCwd },
+      persistence: {
+        version: 1,
+        data: { sessionId: '11111111-1111-4111-8111-111111111111' },
+      },
+      history: 'replay',
+    })
+    await h.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 'archived',
+    )
+    const opened = h.events.find(
+      (e) => e.type === 'session.opened' && e.sessionId === 'archived',
+    )
+    assert.ok(opened?.type === 'session.opened')
+    assert.equal(opened.cwd, missingCwd)
+    const replayed = h.events.find(
+      (e) =>
+        e.type === 'timeline.item' &&
+        e.sessionId === 'archived' &&
+        e.item.type === 'assistant_message' &&
+        e.item.text === 'old answer',
+    )
+    assert.ok(replayed)
+    const calls = await readFile(log, 'utf8')
+    assert.ok(calls.includes(`spawn-cwd:${home}|load-cwd:${missingCwd}`))
+
+    await h.provider.send({
+      type: 'session.prompt',
+      sessionId: 'archived',
+      prompt: {
+        clientMessageId: 'prompt-missing-cwd',
+        delivery: 'auto',
+        input: { type: 'message', content: [{ type: 'text', text: 'hello' }] },
+      },
+    })
+    const promptResult = await h.wait(
+      (e) =>
+        e.type === 'session.prompt_result' &&
+        e.clientMessageId === 'prompt-missing-cwd',
+    )
+    assert.ok(
+      promptResult.type === 'session.prompt_result' &&
+        promptResult.result.type === 'failed',
+    )
+    assert.match(
+      promptResult.result.error.message,
+      /Working directory does not exist/,
+    )
   } finally {
     await h.provider.close()
     await rm(home, { recursive: true, force: true })

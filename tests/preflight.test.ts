@@ -19,6 +19,7 @@ import {
   providerStatus,
   removeSessionArtifacts,
   resolveCatalogCacheKey,
+  resolveSpawnCwd,
 } from '../server/preflight.ts'
 
 const id = '11111111-1111-4111-8111-111111111111'
@@ -313,6 +314,85 @@ test('providerStatus invalidates cached availability immediately on binary downg
     assert.equal((await providerStatus(launch)).available, true)
     await chmod(fakeBin, 0o644)
     assert.equal((await providerStatus(launch)).available, false)
+  } finally {
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('resolveSpawnCwd falls back only when allowed and launch paths are cwd-independent', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'agy-spawn-cwd-'))
+  const existing = join(tmp, 'workspace')
+  const missing = join(tmp, 'deleted-worktree')
+  await mkdir(existing)
+  try {
+    assert.equal(
+      await resolveSpawnCwd(
+        existing,
+        {
+          command: './agy',
+          args: ['acp', '--gemini-dir', './custom'],
+          env: { HOME: tmp },
+        },
+        { allowMissingCwd: true },
+      ),
+      existing,
+    )
+    assert.equal(
+      await resolveSpawnCwd(
+        missing,
+        {
+          command: 'agy',
+          args: ['acp'],
+          env: { HOME: tmp },
+        },
+        { allowMissingCwd: true },
+      ),
+      tmp,
+    )
+    await assert.rejects(
+      resolveSpawnCwd(missing, {
+        command: 'agy',
+        args: ['acp'],
+        env: { HOME: tmp },
+      }),
+      /Working directory does not exist/,
+    )
+    await assert.rejects(
+      resolveSpawnCwd(
+        missing,
+        {
+          command: './agy',
+          args: ['acp'],
+          env: { HOME: tmp },
+        },
+        { allowMissingCwd: true },
+      ),
+      /Working directory does not exist/,
+    )
+    await assert.rejects(
+      resolveSpawnCwd(
+        missing,
+        {
+          command: 'agy',
+          args: ['acp', '--gemini-dir', './custom'],
+          env: { HOME: tmp },
+        },
+        { allowMissingCwd: true },
+      ),
+      /Working directory does not exist/,
+    )
+    await assert.rejects(
+      resolveSpawnCwd(
+        missing,
+        {
+          command: 'agy',
+          args: ['acp'],
+          env: { HOME: join(tmp, 'missing-home') },
+        },
+        { allowMissingCwd: true },
+      ),
+      /Working directory does not exist/,
+    )
   } finally {
     await rm(tmp, { recursive: true, force: true })
   }

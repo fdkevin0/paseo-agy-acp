@@ -8,7 +8,13 @@ import {
   type SessionNotification,
 } from '@agentclientprotocol/sdk/unstable'
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs'
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+} from 'node:fs'
 import { join } from 'node:path'
 import { WritableStream } from 'node:stream/web'
 import { Readable, Writable } from 'node:stream'
@@ -29,7 +35,10 @@ const configOptions = [
     name: 'Model',
     type: 'select' as const,
     currentValue: 'test',
-    options: [{ value: 'test', name: 'Test' }],
+    options: [
+      { value: 'test', name: 'Test' },
+      { value: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B' },
+    ],
   },
   {
     id: 'thought_level',
@@ -206,6 +215,11 @@ connection = agent()
   })
   .onRequest(methods.agent.authenticate, async () => ({}))
   .onRequest(methods.agent.session.new, async ({ params }) => {
+    if (
+      process.env.AGY_TEST_FAIL_NEW_SESSION_FLAG &&
+      existsSync(process.env.AGY_TEST_FAIL_NEW_SESSION_FLAG)
+    )
+      throw new Error('probe unavailable')
     const previousId = nativeId || randomUUID()
     nativeId = randomUUID()
     const append = (
@@ -224,7 +238,9 @@ connection = agent()
   })
   .onRequest(
     methods.agent.session.load,
-    async ({ params: { sessionId, _meta } }) => {
+    async ({ params: { sessionId, cwd, _meta } }) => {
+      if (process.env.AGY_TEST_LOG_CWD)
+        log(`spawn-cwd:${process.cwd()}|load-cwd:${cwd}`)
       const append = (
         _meta?.antigravity as { systemPrompt?: { append?: string } }
       )?.systemPrompt?.append
@@ -339,6 +355,12 @@ connection = agent()
         finishRecordedReads = undefined
         return { configOptions }
       }
+      if (
+        process.env.AGY_TEST_STRICT_MODEL &&
+        configId === 'model' &&
+        !configOptions[0].options.some((o) => o.value === String(value))
+      )
+        throw new Error(`Unknown model ID: ${value}`)
       log(`configure:${configId}=${value}`)
       return {
         configOptions: configOptions.map((o) =>

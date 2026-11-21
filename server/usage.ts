@@ -7,7 +7,7 @@ import {
   stat,
   type FileHandle,
 } from 'node:fs/promises'
-import { join, isAbsolute, sep } from 'node:path'
+import { join, sep } from 'node:path'
 import { homedir } from 'node:os'
 import { z } from 'zod'
 import { spawnProcess, terminateProcess } from '@getpaseo/plugin/server'
@@ -23,7 +23,7 @@ import {
   type UsageSourceRegistration,
 } from '@getpaseo/plugin/server/usage'
 import { definedProcessEnv, formatErrorMessage, setBounded } from './common.ts'
-import { dataDirectory } from './preflight.ts'
+import { dataDirectory, isCwdIndependentLaunch } from './preflight.ts'
 
 const FIVE_HOURS_SECONDS = 5 * 3600
 const WEEKLY_SECONDS = 7 * 86_400
@@ -490,19 +490,16 @@ export class AgyUsageSource {
           () => false,
         ))
       ) {
-        cwd = defaultHome
         const launch = {
           command: cmd,
           args: rawArgs,
           env: known!.env,
         }
-        if (
-          dataDirectory(launch, {}, cwd, defaultHome) !== dataDir ||
-          (!isAbsolute(launch.command) && /[/\\]/.test(launch.command))
-        )
+        if (!isCwdIndependentLaunch(cwd, defaultHome, launch, {}, defaultHome))
           throw new Error(
             'Remembered workspace is missing and the usage launch depends on relative paths',
           )
+        cwd = defaultHome
       }
       const stdout = await runUsageCommand(
         cmd,
