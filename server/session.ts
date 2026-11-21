@@ -293,7 +293,7 @@ export class SessionManager {
         const dir = this.options.usage.remember(
           this.options.launch,
           input.config.env,
-          input.config.cwd,
+          session.spawnCwd,
         )
         if (session.transport.tier?.name)
           setBounded(
