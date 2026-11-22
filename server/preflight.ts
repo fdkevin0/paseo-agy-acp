@@ -2,7 +2,7 @@
 import { createHash } from 'node:crypto'
 import { constants, realpathSync } from 'node:fs'
 import { access, lstat, realpath, rm, stat } from 'node:fs/promises'
-import { delimiter, isAbsolute, join, resolve } from 'node:path'
+import { delimiter, extname, isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { execCommand } from '@getpaseo/plugin/server'
 import type {
@@ -36,9 +36,83 @@ export function agyVersionDiagnostic(version?: string): string | undefined {
     return `agy ${version} is too old; requires >=${MIN_AGY_VERSION}. Run agy update.`
 }
 
-async function fingerprintPath(path: string): Promise<string | undefined> {
+const DEFAULT_WINDOWS_PATHEXT = ['.exe', '.cmd', '.bat', '.com']
+
+export interface BinaryFingerprintOptions {
+  platform?: NodeJS.Platform
+  fallbackHome?: string
+}
+
+function readEnv(
+  env: Readonly<Record<string, string | undefined>> | undefined,
+  name: string,
+): string | undefined {
+  if (!env) return undefined
+  const direct = env[name]
+  if (direct) return direct
+  const lower = name.toLowerCase()
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toLowerCase() === lower && value) return value
+  }
+  return undefined
+}
+
+/** Resolve the effective home directory (`HOME`, then `USERPROFILE`, ignoring empty strings). */
+export function resolveHome(
+  env: Readonly<Record<string, string | undefined>> | undefined,
+  launchEnv?: Readonly<Record<string, string | undefined>>,
+  fallbackHome?: string,
+): string {
+  return (
+    readEnv(env, 'HOME') ??
+    readEnv(env, 'USERPROFILE') ??
+    readEnv(launchEnv, 'HOME') ??
+    readEnv(launchEnv, 'USERPROFILE') ??
+    (fallbackHome || homedir())
+  )
+}
+
+function windowsPathExts(
+  env: Readonly<Record<string, string | undefined>>,
+): string[] {
+  const raw = readEnv(env, 'PATHEXT')
+  if (!raw) return DEFAULT_WINDOWS_PATHEXT
+  const exts: string[] = []
+  for (const entry of raw.split(';')) {
+    const cleaned = entry.trim().toLowerCase()
+    if (!cleaned) continue
+    const ext = cleaned.startsWith('.') ? cleaned : `.${cleaned}`
+    if (!exts.includes(ext)) exts.push(ext)
+  }
+  if (!exts.includes('.exe')) exts.unshift('.exe')
+  return exts
+}
+
+function windowsCandidates(
+  basePath: string,
+  exts: readonly string[],
+): string[] {
+  const lower = basePath.toLowerCase()
+  if (exts.some((ext) => lower.endsWith(ext))) return [basePath]
+  if (extname(basePath))
+    return [basePath, ...exts.map((ext) => `${basePath}${ext}`)]
+  return [...exts.map((ext) => `${basePath}${ext}`), basePath]
+}
+
+function stripOuterQuotes(entry: string, isWindows: boolean): string {
+  const raw = isWindows ? entry.trim() : entry
+  return raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"')
+    ? raw.slice(1, -1)
+    : raw
+}
+
+async function fingerprintPath(
+  path: string,
+  isWindows: boolean,
+): Promise<string | undefined> {
   try {
-    await access(path, constants.X_OK)
+    // POSIX requires execute permission; Windows lacks POSIX X_OK semantics so stat().isFile() is authoritative.
+    if (!isWindows) await access(path, constants.X_OK)
     const real = await realpath(path)
     const info = await stat(real, { bigint: true })
     if (!info.isFile()) return undefined
@@ -48,17 +122,61 @@ async function fingerprintPath(path: string): Promise<string | undefined> {
   }
 }
 
+async function fingerprintCandidates(
+  basePath: string,
+  isWindows: boolean,
+  exts: readonly string[],
+): Promise<string | undefined> {
+  if (!isWindows) return fingerprintPath(basePath, false)
+  for (const candidate of windowsCandidates(basePath, exts)) {
+    const found = await fingerprintPath(candidate, true)
+    if (found) return found
+  }
+  return undefined
+}
+
+function defaultAgyInstallPaths(
+  env: Readonly<Record<string, string | undefined>>,
+  isWindows: boolean,
+  fallbackHome: string,
+): string[] {
+  const home = resolveHome(env, undefined, fallbackHome)
+  if (!isWindows) return home ? [join(home, '.local', 'bin', 'agy')] : []
+  const paths: string[] = []
+  const localAppData = readEnv(env, 'LOCALAPPDATA')
+  if (localAppData) paths.push(join(localAppData, 'agy', 'bin', 'agy.exe'))
+  if (home) paths.push(join(home, 'AppData', 'Local', 'agy', 'bin', 'agy.exe'))
+  return [...new Set(paths)]
+}
+
 async function binaryFingerprint(
   launch?: ProviderLaunch,
+  options?: BinaryFingerprintOptions,
 ): Promise<string | undefined> {
+  const platform = options?.platform ?? process.platform
+  const isWindows = platform === 'win32'
+  const pathDelimiter = options?.platform ? (isWindows ? ';' : ':') : delimiter
+  const env = launch?.env ?? process.env
+  const exts = isWindows ? windowsPathExts(env) : []
   const cmd = launch?.command ?? 'agy'
   if (isAbsolute(cmd) || cmd.includes('/') || cmd.includes('\\'))
-    return fingerprintPath(cmd)
-  const pathEnv = (launch?.env ?? process.env).PATH ?? ''
-  for (const dir of pathEnv.split(delimiter)) {
+    return fingerprintCandidates(cmd, isWindows, exts)
+  const pathEnv = readEnv(env, 'PATH') ?? ''
+  for (const entry of pathEnv.split(pathDelimiter)) {
+    const dir = stripOuterQuotes(entry, isWindows)
     if (!dir) continue
-    const found = await fingerprintPath(join(dir, cmd))
+    const found = await fingerprintCandidates(join(dir, cmd), isWindows, exts)
     if (found) return found
+  }
+  if (cmd === 'agy' || (isWindows && cmd.toLowerCase() === 'agy.exe')) {
+    for (const candidate of defaultAgyInstallPaths(
+      env,
+      isWindows,
+      options?.fallbackHome ?? homedir(),
+    )) {
+      const found = await fingerprintPath(candidate, isWindows)
+      if (found) return found
+    }
   }
   return undefined
 }
@@ -130,8 +248,9 @@ export function catalogCacheKey(
 /** Include the resolved executable fingerprint so binary upgrades invalidate host catalog caches. */
 export async function resolveCatalogCacheKey(
   launch?: ProviderLaunch,
+  options?: BinaryFingerprintOptions,
 ): Promise<string> {
-  return catalogCacheKey(launch, await binaryFingerprint(launch))
+  return catalogCacheKey(launch, await binaryFingerprint(launch, options))
 }
 
 /** Resolve the native data directory using agy's documented directory flags. */
@@ -156,7 +275,7 @@ export function dataDirectory(
     }
     return value
   }
-  const home = env.HOME ?? launch?.env?.HOME ?? fallbackHome
+  const home = resolveHome(env, launch?.env, fallbackHome)
   const gemini = flag(['--gemini-dir', '--gemini_dir'], join(home, '.gemini'))
   const app = flag(['--app-data-dir', '--app_data_dir'], 'antigravity-cli')
   if (isAbsolute(gemini)) {
@@ -206,8 +325,11 @@ export async function resolveSpawnCwd(
   },
 ): Promise<string> {
   const env = options?.env ?? {}
-  const fallback =
-    env.HOME ?? launch?.env?.HOME ?? options?.fallbackHome ?? homedir()
+  const fallback = resolveHome(
+    env,
+    launch?.env,
+    options?.fallbackHome ?? homedir(),
+  )
   const target = cwd ?? fallback
   if (await isExistingDirectory(target)) return target
   if (

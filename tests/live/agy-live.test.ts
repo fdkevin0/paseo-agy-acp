@@ -3,16 +3,21 @@ import { test } from 'node:test'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { providerStatus } from '../../server/preflight.ts'
+import {
+  catalogCacheKey,
+  providerStatus,
+  resolveCatalogCacheKey,
+} from '../../server/preflight.ts'
 import { AgyUsageSource } from '../../server/usage.ts'
 import { isolatedEnv } from '../helpers.ts'
 
 test(
-  'live agy CLI satisfies minimum version requirement',
+  'live agy CLI satisfies minimum version requirement and resolves executable fingerprint',
   { timeout: 10_000 },
   async () => {
     const status = await providerStatus()
     assert.equal(status.available, true, status.diagnostic)
+    assert.notEqual(await resolveCatalogCacheKey(), catalogCacheKey())
   },
 )
 

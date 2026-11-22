@@ -351,12 +351,15 @@ export class SessionManager {
             : {}),
         })
         await session.refreshSubagents()
+        let persistedEstimatedTokens: number | undefined
         if (input.persistence) {
           const persistedModel = configState(session.state.metadata).model
-          await session.refreshCompactionWindow({
-            allowExisting: true,
-            model: persistedModel,
-          })
+          persistedEstimatedTokens = (
+            await session.refreshCompactionWindow({
+              allowExisting: true,
+              model: persistedModel,
+            })
+          )?.estimatedTokens
         }
         await session.flush()
         if (input.persistence) {
@@ -378,7 +381,8 @@ export class SessionManager {
           input.persistence ? 'restore' : 'open',
         )
         await session.drain()
-        if (input.persistence) await session.restoreUsage()
+        if (input.persistence)
+          await session.restoreUsage(persistedEstimatedTokens)
         session.state.loading = false
         session.state.replay = true
         session.flushDeferredUsage()
@@ -677,7 +681,7 @@ async function createSession(
   async function refreshCompactionWindow(options?: {
     allowExisting?: boolean
     model?: string
-  }): Promise<number | undefined> {
+  }): Promise<{ maxTokens?: number; estimatedTokens?: number } | undefined> {
     const snapshot = await readConversationCompactionWindow(
       brainRoot,
       state.nativeId,
@@ -696,7 +700,10 @@ async function createSession(
           : configState(state.metadata).model
       setBounded(compactionWindowSizes, targetModel, snapshot.maxTokens, 100)
     }
-    return snapshot.maxTokens
+    return {
+      maxTokens: snapshot.maxTokens,
+      estimatedTokens: snapshot.estimatedTokens,
+    }
   }
   function syncModelContextWindow() {
     const prevMax = usage.contextWindowMaxTokens
@@ -1535,7 +1542,7 @@ async function createSession(
         if (contextWindowUsedTokens !== undefined)
           publishUsage({ contextWindowUsedTokens })
       },
-      async restoreUsage() {
+      async restoreUsage(estimatedTokens?: number) {
         if (usage?.contextWindowUsedTokens !== undefined) return
         const snapshot = await readLatestStepUsage(
           brainRoot,
@@ -1543,6 +1550,8 @@ async function createSession(
         ).catch(() => undefined)
         if (snapshot?.lastStepUsage)
           this.publishStepContext(snapshot.lastStepUsage)
+        else if (estimatedTokens !== undefined)
+          publishUsage({ contextWindowUsedTokens: estimatedTokens })
       },
       async replayTools() {
         if (!state.replay) return
@@ -2066,6 +2075,7 @@ async function promptSession(
   let observationTransport = session.transport
   let effectiveUsage: Usage | null | undefined
   let lastStep: StepUsage | undefined
+  let turnEstimatedTokens: number | undefined
   let turnWokeUp = false
   let turnWakeupUsage: StepUsage | undefined
   let pendingFinish:
@@ -2073,16 +2083,30 @@ async function promptSession(
   const settleTurnUsage = (isError: boolean) => {
     if (!started) return
     const preserveContext = session.state.turnHadContextUsage && !turnWokeUp
+    const fallbackContextUsed =
+      !preserveContext &&
+      !lastStep &&
+      turnEstimatedTokens !== undefined &&
+      (!isError || isCurrent())
+        ? turnEstimatedTokens
+        : undefined
     if (effectiveUsage || turnWakeupUsage) {
-      session.publishUsage(
-        promptUsage(effectiveUsage, {
-          preserveContext,
-          lastStep,
-          wakeup: turnWakeupUsage,
-        }),
-      )
+      const next = promptUsage(effectiveUsage, {
+        preserveContext,
+        lastStep,
+        wakeup: turnWakeupUsage,
+      })
+      if (
+        next.contextWindowUsedTokens === undefined &&
+        fallbackContextUsed !== undefined
+      ) {
+        next.contextWindowUsedTokens = fallbackContextUsed
+      }
+      session.publishUsage(next)
     } else if (lastStep && !preserveContext && (!isError || isCurrent())) {
       session.publishStepContext(lastStep)
+    } else if (fallbackContextUsed !== undefined) {
+      session.publishUsage({ contextWindowUsedTokens: fallbackContextUsed })
     } else if (!isError || isCurrent()) {
       session.syncModelContextWindow()
     }
@@ -2357,7 +2381,8 @@ async function promptSession(
     }
     lastStep = await reconcileFinalSnapshot(lastStep)
     if (!session.state.closing && session.state.nativeId === nativeId)
-      await session.refreshCompactionWindow()
+      turnEstimatedTokens = (await session.refreshCompactionWindow())
+        ?.estimatedTokens
     turnWokeUp ||= observation?.wokeUp === true
     if (!session.state.closing && session.state.failed)
       throw sessionRuntimeExitedError(session.state.failureError)
@@ -2379,7 +2404,9 @@ async function promptSession(
       () => observation?.usage.latest,
     )
     if (!session.state.closing && session.state.nativeId === nativeId)
-      await session.refreshCompactionWindow().catch(() => undefined)
+      turnEstimatedTokens ??= (
+        await session.refreshCompactionWindow().catch(() => undefined)
+      )?.estimatedTokens
     turnWokeUp ||= observation?.wokeUp === true
     settleTurnUsage(true)
     const failure =

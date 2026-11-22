@@ -1,12 +1,15 @@
 /** Shared ACP initialization, idle-reaped control runtime, and pre-warmed standby runtime pool. */
 import { createHash } from 'node:crypto'
 import { statSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk/unstable'
 import type { ProviderLaunch } from '@getpaseo/plugin/server/provider'
 import { PACKAGE_VERSION } from './common.ts'
-import { agyVersionDiagnostic, isCwdIndependentLaunch } from './preflight.ts'
+import {
+  agyVersionDiagnostic,
+  isCwdIndependentLaunch,
+  resolveHome,
+} from './preflight.ts'
 import { connectAcp, type AcpClient } from './transport.ts'
 
 export type ControlTransport = ReturnType<typeof connectAcp>
@@ -79,7 +82,7 @@ export function isLaunchCwdIndependent(
   launch?: ProviderLaunch,
   env: Readonly<Record<string, string>> = {},
 ): boolean {
-  const fallbackHome = env.HOME ?? launch?.env?.HOME ?? homedir()
+  const fallbackHome = resolveHome(env, launch?.env)
   return (
     isCwdIndependentLaunch(spawnCwd, fallbackHome, launch, env, fallbackHome) &&
     isCwdIndependentLaunch(
@@ -128,7 +131,7 @@ function resolveWarmCwd(
   launch?: ProviderLaunch,
   env: Readonly<Record<string, string>> = {},
 ): string {
-  const fallbackHome = env.HOME ?? launch?.env?.HOME ?? homedir()
+  const fallbackHome = resolveHome(env, launch?.env)
   if (spawnCwd === fallbackHome) return spawnCwd
   return isExistingDirectorySync(fallbackHome) ? fallbackHome : spawnCwd
 }

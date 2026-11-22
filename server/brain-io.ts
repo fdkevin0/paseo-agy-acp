@@ -934,14 +934,18 @@ async function resolveConversationDbPath(
 }
 
 const GEN_MAX_CONTEXT_TOKENS_PATH = [1, 9, 10, 4] as const
+const GEN_ESTIMATED_TOKENS_PATH = [1, 9, 10, 1] as const
+// gen_metadata [1, 5] (`model_cost`, float32) is intentionally not extracted into Paseo's
+// `totalCostUsd`: it is a per-generation scalar with no currency field, conflicting with
+// Paseo's cumulative USD cost contract (verified only via ACP usage_update.cost.currency === 'USD').
 const SQLITE_BUSY_TIMEOUT_MS = 50
 
-/** Read server-issued max_context_tokens from conversations/<nativeId>.db gen_metadata after minGenIdx. */
+/** Read server-issued max_context_tokens and estimated_tokens_used from conversations/<nativeId>.db gen_metadata after minGenIdx. */
 export async function readConversationCompactionWindow(
   brainRoot: string,
   nativeId: string,
   minGenIdx = -1,
-): Promise<{ maxTokens?: number; genIdx: number }> {
+): Promise<{ maxTokens?: number; estimatedTokens?: number; genIdx: number }> {
   if (!sessionIdPattern.test(nativeId)) return { genIdx: minGenIdx }
   let dbPath: string
   try {
@@ -969,6 +973,8 @@ export async function readConversationCompactionWindow(
     const stmt = db.prepare(
       'SELECT idx, data FROM gen_metadata WHERE idx > ? ORDER BY idx DESC',
     )
+    let maxTokens: number | undefined
+    let estimatedTokens: number | undefined
     for (const row of stmt.iterate(minGenIdx) as Iterable<{
       idx?: unknown
       data?: unknown
@@ -981,13 +987,27 @@ export async function readConversationCompactionWindow(
         genIdx = Math.max(genIdx, row.idx)
       }
       if (!(row.data instanceof Uint8Array)) continue
-      const maxTokens = readProtoVarintPath(
-        row.data,
-        GEN_MAX_CONTEXT_TOKENS_PATH,
-      )
-      if (maxTokens !== undefined) return { maxTokens, genIdx }
+      if (maxTokens === undefined) {
+        maxTokens = readProtoVarintPath(row.data, GEN_MAX_CONTEXT_TOKENS_PATH)
+      }
+      if (estimatedTokens === undefined) {
+        estimatedTokens = readProtoVarintPath(
+          row.data,
+          GEN_ESTIMATED_TOKENS_PATH,
+        )
+      }
+      if (maxTokens !== undefined) {
+        return {
+          maxTokens,
+          ...(estimatedTokens !== undefined ? { estimatedTokens } : {}),
+          genIdx,
+        }
+      }
     }
-    return { genIdx }
+    return {
+      ...(estimatedTokens !== undefined ? { estimatedTokens } : {}),
+      genIdx,
+    }
   } catch {
     return { genIdx }
   } finally {

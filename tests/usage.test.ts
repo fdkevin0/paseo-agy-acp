@@ -16,7 +16,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { hashAccountKey } from '@getpaseo/plugin/server/usage'
-import { AgyUsageSource, parseUsage, readLoggedEmail } from '../server/usage.ts'
+import {
+  AgyUsageSource,
+  parseUsage,
+  readLoggedEmail,
+  usageWindows,
+} from '../server/usage.ts'
 import { isolatedEnv, waitUntil } from './helpers.ts'
 
 const groups = ['Gemini Models', 'Claude and GPT models'].map((name) => ({
@@ -56,6 +61,163 @@ test('quota parser validates the CLI envelope and preserves unknown windows', ()
     )[0].buckets[0].remainingFraction,
     undefined,
   )
+
+  // Non-standard buckets (credit-only remaining_amount, missing/null window or id/name, disabled entries)
+  // must not produce NaN or block valid sibling buckets in the same group.
+  const mixed = parseUsage(
+    envelope([
+      {
+        name: 'Gemini Models',
+        buckets: [
+          {
+            window: '5h',
+            remaining_fraction: 0.8,
+            reset_time: '2026-11-08T10:00:00Z',
+          },
+          { id: 'credits', name: 'AI Credits', remaining_amount: 500 },
+          {
+            window: 'bonus',
+            remaining_amount: 100,
+            remaining_fraction: null,
+            reset_time: null,
+          },
+          { disabled: true },
+          { remaining_amount: 250, window: '' },
+          {
+            id: null,
+            name: null,
+            window: 'weekly',
+            remaining_fraction: 0.25,
+          },
+        ],
+      },
+    ]),
+  )
+  assert.deepEqual(mixed, [
+    {
+      name: 'Gemini Models',
+      buckets: [
+        {
+          id: '5h',
+          name: '5h',
+          window: '5h',
+          remainingFraction: 0.8,
+          resetTime: '2026-11-08T10:00:00Z',
+        },
+        {
+          id: 'credits',
+          name: 'AI Credits',
+          window: '',
+          remainingFraction: undefined,
+          resetTime: '',
+        },
+        {
+          id: 'bonus',
+          name: 'bonus',
+          window: 'bonus',
+          remainingFraction: undefined,
+          resetTime: '',
+        },
+        {
+          id: 'weekly',
+          name: 'weekly',
+          window: 'weekly',
+          remainingFraction: 0.25,
+          resetTime: '',
+        },
+      ],
+    },
+  ])
+})
+
+test('usageWindows maps real agy buckets and non-standard credit/disabled buckets without NaN', () => {
+  const windows = usageWindows(
+    envelope([
+      {
+        name: 'Gemini Models',
+        buckets: [
+          {
+            id: 'gemini-weekly',
+            name: 'Weekly Limit Remaining',
+            window: 'weekly',
+            remaining_fraction: 0.9501999020576477,
+            reset_time: '2026-11-28T09:06:07Z',
+          },
+          { id: 'credits', name: 'AI Credits', remaining_amount: 500 },
+          { disabled: true, remaining_amount: 100 },
+          {
+            id: 'gemini-5h',
+            name: 'Five Hour Limit Remaining',
+            window: '5h',
+            remaining_fraction: 0.943389356136322,
+            reset_time: '2026-11-22T07:56:41Z',
+          },
+        ],
+      },
+    ]),
+  )
+  assert.deepEqual(
+    windows.map((w) => ({
+      id: w.id,
+      label: w.label,
+      shortLabel: w.shortLabel,
+      usedPct: w.usedPct,
+      tone: w.tone,
+    })),
+    [
+      {
+        id: 'gemini_models:five_hour',
+        label: 'Gemini · 5-hour',
+        shortLabel: 'Gemini 5h',
+        usedPct: 6,
+        tone: 'ok',
+      },
+      {
+        id: 'gemini_models:weekly',
+        label: 'Gemini · Weekly',
+        shortLabel: 'Gemini wk',
+        usedPct: 5,
+        tone: 'ok',
+      },
+      {
+        id: 'gemini_models:credits',
+        label: 'Gemini · AI Credits',
+        shortLabel: 'Gemini credits',
+        usedPct: null,
+        tone: 'default',
+      },
+    ],
+  )
+})
+
+test('usage discovery and remember resolve USERPROFILE and ignore empty HOME strings consistently', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-usage-userprofile-'))
+  const winHome = join(root, 'win-home')
+  const dir = join(winHome, '.gemini', 'antigravity-cli')
+  try {
+    await mkdir(dir, { recursive: true })
+    await writeFile(
+      join(dir, 'cli.log'),
+      'applyAuthResult: email=win@example.test\n',
+    )
+
+    const profileOnly = new AgyUsageSource({ env: { USERPROFILE: winHome } })
+    const [discoveredProfile] = await profileOnly.discover({ kind: 'global' })
+    assert.equal(discoveredProfile.key, hashAccountKey(dir))
+    assert.deepEqual(discoveredProfile.input, { dataDir: dir })
+    assert.equal(discoveredProfile.label, 'win@example.test')
+    assert.equal(profileOnly.remember(undefined, {}, root), dir)
+
+    const emptyHome = new AgyUsageSource({
+      env: { HOME: '', USERPROFILE: winHome },
+    })
+    const [discoveredEmptyHome] = await emptyHome.discover({ kind: 'global' })
+    assert.equal(discoveredEmptyHome.key, hashAccountKey(dir))
+    assert.deepEqual(discoveredEmptyHome.input, { dataDir: dir })
+    assert.equal(emptyHome.remember(undefined, { HOME: '' }, root), dir)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('email discovery reads bounded tail and startup head chunks and deduplicates cli.log', async () => {
