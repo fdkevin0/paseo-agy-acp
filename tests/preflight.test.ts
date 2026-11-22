@@ -467,3 +467,306 @@ test('resolveSpawnCwd falls back only when allowed and launch paths are cwd-inde
     await rm(tmp, { recursive: true, force: true })
   }
 })
+
+test('resolveCatalogCacheKey handles case-insensitive Path, quoted entries, Windows PATHEXT, and default install fallbacks', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'agy-cross-platform-key-'))
+  try {
+    // POSIX: case-insensitive Path key and quoted directory with spaces.
+    const quotedBin = join(tmp, 'my bin')
+    await mkdir(quotedBin, { recursive: true })
+    const posixAgy = join(quotedBin, 'agy')
+    await writeExecutable(posixAgy, '#!/bin/sh\necho 1.5.12\n')
+    const quotedLaunch = {
+      command: 'agy',
+      args: ['acp'],
+      env: { Path: `"${quotedBin}"`, HOME: join(tmp, 'empty-home') },
+    }
+    const quotedKey1 = await resolveCatalogCacheKey(quotedLaunch, {
+      platform: 'linux',
+      fallbackHome: join(tmp, 'empty-home'),
+    })
+    assert.notEqual(quotedKey1, catalogCacheKey(quotedLaunch))
+    await writeExecutable(posixAgy, '#!/bin/sh\necho 1.5.13\n')
+    assert.notEqual(
+      await resolveCatalogCacheKey(quotedLaunch, {
+        platform: 'linux',
+        fallbackHome: join(tmp, 'empty-home'),
+      }),
+      quotedKey1,
+    )
+
+    // POSIX default install fallback (~/.local/bin/agy) when PATH misses for bare 'agy'.
+    const posixHome = join(tmp, 'posix-home')
+    const posixDefaultBin = join(posixHome, '.local', 'bin')
+    await mkdir(posixDefaultBin, { recursive: true })
+    const posixDefaultAgy = join(posixDefaultBin, 'agy')
+    await writeExecutable(posixDefaultAgy, '#!/bin/sh\necho 1.5.12\n')
+    const posixFallbackLaunch = {
+      command: 'agy',
+      args: ['acp'],
+      env: { PATH: join(tmp, 'missing-dir'), HOME: posixHome },
+    }
+    const posixFallbackKey1 = await resolveCatalogCacheKey(
+      posixFallbackLaunch,
+      { platform: 'linux', fallbackHome: join(tmp, 'unused-home') },
+    )
+    assert.notEqual(posixFallbackKey1, catalogCacheKey(posixFallbackLaunch))
+    await writeExecutable(posixDefaultAgy, '#!/bin/sh\necho 1.5.14\n')
+    assert.notEqual(
+      await resolveCatalogCacheKey(posixFallbackLaunch, {
+        platform: 'linux',
+        fallbackHome: join(tmp, 'unused-home'),
+      }),
+      posixFallbackKey1,
+    )
+
+    // Non-default bare commands never fall back to ~/.local/bin/agy.
+    const customCmdLaunch = {
+      command: 'custom-agy',
+      args: ['acp'],
+      env: { PATH: join(tmp, 'missing-dir'), HOME: posixHome },
+    }
+    assert.equal(
+      await resolveCatalogCacheKey(customCmdLaunch, {
+        platform: 'linux',
+        fallbackHome: posixHome,
+      }),
+      catalogCacheKey(customCmdLaunch),
+    )
+
+    // Non-executable POSIX default install is ignored on POSIX.
+    await chmod(posixDefaultAgy, 0o644)
+    assert.equal(
+      await resolveCatalogCacheKey(posixFallbackLaunch, {
+        platform: 'linux',
+        fallbackHome: posixHome,
+      }),
+      catalogCacheKey(posixFallbackLaunch),
+    )
+
+    // Windows: case-insensitive Path, semicolon delimiter, quoted dir, .exe via PATHEXT,
+    // skips directory shadows, and uses stat().isFile() instead of POSIX X_OK.
+    const winShadow = join(tmp, 'win-shadow')
+    const winBin = join(tmp, 'win bin')
+    await mkdir(join(winShadow, 'agy.exe'), { recursive: true })
+    await mkdir(winBin, { recursive: true })
+    const winExe = join(winBin, 'agy.exe')
+    await writeFile(winExe, 'MZ-v1', { mode: 0o644 })
+    const winPathLaunch = {
+      command: 'agy',
+      args: ['acp'],
+      env: {
+        Path: `${winShadow}; "${winBin}" ; ""`,
+        PathExt: '.COM;.EXE;.BAT;.CMD',
+        USERPROFILE: join(tmp, 'win-empty-home'),
+      },
+    }
+    const winKey1 = await resolveCatalogCacheKey(winPathLaunch, {
+      platform: 'win32',
+      fallbackHome: join(tmp, 'win-empty-home'),
+    })
+    assert.notEqual(winKey1, catalogCacheKey(winPathLaunch))
+    await writeFile(winExe, 'MZ-v2-longer', { mode: 0o644 })
+    assert.notEqual(
+      await resolveCatalogCacheKey(winPathLaunch, {
+        platform: 'win32',
+        fallbackHome: join(tmp, 'win-empty-home'),
+      }),
+      winKey1,
+    )
+
+    // Windows default install fallback: %LOCALAPPDATA%\agy\bin\agy.exe.
+    const winLocalAppData = join(tmp, 'win-local-appdata')
+    await mkdir(join(winLocalAppData, 'agy', 'bin'), { recursive: true })
+    const winLocalExe = join(winLocalAppData, 'agy', 'bin', 'agy.exe')
+    await writeFile(winLocalExe, 'MZ-local-1', { mode: 0o644 })
+    const winLocalLaunch = {
+      command: 'agy',
+      args: ['acp'],
+      env: {
+        Path: join(tmp, 'missing-win-dir'),
+        LocalAppData: winLocalAppData,
+        USERPROFILE: join(tmp, 'win-empty-home'),
+      },
+    }
+    const winLocalKey1 = await resolveCatalogCacheKey(winLocalLaunch, {
+      platform: 'win32',
+      fallbackHome: join(tmp, 'win-empty-home'),
+    })
+    assert.notEqual(winLocalKey1, catalogCacheKey(winLocalLaunch))
+    await writeFile(winLocalExe, 'MZ-local-2-updated', { mode: 0o644 })
+    assert.notEqual(
+      await resolveCatalogCacheKey(winLocalLaunch, {
+        platform: 'win32',
+        fallbackHome: join(tmp, 'win-empty-home'),
+      }),
+      winLocalKey1,
+    )
+
+    // Windows secondary default install fallback: ~/AppData/Local/agy/bin/agy.exe.
+    const winProfile = join(tmp, 'win-profile')
+    await mkdir(join(winProfile, 'AppData', 'Local', 'agy', 'bin'), {
+      recursive: true,
+    })
+    const winProfileExe = join(
+      winProfile,
+      'AppData',
+      'Local',
+      'agy',
+      'bin',
+      'agy.exe',
+    )
+    await writeFile(winProfileExe, 'MZ-profile-1', { mode: 0o644 })
+    const winProfileLaunch = {
+      command: 'agy',
+      args: ['acp'],
+      env: {
+        Path: join(tmp, 'missing-win-dir'),
+        USERPROFILE: winProfile,
+      },
+    }
+    assert.notEqual(
+      await resolveCatalogCacheKey(winProfileLaunch, {
+        platform: 'win32',
+        fallbackHome: join(tmp, 'win-empty-home'),
+      }),
+      catalogCacheKey(winProfileLaunch),
+    )
+
+    // Windows default install fallback also applies when launch.command is bare 'agy.exe'.
+    const winExeFallbackLaunch = {
+      command: 'agy.exe',
+      args: ['acp'],
+      env: {
+        Path: join(tmp, 'missing-win-dir'),
+        LOCALAPPDATA: winLocalAppData,
+        USERPROFILE: join(tmp, 'win-empty-home'),
+      },
+    }
+    assert.notEqual(
+      await resolveCatalogCacheKey(winExeFallbackLaunch, {
+        platform: 'win32',
+        fallbackHome: join(tmp, 'win-empty-home'),
+      }),
+      catalogCacheKey(winExeFallbackLaunch),
+    )
+
+    // Windows non-default bare command does not fall back to default agy install paths.
+    const winCustomLaunch = {
+      command: 'other-agy',
+      args: ['acp'],
+      env: {
+        Path: join(tmp, 'missing-win-dir'),
+        LOCALAPPDATA: winLocalAppData,
+        USERPROFILE: winProfile,
+      },
+    }
+    assert.equal(
+      await resolveCatalogCacheKey(winCustomLaunch, {
+        platform: 'win32',
+        fallbackHome: winProfile,
+      }),
+      catalogCacheKey(winCustomLaunch),
+    )
+  } finally {
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('dataDirectory and resolveSpawnCwd fall back through HOME, USERPROFILE, launch.env and fallbackHome while ignoring empty strings', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'agy-home-fallback-'))
+  try {
+    const envHome = join(tmp, 'env-home')
+    const envProfile = join(tmp, 'env-profile')
+    const launchHome = join(tmp, 'launch-home')
+    const launchProfile = join(tmp, 'launch-profile')
+    const fallbackHome = join(tmp, 'fallback-home')
+    await mkdir(envProfile)
+    await mkdir(launchProfile)
+
+    const launch = {
+      command: 'agy',
+      args: ['acp'],
+      env: { HOME: launchHome, USERPROFILE: launchProfile },
+    }
+
+    assert.equal(
+      dataDirectory(
+        launch,
+        { HOME: envHome, USERPROFILE: envProfile },
+        tmp,
+        fallbackHome,
+      ),
+      join(envHome, '.gemini', 'antigravity-cli'),
+    )
+    assert.equal(
+      dataDirectory(
+        launch,
+        { HOME: '', USERPROFILE: envProfile },
+        tmp,
+        fallbackHome,
+      ),
+      join(envProfile, '.gemini', 'antigravity-cli'),
+    )
+    assert.equal(
+      dataDirectory(launch, { HOME: '', USERPROFILE: '' }, tmp, fallbackHome),
+      join(launchHome, '.gemini', 'antigravity-cli'),
+    )
+    assert.equal(
+      dataDirectory(
+        {
+          command: 'agy',
+          args: ['acp'],
+          env: { HOME: '', USERPROFILE: launchProfile },
+        },
+        { HOME: '', USERPROFILE: '' },
+        tmp,
+        fallbackHome,
+      ),
+      join(launchProfile, '.gemini', 'antigravity-cli'),
+    )
+    assert.equal(
+      dataDirectory(
+        { command: 'agy', args: ['acp'], env: { HOME: '', USERPROFILE: '' } },
+        { HOME: '', USERPROFILE: '' },
+        tmp,
+        fallbackHome,
+      ),
+      join(fallbackHome, '.gemini', 'antigravity-cli'),
+    )
+    assert.equal(
+      await resolveSpawnCwd(
+        join(tmp, 'deleted-cwd'),
+        {
+          command: 'agy',
+          args: ['acp'],
+          env: { HOME: '', USERPROFILE: launchProfile },
+        },
+        {
+          env: { HOME: '', USERPROFILE: envProfile },
+          fallbackHome,
+          allowMissingCwd: true,
+        },
+      ),
+      envProfile,
+    )
+    assert.equal(
+      await resolveSpawnCwd(
+        join(tmp, 'deleted-cwd'),
+        {
+          command: 'agy',
+          args: ['acp'],
+          env: { HOME: '', USERPROFILE: launchProfile },
+        },
+        {
+          env: { HOME: '', USERPROFILE: '' },
+          fallbackHome,
+          allowMissingCwd: true,
+        },
+      ),
+      launchProfile,
+    )
+  } finally {
+    await rm(tmp, { recursive: true, force: true })
+  }
+})

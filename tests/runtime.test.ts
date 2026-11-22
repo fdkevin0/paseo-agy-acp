@@ -1925,3 +1925,48 @@ test('draft session.close while session.configure is in flight stops instead of 
     await rm(home, { recursive: true, force: true })
   }
 })
+
+test('isLaunchCwdIndependent and StandbyRuntimePool resolve USERPROFILE and ignore empty HOME strings', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-runtime-userprofile-'))
+  const winHome = join(root, 'win-home')
+  const workspace = join(root, 'workspace')
+  await mkdir(winHome, { recursive: true })
+  await mkdir(workspace, { recursive: true })
+  const seenCwds: string[] = []
+  const fake = createControlledSessionConnect([{}])
+  const trackingConnect: typeof connectAcp = (
+    launch,
+    cwd,
+    env,
+    client,
+    onExit,
+  ) => {
+    seenCwds.push(cwd)
+    return fake.connect(launch, cwd, env, client, onExit)
+  }
+  const launch: ProviderLaunch = {
+    command: 'agy',
+    args: ['acp'],
+    env: { HOME: '', USERPROFILE: winHome },
+  }
+  const pool = new StandbyRuntimePool({ launch, connectAcp: trackingConnect })
+  try {
+    assert.equal(isLaunchCwdIndependent(workspace, launch, {}), true)
+    assert.equal(
+      isLaunchCwdIndependent(workspace, {
+        command: 'agy',
+        args: ['acp'],
+        env: { HOME: '' },
+      }),
+      true,
+    )
+    pool.warm(launch, workspace, {})
+    const warmed = await pool.take(launch, workspace, {})
+    assert.ok(warmed)
+    assert.deepEqual(seenCwds, [winHome])
+    await warmed.transport.close()
+  } finally {
+    await pool.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})

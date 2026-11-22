@@ -8,7 +8,6 @@ import {
   type FileHandle,
 } from 'node:fs/promises'
 import { join, sep } from 'node:path'
-import { homedir } from 'node:os'
 import { z } from 'zod'
 import { spawnProcess, terminateProcess } from '@getpaseo/plugin/server'
 import type { ProviderLaunch } from '@getpaseo/plugin/server/provider'
@@ -23,7 +22,11 @@ import {
   type UsageSourceRegistration,
 } from '@getpaseo/plugin/server/usage'
 import { definedProcessEnv, formatErrorMessage, setBounded } from './common.ts'
-import { dataDirectory, isCwdIndependentLaunch } from './preflight.ts'
+import {
+  dataDirectory,
+  isCwdIndependentLaunch,
+  resolveHome,
+} from './preflight.ts'
 
 const FIVE_HOURS_SECONDS = 5 * 3600
 const WEEKLY_SECONDS = 7 * 86_400
@@ -56,9 +59,9 @@ const groupsSchema = z.object({
           name: z.string().min(1),
           buckets: z.array(
             z.object({
-              id: z.string().optional(),
-              name: z.string().optional(),
-              window: z.string(),
+              id: z.string().nullish(),
+              name: z.string().nullish(),
+              window: z.string().nullish(),
               remaining_fraction: z.number().finite().nullish(),
               reset_time: z.string().nullish(),
             }),
@@ -79,14 +82,68 @@ export function parseUsage(stdout: string) {
   }
   return parsed.command.data.groups.map((group) => ({
     name: group.name,
-    buckets: group.buckets.map((bucket) => ({
-      id: bucket.id ?? bucket.window,
-      name: bucket.name ?? bucket.window,
-      window: bucket.window,
-      remainingFraction: bucket.remaining_fraction ?? undefined,
-      resetTime: bucket.reset_time ?? '',
-    })),
+    buckets: group.buckets.flatMap((bucket) => {
+      const window = bucket.window?.trim() ?? ''
+      const id = bucket.id?.trim() || window
+      // Drop unidentifiable non-standard buckets (e.g. disabled or amount-only entries without id/window)
+      // instead of failing or blocking valid sibling buckets in the same group.
+      if (!id) return []
+      return [
+        {
+          id,
+          name: bucket.name?.trim() || window || id,
+          window,
+          remainingFraction: bucket.remaining_fraction ?? undefined,
+          resetTime: bucket.reset_time ?? '',
+        },
+      ]
+    }),
   }))
+}
+
+/** Translate validated `/usage` groups into Paseo quota windows without producing NaN. */
+export function usageWindows(stdout: string) {
+  return parseUsage(stdout).flatMap((group) =>
+    group.buckets
+      .toSorted((a, b) => windowOrder(a.window) - windowOrder(b.window))
+      .map((bucket) => {
+        const utilizationPct =
+          bucket.remainingFraction === undefined
+            ? null
+            : Math.round(
+                Math.max(0, Math.min(1, 1 - bucket.remainingFraction)) * 100,
+              )
+        return windowFromReportedDuration({
+          durationSeconds:
+            bucket.window === '5h'
+              ? FIVE_HOURS_SECONDS
+              : bucket.window === 'weekly'
+                ? WEEKLY_SECONDS
+                : null,
+          scope: {
+            id: group.name
+              .toLowerCase()
+              .replace(/[^a-z0-9]+/g, '_')
+              .replace(/^_|_$/g, ''),
+            label:
+              group.name === 'Gemini Models'
+                ? 'Gemini'
+                : group.name === 'Claude and GPT models'
+                  ? 'Claude / GPT'
+                  : group.name,
+          },
+          unknown: {
+            id: bucket.id,
+            label: bucket.name,
+            shortLabel: bucket.window || bucket.id,
+          },
+          utilizationPct,
+          resetsAt: bucket.resetTime || null,
+          summary: true,
+          tone: toneFromUsedPct(utilizationPct),
+        })
+      }),
+  )
 }
 
 async function readChunkEmail(
@@ -392,7 +449,7 @@ export class AgyUsageSource {
     env: Readonly<Record<string, string>> = {},
     cwd?: string,
   ): string {
-    const defaultHome = this.baseEnv().HOME ?? homedir()
+    const defaultHome = resolveHome(this.baseEnv())
     const dir = dataDirectory(launch, env, cwd, defaultHome)
     this.sessionEnvs.delete(dir)
     setBounded(
@@ -416,7 +473,7 @@ export class AgyUsageSource {
     )
       return []
     const base = this.baseEnv()
-    const defaultHome = base.HOME ?? homedir()
+    const defaultHome = resolveHome(base)
     let dirs: string[]
     if (scope.kind === 'global') {
       dirs = [
@@ -466,7 +523,7 @@ export class AgyUsageSource {
   async fetch(rawInput: unknown): Promise<UsageReport> {
     const { dataDir } = usageInputSchema.parse(rawInput)
     const base = this.baseEnv()
-    const defaultHome = base.HOME ?? homedir()
+    const defaultHome = resolveHome(base)
     const defaultDir = dataDirectory(undefined, {}, undefined, defaultHome)
     const known = this.launches.get(dataDir)
     const sessionEnv = known ? undefined : this.sessionEnvs.get(dataDir)
@@ -512,48 +569,7 @@ export class AgyUsageSource {
           cwd,
         },
       )
-      const windows = parseUsage(stdout).flatMap((group) =>
-        group.buckets
-          .toSorted((a, b) => windowOrder(a.window) - windowOrder(b.window))
-          .map((bucket) => {
-            const utilizationPct =
-              bucket.remainingFraction === undefined
-                ? null
-                : Math.round(
-                    Math.max(0, Math.min(1, 1 - bucket.remainingFraction)) *
-                      100,
-                  )
-            return windowFromReportedDuration({
-              durationSeconds:
-                bucket.window === '5h'
-                  ? FIVE_HOURS_SECONDS
-                  : bucket.window === 'weekly'
-                    ? WEEKLY_SECONDS
-                    : null,
-              scope: {
-                id: group.name
-                  .toLowerCase()
-                  .replace(/[^a-z0-9]+/g, '_')
-                  .replace(/^_|_$/g, ''),
-                label:
-                  group.name === 'Gemini Models'
-                    ? 'Gemini'
-                    : group.name === 'Claude and GPT models'
-                      ? 'Claude / GPT'
-                      : group.name,
-              },
-              unknown: {
-                id: bucket.id,
-                label: bucket.name,
-                shortLabel: bucket.window,
-              },
-              utilizationPct,
-              resetsAt: bucket.resetTime || null,
-              summary: true,
-              tone: toneFromUsedPct(utilizationPct),
-            })
-          }),
-      )
+      const windows = usageWindows(stdout)
       if (!windows.length)
         return unavailable({
           kind: 'no_quota',

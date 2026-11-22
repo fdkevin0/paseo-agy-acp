@@ -45,11 +45,23 @@ function encodeProtoField(
   ])
 }
 
-function encodeGenMetadataMaxContext(maxTokens: number): Buffer {
+function encodeGenMetadataContextUsage(fields: {
+  maxTokens?: number
+  estimatedTokens?: number
+}): Buffer {
+  const inner: Buffer[] = []
+  if (fields.estimatedTokens !== undefined)
+    inner.push(encodeProtoField(1, fields.estimatedTokens))
+  if (fields.maxTokens !== undefined)
+    inner.push(encodeProtoField(4, fields.maxTokens))
   return encodeProtoField(
     1,
-    encodeProtoField(9, encodeProtoField(10, encodeProtoField(4, maxTokens))),
+    encodeProtoField(9, encodeProtoField(10, Buffer.concat(inner))),
   )
+}
+
+function encodeGenMetadataMaxContext(maxTokens: number): Buffer {
+  return encodeGenMetadataContextUsage({ maxTokens })
 }
 
 function writeConversationDb(
@@ -976,4 +988,270 @@ test('newline-less snapshot survives cancel, next-turn baseline and restore', as
 
 test('newline-less snapshot survives error, next-turn baseline and restore', async (t) => {
   await runNoLfSnapshotSurvivesTest(t, 'no-lf-snapshot-error')
+})
+
+test('SQLite gen_metadata reader extracts estimated_tokens_used alongside max_context_tokens without stale leakage', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-sqlite-estimated-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const brainRoot = join(home, '.gemini/antigravity-cli/brain')
+  await mkdir(brainRoot, { recursive: true })
+
+  const idBoth = '88888888-8888-4888-8888-888888888881'
+  writeConversationDb(home, idBoth, {
+    gen: [
+      {
+        idx: 0,
+        data: encodeGenMetadataContextUsage({
+          maxTokens: 1_000_000,
+          estimatedTokens: 5_000,
+        }),
+      },
+      {
+        idx: 1,
+        data: encodeGenMetadataContextUsage({
+          maxTokens: 512_000,
+          estimatedTokens: 18_500,
+        }),
+      },
+    ],
+  })
+  assert.deepEqual(await readConversationCompactionWindow(brainRoot, idBoth), {
+    maxTokens: 512_000,
+    estimatedTokens: 18_500,
+    genIdx: 1,
+  })
+
+  // Zero estimated_tokens_used is ignored and older row estimated_tokens_used is not leaked when newer row has maxTokens.
+  const idNoLeak = '88888888-8888-4888-8888-888888888882'
+  writeConversationDb(home, idNoLeak, {
+    gen: [
+      {
+        idx: 0,
+        data: encodeGenMetadataContextUsage({
+          maxTokens: 1_000_000,
+          estimatedTokens: 9_000,
+        }),
+      },
+      {
+        idx: 1,
+        data: encodeGenMetadataContextUsage({
+          maxTokens: 512_000,
+          estimatedTokens: 0,
+        }),
+      },
+    ],
+  })
+  assert.deepEqual(
+    await readConversationCompactionWindow(brainRoot, idNoLeak),
+    {
+      maxTokens: 512_000,
+      genIdx: 1,
+    },
+  )
+
+  // Newer estimated-only row pairs with older maxTokens row, and estimated-only DB returns estimatedTokens without maxTokens.
+  const idSplit = '88888888-8888-4888-8888-888888888883'
+  writeConversationDb(home, idSplit, {
+    gen: [
+      {
+        idx: 0,
+        data: encodeGenMetadataContextUsage({
+          maxTokens: 512_000,
+          estimatedTokens: 10_000,
+        }),
+      },
+      {
+        idx: 1,
+        data: encodeGenMetadataContextUsage({ estimatedTokens: 22_000 }),
+      },
+    ],
+  })
+  assert.deepEqual(await readConversationCompactionWindow(brainRoot, idSplit), {
+    maxTokens: 512_000,
+    estimatedTokens: 22_000,
+    genIdx: 1,
+  })
+  assert.deepEqual(
+    await readConversationCompactionWindow(brainRoot, idSplit, 0),
+    {
+      estimatedTokens: 22_000,
+      genIdx: 1,
+    },
+  )
+})
+
+test('SQLite estimated_tokens_used acts as last-resort context fallback without overriding usage_update or transcript counts', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-context-estimated-fallback-'))
+  const { events, wait, manager, latestUsage } = setupUsageManager(t, home)
+  await openFreshUsageSession(manager, home)
+  const opened = events.find((e) => e.type === 'session.opened')
+  assert.ok(opened?.type === 'session.opened' && opened.persistence)
+  const nativeId = (opened.persistence.data as { sessionId: string }).sessionId
+
+  // 1. No usage_update and no transcript step tokens -> falls back to SQLite estimated_tokens_used + max_context_tokens.
+  writeConversationDb(home, nativeId, {
+    gen: [
+      {
+        idx: 0,
+        data: encodeGenMetadataContextUsage({
+          maxTokens: 512_000,
+          estimatedTokens: 18_500,
+        }),
+      },
+    ],
+  })
+  await sendUsagePrompt(manager, 'p1', 'usage-empty')
+  assert.equal(latestUsage().contextWindowUsedTokens, 18_500)
+  assert.equal(latestUsage().contextWindowMaxTokens, 512_000)
+  assert.equal(latestUsage().inputTokens, 600_000)
+
+  // 2. Empty subsequent turn with no new SQLite row does not republish stale estimatedTokens.
+  const usageCountAfterP1 = events.filter(
+    (e) => e.type === 'session.usage',
+  ).length
+  await sendUsagePrompt(manager, 'p2', 'cancel-only')
+  assert.equal(
+    events.filter((e) => e.type === 'session.usage').length,
+    usageCountAfterP1,
+  )
+
+  // 3. Cancelled turn without ACP usage or transcript recovers new SQLite estimatedTokens without fabricating turn billing.
+  writeConversationDb(home, nativeId, {
+    gen: [
+      {
+        idx: 1,
+        data: encodeGenMetadataContextUsage({
+          maxTokens: 512_000,
+          estimatedTokens: 24_000,
+        }),
+      },
+    ],
+  })
+  await sendUsagePrompt(manager, 'p3', 'cancel-only')
+  assert.equal(latestUsage().contextWindowUsedTokens, 24_000)
+  assert.equal(latestUsage().contextWindowMaxTokens, 512_000)
+  assert.equal(latestUsage().inputTokens, 600_000)
+
+  // 4. Live usage_update.used takes precedence over SQLite estimated_tokens_used.
+  writeConversationDb(home, nativeId, {
+    gen: [
+      {
+        idx: 2,
+        data: encodeGenMetadataContextUsage({
+          maxTokens: 512_000,
+          estimatedTokens: 99_999,
+        }),
+      },
+    ],
+  })
+  await sendUsagePrompt(manager, 'p4', 'usage-stream:15000:1048576')
+  assert.equal(latestUsage().contextWindowUsedTokens, 15_000)
+  assert.equal(latestUsage().contextWindowMaxTokens, 512_000)
+
+  // 5. Exact transcript_full.jsonl step tokens take precedence over SQLite estimated_tokens_used.
+  writeConversationDb(home, nativeId, {
+    gen: [
+      {
+        idx: 3,
+        data: encodeGenMetadataContextUsage({
+          maxTokens: 512_000,
+          estimatedTokens: 88_888,
+        }),
+      },
+    ],
+  })
+  await sendUsagePrompt(manager, 'p5', 'usage-cancel')
+  assert.equal(latestUsage().contextWindowUsedTokens, 70_463)
+  assert.equal(latestUsage().contextWindowMaxTokens, 512_000)
+
+  // 6. Persisted session restore uses SQLite estimatedTokens only when transcript has no step counts.
+  const restoreNoTranscriptId = '88888888-8888-4888-8888-888888888889'
+  writeConversationDb(home, restoreNoTranscriptId, {
+    gen: [
+      {
+        idx: 0,
+        data: encodeGenMetadataContextUsage({
+          maxTokens: 256_000,
+          estimatedTokens: 31_400,
+        }),
+      },
+    ],
+  })
+  await manager.handle({
+    type: 'session.open',
+    requestId: 'open-restore-estimated',
+    sessionId: 'restored-est',
+    history: 'skip',
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+      model: 'test',
+    },
+    persistence: { version: 1, data: { sessionId: restoreNoTranscriptId } },
+  })
+  await wait(
+    (e) => e.type === 'session.usage' && e.sessionId === 'restored-est',
+  )
+  const restoredEstUsage = events.findLast(
+    (e) => e.type === 'session.usage' && e.sessionId === 'restored-est',
+  )
+  assert.ok(restoredEstUsage?.type === 'session.usage')
+  assert.equal(restoredEstUsage.usage.contextWindowUsedTokens, 31_400)
+  assert.equal(restoredEstUsage.usage.contextWindowMaxTokens, 256_000)
+  assert.equal(restoredEstUsage.usage.inputTokens, undefined)
+
+  // 7. Persisted session restore prefers exact transcript_full.jsonl counts over SQLite estimatedTokens.
+  const restoreWithTranscriptId = '88888888-8888-4888-8888-888888888890'
+  const transcriptDir = join(
+    home,
+    '.gemini/antigravity-cli/brain',
+    restoreWithTranscriptId,
+    '.system_generated/logs',
+  )
+  await mkdir(transcriptDir, { recursive: true })
+  await writeFile(
+    join(transcriptDir, 'transcript_full.jsonl'),
+    JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      input_tokens: 70,
+      output_tokens: 3,
+    }) + '\n',
+  )
+  writeConversationDb(home, restoreWithTranscriptId, {
+    gen: [
+      {
+        idx: 0,
+        data: encodeGenMetadataContextUsage({
+          maxTokens: 256_000,
+          estimatedTokens: 99_999,
+        }),
+      },
+    ],
+  })
+  await manager.handle({
+    type: 'session.open',
+    requestId: 'open-restore-transcript',
+    sessionId: 'restored-tx',
+    history: 'skip',
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+      model: 'test',
+    },
+    persistence: { version: 1, data: { sessionId: restoreWithTranscriptId } },
+  })
+  await wait((e) => e.type === 'session.usage' && e.sessionId === 'restored-tx')
+  const restoredTxUsage = events.findLast(
+    (e) => e.type === 'session.usage' && e.sessionId === 'restored-tx',
+  )
+  assert.ok(restoredTxUsage?.type === 'session.usage')
+  assert.equal(restoredTxUsage.usage.contextWindowUsedTokens, 73)
+  assert.equal(restoredTxUsage.usage.contextWindowMaxTokens, 256_000)
 })
