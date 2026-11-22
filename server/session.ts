@@ -61,8 +61,19 @@ import {
   removeSessionArtifacts,
   resolveSpawnCwd,
 } from './preflight.ts'
-import { initializeAcp } from './runtime.ts'
-import { connectAcp } from './transport.ts'
+import {
+  SKIP_PERMISSIONS_FLAG,
+  createAttachableTransport,
+  hasSkipPermissionsFlag,
+  initializeAcp,
+  isLaunchCwdIndependent,
+  standbyPoolKey,
+  type AttachableRuntime,
+  type ControlTransport,
+  type InitializedAcp,
+  type StandbyRuntimePool,
+} from './runtime.ts'
+import { connectAcp, type AcpClient } from './transport.ts'
 import {
   definedProcessEnv,
   formatErrorMessage,
@@ -109,6 +120,7 @@ interface SessionOptions {
   observationPollIntervalMs?: number
   commandWaitTimeoutMs?: number
   connectAcp?: typeof connectAcp
+  standby?: StandbyRuntimePool
   createObservation?: (
     ...args: ConstructorParameters<typeof BrainTurnObservation>
   ) => BrainTurnObservation
@@ -117,7 +129,6 @@ interface SessionOptions {
   hasActiveBackgroundWork?: typeof hasActiveBackgroundWork
 }
 
-const SKIP_PERMISSIONS_FLAG = '--dangerously-skip-permissions'
 const TIER_CACHE_LIMIT = 100
 const LOAD_HISTORY_UPDATES = new Set<
   SessionNotification['update']['sessionUpdate']
@@ -217,7 +228,8 @@ export class ReportedRequestError extends Error {
 export class SessionManager {
   private sessions = new Map<string, Session>()
   private opening = new Map<string, Promise<Session>>()
-  private transports = new Set<ReturnType<typeof connectAcp>>()
+  private transports = new Set<ControlTransport>()
+  private watchedStops = new WeakSet<ControlTransport>()
   private closed = false
   private options: SessionOptions
   constructor(options: SessionOptions) {
@@ -237,6 +249,7 @@ export class SessionManager {
       config,
       this.options,
       this.transports,
+      this.watchedStops,
       startOptions,
     )
   }
@@ -396,6 +409,9 @@ export class SessionManager {
           sessionId: input.sessionId,
           requestId: input.requestId,
         })
+        if (input.persistence && !this.closed) {
+          session.replenishStandby()
+        }
       } catch (error) {
         const wasOpened = session.state.opened
         const closedExternally = session.state.closedEmitted
@@ -524,7 +540,8 @@ async function createSession(
   cwd: string,
   config: ProviderSessionConfig | undefined,
   options: SessionOptions,
-  transports: Set<ReturnType<typeof connectAcp>>,
+  transports: Set<ControlTransport>,
+  watchedStops: WeakSet<ControlTransport>,
   startOptions?: { allowMissingCwd?: boolean },
 ) {
   const { launch, capabilities, emit } = options
@@ -1113,14 +1130,53 @@ async function createSession(
         error: { message },
       })
   }
-  /** Start an owned ACP runtime; it leaves the connection's transports once it exits and stops. */
-  function startRuntime(skipPermissions: boolean) {
+  const sessionEnv = config?.env ?? {}
+  function trackSessionTransport(transport: ControlTransport) {
+    transports.add(transport)
+    if (!watchedStops.has(transport)) {
+      watchedStops.add(transport)
+      void transport.stopped.then(
+        () => transports.delete(transport),
+        () => transports.delete(transport),
+      )
+    }
+  }
+  function bindSessionCallbacks(transport: ControlTransport): {
+    sessionClient: AcpClient
+    sessionOnExit: (error: Error) => void
+  } {
     const isStale = () =>
       transport !== currentTransport || retiring.has(transport)
-    const transport = (options.connectAcp ?? connectAcp)(
-      effectiveLaunch(launch, skipPermissions),
+    return {
+      sessionClient: {
+        sessionUpdate: (notification) =>
+          isStale() ? Promise.resolve() : client.sessionUpdate(notification),
+        requestPermission: (request) =>
+          isStale()
+            ? Promise.resolve({ outcome: { outcome: 'cancelled' as const } })
+            : client.requestPermission(request),
+        requestElicitation: (params) =>
+          isStale()
+            ? Promise.resolve({ action: 'cancel' })
+            : client.requestElicitation(params),
+      },
+      sessionOnExit: (error) => {
+        if (isStale()) return
+        onExit(error)
+      },
+    }
+  }
+  /** Start an owned ACP runtime; it leaves the connection's transports once it exits and stops. */
+  function startColdRuntime(skipPermissions: boolean) {
+    const runLaunch = effectiveLaunch(launch, skipPermissions)
+    let boundTransport!: ControlTransport
+    const isStale = () =>
+      boundTransport !== currentTransport || retiring.has(boundTransport)
+    const { transport, bind } = createAttachableTransport(
+      options.connectAcp ?? connectAcp,
+      runLaunch,
       spawnCwd,
-      config?.env ?? {},
+      sessionEnv,
       {
         sessionUpdate: (notification) =>
           isStale() ? Promise.resolve() : client.sessionUpdate(notification),
@@ -1138,20 +1194,65 @@ async function createSession(
         onExit(error)
       },
     )
-    transports.add(transport)
-    void transport.stopped.then(() => transports.delete(transport))
-    return transport
+    boundTransport = transport
+    trackSessionTransport(transport)
+    return {
+      transport,
+      toAttachable: (initialized: InitializedAcp): AttachableRuntime => ({
+        transport,
+        initialized,
+        key: standbyPoolKey(runLaunch, sessionEnv),
+        reusable: isLaunchCwdIndependent(spawnCwd, runLaunch, sessionEnv),
+        attach: (nextClient, nextOnExit) => bind(nextClient, nextOnExit),
+      }),
+    }
   }
-  let currentTransport = startRuntime(state.skipPermissions)
-  try {
-    let currentInitialized = await initializeAcp(currentTransport)
+  let currentTransport!: ControlTransport
+  let currentAttachable: AttachableRuntime | undefined
+  let currentInitialized!: InitializedAcp
+  const warmInitial = await options.standby?.take(
+    effectiveLaunch(launch, state.skipPermissions),
+    spawnCwd,
+    sessionEnv,
+  )
+  if (warmInitial && !warmInitial.transport.closed) {
+    currentTransport = warmInitial.transport
+    currentAttachable = warmInitial
+    currentInitialized = warmInitial.initialized
+    const { sessionClient, sessionOnExit } =
+      bindSessionCallbacks(currentTransport)
+    warmInitial.attach(sessionClient, sessionOnExit)
+    trackSessionTransport(currentTransport)
+  } else {
+    if (warmInitial) await warmInitial.transport.close().catch(() => undefined)
+    const started = startColdRuntime(state.skipPermissions)
+    currentTransport = started.transport
+    try {
+      currentInitialized = await initializeAcp(currentTransport)
+      currentAttachable = started.toAttachable(currentInitialized)
+    } catch (error) {
+      await currentTransport.close()
+      throw error
+    }
+  }
+  function replenishStandby(skipPermissions = state.skipPermissions) {
+    if (
+      state.closing ||
+      state.failed ||
+      skipPermissions ||
+      hasSkipPermissionsFlag(launch)
+    )
+      return
+    options.standby?.warm(launch, spawnCwd, sessionEnv)
+  }
+  {
     function canReloadSession() {
       return Boolean(
         currentInitialized.agentCapabilities?.sessionCapabilities?.resume ||
         currentInitialized.agentCapabilities?.loadSession,
       )
     }
-    function isReloadAlive(next: ReturnType<typeof connectAcp>): boolean {
+    function isReloadAlive(next: ControlTransport): boolean {
       if (state.closing) {
         void next.close().catch(() => undefined)
         return false
@@ -1164,7 +1265,7 @@ async function createSession(
         )
       return true
     }
-    function isRetireAlive(obsolete: ReturnType<typeof connectAcp>): boolean {
+    function isRetireAlive(obsolete: ControlTransport): boolean {
       if (state.closing) return false
       if (currentTransport !== obsolete)
         throw new Error('ACP runtime superseded during relaunch')
@@ -1186,7 +1287,10 @@ async function createSession(
       ).catch(() => state.runtimeEpoch)
     }
     async function reloadIntoRuntime(
-      next: ReturnType<typeof connectAcp>,
+      next: ControlTransport,
+      nextInitialized: InitializedAcp | undefined,
+      toAttachable:
+        ((initialized: InitializedAcp) => AttachableRuntime) | undefined,
       skipPermissions: boolean,
       restoreMode: boolean,
       prev: ReturnType<typeof configState>,
@@ -1194,7 +1298,10 @@ async function createSession(
       nativeMode: string | undefined,
     ): Promise<void> {
       try {
-        currentInitialized = await initializeAcp(next)
+        currentInitialized = nextInitialized ?? (await initializeAcp(next))
+        if (toAttachable && currentTransport === next) {
+          currentAttachable = toAttachable(currentInitialized)
+        }
         if (!isReloadAlive(next)) return
         if (!canReloadSession())
           throw new Error(
@@ -1304,11 +1411,48 @@ async function createSession(
         }
         await updateRuntimeEpoch()
         if (!isRetireAlive(obsolete)) return
-        const next = startRuntime(skipPermissions)
-        currentTransport = next
+        const warmNext = await options.standby?.take(
+          effectiveLaunch(launch, skipPermissions),
+          spawnCwd,
+          sessionEnv,
+        )
+        let alive = false
+        try {
+          alive = isRetireAlive(obsolete)
+        } catch (error) {
+          if (warmNext) await warmNext.transport.close().catch(() => undefined)
+          throw error
+        }
+        if (!alive) {
+          if (warmNext) await warmNext.transport.close().catch(() => undefined)
+          return
+        }
+        let next: ControlTransport
+        let nextInitialized: InitializedAcp | undefined
+        let toAttachable:
+          ((initialized: InitializedAcp) => AttachableRuntime) | undefined
+        if (warmNext && !warmNext.transport.closed) {
+          next = warmNext.transport
+          nextInitialized = warmNext.initialized
+          currentTransport = next
+          currentAttachable = warmNext
+          const { sessionClient, sessionOnExit } = bindSessionCallbacks(next)
+          warmNext.attach(sessionClient, sessionOnExit)
+          trackSessionTransport(next)
+          replenishStandby(skipPermissions)
+        } else {
+          if (warmNext) await warmNext.transport.close().catch(() => undefined)
+          const started = startColdRuntime(skipPermissions)
+          next = started.transport
+          toAttachable = started.toAttachable
+          currentTransport = next
+          currentAttachable = undefined
+        }
         handedToReload = true
         const reload = reloadIntoRuntime(
           next,
+          nextInitialized,
+          toAttachable,
           skipPermissions,
           Boolean(deferReload),
           prev,
@@ -1564,6 +1708,7 @@ async function createSession(
         await settled
       },
       relaunchForPermissions,
+      replenishStandby,
       close(): Promise<void> {
         if (closing) return closing
         state.closing = true
@@ -1582,21 +1727,57 @@ async function createSession(
             !state.persisted &&
             (config?.persist === false || state.prompts.size === 0) &&
             sessionIdPattern.test(state.nativeId)
-          if (disposable)
-            await currentTransport
-              .request(
+          let closeOk = false
+          if (disposable) {
+            try {
+              await currentTransport.request(
                 currentTransport.rpc.closeSession({
                   sessionId: state.nativeId,
                 }),
                 { timeoutMs: 1500, fatalOnTimeout: false },
               )
-              .catch(() => undefined)
+              closeOk = !currentTransport.closed
+            } catch {
+              closeOk = false
+            }
+          }
           await closingObservation?.dispose()
-          const stopped = await currentTransport.close().then(
-            () => true,
-            () => false,
-          )
-          if (disposable && stopped)
+          const recyclable =
+            disposable &&
+            state.ready &&
+            closeOk &&
+            !state.failed &&
+            !state.skipPermissions &&
+            !hasSkipPermissionsFlag(launch) &&
+            controlActive === 0 &&
+            !state.loading &&
+            !state.interrupting &&
+            !retiring.has(currentTransport) &&
+            state.prompts.size === 0 &&
+            mcpServerNames.length === 0 &&
+            currentAttachable !== undefined &&
+            currentAttachable.transport === currentTransport &&
+            currentAttachable.reusable &&
+            options.standby !== undefined
+          let recycled = false
+          if (recyclable) {
+            recycled = options.standby!.recycle(
+              currentAttachable!,
+              effectiveLaunch(launch, state.skipPermissions),
+              spawnCwd,
+              sessionEnv,
+            )
+            if (recycled) {
+              transports.delete(currentTransport)
+            }
+          }
+          const cleaned = recycled
+            ? true
+            : await currentTransport.close().then(
+                () => true,
+                () => false,
+              )
+          if (disposable && cleaned)
             await removeSessionArtifacts(appData, state.nativeId).catch(
               () => undefined,
             )
@@ -1604,9 +1785,6 @@ async function createSession(
         return closing
       },
     }
-  } catch (error) {
-    await currentTransport.close()
-    throw error
   }
 }
 
@@ -1853,7 +2031,10 @@ async function promptSession(
   session.state.turnForegroundAcp = []
   session.state.deniedToolCallIds.clear()
   let started = false
+  const isFirstNewPrompt =
+    !session.state.persisted && session.state.prompts.size === 0
   session.state.prompts.add(p.clientMessageId)
+  if (isFirstNewPrompt) session.replenishStandby()
   session.timeline.boundary()
   emit({
     type: 'timeline.item',

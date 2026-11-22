@@ -26,7 +26,11 @@ import {
   sessionIdPattern,
   setBounded,
 } from './common.ts'
-import { SharedControlRuntime } from './runtime.ts'
+import {
+  hasSkipPermissionsFlag,
+  SharedControlRuntime,
+  StandbyRuntimePool,
+} from './runtime.ts'
 import { AgyUsageSource } from './usage.ts'
 import { ReportedRequestError, SessionManager } from './session.ts'
 
@@ -72,11 +76,15 @@ export function createProvider(
       const emit = (event: ProviderEvent) => {
         for (const listener of listeners) listener(event)
       }
+      const standbyPool = new StandbyRuntimePool({
+        launch: connection.launch,
+      })
       const manager = new SessionManager({
         launch: connection.launch,
         usage,
         capabilities,
         emit,
+        standby: standbyPool,
       })
       const controlRuntime = new SharedControlRuntime({
         launch: connection.launch,
@@ -84,6 +92,11 @@ export function createProvider(
       const pending = new Set<Promise<void>>()
       const pendingCatalogs = new Map<string, Promise<ProviderCatalog>>()
       let closed = false
+      const warmStandby = (cwd: string) => {
+        if (!closed && !hasSkipPermissionsFlag(connection.launch)) {
+          standbyPool.warm(connection.launch, cwd, {})
+        }
+      }
       async function handle(input: ProviderInput) {
         if (input.type === 'catalog') {
           const cwd = await resolveSpawnCwd(input.cwd, connection.launch, {
@@ -110,13 +123,21 @@ export function createProvider(
             }
             void pendingCatalog.then(clear, clear)
           }
+          const resolvedCatalog = await catalog
+          warmStandby(cwd)
           emit({
             type: 'catalog',
             requestId: input.requestId,
-            catalog: await catalog,
+            catalog: resolvedCatalog,
           })
         } else if (input.type === 'sessions')
-          await listSessions(controlRuntime, connection.launch, input, emit)
+          await listSessions(
+            controlRuntime,
+            connection.launch,
+            input,
+            emit,
+            warmStandby,
+          )
         else await manager.handle(input)
       }
       return {
@@ -164,7 +185,11 @@ export function createProvider(
         },
         async close() {
           closed = true
-          await Promise.all([manager.close(), controlRuntime.close()])
+          await Promise.all([
+            manager.close(),
+            controlRuntime.close(),
+            standbyPool.close(),
+          ])
           await Promise.all([...pending])
           listeners.clear()
         },
@@ -241,6 +266,7 @@ async function listSessions(
   launch: ProviderLaunch | undefined,
   input: Extract<ProviderInput, { type: 'sessions' }>,
   emit: (event: ProviderEvent) => void,
+  onReady: (spawnCwd: string) => void,
 ) {
   const spawnCwd = await resolveSpawnCwd(input.cwd, launch, {
     allowMissingCwd: true,
@@ -290,6 +316,7 @@ async function listSessions(
     } while (cursor && results.length < (input.limit ?? 100))
     return results.slice(0, input.limit ?? 100)
   })
+  onReady(spawnCwd)
   emit({
     type: 'sessions',
     requestId: input.requestId,

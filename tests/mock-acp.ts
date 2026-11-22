@@ -29,6 +29,13 @@ if (process.env.AGY_TEST_PID_FILE)
   writeFileSync(process.env.AGY_TEST_PID_FILE, String(process.pid))
 if (process.env.AGY_TEST_PID_LOG)
   appendFileSync(process.env.AGY_TEST_PID_LOG, `${process.pid}\n`)
+function logRpcPid(method: string) {
+  if (process.env.AGY_TEST_RPC_PID_LOG)
+    appendFileSync(
+      process.env.AGY_TEST_RPC_PID_LOG,
+      `${process.pid}:${method}\n`,
+    )
+}
 function log(method: string) {
   if (process.env.AGY_TEST_LOG)
     appendFileSync(process.env.AGY_TEST_LOG, method + '\n')
@@ -204,6 +211,7 @@ function sendCommands(sessionId: string) {
 }
 connection = agent()
   .onRequest(methods.agent.initialize, async ({ params }) => {
+    logRpcPid('initialize')
     if (
       process.env.AGY_TEST_LOG_ELICITATION_CAP &&
       params.clientCapabilities?.elicitation?.form
@@ -228,6 +236,7 @@ connection = agent()
   })
   .onRequest(methods.agent.authenticate, async () => ({}))
   .onRequest(methods.agent.session.new, async ({ params }) => {
+    logRpcPid('new')
     if (
       process.env.AGY_TEST_FAIL_NEW_SESSION_FLAG &&
       existsSync(process.env.AGY_TEST_FAIL_NEW_SESSION_FLAG)
@@ -275,6 +284,7 @@ connection = agent()
     return { sessionId: nativeId, configOptions }
   })
   .onRequest(methods.agent.session.close, async ({ params: { sessionId } }) => {
+    logRpcPid('close')
     log('close')
     if (process.env.AGY_TEST_STALE_EVENTS) await staleEvents(sessionId)
     if (
@@ -290,6 +300,7 @@ connection = agent()
   .onRequest(
     methods.agent.session.load,
     async ({ params: { sessionId, cwd, _meta } }) => {
+      logRpcPid('load')
       if (process.env.AGY_TEST_LOG_CWD)
         log(`spawn-cwd:${process.cwd()}|load-cwd:${cwd}`)
       const append = (
@@ -378,6 +389,7 @@ connection = agent()
   .onRequest(
     methods.agent.session.resume,
     async ({ params: { sessionId, _meta } }) => {
+      logRpcPid('resume')
       const append = (
         _meta?.antigravity as { systemPrompt?: { append?: string } }
       )?.systemPrompt?.append
@@ -387,12 +399,19 @@ connection = agent()
     },
   )
   .onRequest(methods.agent.session.list, async ({ params: { cwd } }) => {
+    logRpcPid('list')
     if (
       process.env.AGY_TEST_CRASH_ON_LIST_FLAG &&
       existsSync(process.env.AGY_TEST_CRASH_ON_LIST_FLAG)
     ) {
-      unlinkSync(process.env.AGY_TEST_CRASH_ON_LIST_FLAG)
-      process.exit(1)
+      const target = readFileSync(
+        process.env.AGY_TEST_CRASH_ON_LIST_FLAG,
+        'utf8',
+      ).trim()
+      if (!target || target === '1' || target === cwd) {
+        unlinkSync(process.env.AGY_TEST_CRASH_ON_LIST_FLAG)
+        process.exit(1)
+      }
     }
     return {
       sessions: [
