@@ -49,11 +49,9 @@ import {
   type ForegroundAcpSegment,
   type RuntimeEpoch,
 } from './brain.ts'
-import {
-  readConversationCompactionWindow,
-  readLatestStepUsage,
-  type TranscriptReader,
-} from './brain-io.ts'
+import { readLatestStepUsage, type TranscriptReader } from './brain-io.ts'
+import { readConversationCompactionWindow } from './conversation-db.ts'
+import { toolDisplayName } from './mcp.ts'
 import { projectReplayHistory, type HistoryEntry } from './history.ts'
 import { SubagentRegistry } from './subagents.ts'
 import {
@@ -85,6 +83,8 @@ import {
 } from './common.ts'
 import {
   configState,
+  currentModelId,
+  currentNativeMode,
   FULL_ACCESS_MODE_ID,
   hasPositivePromptUsage,
   Timeline,
@@ -132,6 +132,8 @@ interface SessionOptions {
 }
 
 const TIER_CACHE_LIMIT = 100
+const PROMPT_DEDUPE_LIMIT = 1000
+const permissionInputSchema = z.record(z.string(), z.json())
 const LOAD_HISTORY_UPDATES = new Set<
   SessionNotification['update']['sessionUpdate']
 >([
@@ -361,7 +363,7 @@ export class SessionManager {
         await session.refreshSubagents()
         let persistedEstimatedTokens: number | undefined
         if (input.persistence) {
-          const persistedModel = configState(session.state.metadata).model
+          const persistedModel = currentModelId(session.state.metadata)
           persistedEstimatedTokens = (
             await session.refreshCompactionWindow({
               allowExisting: true,
@@ -620,7 +622,9 @@ async function createSession(
     failed: false,
     failureError: undefined as Error | undefined,
     metadata: { sessionId: '' } as NewSessionResponse & SessionMetadata,
-    prompts: new Set<string>(),
+    prompts: new Map<string, true>(),
+    hasPrompted: false,
+    turnEstimatedTokens: undefined as number | undefined,
   }
   const buffered: SessionNotification[] = []
   let collectingHistory = true
@@ -652,6 +656,10 @@ async function createSession(
     createTranscriptReader: options.createTranscriptReader,
   })
   let notificationLane = Promise.resolve()
+  function enqueueNotification(fn: () => Promise<void>): Promise<void> {
+    notificationLane = notificationLane.then(fn, fn).catch(() => undefined)
+    return notificationLane
+  }
   let controlLane = Promise.resolve()
   let controlActive = 0
   function runControl<T>(
@@ -684,7 +692,7 @@ async function createSession(
   const compactionWindowSizes = new Map<string | undefined, number>()
   let sqlGenIdx = -1
   function activeModelWindow(): number | undefined {
-    const model = configState(state.metadata).model
+    const model = currentModelId(state.metadata)
     return compactionWindowSizes.get(model) ?? nativeWindowSizes.get(model)
   }
   function withActiveWindow(next: ProviderUsage): ProviderUsage {
@@ -712,11 +720,14 @@ async function createSession(
     })
     if (!snapshot) return undefined
     sqlGenIdx = Math.max(sqlGenIdx, snapshot.genIdx)
+    if (snapshot.estimatedTokens !== undefined && state.turn !== '') {
+      state.turnEstimatedTokens = snapshot.estimatedTokens
+    }
     if (snapshot.maxTokens !== undefined) {
       const targetModel =
         options && 'model' in options
           ? options.model
-          : configState(state.metadata).model
+          : currentModelId(state.metadata)
       setBounded(compactionWindowSizes, targetModel, snapshot.maxTokens, 100)
     }
     return {
@@ -863,12 +874,12 @@ async function createSession(
     if (notification.sessionId !== state.nativeId) return
     const u = notification.update
     if (u.sessionUpdate === 'config_option_update') {
-      const prevModel = configState(state.metadata).model
+      const prevModel = currentModelId(state.metadata)
       state.metadata.configOptions = u.configOptions
       if (state.loading && state.ready) return
-      if (configState({ ...state.metadata, fullAccess: false }).mode === 'plan')
+      if (currentNativeMode(state.metadata) === 'plan')
         state.metadata.fullAccess = false
-      const nextModel = configState(state.metadata).model
+      const nextModel = currentModelId(state.metadata)
       if (!state.loading && nextModel !== prevModel) {
         await refreshCompactionWindow({ model: prevModel }).catch(
           () => undefined,
@@ -897,11 +908,15 @@ async function createSession(
     } else if (u.sessionUpdate === 'usage_update') {
       const next = contextUsage(u)
       if (!next) return
-      const model = configState(state.metadata).model
+      const model = currentModelId(state.metadata)
       setBounded(nativeWindowSizes, model, u.size, 100)
       // agy writes server-issued max_context_tokens to SQLite before/as steps emit usage_update;
-      // refresh live so Turn 1 does not show the raw API interface cap (e.g. 1m instead of 512k).
-      if (!state.loading && state.nativeId) {
+      // refresh once per model so Turn 1 does not show the raw API cap, and skip once cached.
+      if (
+        !state.loading &&
+        state.nativeId &&
+        !compactionWindowSizes.has(model)
+      ) {
         await refreshCompactionWindow({ model }).catch(() => undefined)
         if (state.closing || state.failed) return
       }
@@ -1026,10 +1041,7 @@ async function createSession(
   const client = {
     sessionUpdate: (notification: SessionNotification) => {
       const foreground = !state.inSettle
-      notificationLane = notificationLane.then(() =>
-        update(notification, foreground),
-      )
-      return notificationLane
+      return enqueueNotification(() => update(notification, foreground))
     },
     requestElicitation: async (params: Record<string, unknown>) => {
       if (
@@ -1094,9 +1106,9 @@ async function createSession(
         state.failed
       )
         return Promise.resolve({ outcome: { outcome: 'cancelled' as const } })
-      const input = z
-        .record(z.string(), z.json())
-        .safeParse(record(request.toolCall?.rawInput))
+      const input = permissionInputSchema.safeParse(
+        record(request.toolCall?.rawInput),
+      )
       if (!input.success)
         return Promise.resolve({ outcome: { outcome: 'cancelled' as const } })
       const detail = toolDetail(request.toolCall)
@@ -1123,7 +1135,10 @@ async function createSession(
           sessionId: id,
           request: {
             id: permissionId,
-            name: request.toolCall.title ?? 'Tool',
+            name: toolDisplayName(
+              { ...request.toolCall, name: record(request.toolCall).name },
+              mcpServerNames,
+            ),
             kind,
             title: request.toolCall.title ?? undefined,
             input: input.data,
@@ -1344,7 +1359,8 @@ async function createSession(
       nativeMode: string | undefined,
     ): Promise<void> {
       try {
-        currentInitialized = nextInitialized ?? (await initializeAcp(next))
+        currentInitialized =
+          nextInitialized ?? (await initializeAcp(next, closeSignal))
         if (toAttachable && currentTransport === next) {
           currentAttachable = toAttachable(currentInitialized)
         }
@@ -1412,10 +1428,7 @@ async function createSession(
       const { skipPermissions, sendCancel, deferReload } = opts
       const prev = configState(state.metadata)
       const prevModels = state.metadata.models
-      const nativeMode = configState({
-        ...state.metadata,
-        fullAccess: false,
-      }).mode
+      const nativeMode = currentNativeMode(state.metadata)
       if (retiring.has(currentTransport))
         throw new Error('ACP runtime superseded during relaunch')
       const obsolete = currentTransport
@@ -1708,7 +1721,7 @@ async function createSession(
       async flush() {
         state.opening = false
         for (const item of buffered.splice(0))
-          notificationLane = notificationLane.then(() => update(item))
+          enqueueNotification(() => update(item))
         await notificationLane
       },
       async interrupt(): Promise<void> {
@@ -1792,7 +1805,7 @@ async function createSession(
           state.silenced = true
           const disposable =
             !state.persisted &&
-            (config?.persist === false || state.prompts.size === 0) &&
+            (config?.persist === false || !state.hasPrompted) &&
             sessionIdPattern.test(state.nativeId)
           let closeOk = false
           if (disposable) {
@@ -1820,7 +1833,7 @@ async function createSession(
             !state.loading &&
             !state.interrupting &&
             !retiring.has(currentTransport) &&
-            state.prompts.size === 0 &&
+            !state.hasPrompted &&
             mcpServerNames.length === 0 &&
             currentAttachable !== undefined &&
             currentAttachable.transport === currentTransport &&
@@ -2021,14 +2034,14 @@ async function configureSession(
       mutated ||= applied
     }
   } catch (error) {
-    if (configState(session.state.metadata).model !== initial.model) {
+    if (currentModelId(session.state.metadata) !== initial.model) {
       await session.drain()
       session.syncModelContextWindow()
     }
     if (mutated) session.publishConfig()
     throw error
   }
-  if (configState(session.state.metadata).model !== initial.model) {
+  if (currentModelId(session.state.metadata) !== initial.model) {
     await session.drain()
     session.syncModelContextWindow()
   }
@@ -2091,6 +2104,7 @@ async function promptSession(
   session.state.turnFinished = false
   session.state.turnHadContextUsage = false
   session.state.turnHadModelOutput = false
+  session.state.turnEstimatedTokens = undefined
   session.state.inSettle = false
   session.state.handledElicitations = []
   session.state.wakeupQuestionDeclined = false
@@ -2099,8 +2113,14 @@ async function promptSession(
   session.state.deniedToolCallIds.clear()
   let started = false
   const isFirstNewPrompt =
-    !session.state.persisted && session.state.prompts.size === 0
-  session.state.prompts.add(p.clientMessageId)
+    !session.state.persisted && !session.state.hasPrompted
+  session.state.hasPrompted = true
+  setBounded(
+    session.state.prompts,
+    p.clientMessageId,
+    true,
+    PROMPT_DEDUPE_LIMIT,
+  )
   if (isFirstNewPrompt) session.replenishStandby()
   session.timeline.boundary()
   emit({
@@ -2435,8 +2455,9 @@ async function promptSession(
     }
     lastStep = await reconcileFinalSnapshot(lastStep)
     if (!session.state.closing && session.state.nativeId === nativeId)
-      turnEstimatedTokens = (await session.refreshCompactionWindow())
-        ?.estimatedTokens
+      turnEstimatedTokens =
+        (await session.refreshCompactionWindow())?.estimatedTokens ??
+        session.state.turnEstimatedTokens
     turnWokeUp ||= observation?.wokeUp === true
     if (!session.state.closing && session.state.failed)
       throw sessionRuntimeExitedError(session.state.failureError)
@@ -2458,9 +2479,9 @@ async function promptSession(
       () => observation?.usage.latest,
     )
     if (!session.state.closing && session.state.nativeId === nativeId)
-      turnEstimatedTokens ??= (
-        await session.refreshCompactionWindow().catch(() => undefined)
-      )?.estimatedTokens
+      turnEstimatedTokens ??=
+        (await session.refreshCompactionWindow().catch(() => undefined))
+          ?.estimatedTokens ?? session.state.turnEstimatedTokens
     turnWokeUp ||= observation?.wokeUp === true
     settleTurnUsage(true)
     const failure =
@@ -2486,6 +2507,7 @@ async function promptSession(
           return
         session.state.turnRunning = false
         session.state.inSettle = false
+        session.state.turnEstimatedTokens = undefined
         session.state.handledElicitations = []
         session.state.wakeupQuestionDeclined = false
         session.state.turnAbort = null

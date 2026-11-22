@@ -1,6 +1,6 @@
 import { test, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync } from 'node:fs'
+import { mkdirSync, utimesSync } from 'node:fs'
 import { mkdtemp, mkdir, writeFile, rm, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -64,6 +64,8 @@ function encodeGenMetadataMaxContext(maxTokens: number): Buffer {
   return encodeGenMetadataContextUsage({ maxTokens })
 }
 
+let dbWriteEpochSeconds = Math.floor(Date.now() / 1000) + 1
+
 function writeConversationDb(
   home: string,
   nativeId: string,
@@ -73,7 +75,8 @@ function writeConversationDb(
 ) {
   const convDir = join(home, '.gemini/antigravity-cli/conversations')
   mkdirSync(convDir, { recursive: true })
-  const db = new DatabaseSync(join(convDir, `${nativeId}.db`))
+  const dbPath = join(convDir, `${nativeId}.db`)
+  const db = new DatabaseSync(dbPath)
   try {
     db.exec(
       'CREATE TABLE IF NOT EXISTS gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)',
@@ -85,6 +88,8 @@ function writeConversationDb(
   } finally {
     db.close()
   }
+  const tick = ++dbWriteEpochSeconds
+  utimesSync(dbPath, tick, tick)
 }
 
 test('latest usage respects the turn boundary, incomplete rows and cache-only counters', async () => {
@@ -1254,4 +1259,362 @@ test('SQLite estimated_tokens_used acts as last-resort context fallback without 
   assert.ok(restoredTxUsage?.type === 'session.usage')
   assert.equal(restoredTxUsage.usage.contextWindowUsedTokens, 73)
   assert.equal(restoredTxUsage.usage.contextWindowMaxTokens, 256_000)
+})
+
+test('SQLite compaction reader caches by stat fingerprint, invalidates on .db/.db-wal edits, and reopens on lower minGenIdx', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-sqlite-cache-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const brainRoot = join(home, '.gemini/antigravity-cli/brain')
+  await mkdir(brainRoot, { recursive: true })
+  const id = '33333333-3333-4333-8333-333333333331'
+
+  let openCount = 0
+  const openDb = (path: string) => {
+    openCount += 1
+    return new DatabaseSync(path, { readOnly: true, timeout: 50 })
+  }
+
+  writeConversationDb(home, id, {
+    gen: [
+      {
+        idx: 0,
+        data: encodeGenMetadataContextUsage({
+          maxTokens: 512_000,
+          estimatedTokens: 12_000,
+        }),
+      },
+      {
+        idx: 1,
+        data: encodeGenMetadataContextUsage({
+          maxTokens: 512_000,
+          estimatedTokens: 19_000,
+        }),
+      },
+    ],
+  })
+
+  // First read opens SQLite once and populates cache.
+  assert.deepEqual(
+    await readConversationCompactionWindow(brainRoot, id, -1, { openDb }),
+    { maxTokens: 512_000, estimatedTokens: 19_000, genIdx: 1 },
+  )
+  assert.equal(openCount, 1)
+
+  // Repeated read with identical cursor reuses cache without reopening SQLite.
+  assert.deepEqual(
+    await readConversationCompactionWindow(brainRoot, id, -1, { openDb }),
+    { maxTokens: 512_000, estimatedTokens: 19_000, genIdx: 1 },
+  )
+  assert.equal(openCount, 1)
+
+  // Advancing minGenIdx to >= cached genIdx short-circuits without reopening SQLite.
+  assert.deepEqual(
+    await readConversationCompactionWindow(brainRoot, id, 1, { openDb }),
+    { genIdx: 1 },
+  )
+  assert.deepEqual(
+    await readConversationCompactionWindow(brainRoot, id, 4, { openDb }),
+    { genIdx: 4 },
+  )
+  assert.equal(openCount, 1)
+
+  // Modifying .db invalidates the fingerprint and reopens SQLite for the new row.
+  writeConversationDb(home, id, {
+    gen: [
+      {
+        idx: 2,
+        data: encodeGenMetadataContextUsage({
+          maxTokens: 256_000,
+          estimatedTokens: 25_000,
+        }),
+      },
+    ],
+  })
+  assert.deepEqual(
+    await readConversationCompactionWindow(brainRoot, id, 1, { openDb }),
+    { maxTokens: 256_000, estimatedTokens: 25_000, genIdx: 2 },
+  )
+  assert.equal(openCount, 2)
+
+  // Asking for a lower minGenIdx than the cached cursor reopens SQLite to scan full history.
+  const idLowerCursor = '33333333-3333-4333-8333-333333333332'
+  writeConversationDb(home, idLowerCursor, {
+    gen: [
+      {
+        idx: 0,
+        data: encodeGenMetadataContextUsage({
+          maxTokens: 1_000_000,
+          estimatedTokens: 42_000,
+        }),
+      },
+    ],
+  })
+  assert.deepEqual(
+    await readConversationCompactionWindow(brainRoot, idLowerCursor, 0, {
+      openDb,
+    }),
+    { genIdx: 0 },
+  )
+  assert.equal(openCount, 3)
+  assert.deepEqual(
+    await readConversationCompactionWindow(brainRoot, idLowerCursor, -1, {
+      openDb,
+    }),
+    { maxTokens: 1_000_000, estimatedTokens: 42_000, genIdx: 0 },
+  )
+  assert.equal(openCount, 4)
+
+  // Modifying .db-wal (while .db itself stays unchanged) invalidates the fingerprint and reopens SQLite.
+  const idWal = '33333333-3333-4333-8333-333333333333'
+  const convDir = join(home, '.gemini/antigravity-cli/conversations')
+  const walWriter = new DatabaseSync(join(convDir, `${idWal}.db`))
+  t.after(() => walWriter.close())
+  walWriter.exec('PRAGMA journal_mode = WAL')
+  walWriter.exec(
+    'CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)',
+  )
+  const insWal = walWriter.prepare(
+    'INSERT INTO gen_metadata (idx, data) VALUES (?, ?)',
+  )
+  insWal.run(
+    0,
+    encodeGenMetadataContextUsage({
+      maxTokens: 512_000,
+      estimatedTokens: 10_000,
+    }),
+  )
+  assert.deepEqual(
+    await readConversationCompactionWindow(brainRoot, idWal, -1, { openDb }),
+    { maxTokens: 512_000, estimatedTokens: 10_000, genIdx: 0 },
+  )
+  assert.equal(openCount, 5)
+  assert.deepEqual(
+    await readConversationCompactionWindow(brainRoot, idWal, -1, { openDb }),
+    { maxTokens: 512_000, estimatedTokens: 10_000, genIdx: 0 },
+  )
+  assert.equal(openCount, 5)
+  insWal.run(
+    1,
+    encodeGenMetadataContextUsage({
+      maxTokens: 256_000,
+      estimatedTokens: 33_000,
+    }),
+  )
+  assert.deepEqual(
+    await readConversationCompactionWindow(brainRoot, idWal, 0, { openDb }),
+    { maxTokens: 256_000, estimatedTokens: 33_000, genIdx: 1 },
+  )
+  assert.equal(openCount, 6)
+})
+
+test('warm SQLite compaction cache never bypasses symlink validation on .db or .db-wal', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-sqlite-cache-symlink-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const brainRoot = join(home, '.gemini/antigravity-cli/brain')
+  const convDir = join(home, '.gemini/antigravity-cli/conversations')
+  await mkdir(brainRoot, { recursive: true })
+  const outsideTarget = join(home, 'outside.db')
+  await writeFile(outsideTarget, 'outside')
+
+  const idReplaceDb = '33333333-3333-4333-8333-333333333334'
+  writeConversationDb(home, idReplaceDb, {
+    gen: [{ idx: 0, data: encodeGenMetadataMaxContext(512_000) }],
+  })
+  assert.deepEqual(
+    await readConversationCompactionWindow(brainRoot, idReplaceDb),
+    { maxTokens: 512_000, genIdx: 0 },
+  )
+  await rm(join(convDir, `${idReplaceDb}.db`))
+  await symlink(outsideTarget, join(convDir, `${idReplaceDb}.db`))
+  await assert.rejects(
+    readConversationCompactionWindow(brainRoot, idReplaceDb),
+    { name: 'BrainEscapeError' },
+  )
+
+  const idAddWalSymlink = '33333333-3333-4333-8333-333333333335'
+  writeConversationDb(home, idAddWalSymlink, {
+    gen: [{ idx: 0, data: encodeGenMetadataMaxContext(512_000) }],
+  })
+  assert.deepEqual(
+    await readConversationCompactionWindow(brainRoot, idAddWalSymlink),
+    { maxTokens: 512_000, genIdx: 0 },
+  )
+  await symlink(outsideTarget, join(convDir, `${idAddWalSymlink}.db-wal`))
+  await assert.rejects(
+    readConversationCompactionWindow(brainRoot, idAddWalSymlink),
+    { name: 'BrainEscapeError' },
+  )
+})
+
+test('mid-turn usage_update advancing sqlGenIdx preserves turnEstimatedTokens for wakeup end-of-turn fallback', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-sqlgen-est-cache-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const nativeId = '44444444-4444-4444-8444-444444444444'
+  const sender = '55555555-5555-4555-8555-555555555555'
+  const brainDir = join(
+    home,
+    '.gemini/antigravity-cli/brain',
+    nativeId,
+    '.system_generated/logs',
+  )
+  await mkdir(brainDir, { recursive: true })
+  const events: Array<
+    import('@getpaseo/plugin/server/provider').ProviderEvent
+  > = []
+  const env = isolatedEnv(home)
+  const manager = new SessionManager({
+    launch: { command: 'agy', args: ['acp'], env },
+    usage: new AgyUsageSource({ env }),
+    capabilities: [
+      'prompt.message',
+      'prompt.command',
+      'prompt.image',
+      'session.configure',
+      'session.list',
+      'session.persistence',
+      'session.can_stop_runtime',
+      'permission',
+      'permission.tool_policy',
+      'session.subsession',
+    ],
+    emit: (event) => events.push(event),
+    commandWaitTimeoutMs: 50,
+    connectAcp: (_l, _cwd, _e, client) => {
+      const closed = new Promise<void>(() => {})
+      const rpc = {
+        closed,
+        initialize: async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
+          agentCapabilities: { loadSession: true },
+        }),
+        newSession: async () => {
+          void client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'available_commands_update',
+              availableCommands: [],
+            },
+          })
+          return {
+            sessionId: nativeId,
+            configOptions: [
+              {
+                id: 'model',
+                name: 'Model',
+                category: 'model',
+                type: 'select',
+                currentValue: 'model-a',
+                options: [{ value: 'model-a', name: 'Model A' }],
+              },
+            ],
+          }
+        },
+        closeSession: async () => ({}),
+        prompt: async () => {
+          writeConversationDb(home, nativeId, {
+            gen: [
+              {
+                idx: 0,
+                data: encodeGenMetadataContextUsage({
+                  maxTokens: 512_000,
+                  estimatedTokens: 88_000,
+                }),
+              },
+            ],
+          })
+          // Live usage_update advances sqlGenIdx to 0 while caching turnEstimatedTokens = 88_000.
+          await client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'usage_update',
+              used: 40_000,
+              size: 1_000_000,
+            },
+          })
+          // Post-RPC wakeup completes without per-step token counters in transcript_full.jsonl,
+          // so end-of-turn settlement must fall back to the cached 88_000 estimatedTokens even
+          // though sqlGenIdx is already at 0 and no new gen_metadata row was written.
+          await writeFile(
+            join(brainDir, 'transcript_full.jsonl'),
+            [
+              { step_index: 1, type: 'USER_INPUT', content: 'run' },
+              {
+                step_index: 2,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                content: 'waiting',
+              },
+              {
+                step_index: 3,
+                type: 'SYSTEM_MESSAGE',
+                content: `<SYSTEM_MESSAGE>\n[Message] sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=done\n</SYSTEM_MESSAGE>`,
+              },
+              {
+                step_index: 4,
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                content: 'wakeup reply without token fields',
+              },
+            ]
+              .map((row) => JSON.stringify(row) + '\n')
+              .join(''),
+          )
+          return { stopReason: 'end_turn' as const }
+        },
+        cancel: async () => {},
+      } as unknown as ReturnType<
+        typeof import('../server/transport.ts').connectAcp
+      >['rpc']
+      return {
+        rpc,
+        exited: closed,
+        stopped: Promise.resolve(),
+        close: async () => {},
+        request: async <T>(op: Promise<T>) => op,
+        get closed() {
+          return false
+        },
+        get tier() {
+          return undefined
+        },
+        get models() {
+          return undefined
+        },
+      }
+    },
+  })
+  t.after(() => manager.close())
+  await manager.handle({
+    type: 'session.open',
+    requestId: 'open',
+    sessionId: 's',
+    history: 'skip',
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+  await manager.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId: 'm1',
+      delivery: 'auto',
+      input: { type: 'message', content: [{ type: 'text', text: 'go' }] },
+    },
+  })
+  const usageEvents = events.filter(
+    (
+      e,
+    ): e is Extract<
+      import('@getpaseo/plugin/server/provider').ProviderEvent,
+      { type: 'session.usage' }
+    > => e.type === 'session.usage',
+  )
+  assert.equal(usageEvents.at(-1)?.usage.contextWindowMaxTokens, 512_000)
+  assert.equal(usageEvents.at(-1)?.usage.contextWindowUsedTokens, 88_000)
 })

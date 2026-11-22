@@ -24,6 +24,7 @@ import {
   isAskQuestionName,
   sessionIdPattern,
   setBounded,
+  unwrapToolTitle,
   record,
   str,
   num,
@@ -112,6 +113,43 @@ function cleanReadOutput(output: string | undefined): {
   }
 }
 
+type JsonValue = Extract<ProviderToolCallDetail, { type: 'unknown' }>['input']
+
+function sanitizeJsonValue(
+  value: unknown,
+  seen = new WeakSet<object>(),
+): JsonValue {
+  if (
+    value === null ||
+    typeof value === 'boolean' ||
+    typeof value === 'string'
+  ) {
+    return value
+  }
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null
+  }
+  if (typeof value !== 'object') {
+    return null
+  }
+  if (seen.has(value)) return null
+  seen.add(value)
+  try {
+    if (Array.isArray(value)) {
+      return value.map((item) => sanitizeJsonValue(item, seen))
+    }
+    const entries: [string, JsonValue][] = []
+    for (const [key, entry] of Object.entries(value)) {
+      if (entry !== undefined) {
+        entries.push([key, sanitizeJsonValue(entry, seen)])
+      }
+    }
+    return Object.fromEntries(entries)
+  } finally {
+    seen.delete(value)
+  }
+}
+
 function nonEmptyRawOutput(rawOutput: unknown): string | undefined {
   if (typeof rawOutput === 'string')
     return rawOutput.trim() ? rawOutput : undefined
@@ -120,7 +158,7 @@ function nonEmptyRawOutput(rawOutput: unknown): string | undefined {
   const keys = Object.keys(obj)
   if (keys.length === 0) return undefined
   if (keys.length === 1 && obj.output === '') return undefined
-  return JSON.stringify(rawOutput)
+  return JSON.stringify(sanitizeJsonValue(rawOutput))
 }
 
 /** Map native tool arguments and output to Paseo detail cards. */
@@ -150,7 +188,6 @@ const nativeToolKinds: Record<string, ToolCall['kind']> = {
   search_web: 'search',
   web_search: 'search',
 }
-const jsonValueSchema = z.json()
 const TOOL_SNAPSHOT_LIMIT = 1024
 
 function isTerminalToolStatus(status: unknown): boolean {
@@ -172,10 +209,10 @@ export function toolDetail(
       : (extractToolContentText(tool) ?? nonEmptyRawOutput(tool.rawOutput))
   const explicitRawName = str(record(tool).name)
   const rawName = cleanToolName(explicitRawName ?? tool.title ?? '')
-  // Legacy ACP titles use `Run <native identity>` when no raw name is sent.
-  const legacyName = rawName.startsWith('Run ')
-    ? cleanToolName(rawName.slice(4)).toLowerCase()
-    : ''
+  // Legacy ACP titles may wrap native identities as `Run`/`Running <name>` or append `?`.
+  const legacyName = unwrapToolTitle(
+    rawName.replace(/^Running\s+/i, '').replace(/\?$/, ''),
+  ).toLowerCase()
   const name =
     explicitRawName === undefined && Object.hasOwn(nativeToolKinds, legacyName)
       ? legacyName
@@ -395,8 +432,8 @@ export function toolDetail(
   }
   return {
     type: 'unknown',
-    input: jsonValueSchema.parse(tool.rawInput ?? null),
-    output: jsonValueSchema.parse(
+    input: sanitizeJsonValue(tool.rawInput ?? null),
+    output: sanitizeJsonValue(
       tool.rawOutput !== undefined ? tool.rawOutput : (tool.content ?? null),
     ),
   }
@@ -440,18 +477,37 @@ function parseModelEffort(
   return undefined
 }
 
+type SelectConfigOption = Extract<SessionConfigOption, { type: 'select' }>
+
+function selectConfigOption(
+  response: SessionMetadata,
+  key: 'model' | 'mode' | 'thought_level',
+): SelectConfigOption | undefined {
+  return response.configOptions?.find(
+    (o): o is SelectConfigOption =>
+      o.type === 'select' && (o.category === key || o.id === key),
+  )
+}
+
+export function currentModelId(response: SessionMetadata): string | undefined {
+  return (
+    selectConfigOption(response, 'model')?.currentValue ??
+    response.models?.currentModelId
+  )
+}
+
+export function currentNativeMode(
+  response: SessionMetadata,
+): string | undefined {
+  return selectConfigOption(response, 'mode')?.currentValue
+}
+
 /** Convert native catalog options to Paseo's model-specific composer controls. */
 export function configState(response: SessionMetadata): ProviderConfigState {
-  const options = (response.configOptions ?? []).filter(
-    (o): o is Extract<SessionConfigOption, { type: 'select' }> =>
-      o.type === 'select',
-  )
-  const model = options.find((o) => o.category === 'model' || o.id === 'model')
-  const thinking = options.find(
-    (o) => o.category === 'thought_level' || o.id === 'thought_level',
-  )
-  const mode = options.find((o) => o.category === 'mode' || o.id === 'mode')
-  const choices = (o?: Extract<SessionConfigOption, { type: 'select' }>) =>
+  const model = selectConfigOption(response, 'model')
+  const thinking = selectConfigOption(response, 'thought_level')
+  const mode = selectConfigOption(response, 'mode')
+  const choices = (o?: SelectConfigOption) =>
     o?.options
       .flatMap((v) => ('group' in v ? v.options : [v]))
       .map((v) => ({

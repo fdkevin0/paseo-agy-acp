@@ -788,3 +788,220 @@ test('ACP top-level null permits content replacement without altering direct Bra
     unknownDetail({ nested: null }, null),
   )
 })
+
+test('unknown tool details sanitize non-JSON and cyclic values without throwing', () => {
+  const sharedObj = { nil: null, flag: false, zero: 0, empty: '' }
+  const sharedArr = [null, false, 0, '']
+  const cyclicObj: Record<string, unknown> = { ok: 'yes', nested: { n: 1 } }
+  cyclicObj.self = cyclicObj
+  ;(cyclicObj.nested as Record<string, unknown>).root = cyclicObj
+  const cyclicArr: unknown[] = ['head']
+  cyclicArr.push(cyclicArr)
+
+  const rawInput = {
+    nan: Number.NaN,
+    posInf: Number.POSITIVE_INFINITY,
+    negInf: Number.NEGATIVE_INFINITY,
+    omitted: undefined,
+    big: 42n,
+    fn: () => 'ignored',
+    sym: Symbol('ignored'),
+    nil: null,
+    flag: false,
+    zero: 0,
+    empty: '',
+    sharedA: sharedObj,
+    sharedB: sharedObj,
+    sharedList: [sharedArr, sharedArr],
+    arr: [
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      undefined,
+      7n,
+      () => {},
+      Symbol('el'),
+      null,
+      false,
+      0,
+      '',
+    ],
+    cyclicObj,
+    cyclicArr,
+  }
+  const rawOutput: Record<string, unknown> = {
+    big: 9n,
+    nan: Number.NaN,
+    omitted: undefined,
+    shared: [sharedObj, sharedObj],
+  }
+  rawOutput.self = rawOutput
+
+  const detail = toolDetail({
+    title: fixture.name,
+    rawInput,
+    rawOutput,
+  })
+  const expectedInput = {
+    nan: null,
+    posInf: null,
+    negInf: null,
+    big: null,
+    fn: null,
+    sym: null,
+    nil: null,
+    flag: false,
+    zero: 0,
+    empty: '',
+    sharedA: { nil: null, flag: false, zero: 0, empty: '' },
+    sharedB: { nil: null, flag: false, zero: 0, empty: '' },
+    sharedList: [
+      [null, false, 0, ''],
+      [null, false, 0, ''],
+    ],
+    arr: [null, null, null, null, null, null, null, false, 0, ''],
+    cyclicObj: { ok: 'yes', nested: { n: 1, root: null }, self: null },
+    cyclicArr: ['head', null],
+  }
+  const expectedOutput = {
+    big: null,
+    nan: null,
+    shared: [
+      { nil: null, flag: false, zero: 0, empty: '' },
+      { nil: null, flag: false, zero: 0, empty: '' },
+    ],
+    self: null,
+  }
+  assert.deepEqual(detail, unknownDetail(expectedInput, expectedOutput))
+  assert.ok(
+    detail.type === 'unknown' &&
+      detail.input &&
+      typeof detail.input === 'object',
+  )
+  assert.equal(Object.hasOwn(detail.input, 'omitted'), false)
+  assert.deepEqual(JSON.parse(JSON.stringify(detail)), detail)
+
+  assert.deepEqual(
+    toolDetail({
+      title: fixture.name,
+      rawInput: Number.NaN,
+      rawOutput: 99n,
+    }),
+    unknownDetail(null, null),
+  )
+  assert.deepEqual(
+    toolDetail({
+      title: fixture.name,
+      rawInput: () => {},
+      rawOutput: Symbol('out'),
+    }),
+    unknownDetail(null, null),
+  )
+})
+
+test('legacy ACP Running/Run/? titles map to dedicated cards without overriding explicit names or unknown tools', () => {
+  assert.deepEqual(
+    toolDetail({
+      title: 'Running run_command',
+      rawInput: { CommandLine: 'pwd' },
+    }),
+    {
+      type: 'shell',
+      command: 'pwd',
+      cwd: undefined,
+      output: undefined,
+    },
+  )
+  assert.deepEqual(
+    toolDetail({
+      title: 'Run read_file?',
+      rawInput: { Path: '/repo/a.ts' },
+    }),
+    {
+      type: 'read',
+      filePath: '/repo/a.ts',
+      content: undefined,
+      offset: undefined,
+      limit: undefined,
+    },
+  )
+  assert.deepEqual(
+    toolDetail({
+      title: 'run default_api:edit_file?',
+      rawInput: { Path: '/repo/a.ts', Target: 'old', Replacement: 'new' },
+    }),
+    {
+      type: 'edit',
+      filePath: '/repo/a.ts',
+      oldString: 'old',
+      newString: 'new',
+    },
+  )
+  assert.deepEqual(
+    toolDetail({
+      title: 'Running default_api:write_file?',
+      rawInput: { Path: '/repo/a.ts', Content: 'hello' },
+    }),
+    {
+      type: 'write',
+      filePath: '/repo/a.ts',
+      content: 'hello',
+    },
+  )
+  assert.equal(
+    toolDetail({
+      title: 'run default_api:read_file',
+      rawInput: { Path: '/repo/a.ts' },
+    }).type,
+    'read',
+  )
+
+  // Explicit raw name takes precedence over legacy ACP title normalization.
+  assert.deepEqual(
+    toolDetail({
+      name: 'custom_tool',
+      title: 'Running run_command',
+      kind: 'execute',
+      rawInput: { CommandLine: 'pwd' },
+    }),
+    unknownDetail({ CommandLine: 'pwd' }, null),
+  )
+  assert.deepEqual(
+    toolDetail({
+      name: 'Running run_command',
+      title: 'Running run_command',
+      rawInput: { CommandLine: 'pwd' },
+    }),
+    unknownDetail({ CommandLine: 'pwd' }, null),
+  )
+  assert.deepEqual(
+    toolDetail({
+      name: 'Run read_file?',
+      title: 'Run read_file?',
+      rawInput: { Path: '/repo/a.ts' },
+    }),
+    unknownDetail({ Path: '/repo/a.ts' }, null),
+  )
+
+  // Unknown names remain unknown even with Running/Run/? wrappers.
+  assert.deepEqual(
+    toolDetail({
+      title: 'Running custom_tool?',
+      rawInput: { CommandLine: 'pwd' },
+    }),
+    unknownDetail({ CommandLine: 'pwd' }, null),
+  )
+  assert.deepEqual(
+    toolDetail({
+      title: 'Run mcp__srv__read_file?',
+      rawInput: { Path: '/repo/a.ts' },
+    }),
+    unknownDetail({ Path: '/repo/a.ts' }, null),
+  )
+  assert.deepEqual(
+    toolDetail({
+      title: 'Running read_file with extra?',
+      rawInput: { Path: '/repo/a.ts' },
+    }),
+    unknownDetail({ Path: '/repo/a.ts' }, null),
+  )
+})

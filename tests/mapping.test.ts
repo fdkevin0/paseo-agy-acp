@@ -5,6 +5,8 @@ import {
   Timeline,
   toolDetail,
   configState,
+  currentModelId,
+  currentNativeMode,
   contextUsage,
   promptUsage,
   promptContent,
@@ -1221,4 +1223,125 @@ test('Timeline projects image blocks in user_message_chunk as [image] placeholde
     }),
     undefined,
   )
+})
+
+test('currentModelId and currentNativeMode match configState without building full state', () => {
+  assert.equal(currentModelId({}), undefined)
+  assert.equal(currentNativeMode({}), undefined)
+  assert.equal(currentModelId({}), configState({}).model)
+  assert.equal(currentNativeMode({}), configState({}).mode)
+
+  const byId = {
+    configOptions: [
+      {
+        type: 'select' as const,
+        id: 'model',
+        name: 'Model',
+        currentValue: 'gemini-4-carbon',
+        options: [{ value: 'gemini-4-carbon', name: 'Gemini 4 Carbon' }],
+      },
+      {
+        type: 'select' as const,
+        id: 'mode',
+        name: 'Mode',
+        currentValue: 'plan',
+        options: [{ value: 'plan', name: 'Plan' }],
+      },
+    ],
+  }
+  assert.equal(currentModelId(byId), 'gemini-4-carbon')
+  assert.equal(currentNativeMode(byId), 'plan')
+  assert.equal(currentModelId(byId), configState(byId).model)
+  assert.equal(currentNativeMode(byId), configState(byId).mode)
+
+  const byCategory = {
+    configOptions: [
+      {
+        type: 'select' as const,
+        id: 'primary-model',
+        category: 'model',
+        name: 'Model',
+        currentValue: 'gemini-4-hydrogen',
+        options: [{ value: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen' }],
+      },
+      {
+        type: 'select' as const,
+        id: 'approval-mode',
+        category: 'mode',
+        name: 'Approval',
+        currentValue: 'accept-edits',
+        options: [{ value: 'accept-edits', name: 'Accept Edits' }],
+      },
+    ],
+  }
+  assert.equal(currentModelId(byCategory), 'gemini-4-hydrogen')
+  assert.equal(currentNativeMode(byCategory), 'accept-edits')
+  assert.equal(currentModelId(byCategory), configState(byCategory).model)
+  assert.equal(currentNativeMode(byCategory), configState(byCategory).mode)
+
+  const fallbackMeta = {
+    models: {
+      currentModelId: 'legacy-model',
+      availableModels: [{ modelId: 'legacy-model' }],
+    },
+  }
+  assert.equal(currentModelId(fallbackMeta), 'legacy-model')
+  assert.equal(currentModelId(fallbackMeta), configState(fallbackMeta).model)
+
+  const selectOverridesFallback = {
+    ...byId,
+    models: fallbackMeta.models,
+  }
+  assert.equal(currentModelId(selectOverridesFallback), 'gemini-4-carbon')
+  assert.equal(
+    currentModelId(selectOverridesFallback),
+    configState(selectOverridesFallback).model,
+  )
+
+  const nonSelectIgnored = {
+    configOptions: [
+      {
+        type: 'boolean' as const,
+        id: 'model',
+        category: 'model',
+        name: 'Model Toggle',
+        currentValue: true,
+      },
+      {
+        type: 'boolean' as const,
+        id: 'mode',
+        category: 'mode',
+        name: 'Mode Toggle',
+        currentValue: false,
+      },
+      ...byCategory.configOptions,
+    ],
+    models: fallbackMeta.models,
+  }
+  assert.equal(currentModelId(nonSelectIgnored), 'gemini-4-hydrogen')
+  assert.equal(currentNativeMode(nonSelectIgnored), 'accept-edits')
+  assert.equal(
+    currentModelId(nonSelectIgnored),
+    configState(nonSelectIgnored).model,
+  )
+  assert.equal(
+    currentNativeMode(nonSelectIgnored),
+    configState(nonSelectIgnored).mode,
+  )
+
+  const nonSelectOnly = {
+    configOptions: nonSelectIgnored.configOptions.slice(0, 2),
+    models: fallbackMeta.models,
+  }
+  assert.equal(currentModelId(nonSelectOnly), 'legacy-model')
+  assert.equal(currentNativeMode(nonSelectOnly), undefined)
+  assert.equal(currentModelId(nonSelectOnly), configState(nonSelectOnly).model)
+  assert.equal(
+    currentNativeMode(nonSelectOnly),
+    configState(nonSelectOnly).mode,
+  )
+
+  const fullAccessMeta = { ...byId, fullAccess: true }
+  assert.equal(currentNativeMode(fullAccessMeta), 'plan')
+  assert.equal(configState(fullAccessMeta).mode, 'full-access')
 })

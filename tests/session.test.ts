@@ -3794,3 +3794,142 @@ test('promptSession failure cleanup forwards runtimeEpoch and options.hasActiveB
   assert.ok(turnFailed?.type === 'session.turn')
   assert.equal(turnFailed.error?.message, 'upstream terminal failure')
 })
+
+test('notificationLane isolates single-notification failures and requestPermission formats tool names via toolDisplayName', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-notif-perm-name-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const nativeId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+  const events: ProviderEvent[] = []
+  let acpClient!: import('../server/transport.ts').AcpClient
+  const env = isolatedEnv(home)
+  let onEmit: (event: ProviderEvent) => void = (event) => events.push(event)
+  const manager = new SessionManager({
+    launch: { command: 'agy', args: ['acp'], env },
+    usage: new AgyUsageSource({ env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: (event) => onEmit(event),
+    commandWaitTimeoutMs: 50,
+    connectAcp: (_l, _cwd, _e, client) => {
+      acpClient = client
+      const closed = new Promise<void>(() => {})
+      const rpc = {
+        closed,
+        initialize: async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
+          agentCapabilities: { loadSession: true },
+        }),
+        newSession: async () => {
+          void client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'available_commands_update',
+              availableCommands: [],
+            },
+          })
+          return { sessionId: nativeId, configOptions: [] }
+        },
+        closeSession: async () => ({}),
+        prompt: async () => {
+          // 1. Trigger a failure on one notification; lane must not stay poisoned.
+          onEmit = (event) => {
+            events.push(event)
+            throw new Error('transient downstream listener boom')
+          }
+          await acpClient.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'poison' },
+            },
+          })
+          onEmit = (event) => events.push(event)
+          await acpClient.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: ' recovered' },
+            },
+          })
+          // 2. Permission request resolves MCP tool name via toolDisplayName.
+          const permPromise = acpClient.requestPermission({
+            sessionId: nativeId,
+            toolCall: {
+              toolCallId: 'call-mcp-1',
+              title: 'Run default_api:mcp_docs_search',
+              rawInput: { q: 'paseo' },
+            },
+            options: [
+              { optionId: 'yes', name: 'Allow', kind: 'allow_once' },
+              { optionId: 'no', name: 'Deny', kind: 'reject_once' },
+            ],
+          })
+          const permEvent = events.findLast(
+            (e): e is Extract<ProviderEvent, { type: 'session.permission' }> =>
+              e.type === 'session.permission',
+          )
+          assert.ok(permEvent)
+          assert.equal(permEvent.request.name, 'docs.search')
+          await manager.handle({
+            type: 'session.permission',
+            sessionId: 's',
+            permissionId: permEvent.request.id,
+            response: { behavior: 'allow', selectedActionId: 'yes' },
+          })
+          assert.deepEqual(await permPromise, {
+            outcome: { outcome: 'selected', optionId: 'yes' },
+          })
+          return { stopReason: 'end_turn' as const }
+        },
+        cancel: async () => {},
+      } as unknown as ReturnType<
+        typeof import('../server/transport.ts').connectAcp
+      >['rpc']
+      return {
+        rpc,
+        exited: closed,
+        stopped: Promise.resolve(),
+        close: async () => {},
+        request: async <T>(op: Promise<T>) => op,
+        get closed() {
+          return false
+        },
+        get tier() {
+          return undefined
+        },
+        get models() {
+          return undefined
+        },
+      }
+    },
+  })
+  t.after(() => manager.close())
+  await manager.handle({
+    type: 'session.open',
+    requestId: 'open',
+    sessionId: 's',
+    history: 'skip',
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: { docs: { type: 'stdio', command: 'docs-mcp' } },
+      settings: {},
+      persist: true,
+    },
+  })
+  await manager.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId: 'm1',
+      delivery: 'auto',
+      input: { type: 'message', content: [{ type: 'text', text: 'hi' }] },
+    },
+  })
+  const recovered = events.findLast(
+    (e) => e.type === 'timeline.item' && e.item.type === 'assistant_message',
+  )
+  assert.ok(recovered?.type === 'timeline.item')
+  assert.ok(recovered.item.type === 'assistant_message')
+  assert.equal(recovered.item.text, 'poison recovered')
+})
