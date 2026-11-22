@@ -37,6 +37,7 @@ import {
   type NormalizedQuestion,
 } from './questions.ts'
 import {
+  BackgroundWorkProbe,
   captureRuntimeEpoch,
   computeRuntimeEpoch,
   hasActiveBackgroundWork,
@@ -56,6 +57,7 @@ import {
 import { projectReplayHistory, type HistoryEntry } from './history.ts'
 import { SubagentRegistry } from './subagents.ts'
 import {
+  binaryFingerprint,
   dataDirectory,
   hasLocalSessionArtifacts,
   removeSessionArtifacts,
@@ -231,6 +233,7 @@ export class SessionManager {
   private transports = new Set<ControlTransport>()
   private watchedStops = new WeakSet<ControlTransport>()
   private closed = false
+  private closeController = new AbortController()
   private options: SessionOptions
   constructor(options: SessionOptions) {
     this.options = options
@@ -251,6 +254,7 @@ export class SessionManager {
       this.transports,
       this.watchedStops,
       startOptions,
+      this.closeController.signal,
     )
   }
 
@@ -269,6 +273,10 @@ export class SessionManager {
     this.opening.set(input.sessionId, starting)
     try {
       const session = await starting
+      if (this.closed) {
+        await session.close().catch(() => undefined)
+        throw new Error('Provider connection is closed')
+      }
       this.sessions.set(input.sessionId, session)
       try {
         const data = record(input.persistence?.data)
@@ -527,6 +535,7 @@ export class SessionManager {
 
   async close() {
     this.closed = true
+    this.closeController.abort(new Error('Provider connection is closed'))
     const pendingOpens = await Promise.all(
       [...this.opening.values()].map((p) => p.catch(() => undefined)),
     )
@@ -547,12 +556,22 @@ async function createSession(
   transports: Set<ControlTransport>,
   watchedStops: WeakSet<ControlTransport>,
   startOptions?: { allowMissingCwd?: boolean },
+  closeSignal?: AbortSignal,
 ) {
+  const assertManagerOpen = () => {
+    if (closeSignal?.aborted) {
+      throw closeSignal.reason instanceof Error
+        ? closeSignal.reason
+        : new Error('Provider connection is closed')
+    }
+  }
+  assertManagerOpen()
   const { launch, capabilities, emit } = options
   const spawnCwd = await resolveSpawnCwd(cwd, launch, {
     env: config?.env,
     allowMissingCwd: startOptions?.allowMissingCwd,
   })
+  assertManagerOpen()
   const permissions = new Map<string, PendingPermission>()
   const mcpServerNames = Object.keys(config?.mcpServers ?? {})
   const timeline = new Timeline(id, mcpServerNames)
@@ -1173,8 +1192,14 @@ async function createSession(
       },
     }
   }
+  const resolveLaunchFingerprint = (
+    runLaunch: ProviderLaunch | undefined,
+  ): Promise<string | undefined> =>
+    options.standby
+      ? options.standby.resolveBinaryFingerprint(runLaunch, sessionEnv)
+      : binaryFingerprint(runLaunch, { env: sessionEnv }).catch(() => undefined)
   /** Start an owned ACP runtime; it leaves the connection's transports once it exits and stops. */
-  function startColdRuntime(skipPermissions: boolean) {
+  function startColdRuntime(skipPermissions: boolean, fingerprint?: string) {
     const runLaunch = effectiveLaunch(launch, skipPermissions)
     let boundTransport!: ControlTransport
     const isStale = () =>
@@ -1208,7 +1233,7 @@ async function createSession(
       toAttachable: (initialized: InitializedAcp): AttachableRuntime => ({
         transport,
         initialized,
-        key: standbyPoolKey(runLaunch, sessionEnv),
+        key: standbyPoolKey(runLaunch, sessionEnv, fingerprint),
         reusable: isLaunchCwdIndependent(spawnCwd, runLaunch, sessionEnv),
         attach: (nextClient, nextOnExit) => bind(nextClient, nextOnExit),
       }),
@@ -1217,11 +1242,16 @@ async function createSession(
   let currentTransport!: ControlTransport
   let currentAttachable: AttachableRuntime | undefined
   let currentInitialized!: InitializedAcp
+  const initialLaunch = effectiveLaunch(launch, state.skipPermissions)
   const warmInitial = await options.standby?.take(
-    effectiveLaunch(launch, state.skipPermissions),
+    initialLaunch,
     spawnCwd,
     sessionEnv,
   )
+  if (closeSignal?.aborted) {
+    if (warmInitial) await warmInitial.transport.close().catch(() => undefined)
+    assertManagerOpen()
+  }
   if (warmInitial && !warmInitial.transport.closed) {
     currentTransport = warmInitial.transport
     currentAttachable = warmInitial
@@ -1232,14 +1262,23 @@ async function createSession(
     trackSessionTransport(currentTransport)
   } else {
     if (warmInitial) await warmInitial.transport.close().catch(() => undefined)
-    const started = startColdRuntime(state.skipPermissions)
+    const fingerprint = await resolveLaunchFingerprint(initialLaunch)
+    assertManagerOpen()
+    const started = startColdRuntime(state.skipPermissions, fingerprint)
     currentTransport = started.transport
+    const onCloseAbort = () => {
+      void currentTransport.close().catch(() => undefined)
+    }
+    closeSignal?.addEventListener('abort', onCloseAbort, { once: true })
     try {
-      currentInitialized = await initializeAcp(currentTransport)
+      currentInitialized = await initializeAcp(currentTransport, closeSignal)
+      assertManagerOpen()
       currentAttachable = started.toAttachable(currentInitialized)
     } catch (error) {
-      await currentTransport.close()
+      await currentTransport.close().catch(() => undefined)
       throw error
+    } finally {
+      closeSignal?.removeEventListener('abort', onCloseAbort)
     }
   }
   function replenishStandby(skipPermissions = state.skipPermissions) {
@@ -1418,8 +1457,9 @@ async function createSession(
         }
         await updateRuntimeEpoch()
         if (!isRetireAlive(obsolete)) return
+        const reloadLaunch = effectiveLaunch(launch, skipPermissions)
         const warmNext = await options.standby?.take(
-          effectiveLaunch(launch, skipPermissions),
+          reloadLaunch,
           spawnCwd,
           sessionEnv,
         )
@@ -1449,7 +1489,9 @@ async function createSession(
           replenishStandby(skipPermissions)
         } else {
           if (warmNext) await warmNext.transport.close().catch(() => undefined)
-          const started = startColdRuntime(skipPermissions)
+          const fingerprint = await resolveLaunchFingerprint(reloadLaunch)
+          if (!isRetireAlive(obsolete)) return
+          const started = startColdRuntime(skipPermissions, fingerprint)
           next = started.transport
           toAttachable = started.toAttachable
           currentTransport = next
@@ -1495,6 +1537,31 @@ async function createSession(
         skipPermissions,
         sendCancel: false,
       })
+    }
+    const backgroundProbe = new BackgroundWorkProbe()
+    function hasBackgroundWork(probeOptions?: {
+      includeDaemons?: boolean
+    }): Promise<boolean> {
+      const check = options.hasActiveBackgroundWork
+      if (check) {
+        return check(brainRoot, state.nativeId, {
+          includeDaemons: probeOptions?.includeDaemons,
+          retryTimeoutMs: options.retryTimeoutMs,
+          runtimeEpoch: state.runtimeEpoch,
+        })
+      }
+      return backgroundProbe.hasActiveWork(brainRoot, state.nativeId, {
+        includeDaemons: probeOptions?.includeDaemons,
+        retryTimeoutMs: options.retryTimeoutMs,
+        runtimeEpoch: state.runtimeEpoch,
+      })
+    }
+    function syncBackgroundProbe(): Promise<void> {
+      if (options.hasActiveBackgroundWork || state.closing || !state.nativeId)
+        return Promise.resolve()
+      return backgroundProbe
+        .sync(brainRoot, state.nativeId, state.runtimeEpoch)
+        .catch(() => undefined)
     }
     return {
       id,
@@ -1609,14 +1676,12 @@ async function createSession(
           return false
         if (state.failed) return true
         if (permissions.size > 0 || subagents.hasRunningChildren()) return false
-        return !(await (
-          options.hasActiveBackgroundWork ?? hasActiveBackgroundWork
-        )(brainRoot, state.nativeId, {
-          includeDaemons: true,
-          retryTimeoutMs: options.retryTimeoutMs,
-          runtimeEpoch: state.runtimeEpoch,
-        }).catch(() => true))
+        return !(await hasBackgroundWork({ includeDaemons: true }).catch(
+          () => true,
+        ))
       },
+      hasBackgroundWork,
+      syncBackgroundProbe,
       refreshRuntimeEpoch() {
         return updateRuntimeEpoch()
       },
@@ -1661,14 +1726,7 @@ async function createSession(
           const needsRelaunch = await raceTimeout(
             Promise.all([
               Promise.all(canceling),
-              (options.hasActiveBackgroundWork ?? hasActiveBackgroundWork)(
-                brainRoot,
-                state.nativeId,
-                {
-                  retryTimeoutMs: options.retryTimeoutMs,
-                  runtimeEpoch: state.runtimeEpoch,
-                },
-              ).catch(() => true),
+              hasBackgroundWork().catch(() => true),
             ]).then(([, activeBg]) => canceling.length > 0 || activeBg),
             options.backgroundProbeTimeoutMs ?? 200,
             () => true,
@@ -1770,7 +1828,7 @@ async function createSession(
             options.standby !== undefined
           let recycled = false
           if (recyclable) {
-            recycled = options.standby!.recycle(
+            recycled = await options.standby!.recycle(
               currentAttachable!,
               effectiveLaunch(launch, state.skipPermissions),
               spawnCwd,
@@ -2365,11 +2423,7 @@ async function promptSession(
           Boolean(settled.stalled) ||
           (settled.status === 'failed' &&
             (session.hasRunningChildren() ||
-              (await hasActiveBackgroundWork(
-                session.brainRoot,
-                session.state.nativeId,
-                { retryTimeoutMs: session.retryTimeoutMs },
-              ).catch(() => false))))
+              (await session.hasBackgroundWork().catch(() => false))))
         if (needsFailureCleanup) {
           await session.interrupt().catch(() => undefined)
         }
@@ -2452,6 +2506,9 @@ async function promptSession(
     await disposing
     if (observation && session.state.observation === observation) {
       session.state.observation = null
+    }
+    if (!session.state.closing && !session.state.failed) {
+      await session.syncBackgroundProbe()
     }
   }
 }

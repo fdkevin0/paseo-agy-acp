@@ -41,9 +41,9 @@ import {
   readSubagents,
   readTranscriptRows,
   RETRY_IDLE_TIMEOUT_MS,
+  TranscriptReader,
   type InboxState,
   type SubagentRecord,
-  type TranscriptReader,
 } from './brain-io.ts'
 import {
   BrainNode,
@@ -215,6 +215,249 @@ export async function captureRuntimeEpoch(
   )
 }
 
+const MISSING_TRANSCRIPT_READ: BrainRead = {
+  rows: [],
+  reset: false,
+  mtimeMs: undefined,
+}
+
+function applyEpochFloor(node: BrainNode, restartAfterStep?: number) {
+  if (restartAfterStep !== undefined && restartAfterStep >= 0) {
+    node.turnStartStep = restartAfterStep
+    node.promptPhase = 'foreground_idle'
+  }
+}
+
+async function pollAndIngestProbeNode(
+  root: string,
+  nativeId: string,
+  node: BrainNode,
+  runtimeEpoch?: RuntimeEpoch,
+  postEpochSignatures?: Map<string, number>,
+): Promise<{
+  rawInbox: InboxState
+  subagents: SubagentRecord[]
+  rowCount: number
+}> {
+  const readTranscript = () =>
+    node.reader.read(root, nativeId).catch((error) => {
+      if (isMissing(error)) return MISSING_TRANSCRIPT_READ
+      throw error
+    })
+  const [{ inbox: rawInbox, subagents }, firstRead] = await Promise.all([
+    node.pollMetadata(root),
+    readTranscript(),
+  ])
+  // A warm incremental reader (offset > 0) reports { rows: [], reset: true } on either a mid-O_TRUNC
+  // raced write or a corrupt appended JSONL line. Retry once from byte 0 before resetting `node` so
+  // genuinely corrupt transcripts throw SyntaxError (fail-closed) and raced rewrites ingest the snapshot.
+  const readResult =
+    firstRead.reset && firstRead.rows.length === 0
+      ? { ...(await readTranscript()), reset: true }
+      : firstRead
+  const restartAfterStep = runtimeEpoch?.afterStepIndex
+  if (readResult.reset) {
+    node.reset(rawInbox, subagents)
+    applyEpochFloor(node, restartAfterStep)
+    postEpochSignatures?.clear()
+    node.initialReadDone = false
+  }
+  if (readResult.snapshotStepIndices) {
+    node.pruneRetrySteps(readResult.snapshotStepIndices)
+  }
+  const eligibleRows =
+    restartAfterStep !== undefined && restartAfterStep >= 0
+      ? readResult.rows.filter(
+          (row) => Number(row.step_index) > restartAfterStep,
+        )
+      : readResult.rows
+  if (postEpochSignatures) {
+    for (const row of eligibleRows) {
+      for (const sig of extractRowMessageSignatures(row)) {
+        postEpochSignatures.set(sig, (postEpochSignatures.get(sig) ?? 0) + 1)
+      }
+    }
+  }
+  const observedAt = node.initialReadDone ? undefined : readResult.mtimeMs
+  if (readResult.rows.length > 0) node.initialReadDone = true
+  node.projector.observeRows(eligibleRows)
+  for (const row of eligibleRows) {
+    // The restarted runtime left no woken turn running.
+    if (isRestartNotice(row)) node.resetPhase()
+    node.ingest(row, observedAt)
+  }
+  return { rawInbox, subagents, rowCount: readResult.rows.length }
+}
+
+async function evaluateActiveBackgroundWork(
+  root: string,
+  node: BrainNode,
+  rawInbox: InboxState,
+  subagents: readonly SubagentRecord[],
+  options: BackgroundWalk,
+  visiting: Set<string>,
+  postEpochSignatures?: ReadonlyMap<string, number>,
+): Promise<boolean> {
+  const isChild = options.child === true
+  const parentContext = options.parent
+  const inbox = isChild
+    ? rawInbox
+    : adjustInboxForEpoch(rawInbox, options.runtimeEpoch, postEpochSignatures)
+  if (inbox.unconsumedHighPriority.length > 0) return true
+  if (
+    node.projector.hasBackground() ||
+    (options.includeDaemons && node.projector.hasDaemons())
+  )
+    return true
+  const childTurn: ChildTurnState = parentContext
+    ? resolveChildTurnState(
+        parentContext.node,
+        parentContext.minStepIndex,
+        parentContext.subRecord,
+        node,
+        inbox,
+      )
+    : {
+        status: 'active',
+        minStepIndex: node.currentTurnFloor(),
+        awaitingTurnWakeup: false,
+      }
+  if (childTurn.status === 'pending') return true
+  const nodeMinStep = childTurn.minStepIndex
+  // A timed-out model retry does not stop tracked processes or descendants.
+  if (!node.failure(options.retryTimeoutMs, nodeMinStep)) {
+    if (node.retryPending(nodeMinStep)) return true
+    if (
+      isChild
+        ? childTurn.awaitingTurnWakeup ||
+          node.hasUnprocessedMessages(inbox) ||
+          !node.isSettled(inbox, nodeMinStep)
+        : (node.foregroundIdleReached && node.hasUnprocessedMessages(inbox)) ||
+          node.isWokenActive()
+    )
+      return true
+  }
+  const activeChildIds = activeChildIdsForTurn(
+    subagents,
+    node.projector,
+    nodeMinStep,
+    isChild ? undefined : options.runtimeEpoch?.ignoredSubagentIds,
+  )
+  const childOptions = options.runtimeEpoch
+    ? { ...options, runtimeEpoch: undefined }
+    : options
+  for (const childId of activeChildIds) {
+    const subRecord = subagents.find((s) => s.conversationId === childId)
+    if (
+      await hasActiveBackgroundWork(root, childId, {
+        ...childOptions,
+        visiting,
+        child: true,
+        parent: { node, minStepIndex: nodeMinStep, subRecord },
+      })
+    )
+      return true
+  }
+  return false
+}
+
+export type BackgroundWorkProbeOptions = {
+  includeDaemons?: boolean
+  retryTimeoutMs?: number
+  runtimeEpoch?: RuntimeEpoch
+}
+
+/**
+ * Stateful incremental background-work probe for one root session.
+ * Retains a warm TranscriptReader cursor and BrainNode across polls so long transcripts
+ * are not re-read from byte 0 on every interrupt or idle-stop check.
+ */
+export class BackgroundWorkProbe {
+  private readonly createReader: () => TranscriptReader
+  private node?: BrainNode
+  private epoch?: RuntimeEpoch
+  private postEpochSignatures?: Map<string, number>
+  private lane: Promise<void> = Promise.resolve()
+
+  constructor(
+    createReader: () => TranscriptReader = () => new TranscriptReader(),
+  ) {
+    this.createReader = createReader
+  }
+
+  private ensureNode(nativeId: string, runtimeEpoch?: RuntimeEpoch): BrainNode {
+    if (
+      !this.node ||
+      this.node.nativeId !== nativeId ||
+      this.epoch !== runtimeEpoch
+    ) {
+      const node = new BrainNode(nativeId, nativeId, {
+        allowInitialSpawnPrompt: false,
+        reader: this.createReader(),
+      })
+      this.node = node
+      this.epoch = runtimeEpoch
+      this.postEpochSignatures = runtimeEpoch ? new Map() : undefined
+      applyEpochFloor(node, runtimeEpoch?.afterStepIndex)
+    }
+    return this.node
+  }
+
+  private serialize<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.lane.then(fn, fn)
+    this.lane = next.then(
+      () => undefined,
+      () => undefined,
+    )
+    return next
+  }
+
+  async hasActiveWork(
+    root: string,
+    nativeId: string,
+    options: BackgroundWorkProbeOptions = {},
+  ): Promise<boolean> {
+    if (!sessionIdPattern.test(nativeId)) return false
+    return this.serialize(async () => {
+      const node = this.ensureNode(nativeId, options.runtimeEpoch)
+      const { rawInbox, subagents } = await pollAndIngestProbeNode(
+        root,
+        nativeId,
+        node,
+        this.epoch,
+        this.postEpochSignatures,
+      )
+      return evaluateActiveBackgroundWork(
+        root,
+        node,
+        rawInbox,
+        subagents,
+        options,
+        new Set([nativeId]),
+        this.postEpochSignatures,
+      )
+    })
+  }
+
+  async sync(
+    root: string,
+    nativeId: string,
+    runtimeEpoch?: RuntimeEpoch,
+  ): Promise<void> {
+    if (!sessionIdPattern.test(nativeId)) return
+    return this.serialize(async () => {
+      const node = this.ensureNode(nativeId, runtimeEpoch)
+      await pollAndIngestProbeNode(
+        root,
+        nativeId,
+        node,
+        this.epoch,
+        this.postEpochSignatures,
+      )
+    })
+  }
+}
+
 /** Determine whether the session has running background tasks or active subagents. Standing IsDaemon schedules are excluded by default so foreground interrupts do not kill them, and included when checking whether an idle runtime can stop. */
 export async function hasActiveBackgroundWork(
   root: string,
@@ -223,114 +466,34 @@ export async function hasActiveBackgroundWork(
 ): Promise<boolean> {
   const visiting = options.visiting ?? new Set<string>()
   const isChild = options.child === true
-  const parentContext = options.parent
   if (!sessionIdPattern.test(nativeId) || visiting.has(nativeId)) return false
   visiting.add(nativeId)
   try {
     const node = new BrainNode(nativeId, nativeId, {
       allowInitialSpawnPrompt: isChild,
     })
-    const [{ inbox: rawInbox, subagents }, { rows, mtimeMs }] =
-      await Promise.all([
-        node.pollMetadata(root),
-        node.reader.read(root, nativeId).catch((error) => {
-          if (isMissing(error))
-            return { rows: [], reset: false, mtimeMs: undefined }
-          throw error
-        }),
-      ])
-    if (isChild && rows.length === 0) return true
-    const restartAfterStep = isChild
-      ? undefined
-      : options.runtimeEpoch?.afterStepIndex
-    let eligibleRows = rows
-    let postEpochSignatures: Map<string, number> | undefined
-    if (restartAfterStep !== undefined && restartAfterStep >= 0) {
-      node.turnStartStep = restartAfterStep
-      node.promptPhase = 'foreground_idle'
-      eligibleRows = rows.filter(
-        (row) => Number(row.step_index) > restartAfterStep,
-      )
-      postEpochSignatures = new Map<string, number>()
-      for (const row of eligibleRows) {
-        for (const sig of extractRowMessageSignatures(row)) {
-          postEpochSignatures.set(sig, (postEpochSignatures.get(sig) ?? 0) + 1)
-        }
-      }
-    } else if (!isChild && options.runtimeEpoch) {
-      postEpochSignatures = new Map<string, number>()
-      for (const row of rows) {
-        for (const sig of extractRowMessageSignatures(row)) {
-          postEpochSignatures.set(sig, (postEpochSignatures.get(sig) ?? 0) + 1)
-        }
-      }
-    }
-    const inbox = isChild
-      ? rawInbox
-      : adjustInboxForEpoch(rawInbox, options.runtimeEpoch, postEpochSignatures)
-    node.projector.observeRows(eligibleRows)
-    for (const row of eligibleRows) {
-      // The restarted runtime left no woken turn running.
-      if (isRestartNotice(row)) node.resetPhase()
-      node.ingest(row, mtimeMs)
-    }
-    if (inbox.unconsumedHighPriority.length > 0) return true
-    if (
-      node.projector.hasBackground() ||
-      (options.includeDaemons && node.projector.hasDaemons())
+    const runtimeEpoch = isChild ? undefined : options.runtimeEpoch
+    const postEpochSignatures = runtimeEpoch
+      ? new Map<string, number>()
+      : undefined
+    applyEpochFloor(node, runtimeEpoch?.afterStepIndex)
+    const { rawInbox, subagents, rowCount } = await pollAndIngestProbeNode(
+      root,
+      nativeId,
+      node,
+      runtimeEpoch,
+      postEpochSignatures,
     )
-      return true
-    const childTurn: ChildTurnState = parentContext
-      ? resolveChildTurnState(
-          parentContext.node,
-          parentContext.minStepIndex,
-          parentContext.subRecord,
-          node,
-          inbox,
-        )
-      : {
-          status: 'active',
-          minStepIndex: node.currentTurnFloor(),
-          awaitingTurnWakeup: false,
-        }
-    if (childTurn.status === 'pending') return true
-    const nodeMinStep = childTurn.minStepIndex
-    // A timed-out model retry does not stop tracked processes or descendants.
-    if (!node.failure(options.retryTimeoutMs, nodeMinStep)) {
-      if (node.retryPending(nodeMinStep)) return true
-      if (
-        isChild
-          ? childTurn.awaitingTurnWakeup ||
-            node.hasUnprocessedMessages(inbox) ||
-            !node.isSettled(inbox, nodeMinStep)
-          : (node.foregroundIdleReached &&
-              node.hasUnprocessedMessages(inbox)) ||
-            node.isWokenActive()
-      )
-        return true
-    }
-    const activeChildIds = activeChildIdsForTurn(
+    if (isChild && rowCount === 0) return true
+    return await evaluateActiveBackgroundWork(
+      root,
+      node,
+      rawInbox,
       subagents,
-      node.projector,
-      nodeMinStep,
-      isChild ? undefined : options.runtimeEpoch?.ignoredSubagentIds,
+      options,
+      visiting,
+      postEpochSignatures,
     )
-    const childOptions = options.runtimeEpoch
-      ? { ...options, runtimeEpoch: undefined }
-      : options
-    for (const childId of activeChildIds) {
-      const subRecord = subagents.find((s) => s.conversationId === childId)
-      if (
-        await hasActiveBackgroundWork(root, childId, {
-          ...childOptions,
-          visiting,
-          child: true,
-          parent: { node, minStepIndex: nodeMinStep, subRecord },
-        })
-      )
-        return true
-    }
-    return false
   } finally {
     visiting.delete(nativeId)
   }

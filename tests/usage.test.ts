@@ -15,6 +15,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import type { ProviderLaunch } from '@getpaseo/plugin/server/provider'
 import { hashAccountKey } from '@getpaseo/plugin/server/usage'
 import {
   AgyUsageSource,
@@ -865,5 +866,207 @@ test('in-flight discover never overwrites or deletes a concurrent remember()', a
     ])
   } finally {
     await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('parseUsage and usageWindows enforce status, drop disabled buckets, and trim whitespace reset_time', () => {
+  const okWithStatus = parseUsage(
+    JSON.stringify({
+      status: 'SUCCESS',
+      response: '',
+      command: {
+        data: {
+          groups: [
+            {
+              name: 'Gemini Models',
+              buckets: [
+                {
+                  id: 'disabled-5h',
+                  name: 'Disabled 5h',
+                  window: '5h',
+                  disabled: true,
+                  remaining_fraction: 0,
+                  reset_time: '2026-11-08T10:00:00Z',
+                },
+                {
+                  id: 'active-weekly',
+                  name: 'Weekly Limit',
+                  window: 'weekly',
+                  disabled: false,
+                  remaining_fraction: 0.75,
+                  reset_time: '   \t\n  ',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    }),
+  )
+  assert.deepEqual(okWithStatus, [
+    {
+      name: 'Gemini Models',
+      buckets: [
+        {
+          id: 'active-weekly',
+          name: 'Weekly Limit',
+          window: 'weekly',
+          remainingFraction: 0.75,
+          resetTime: '',
+        },
+      ],
+    },
+  ])
+
+  const windows = usageWindows(
+    JSON.stringify({
+      status: 'SUCCESS',
+      command: {
+        data: {
+          groups: [
+            {
+              name: 'Gemini Models',
+              buckets: [
+                {
+                  id: 'disabled-5h',
+                  name: 'Disabled 5h',
+                  window: '5h',
+                  disabled: true,
+                  remaining_fraction: 0,
+                  reset_time: '2026-11-08T10:00:00Z',
+                },
+                {
+                  id: 'active-weekly',
+                  name: 'Weekly Limit',
+                  window: 'weekly',
+                  remaining_fraction: 0.75,
+                  reset_time: '   \t\n  ',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    }),
+  )
+  assert.deepEqual(
+    windows.map((w) => ({
+      id: w.id,
+      usedPct: w.usedPct,
+      resetsAt: w.resetsAt,
+    })),
+    [
+      {
+        id: 'gemini_models:weekly',
+        usedPct: 25,
+        resetsAt: null,
+      },
+    ],
+  )
+
+  assert.throws(
+    () =>
+      parseUsage(
+        JSON.stringify({
+          status: 'ERROR',
+          response: '  Quota backend unavailable  ',
+          command: { data: { groups: [] } },
+        }),
+      ),
+    /ERROR.*Quota backend unavailable/,
+  )
+  assert.throws(
+    () =>
+      parseUsage(
+        JSON.stringify({
+          status: 'ERROR',
+          response: 'Auth token expired',
+        }),
+      ),
+    /ERROR.*Auth token expired/,
+  )
+  assert.throws(
+    () =>
+      parseUsage(
+        JSON.stringify({
+          status: 'FAILED',
+          response: null,
+          command: null,
+        }),
+      ),
+    /FAILED/,
+  )
+  assert.throws(
+    () =>
+      parseUsage(
+        JSON.stringify({
+          status: 'FAILED',
+          response: '   ',
+          command: { data: { groups: [] } },
+        }),
+      ),
+    /FAILED/,
+  )
+})
+
+test('remember() with launch.env undefined preserves baseEnv PATH/HOME and surfaces non-SUCCESS status errors in fetch()', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-usage-undef-env-'))
+  const binDir = join(home, 'bin')
+  const fixture = join(home, 'quota.json')
+  const argsLog = join(home, 'args.json')
+  const mockPath = fileURLToPath(new URL('./mock-usage.ts', import.meta.url))
+  try {
+    await mkdir(binDir, { recursive: true })
+    await writeFile(
+      join(binDir, 'agy'),
+      `#!/bin/sh\nexec "${process.execPath}" "${mockPath}" "$@"\n`,
+      { mode: 0o755 },
+    )
+    await writeFile(
+      join(binDir, 'agy.cmd'),
+      `@"${process.execPath}" "${mockPath}" %*\r\n`,
+    )
+    await writeFile(fixture, envelope(groups))
+
+    const baseEnv = isolatedEnv(home, {
+      PATH: binDir,
+      AGY_USAGE_FIXTURE: fixture,
+      AGY_USAGE_ARGS: argsLog,
+    })
+    const usage = new AgyUsageSource({ env: baseEnv })
+    const dir = usage.remember(
+      {
+        command: 'agy',
+        args: ['acp'],
+        env: undefined,
+      } as unknown as ProviderLaunch,
+      {},
+      home,
+    )
+    assert.equal(dir, join(home, '.gemini/antigravity-cli'))
+
+    const okReport = await usage.fetch({ dataDir: dir })
+    assert.equal(okReport.status, 'available')
+    assert.deepEqual(JSON.parse(await readFile(argsLog, 'utf8')), [
+      '-p',
+      '/usage',
+      '--output-format',
+      'json',
+    ])
+
+    await writeFile(
+      fixture,
+      JSON.stringify({
+        status: 'ERROR',
+        response: 'Quota service unavailable',
+        command: { data: { groups: [] } },
+      }),
+    )
+    const errReport = await usage.fetch({ dataDir: dir })
+    assert.ok(errReport.status === 'error')
+    assert.match(errReport.error, /ERROR/)
+    assert.match(errReport.error, /Quota service unavailable/)
+  } finally {
+    await rm(home, { recursive: true, force: true })
   }
 })

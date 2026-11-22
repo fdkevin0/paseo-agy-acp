@@ -5,7 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { RequestPermissionRequestSchema } from './permissions.ts'
 import { TransformStream, WritableStream } from 'node:stream/web'
 import { nativeModelsSchema, type SessionMetadata } from './mapping.ts'
-import { record } from './common.ts'
+import { mergeEnv, record } from './common.ts'
 import { Readable, Writable } from 'node:stream'
 import {
   client as createAcpClient,
@@ -143,14 +143,14 @@ export function connectAcp(
 ) {
   const cmdName = launch?.command ?? 'agy'
   const requestTimeoutMs = options?.requestTimeoutMs ?? ACP_REQUEST_TIMEOUT_MS
-  const resolvedEnv: NodeJS.ProcessEnv = {
-    ...(launch?.env ?? process.env),
-    ...env,
-  }
+  const resolvedEnv: NodeJS.ProcessEnv = mergeEnv(
+    launch?.env ?? process.env,
+    env,
+  )
   const psEnv: NodeJS.ProcessEnv =
     resolvedEnv.PATH !== undefined
       ? resolvedEnv
-      : { ...process.env, ...resolvedEnv }
+      : mergeEnv(process.env, resolvedEnv)
   const child = spawnProcess(cmdName, launch?.args ?? ['acp'], {
     cwd,
     env: resolvedEnv,

@@ -20,6 +20,7 @@ import { createProvider } from '../server/provider.ts'
 import {
   SharedControlRuntime,
   StandbyRuntimePool,
+  initializeAcp,
   isLaunchCwdIndependent,
   standbyPoolKey,
   type ControlTransport,
@@ -794,14 +795,15 @@ test('StandbyRuntimePool warms with initialize + listSessions, joins in-flight w
     connectAcp: fake.connect,
     idleTimeoutMs: 30_000,
     scheduler: manual.scheduler,
+    resolveFingerprint: async () => 'fp-1',
   })
   try {
     pool.warm(launch, workDir, {})
     // Duplicate warm while in-flight is a no-op.
     pool.warm(launch, workDir, {})
+    await listEntered.promise
     assert.equal(fake.created.length, 1)
     assert.equal(fake.created[0].cwd, home)
-    await listEntered.promise
     assert.deepEqual(fake.created[0].listCalls(), [{ cwd: home }])
 
     // Two concurrent takes: first claims and joins the in-flight warmup; second gets undefined immediately.
@@ -851,7 +853,7 @@ test('StandbyRuntimePool warms with initialize + listSessions, joins in-flight w
     })
 
     // Recycling reverts to CONTROL_CLIENT so the old session receives nothing further.
-    assert.equal(pool.recycle(runtime, launch, home, {}), true)
+    assert.equal(await pool.recycle(runtime, launch, home, {}), true)
     await fake.created[0].client.sessionUpdate({
       sessionId: 'sess-2',
       update: {
@@ -878,7 +880,22 @@ test('StandbyRuntimePool warms with initialize + listSessions, joins in-flight w
 
 test('StandbyRuntimePool isolates skipPermissions and session env keys and rejects cwd-dependent launches', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-standby-keys-'))
-  const fake = createFakeConnect()
+  const baseStarted = deferred<void>()
+  const envStarted = deferred<void>()
+  const fake = createFakeConnect([
+    {
+      init: async () => {
+        baseStarted.resolve()
+        return { agentInfo: { version: '1.5.12' } }
+      },
+    },
+    {
+      init: async () => {
+        envStarted.resolve()
+        return { agentInfo: { version: '1.5.12' } }
+      },
+    },
+  ])
   const baseLaunch: ProviderLaunch = {
     command: 'agy',
     args: ['acp'],
@@ -902,6 +919,7 @@ test('StandbyRuntimePool isolates skipPermissions and session env keys and rejec
   const pool = new StandbyRuntimePool({
     launch: baseLaunch,
     connectAcp: fake.connect,
+    resolveFingerprint: async () => 'fp-1',
   })
   try {
     assert.notEqual(
@@ -916,41 +934,44 @@ test('StandbyRuntimePool isolates skipPermissions and session env keys and rejec
     assert.equal(isLaunchCwdIndependent(home, relDirLaunch, {}), false)
     assert.equal(isLaunchCwdIndependent(home, relCmdLaunch, {}), false)
 
-    // Cwd-dependent launches never warm or take.
+    // Cwd-dependent and skipPermissions launches never warm or take.
     pool.warm(relDirLaunch, home, {})
     pool.warm(relCmdLaunch, home, {})
+    pool.warm(skipLaunch, home, {})
     assert.equal(fake.created.length, 0)
     assert.equal(await pool.take(relDirLaunch, home, {}), undefined)
     assert.equal(await pool.take(relCmdLaunch, home, {}), undefined)
+    assert.equal(await pool.take(skipLaunch, home, {}), undefined)
 
     // Warm base launch with empty env: skipPermissions and distinct session env cannot take it.
     pool.warm(baseLaunch, home, {})
+    await baseStarted.promise
     assert.equal(fake.created.length, 1)
     assert.equal(await pool.take(skipLaunch, home, {}), undefined)
     assert.equal(await pool.take(baseLaunch, home, { FOO: '1' }), undefined)
 
-    // Warm distinct session env and skipPermissions slots independently.
+    // Warm distinct session env slot; skipPermissions remains ignored.
     pool.warm(baseLaunch, home, { FOO: '1' })
     pool.warm(skipLaunch, home, {})
-    assert.equal(fake.created.length, 3)
+    await envStarted.promise
+    assert.equal(fake.created.length, 2)
 
     const baseRt = await pool.take(baseLaunch, home, {})
     const envRt = await pool.take(baseLaunch, home, { FOO: '1' })
     const skipRt = await pool.take(skipLaunch, home, {})
     assert.equal(baseRt?.transport, fake.created[0].transport)
     assert.equal(envRt?.transport, fake.created[1].transport)
-    assert.equal(skipRt?.transport, fake.created[2].transport)
+    assert.equal(skipRt, undefined)
 
     // Recycling under a mismatched key or cwd-dependent launch is rejected.
-    assert.equal(pool.recycle(baseRt!, skipLaunch, home, {}), false)
-    assert.equal(pool.recycle(baseRt!, baseLaunch, home, { FOO: '1' }), false)
-    assert.equal(pool.recycle(baseRt!, relDirLaunch, home, {}), false)
+    assert.equal(await pool.recycle(baseRt!, skipLaunch, home, {}), false)
+    assert.equal(
+      await pool.recycle(baseRt!, baseLaunch, home, { FOO: '1' }),
+      false,
+    )
+    assert.equal(await pool.recycle(baseRt!, relDirLaunch, home, {}), false)
 
-    await Promise.all([
-      baseRt!.transport.close(),
-      envRt!.transport.close(),
-      skipRt!.transport.close(),
-    ])
+    await Promise.all([baseRt!.transport.close(), envRt!.transport.close()])
   } finally {
     await pool.close()
     await rm(home, { recursive: true, force: true })
@@ -986,7 +1007,7 @@ test('StandbyRuntimePool evicts dead standby and failed warmup cleanly so take f
     pool.warm(launch, home, {})
     const readyRt = await pool.take(launch, home, {})
     assert.ok(readyRt)
-    assert.equal(pool.recycle(readyRt, launch, home, {}), true)
+    assert.equal(await pool.recycle(readyRt, launch, home, {}), true)
     assert.equal(manual.scheduled.length, 1)
     assert.equal(manual.scheduled[0].unreffed, true)
 
@@ -1007,7 +1028,29 @@ test('StandbyRuntimePool evicts dead standby and failed warmup cleanly so take f
 
 test('StandbyRuntimePool enforces maxSlots LRU eviction and unreffed idle reaping', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-standby-evict-'))
-  const fake = createFakeConnect()
+  const slot1Started = deferred<void>()
+  const slot2Started = deferred<void>()
+  const slot3Started = deferred<void>()
+  const fake = createFakeConnect([
+    {
+      init: async () => {
+        slot1Started.resolve()
+        return { agentInfo: { version: '1.5.12' } }
+      },
+    },
+    {
+      init: async () => {
+        slot2Started.resolve()
+        return { agentInfo: { version: '1.5.12' } }
+      },
+    },
+    {
+      init: async () => {
+        slot3Started.resolve()
+        return { agentInfo: { version: '1.5.12' } }
+      },
+    },
+  ])
   const manual = createManualScheduler()
   const launch: ProviderLaunch = {
     command: 'agy',
@@ -1020,19 +1063,23 @@ test('StandbyRuntimePool enforces maxSlots LRU eviction and unreffed idle reapin
     maxSlots: 2,
     idleTimeoutMs: 45_000,
     scheduler: manual.scheduler,
+    resolveFingerprint: async () => 'fp-1',
   })
   try {
     pool.warm(launch, home, { SLOT: '1' })
+    await slot1Started.promise
     pool.warm(launch, home, { SLOT: '2' })
+    await slot2Started.promise
     assert.equal(fake.created.length, 2)
 
     // Touch slot 1 via take + recycle so slot 2 becomes oldest (LRU).
     const slot1 = await pool.take(launch, home, { SLOT: '1' })
     assert.equal(slot1?.transport, fake.created[0].transport)
-    assert.equal(pool.recycle(slot1!, launch, home, { SLOT: '1' }), true)
+    assert.equal(await pool.recycle(slot1!, launch, home, { SLOT: '1' }), true)
 
     // Adding slot 3 evicts and closes slot 2 (oldest idle).
     pool.warm(launch, home, { SLOT: '3' })
+    await slot3Started.promise
     assert.equal(fake.created.length, 3)
     await fake.created[1].closedBarrier.promise
     assert.equal(fake.created[1].closeCalled(), 1)
@@ -1089,7 +1136,7 @@ test('StandbyRuntimePool.close shuts down idle, recycled, and in-flight-warming 
     pool.warm(launch, home, { SLOT: 'A' })
     const rtA = await pool.take(launch, home, { SLOT: 'A' })
     assert.ok(rtA)
-    assert.equal(pool.recycle(rtA, launch, home, { SLOT: 'A' }), true)
+    assert.equal(await pool.recycle(rtA, launch, home, { SLOT: 'A' }), true)
 
     pool.warm(launch, home, { SLOT: 'B' })
     await warmEntered.promise
@@ -1416,7 +1463,7 @@ test('prompted sessions do not recycle, first prompt and persisted open replenis
     // which in turn replenishes a new standby!
     const warmedFromPrompt = await pool.take(launch, home, {})
     assert.ok(warmedFromPrompt)
-    assert.equal(pool.recycle(warmedFromPrompt, launch, home, {}), true)
+    assert.equal(await pool.recycle(warmedFromPrompt, launch, home, {}), true)
     const initPidsBeforePersisted = uniqueMethodPids(
       await readRpcPidLog(rpcPidLog),
       'initialize',
@@ -1446,7 +1493,7 @@ test('prompted sessions do not recycle, first prompt and persisted open replenis
     const replenishedBeforeRelaunch = await pool.take(launch, home, {})
     assert.ok(replenishedBeforeRelaunch)
     assert.equal(
-      pool.recycle(replenishedBeforeRelaunch, launch, home, {}),
+      await pool.recycle(replenishedBeforeRelaunch, launch, home, {}),
       true,
     )
     const standbyPidForRelaunch = uniqueMethodPids(
@@ -1968,5 +2015,471 @@ test('isLaunchCwdIndependent and StandbyRuntimePool resolve USERPROFILE and igno
   } finally {
     await pool.close()
     await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('SharedControlRuntime retires and respawns when binary fingerprint changes while idle or in-flight', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-shared-fingerprint-'))
+  const fake = createFakeConnect()
+  const manual = createManualScheduler()
+  let currentFingerprint = 'fp-v1'
+  const runtime = new SharedControlRuntime({
+    launch: { command: 'agy', args: ['acp'], env: isolatedEnv(home) },
+    connectAcp: fake.connect,
+    idleTimeoutMs: 60_000,
+    scheduler: manual.scheduler,
+    resolveFingerprint: async () => currentFingerprint,
+  })
+  const inFlightEntered = deferred<void>()
+  const inFlightGate = deferred<void>()
+  try {
+    // 1. Idle runtime retires and closes immediately when fingerprint changes.
+    await runtime.run(home, async ({ transport }) => {
+      assert.equal(transport, fake.created[0].transport)
+    })
+    assert.equal(manual.scheduled.length, 1)
+    assert.equal(manual.scheduled[0].cleared, false)
+
+    currentFingerprint = 'fp-v2'
+    await runtime.run(home, async ({ transport }) => {
+      assert.equal(transport, fake.created[1].transport)
+    })
+    assert.equal(manual.scheduled[0].cleared, true)
+    await fake.created[0].closedBarrier.promise
+    assert.equal(fake.created[0].closeCalled(), 1)
+
+    // 2. Fingerprint change during an in-flight request respawns for new callers without breaking the active request.
+    const activeRequest = runtime.run(home, async ({ transport }) => {
+      assert.equal(transport, fake.created[1].transport)
+      inFlightEntered.resolve()
+      await inFlightGate.promise
+      return 'in-flight-ok'
+    })
+    await inFlightEntered.promise
+
+    currentFingerprint = 'fp-v3'
+    const upgradedResult = await runtime.run(home, async ({ transport }) => {
+      assert.equal(transport, fake.created[2].transport)
+      return 'upgraded-ok'
+    })
+    assert.equal(upgradedResult, 'upgraded-ok')
+    assert.equal(fake.created[1].closeCalled(), 0)
+
+    inFlightGate.resolve()
+    assert.equal(await activeRequest, 'in-flight-ok')
+    await fake.created[1].closedBarrier.promise
+    assert.equal(fake.created[1].closeCalled(), 1)
+
+    // Subsequent calls reuse the upgraded runtime.
+    await runtime.run(home, async ({ transport }) => {
+      assert.equal(transport, fake.created[2].transport)
+    })
+    assert.equal(fake.created.length, 3)
+  } finally {
+    await runtime.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('StandbyRuntimePool.warm ignores launches with --dangerously-skip-permissions', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-standby-skip-warm-'))
+  const fake = createFakeConnect()
+  let fingerprintCalls = 0
+  const skipLaunch: ProviderLaunch = {
+    command: 'agy',
+    args: ['acp', '--dangerously-skip-permissions'],
+    env: isolatedEnv(home),
+  }
+  const baseLaunch: ProviderLaunch = {
+    command: 'agy',
+    args: ['acp'],
+    env: isolatedEnv(home),
+  }
+  const poolWithBaseDefault = new StandbyRuntimePool({
+    launch: baseLaunch,
+    connectAcp: fake.connect,
+    resolveFingerprint: async () => {
+      fingerprintCalls++
+      return 'fp-1'
+    },
+  })
+  const poolWithSkipDefault = new StandbyRuntimePool({
+    launch: skipLaunch,
+    connectAcp: fake.connect,
+    resolveFingerprint: async () => {
+      fingerprintCalls++
+      return 'fp-1'
+    },
+  })
+  try {
+    poolWithBaseDefault.warm(skipLaunch, home, {})
+    poolWithSkipDefault.warm(undefined, home, {})
+    assert.equal(fingerprintCalls, 0)
+    assert.equal(fake.created.length, 0)
+    assert.equal(
+      await poolWithBaseDefault.take(skipLaunch, home, {}),
+      undefined,
+    )
+    assert.equal(await poolWithSkipDefault.take(undefined, home, {}), undefined)
+  } finally {
+    await Promise.all([
+      poolWithBaseDefault.close(),
+      poolWithSkipDefault.close(),
+    ])
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('StandbyRuntimePool.take misses and closes stale-fingerprint slots and warm replaces stale slots', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-standby-stale-fp-'))
+  const slot1Started = deferred<void>()
+  const slot2Started = deferred<void>()
+  const slot3Started = deferred<void>()
+  const fake = createFakeConnect([
+    {
+      init: async () => {
+        slot1Started.resolve()
+        return { agentInfo: { version: '1.5.12' } }
+      },
+    },
+    {
+      init: async () => {
+        slot2Started.resolve()
+        return { agentInfo: { version: '1.5.12' } }
+      },
+    },
+    {
+      init: async () => {
+        slot3Started.resolve()
+        return { agentInfo: { version: '1.5.12' } }
+      },
+    },
+  ])
+  let currentFingerprint = 'fp-v1'
+  const launch: ProviderLaunch = {
+    command: 'agy',
+    args: ['acp'],
+    env: isolatedEnv(home),
+  }
+  const pool = new StandbyRuntimePool({
+    launch,
+    connectAcp: fake.connect,
+    resolveFingerprint: async () => currentFingerprint,
+  })
+  try {
+    // 1. take() misses and proactively closes a slot warmed under an older binary fingerprint.
+    pool.warm(launch, home, {})
+    await slot1Started.promise
+    currentFingerprint = 'fp-v2'
+    assert.equal(await pool.take(launch, home, {}), undefined)
+    await fake.created[0].closedBarrier.promise
+    assert.equal(fake.created[0].closeCalled(), 1)
+
+    // 2. warm() replaces a pre-warmed stale-fingerprint slot and closes the old transport.
+    pool.warm(launch, home, {})
+    await slot2Started.promise
+    currentFingerprint = 'fp-v3'
+    pool.warm(launch, home, {})
+    await slot3Started.promise
+    await fake.created[1].closedBarrier.promise
+    assert.equal(fake.created[1].closeCalled(), 1)
+
+    const fresh = await pool.take(launch, home, {})
+    assert.equal(fresh?.transport, fake.created[2].transport)
+    await fresh!.transport.close()
+  } finally {
+    await pool.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('StandbyRuntimePool.recycle rejects a runtime whose fingerprint no longer matches the upgraded binary', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-standby-recycle-fp-'))
+  const fake = createFakeConnect()
+  let currentFingerprint = 'fp-v1'
+  const launch: ProviderLaunch = {
+    command: 'agy',
+    args: ['acp'],
+    env: isolatedEnv(home),
+  }
+  const pool = new StandbyRuntimePool({
+    launch,
+    connectAcp: fake.connect,
+    resolveFingerprint: async () => currentFingerprint,
+  })
+  try {
+    pool.warm(launch, home, {})
+    const rt = await pool.take(launch, home, {})
+    assert.ok(rt)
+
+    currentFingerprint = 'fp-v2'
+    assert.equal(await pool.recycle(rt, launch, home, {}), false)
+    assert.equal(fake.created[0].closeCalled(), 0)
+    assert.equal(await pool.take(launch, home, {}), undefined)
+    await rt.transport.close()
+  } finally {
+    await pool.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('StandbyRuntimePool.warm deduplicates concurrent calls during async fingerprint resolution and does not spawn after close', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-standby-warm-dedup-'))
+  const fake = createFakeConnect()
+  const fp1Entered = deferred<void>()
+  const fp1Gate = deferred<string | undefined>()
+  const fp2Entered = deferred<void>()
+  const fp2Gate = deferred<string | undefined>()
+  let fpCalls = 0
+  const fpQueue = [
+    () => {
+      fp1Entered.resolve()
+      return fp1Gate.promise
+    },
+    () => {
+      fp2Entered.resolve()
+      return fp2Gate.promise
+    },
+  ]
+  const launch: ProviderLaunch = {
+    command: 'agy',
+    args: ['acp'],
+    env: isolatedEnv(home),
+  }
+  const pool = new StandbyRuntimePool({
+    launch,
+    connectAcp: fake.connect,
+    resolveFingerprint: () => {
+      fpCalls++
+      return fpQueue.shift()!()
+    },
+  })
+  try {
+    // 1. Overlapping warm() calls while fingerprint resolution is pending only resolve & spawn once.
+    pool.warm(launch, home, {})
+    pool.warm(launch, home, {})
+    await fp1Entered.promise
+    assert.equal(fpCalls, 1)
+    assert.equal(fake.created.length, 0)
+
+    fp1Gate.resolve('fp-1')
+    const rt = await pool.take(launch, home, {})
+    assert.equal(rt?.transport, fake.created[0].transport)
+    assert.equal(fake.created.length, 1)
+    await rt!.transport.close()
+
+    // 2. Closing the pool while fingerprint resolution is pending prevents spawning afterwards.
+    pool.warm(launch, home, {})
+    await fp2Entered.promise
+    await pool.close()
+    fp2Gate.resolve('fp-1')
+    await fp2Gate.promise
+    await Promise.resolve()
+    assert.equal(fake.created.length, 1)
+  } finally {
+    await pool.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('initializeAcp aborts immediately when signal aborts before or during initialize', async () => {
+  const initEntered = deferred<void>()
+  const initGate = deferred<{ agentInfo?: { version?: string } }>()
+  let initCalls = 0
+  const fake = createFakeConnect([
+    {
+      init: () => {
+        initCalls++
+        initEntered.resolve()
+        return initGate.promise
+      },
+    },
+  ])
+  const transport = fake.connect(
+    undefined,
+    process.cwd(),
+    {},
+    {
+      sessionUpdate: async () => {},
+      requestPermission: async () => ({ outcome: { outcome: 'cancelled' } }),
+    },
+    () => {},
+  )
+
+  const preAborted = new AbortController()
+  preAborted.abort(new Error('already closed'))
+  await assert.rejects(
+    initializeAcp(transport, preAborted.signal),
+    /already closed/,
+  )
+  assert.equal(initCalls, 0)
+
+  const nonErrorAbort = new AbortController()
+  nonErrorAbort.abort('cancelled')
+  await assert.rejects(
+    initializeAcp(transport, nonErrorAbort.signal),
+    /Provider connection is closed/,
+  )
+  assert.equal(initCalls, 0)
+
+  const inFlightAbort = new AbortController()
+  const pending = initializeAcp(transport, inFlightAbort.signal)
+  await initEntered.promise
+  assert.equal(initCalls, 1)
+  inFlightAbort.abort(new Error('aborted during initialize'))
+  await assert.rejects(pending, /aborted during initialize/)
+  initGate.reject(new Error('late transport error'))
+  await transport.close()
+})
+
+test('SessionManager.close during standby.take or cold initializeAcp aborts immediately without cold-starting a new runtime', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-close-open-race-'))
+  const warmInitEntered = deferred<void>()
+  const warmInitGate = deferred<{ agentInfo?: { version?: string } }>()
+  const warmFake = createFakeConnect([
+    {
+      init: () => {
+        warmInitEntered.resolve()
+        return warmInitGate.promise
+      },
+    },
+  ])
+  const coldStartCalls: number[] = []
+  const coldInitEntered = deferred<void>()
+  const coldInitGate = deferred<{ agentInfo?: { version?: string } }>()
+  const coldFake = createFakeConnect([
+    {
+      init: () => {
+        coldInitEntered.resolve()
+        return coldInitGate.promise
+      },
+    },
+  ])
+  const launch: ProviderLaunch = {
+    command: 'agy',
+    args: ['acp'],
+    env: isolatedEnv(home),
+  }
+  const pool = new StandbyRuntimePool({
+    launch,
+    connectAcp: warmFake.connect,
+    resolveFingerprint: async () => 'fp-1',
+  })
+  const manager1 = new SessionManager({
+    launch,
+    usage: new AgyUsageSource({ env: launch.env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: () => {},
+    standby: pool,
+    connectAcp: (...args) => {
+      coldStartCalls.push(1)
+      return coldFake.connect(...args)
+    },
+  })
+  const manager2 = new SessionManager({
+    launch,
+    usage: new AgyUsageSource({ env: launch.env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: () => {},
+    connectAcp: coldFake.connect,
+  })
+  try {
+    // 1. Closing manager + standby pool while createSession awaits standby.take must not cold-start a process.
+    pool.warm(launch, home, {})
+    await warmInitEntered.promise
+    const openingFromStandby = manager1.handle({
+      type: 'session.open',
+      requestId: 'open-1',
+      sessionId: 's1',
+      history: 'skip',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    const closing1 = Promise.all([manager1.close(), pool.close()])
+    warmInitGate.resolve({ agentInfo: { version: '1.5.12' } })
+    await closing1
+    await assert.rejects(openingFromStandby, /Provider connection is closed/)
+    assert.equal(coldStartCalls.length, 0)
+
+    // 2. Closing manager while cold initializeAcp is pending aborts and closes the transport immediately.
+    const openingCold = manager2.handle({
+      type: 'session.open',
+      requestId: 'open-2',
+      sessionId: 's2',
+      history: 'skip',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+    })
+    await coldInitEntered.promise
+    await manager2.close()
+    await assert.rejects(openingCold, /Provider connection is closed/)
+    assert.equal(coldFake.created.length, 1)
+    assert.equal(coldFake.created[0].closeCalled(), 1)
+    coldInitGate.reject(new Error('late cold init error'))
+  } finally {
+    await Promise.all([manager1.close(), manager2.close(), pool.close()])
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('SharedControlRuntime transparently retries an in-flight startup caller when binary fingerprint changes during initialize', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-shared-startup-fp-'))
+  const init1Entered = deferred<void>()
+  const init1Gate = deferred<{ agentInfo?: { version?: string } }>()
+  const fake = createFakeConnect([
+    {
+      init: () => {
+        init1Entered.resolve()
+        return init1Gate.promise
+      },
+    },
+    {
+      init: async () => ({ agentInfo: { version: '1.5.12' } }),
+    },
+  ])
+  let currentFingerprint = 'fp-v1'
+  const launch: ProviderLaunch = {
+    command: 'agy',
+    args: ['acp'],
+    env: isolatedEnv(home),
+  }
+  const runtime = new SharedControlRuntime({
+    launch,
+    connectAcp: fake.connect,
+    resolveFingerprint: async () => currentFingerprint,
+  })
+  try {
+    const caller1 = runtime.run(home, async ({ transport }) => transport)
+    await init1Entered.promise
+
+    // Binary upgrades while slot1 initialize is still pending; caller2 starts slot2 and retires slot1.
+    currentFingerprint = 'fp-v2'
+    const transport2 = await runtime.run(
+      home,
+      async ({ transport }) => transport,
+    )
+    assert.equal(transport2, fake.created[1].transport)
+    assert.equal(fake.created[0].closeCalled(), 0)
+
+    // Completing slot1 initialize lets caller1 drain slot1, close it, and transparently acquire slot2.
+    init1Gate.resolve({ agentInfo: { version: '1.5.12' } })
+    const transport1 = await caller1
+    assert.equal(transport1, fake.created[1].transport)
+    await fake.created[0].closedBarrier.promise
+    assert.equal(fake.created[0].closeCalled(), 1)
+    assert.equal(fake.created.length, 2)
+  } finally {
+    await runtime.close()
+    await rm(home, { recursive: true, force: true })
   }
 })

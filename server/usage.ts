@@ -21,7 +21,12 @@ import {
   type UsageScope,
   type UsageSourceRegistration,
 } from '@getpaseo/plugin/server/usage'
-import { definedProcessEnv, formatErrorMessage, setBounded } from './common.ts'
+import {
+  definedProcessEnv,
+  formatErrorMessage,
+  mergeEnv,
+  setBounded,
+} from './common.ts'
 import {
   dataDirectory,
   isCwdIndependentLaunch,
@@ -52,24 +57,29 @@ const usageInputSchema = z.object({
 })
 
 const groupsSchema = z.object({
-  command: z.object({
-    data: z.object({
-      groups: z.array(
-        z.object({
-          name: z.string().min(1),
-          buckets: z.array(
-            z.object({
-              id: z.string().nullish(),
-              name: z.string().nullish(),
-              window: z.string().nullish(),
-              remaining_fraction: z.number().finite().nullish(),
-              reset_time: z.string().nullish(),
-            }),
-          ),
-        }),
-      ),
-    }),
-  }),
+  status: z.string().nullish(),
+  response: z.string().nullish(),
+  command: z
+    .object({
+      data: z.object({
+        groups: z.array(
+          z.object({
+            name: z.string().min(1),
+            buckets: z.array(
+              z.object({
+                id: z.string().nullish(),
+                name: z.string().nullish(),
+                window: z.string().nullish(),
+                disabled: z.boolean().nullish(),
+                remaining_fraction: z.number().finite().nullish(),
+                reset_time: z.string().nullish(),
+              }),
+            ),
+          }),
+        ),
+      }),
+    })
+    .nullish(),
 })
 
 /** Validate the CLI envelope before translating its quota groups. */
@@ -80,12 +90,24 @@ export function parseUsage(stdout: string) {
   } catch (error) {
     throw new Error('Unexpected /usage JSON output from agy', { cause: error })
   }
+  if (parsed.status != null && parsed.status !== 'SUCCESS') {
+    const detail = parsed.response?.trim()
+    throw new Error(
+      detail
+        ? `agy /usage returned status ${parsed.status}: ${detail}`
+        : `agy /usage returned status ${parsed.status}`,
+    )
+  }
+  if (!parsed.command) {
+    throw new Error('Unexpected /usage JSON output from agy')
+  }
   return parsed.command.data.groups.map((group) => ({
     name: group.name,
     buckets: group.buckets.flatMap((bucket) => {
+      if (bucket.disabled === true) return []
       const window = bucket.window?.trim() ?? ''
       const id = bucket.id?.trim() || window
-      // Drop unidentifiable non-standard buckets (e.g. disabled or amount-only entries without id/window)
+      // Drop unidentifiable non-standard buckets (e.g. amount-only entries without id/window)
       // instead of failing or blocking valid sibling buckets in the same group.
       if (!id) return []
       return [
@@ -94,7 +116,7 @@ export function parseUsage(stdout: string) {
           name: bucket.name?.trim() || window || id,
           window,
           remainingFraction: bucket.remaining_fraction ?? undefined,
-          resetTime: bucket.reset_time ?? '',
+          resetTime: bucket.reset_time?.trim() ?? '',
         },
       ]
     }),
@@ -430,7 +452,7 @@ export class AgyUsageSource {
     string,
     {
       launch?: ProviderLaunch
-      env: Record<string, string>
+      sessionEnv: Record<string, string>
       cwd?: string
     }
   >()
@@ -457,7 +479,7 @@ export class AgyUsageSource {
       dir,
       {
         launch,
-        env: { ...launch?.env, ...env },
+        sessionEnv: { ...env },
         cwd,
       },
       ACCOUNT_CACHE_LIMIT,
@@ -536,6 +558,10 @@ export class AgyUsageSource {
     }
     const cmd = known?.launch?.command ?? 'agy'
     const rawArgs = known?.launch?.args ?? []
+    const effectiveEnv =
+      known?.launch?.env !== undefined
+        ? mergeEnv(known.launch.env, known.sessionEnv)
+        : mergeEnv(base, known?.sessionEnv ?? sessionEnv)
     // The CLI is the only reliable auth oracle: keychain logins leave no token file,
     // and a failed read surfaces as an error report instead of a disappearing account.
     try {
@@ -550,7 +576,7 @@ export class AgyUsageSource {
         const launch = {
           command: cmd,
           args: rawArgs,
-          env: known!.env,
+          env: effectiveEnv,
         }
         if (!isCwdIndependentLaunch(cwd, defaultHome, launch, {}, defaultHome))
           throw new Error(
@@ -563,9 +589,7 @@ export class AgyUsageSource {
         [...usageArgs(rawArgs), '-p', '/usage', '--output-format', 'json'],
         {
           timeoutMs: USAGE_FETCH_TIMEOUT_MS,
-          env: known?.launch
-            ? { ...known.env }
-            : { ...base, ...sessionEnv, ...known?.env },
+          env: effectiveEnv,
           cwd,
         },
       )

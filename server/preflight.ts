@@ -9,7 +9,12 @@ import type {
   ProviderLaunch,
   ProviderStatus,
 } from '@getpaseo/plugin/server/provider'
-import { formatErrorMessage, sessionIdPattern, setBounded } from './common.ts'
+import {
+  formatErrorMessage,
+  mergeEnv,
+  sessionIdPattern,
+  setBounded,
+} from './common.ts'
 
 const STATUS_CACHE_LIMIT = 100
 const STATUS_CACHE_TTL_MS = 60_000
@@ -41,6 +46,7 @@ const DEFAULT_WINDOWS_PATHEXT = ['.exe', '.cmd', '.bat', '.com']
 export interface BinaryFingerprintOptions {
   platform?: NodeJS.Platform
   fallbackHome?: string
+  env?: Readonly<Record<string, string>>
 }
 
 function readEnv(
@@ -149,14 +155,15 @@ function defaultAgyInstallPaths(
   return [...new Set(paths)]
 }
 
-async function binaryFingerprint(
+/** Resolve a stable fingerprint for the launch executable (including optional session env overrides). */
+export async function binaryFingerprint(
   launch?: ProviderLaunch,
   options?: BinaryFingerprintOptions,
 ): Promise<string | undefined> {
   const platform = options?.platform ?? process.platform
   const isWindows = platform === 'win32'
   const pathDelimiter = options?.platform ? (isWindows ? ';' : ':') : delimiter
-  const env = launch?.env ?? process.env
+  const env = mergeEnv(launch?.env ?? process.env, options?.env, isWindows)
   const exts = isWindows ? windowsPathExts(env) : []
   const cmd = launch?.command ?? 'agy'
   if (isAbsolute(cmd) || cmd.includes('/') || cmd.includes('\\'))
@@ -168,7 +175,11 @@ async function binaryFingerprint(
     const found = await fingerprintCandidates(join(dir, cmd), isWindows, exts)
     if (found) return found
   }
-  if (cmd === 'agy' || (isWindows && cmd.toLowerCase() === 'agy.exe')) {
+  const lower = cmd.toLowerCase()
+  if (
+    cmd === 'agy' ||
+    (isWindows && (lower === 'agy' || lower === 'agy.exe'))
+  ) {
     for (const candidate of defaultAgyInstallPaths(
       env,
       isWindows,

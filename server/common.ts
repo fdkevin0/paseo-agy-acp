@@ -119,6 +119,35 @@ export function definedProcessEnv(): Record<string, string> {
   return env
 }
 
+/**
+ * Merge defined environment entries, deduplicating case-variant keys (e.g. `Path` vs `PATH`)
+ * on case-insensitive platforms so overrides cleanly replace inherited entries.
+ */
+export function mergeEnv(
+  base: Readonly<Record<string, string | undefined>> | undefined,
+  override?: Readonly<Record<string, string | undefined>>,
+  caseInsensitive = process.platform === 'win32',
+): Record<string, string> {
+  const result: Record<string, string> = {}
+  const lowerToKey = caseInsensitive ? new Map<string, string>() : undefined
+  const apply = (source?: Readonly<Record<string, string | undefined>>) => {
+    if (!source) return
+    for (const [key, value] of Object.entries(source)) {
+      if (typeof value !== 'string') continue
+      if (lowerToKey) {
+        const lower = key.toLowerCase()
+        const prev = lowerToKey.get(lower)
+        if (prev !== undefined && prev !== key) delete result[prev]
+        lowerToKey.set(lower, key)
+      }
+      result[key] = value
+    }
+  }
+  apply(base)
+  apply(override)
+  return result
+}
+
 /** Insert or refresh `key` in `map`, evicting oldest entries when exceeding `limit`. */
 export function setBounded<K, V>(
   map: Map<K, V>,
