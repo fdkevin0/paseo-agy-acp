@@ -13,7 +13,9 @@ import {
 } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { mergeEnv } from '../server/common.ts'
 import {
+  binaryFingerprint,
   catalogCacheKey,
   dataDirectory,
   hasLocalSessionArtifacts,
@@ -766,6 +768,126 @@ test('dataDirectory and resolveSpawnCwd fall back through HOME, USERPROFILE, lau
       ),
       launchProfile,
     )
+  } finally {
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('mergeEnv deduplicates case-variant keys when caseInsensitive is true and preserves them when false', () => {
+  assert.deepEqual(
+    mergeEnv(
+      { Path: 'C:\\old', KEEP: '1', DROP: undefined },
+      { PATH: 'C:\\new', IGNORED: undefined },
+      true,
+    ),
+    { KEEP: '1', PATH: 'C:\\new' },
+  )
+  assert.deepEqual(
+    mergeEnv(
+      { Path: '/old', KEEP: '1' },
+      { PATH: '/new', IGNORED: undefined },
+      false,
+    ),
+    { Path: '/old', KEEP: '1', PATH: '/new' },
+  )
+})
+
+test('binaryFingerprint recognizes uppercase AGY/AGY.EXE on win32 and honors options.env PATH overrides', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'agy-fingerprint-env-'))
+  try {
+    const emptyHome = join(tmp, 'empty-home')
+    const missingDir = join(tmp, 'missing-dir')
+    const winLocalAppData = join(tmp, 'win-local-appdata')
+    await mkdir(join(winLocalAppData, 'agy', 'bin'), { recursive: true })
+    const winLocalExe = join(winLocalAppData, 'agy', 'bin', 'agy.exe')
+    await writeFile(winLocalExe, 'MZ-default-agy', { mode: 0o644 })
+
+    const baseWinEnv = {
+      Path: missingDir,
+      LOCALAPPDATA: winLocalAppData,
+      USERPROFILE: emptyHome,
+    }
+    const lowerFp = await binaryFingerprint(
+      { command: 'agy', args: ['acp'], env: baseWinEnv },
+      { platform: 'win32', fallbackHome: emptyHome },
+    )
+    const upperCmdFp = await binaryFingerprint(
+      { command: 'AGY', args: ['acp'], env: baseWinEnv },
+      { platform: 'win32', fallbackHome: emptyHome },
+    )
+    const upperExeFp = await binaryFingerprint(
+      { command: 'AGY.EXE', args: ['acp'], env: baseWinEnv },
+      { platform: 'win32', fallbackHome: emptyHome },
+    )
+    assert.ok(lowerFp)
+    assert.equal(upperCmdFp, lowerFp)
+    assert.equal(upperExeFp, lowerFp)
+
+    // POSIX options.env PATH overrides launch.env PATH.
+    const binA = join(tmp, 'bin-a')
+    const binB = join(tmp, 'bin-b')
+    await mkdir(binA)
+    await mkdir(binB)
+    const agyA = join(binA, 'agy')
+    const agyB = join(binB, 'agy')
+    await writeExecutable(agyA, '#!/bin/sh\necho 1.5.11\n')
+    await writeExecutable(agyB, '#!/bin/sh\necho 1.5.12-override\n')
+
+    const posixLaunch = {
+      command: 'agy',
+      args: ['acp'],
+      env: { PATH: binA, HOME: emptyHome },
+    }
+    const fpFromLaunch = await binaryFingerprint(posixLaunch, {
+      platform: 'linux',
+      fallbackHome: emptyHome,
+    })
+    const fpFromOverride = await binaryFingerprint(posixLaunch, {
+      platform: 'linux',
+      fallbackHome: emptyHome,
+      env: { PATH: binB },
+    })
+    const fpDirectB = await binaryFingerprint(
+      { command: agyB, args: ['acp'], env: {} },
+      { platform: 'linux', fallbackHome: emptyHome },
+    )
+    assert.ok(fpFromLaunch)
+    assert.ok(fpFromOverride)
+    assert.notEqual(fpFromOverride, fpFromLaunch)
+    assert.equal(fpFromOverride, fpDirectB)
+
+    // Windows options.env PATH overrides case-variant launch.env Path.
+    const winBinA = join(tmp, 'win-bin-a')
+    const winBinB = join(tmp, 'win-bin-b')
+    await mkdir(winBinA)
+    await mkdir(winBinB)
+    const winA = join(winBinA, 'agy.exe')
+    const winB = join(winBinB, 'agy.exe')
+    await writeFile(winA, 'MZ-a', { mode: 0o644 })
+    await writeFile(winB, 'MZ-b-override', { mode: 0o644 })
+
+    const winLaunch = {
+      command: 'agy',
+      args: ['acp'],
+      env: { Path: winBinA, USERPROFILE: emptyHome },
+    }
+    const winFpFromLaunch = await binaryFingerprint(winLaunch, {
+      platform: 'win32',
+      fallbackHome: emptyHome,
+    })
+    const winFpFromOverride = await binaryFingerprint(winLaunch, {
+      platform: 'win32',
+      fallbackHome: emptyHome,
+      env: { PATH: winBinB },
+    })
+    const winFpDirectB = await binaryFingerprint(
+      { command: winB, args: ['acp'], env: {} },
+      { platform: 'win32', fallbackHome: emptyHome },
+    )
+    assert.ok(winFpFromLaunch)
+    assert.ok(winFpFromOverride)
+    assert.notEqual(winFpFromOverride, winFpFromLaunch)
+    assert.equal(winFpFromOverride, winFpDirectB)
   } finally {
     await rm(tmp, { recursive: true, force: true })
   }

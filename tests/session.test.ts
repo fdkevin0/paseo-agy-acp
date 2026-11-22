@@ -3660,3 +3660,137 @@ test(
     )
   },
 )
+
+test('promptSession failure cleanup forwards runtimeEpoch and options.hasActiveBackgroundWork without spurious interrupt', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-failure-cleanup-epoch-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const nativeId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+  const brainRoot = join(home, '.gemini/antigravity-cli/brain')
+  const probeCalls: Array<{
+    nativeId: string
+    afterStepIndex: number | undefined
+  }> = []
+  let cancelCount = 0
+  const events: ProviderEvent[] = []
+  const env = isolatedEnv(home)
+  const launch = { command: 'agy', args: ['acp'], env }
+  const manager = new SessionManager({
+    launch,
+    usage: new AgyUsageSource({ env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: (event) => events.push(event),
+    commandWaitTimeoutMs: 50,
+    hasActiveBackgroundWork: async (_root, id, opts) => {
+      probeCalls.push({
+        nativeId: id,
+        afterStepIndex: opts?.runtimeEpoch?.afterStepIndex,
+      })
+      return false
+    },
+    connectAcp: (_l, _cwd, _e, client) => {
+      const closed = new Promise<void>(() => {})
+      const rpc = {
+        closed,
+        initialize: async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
+          agentCapabilities: {
+            loadSession: true,
+            sessionCapabilities: { resume: {} },
+          },
+        }),
+        resumeSession: async () => {
+          void client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'available_commands_update',
+              availableCommands: [],
+            },
+          })
+          return { configOptions: [] }
+        },
+        prompt: async () => {
+          await writeBrainTranscript(brainRoot, nativeId, [
+            { step_index: 1, type: 'USER_INPUT', content: 'old turn' },
+            {
+              step_index: 2,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'old done',
+            },
+            { step_index: 3, type: 'USER_INPUT', content: 'failing turn' },
+            {
+              step_index: 4,
+              type: 'ERROR_MESSAGE',
+              status: 'DONE',
+              content: 'upstream terminal failure',
+            },
+          ])
+          return { stopReason: 'end_turn' as const }
+        },
+        cancel: async () => {
+          cancelCount++
+        },
+      } as unknown as ReturnType<
+        typeof import('../server/transport.ts').connectAcp
+      >['rpc']
+      return {
+        rpc,
+        exited: closed,
+        stopped: Promise.resolve(),
+        close: async () => {},
+        request: async <T>(op: Promise<T>) => op,
+        get closed() {
+          return false
+        },
+        get tier() {
+          return undefined
+        },
+        get models() {
+          return undefined
+        },
+      }
+    },
+  })
+  t.after(() => manager.close())
+  // Seed prior-epoch history before reopening so runtimeEpoch.afterStepIndex is established at step 2.
+  await writeBrainTranscript(brainRoot, nativeId, [
+    { step_index: 1, type: 'USER_INPUT', content: 'old turn' },
+    {
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      content: 'old done',
+    },
+  ])
+  await manager.handle({
+    type: 'session.open',
+    requestId: 'open',
+    sessionId: 's',
+    history: 'skip',
+    persistence: { version: 1, data: { sessionId: nativeId } },
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+  await manager.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId: 'm1',
+      delivery: 'auto',
+      input: { type: 'message', content: [{ type: 'text', text: 'fail' }] },
+    },
+  })
+  assert.deepEqual(probeCalls, [{ nativeId, afterStepIndex: 2 }])
+  assert.equal(cancelCount, 0)
+  const turnFailed = events.find(
+    (e) => e.type === 'session.turn' && e.state === 'failed',
+  )
+  assert.ok(turnFailed?.type === 'session.turn')
+  assert.equal(turnFailed.error?.message, 'upstream terminal failure')
+})

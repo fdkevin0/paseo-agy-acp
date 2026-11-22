@@ -4,9 +4,10 @@ import { statSync } from 'node:fs'
 import { join } from 'node:path'
 import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk/unstable'
 import type { ProviderLaunch } from '@getpaseo/plugin/server/provider'
-import { PACKAGE_VERSION } from './common.ts'
+import { PACKAGE_VERSION, mergeEnv } from './common.ts'
 import {
   agyVersionDiagnostic,
+  binaryFingerprint,
   isCwdIndependentLaunch,
   resolveHome,
 } from './preflight.ts'
@@ -37,6 +38,7 @@ export interface SharedControlRuntimeOptions {
   connectAcp?: typeof connectAcp
   idleTimeoutMs?: number
   scheduler?: IdleTimerScheduler
+  resolveFingerprint?: typeof binaryFingerprint
 }
 
 export interface StandbyRuntimePoolOptions {
@@ -45,6 +47,7 @@ export interface StandbyRuntimePoolOptions {
   idleTimeoutMs?: number
   maxSlots?: number
   scheduler?: IdleTimerScheduler
+  resolveFingerprint?: typeof binaryFingerprint
 }
 
 export interface AttachableRuntime {
@@ -95,24 +98,23 @@ export function isLaunchCwdIndependent(
   )
 }
 
-/** Canonical SHA-256 standby pool key covering command, args, and resolved environment. */
+/** Canonical SHA-256 standby pool key covering command, args, resolved environment, and optional binary fingerprint. */
 export function standbyPoolKey(
   launch?: ProviderLaunch,
   env: Readonly<Record<string, string>> = {},
+  fingerprint?: string,
 ): string {
-  const merged: Record<string, string | undefined> = {
-    ...(launch?.env ?? process.env),
-    ...env,
-  }
-  const sortedEnv = Object.entries(merged)
-    .filter((entry): entry is [string, string] => entry[1] !== undefined)
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  const merged = mergeEnv(launch?.env ?? process.env, env)
+  const sortedEnv = Object.entries(merged).sort(([a], [b]) =>
+    a < b ? -1 : a > b ? 1 : 0,
+  )
   return createHash('sha256')
     .update(
       JSON.stringify([
         launch?.command ?? 'agy',
         launch?.args ?? ['acp'],
         sortedEnv,
+        ...(fingerprint !== undefined ? [fingerprint] : []),
       ]),
     )
     .digest('hex')
@@ -177,9 +179,19 @@ export function createAttachableTransport(
   }
 }
 
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error('Provider connection is closed')
+}
+
 /** Run ACP `initialize` and reject runtimes below the minimum supported `agy` version. */
-export async function initializeAcp(transport: ControlTransport) {
-  const initialized = await transport.request(
+export async function initializeAcp(
+  transport: ControlTransport,
+  signal?: AbortSignal,
+) {
+  if (signal?.aborted) throw abortError(signal)
+  const initPromise = transport.request(
     transport.rpc.initialize({
       protocolVersion: PROTOCOL_VERSION,
       clientInfo: { name: 'paseo-agy-acp', version: PACKAGE_VERSION },
@@ -190,12 +202,31 @@ export async function initializeAcp(transport: ControlTransport) {
       },
     }),
   )
+  let initialized: Awaited<typeof initPromise>
+  if (signal) {
+    void initPromise.catch(() => undefined)
+    if (signal.aborted) throw abortError(signal)
+    let onAbort!: () => void
+    const aborted = new Promise<never>((_, reject) => {
+      onAbort = () => reject(abortError(signal))
+    })
+    signal.addEventListener('abort', onAbort, { once: true })
+    try {
+      initialized = await Promise.race([initPromise, aborted])
+    } finally {
+      signal.removeEventListener('abort', onAbort)
+    }
+    if (signal.aborted) throw abortError(signal)
+  } else {
+    initialized = await initPromise
+  }
   const diagnostic = agyVersionDiagnostic(initialized.agentInfo?.version)
   if (diagnostic) throw new Error(diagnostic)
   return initialized
 }
 
 interface SharedSlot {
+  readonly fingerprint: string | undefined
   transport: ControlTransport
   ready: Promise<void>
   inFlight: number
@@ -213,6 +244,7 @@ export class SharedControlRuntime {
   private readonly connect: typeof connectAcp
   private readonly idleTimeoutMs: number
   private readonly scheduler: IdleTimerScheduler
+  private readonly resolveFingerprint: typeof binaryFingerprint
   private active: SharedSlot | undefined
   private readonly transports = new Set<ControlTransport>()
   private serializedLane: Promise<void> = Promise.resolve()
@@ -224,6 +256,7 @@ export class SharedControlRuntime {
     this.connect = options.connectAcp ?? connectAcp
     this.idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS
     this.scheduler = options.scheduler ?? defaultScheduler
+    this.resolveFingerprint = options.resolveFingerprint ?? binaryFingerprint
   }
 
   /** Whether a single shared control runtime is valid across working directories for this launch. */
@@ -316,7 +349,10 @@ export class SharedControlRuntime {
     if (this.active === slot) this.active = undefined
   }
 
-  private startShared(spawnCwd: string): SharedSlot {
+  private startShared(
+    spawnCwd: string,
+    fingerprint: string | undefined,
+  ): SharedSlot {
     let exitError: Error | undefined
     let slot: SharedSlot | undefined
     const transport = this.connect(
@@ -331,6 +367,7 @@ export class SharedControlRuntime {
       },
     )
     slot = {
+      fingerprint,
       transport,
       ready: undefined as unknown as Promise<void>,
       inFlight: 0,
@@ -361,9 +398,25 @@ export class SharedControlRuntime {
   private async acquireShared(spawnCwd: string): Promise<SharedSlot> {
     while (true) {
       if (this.closed) throw new Error('Provider connection is closed')
+      const fingerprint = await this.resolveFingerprint(this.launch).catch(
+        () => undefined,
+      )
+      if (this.closed) throw new Error('Provider connection is closed')
       let slot = this.active
+      if (
+        slot &&
+        !slot.retired &&
+        !slot.transport.closed &&
+        slot.fingerprint !== fingerprint
+      ) {
+        this.evict(slot)
+        if (slot.inFlight === 0) {
+          void this.closeTransport(slot.transport).catch(() => undefined)
+        }
+        slot = undefined
+      }
       if (!slot || slot.retired || slot.transport.closed) {
-        slot = this.startShared(spawnCwd)
+        slot = this.startShared(spawnCwd, fingerprint)
         this.active = slot
       }
       this.cancelIdleTimer(slot)
@@ -380,6 +433,9 @@ export class SharedControlRuntime {
       }
       if (slot.retired || slot.transport.closed) {
         slot.inFlight--
+        if (slot.inFlight === 0 && slot.retired) {
+          void this.closeTransport(slot.transport).catch(() => undefined)
+        }
         if (this.active === slot) this.evict(slot)
         continue
       }
@@ -404,7 +460,13 @@ export class SharedControlRuntime {
       return await fn(lease)
     } finally {
       slot.inFlight--
-      if (slot.inFlight === 0) this.armIdleTimer(slot)
+      if (slot.inFlight === 0) {
+        if (slot.retired) {
+          void this.closeTransport(slot.transport).catch(() => undefined)
+        } else {
+          this.armIdleTimer(slot)
+        }
+      }
     }
   }
 
@@ -437,6 +499,7 @@ export class SharedControlRuntime {
 
 interface StandbySlot {
   readonly key: string
+  readonly baseKey: string
   readonly transport: ControlTransport
   ready: Promise<AttachableRuntime>
   idleTimer: IdleTimerHandle | undefined
@@ -457,7 +520,9 @@ export class StandbyRuntimePool {
   private readonly idleTimeoutMs: number
   private readonly maxSlots: number
   private readonly scheduler: IdleTimerScheduler
+  private readonly resolveFingerprint: typeof binaryFingerprint
   private readonly slots = new Map<string, StandbySlot>()
+  private readonly warming = new Map<string, Promise<string | undefined>>()
   private readonly transports = new Set<ControlTransport>()
   private readonly watchedStops = new WeakSet<ControlTransport>()
   private closed = false
@@ -469,6 +534,17 @@ export class StandbyRuntimePool {
     this.idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS
     this.maxSlots = options.maxSlots ?? DEFAULT_MAX_STANDBY_SLOTS
     this.scheduler = options.scheduler ?? defaultScheduler
+    this.resolveFingerprint = options.resolveFingerprint ?? binaryFingerprint
+  }
+
+  /** Resolve the executable fingerprint using this pool's configured resolver. */
+  resolveBinaryFingerprint(
+    effectiveLaunch: ProviderLaunch | undefined,
+    sessionEnv: Readonly<Record<string, string>> = {},
+  ): Promise<string | undefined> {
+    return this.resolveFingerprint(effectiveLaunch ?? this.launch, {
+      env: sessionEnv,
+    }).catch(() => undefined)
   }
 
   /** Start warming one standby runtime in the background if the slot is empty and reusable. */
@@ -478,88 +554,123 @@ export class StandbyRuntimePool {
     sessionEnv: Readonly<Record<string, string>> = {},
   ): void {
     const launch = effectiveLaunch ?? this.launch
-    if (this.closed || this.maxSlots <= 0) return
-    if (!isLaunchCwdIndependent(spawnCwd, launch, sessionEnv)) return
-    const key = standbyPoolKey(launch, sessionEnv)
-    const existing = this.slots.get(key)
-    if (
-      existing &&
-      !existing.retired &&
-      !existing.exited &&
-      !existing.transport.closed
-    )
+    if (this.closed || this.maxSlots <= 0 || hasSkipPermissionsFlag(launch))
       return
-    if (existing) this.evictSlot(existing)
-    this.evictToFit()
-
-    const warmCwd = resolveWarmCwd(spawnCwd, launch, sessionEnv)
-    let slot!: StandbySlot
-    const { transport, bind } = createAttachableTransport(
-      this.connect,
-      launch,
-      warmCwd,
-      sessionEnv,
-      CONTROL_CLIENT,
-      (error) => {
-        if (slot) {
-          slot.exited = true
-          slot.exitError = error
-          this.evictSlot(slot)
-        }
-        void this.closeTransport(transport).catch(() => undefined)
-      },
-    )
-    this.trackTransport(transport)
-    slot = {
-      key,
-      transport,
-      ready: undefined as unknown as Promise<AttachableRuntime>,
-      idleTimer: undefined,
-      retired: false,
-      exited: false,
-      exitError: undefined,
-      claimed: false,
-    }
-    this.slots.set(key, slot)
-    slot.ready = (async (): Promise<AttachableRuntime> => {
+    if (!isLaunchCwdIndependent(spawnCwd, launch, sessionEnv)) return
+    const baseKey = standbyPoolKey(launch, sessionEnv)
+    if (this.warming.has(baseKey)) return
+    let pending!: Promise<string | undefined>
+    pending = (async (): Promise<string | undefined> => {
       try {
-        const initialized = await initializeAcp(transport)
-        if (this.closed || slot.retired || slot.exited || transport.closed) {
-          throw (
-            slot.exitError ??
-            new Error('Standby ACP runtime closed during startup')
-          )
+        const fingerprint = await this.resolveFingerprint(launch, {
+          env: sessionEnv,
+        }).catch(() => undefined)
+        if (this.warming.get(baseKey) === pending) {
+          this.warming.delete(baseKey)
         }
-        if (initialized.agentCapabilities?.sessionCapabilities?.list) {
-          await transport
-            .request(transport.rpc.listSessions({ cwd: warmCwd }))
-            .catch(() => undefined)
-        }
-        if (this.closed || slot.retired || slot.exited || transport.closed) {
-          throw (
-            slot.exitError ??
-            new Error('Standby ACP runtime closed during warmup')
-          )
-        }
-        const runtime: AttachableRuntime = {
-          transport,
-          initialized,
+        if (this.closed || this.maxSlots <= 0) return fingerprint
+        const key = standbyPoolKey(launch, sessionEnv, fingerprint)
+        this.evictStaleSlots(baseKey, key)
+        const existing = this.slots.get(key)
+        if (
+          existing &&
+          !existing.retired &&
+          !existing.exited &&
+          !existing.transport.closed
+        )
+          return fingerprint
+        if (existing) this.evictSlot(existing)
+        this.evictToFit()
+
+        const warmCwd = resolveWarmCwd(spawnCwd, launch, sessionEnv)
+        let slot!: StandbySlot
+        const { transport, bind } = createAttachableTransport(
+          this.connect,
+          launch,
+          warmCwd,
+          sessionEnv,
+          CONTROL_CLIENT,
+          (error) => {
+            if (slot) {
+              slot.exited = true
+              slot.exitError = error
+              this.evictSlot(slot)
+            }
+            void this.closeTransport(transport).catch(() => undefined)
+          },
+        )
+        this.trackTransport(transport)
+        slot = {
           key,
-          reusable: true,
-          attach: (client, onExit) => bind(client, onExit),
+          baseKey,
+          transport,
+          ready: undefined as unknown as Promise<AttachableRuntime>,
+          idleTimer: undefined,
+          retired: false,
+          exited: false,
+          exitError: undefined,
+          claimed: false,
         }
-        if (!slot.claimed && this.slots.get(key) === slot && !this.closed) {
-          this.armIdleTimer(slot)
+        this.slots.set(key, slot)
+        slot.ready = (async (): Promise<AttachableRuntime> => {
+          try {
+            const initialized = await initializeAcp(transport)
+            if (
+              this.closed ||
+              slot.retired ||
+              slot.exited ||
+              transport.closed
+            ) {
+              throw (
+                slot.exitError ??
+                new Error('Standby ACP runtime closed during startup')
+              )
+            }
+            if (initialized.agentCapabilities?.sessionCapabilities?.list) {
+              await transport
+                .request(transport.rpc.listSessions({ cwd: warmCwd }))
+                .catch(() => undefined)
+            }
+            if (
+              this.closed ||
+              slot.retired ||
+              slot.exited ||
+              transport.closed
+            ) {
+              throw (
+                slot.exitError ??
+                new Error('Standby ACP runtime closed during warmup')
+              )
+            }
+            const runtime: AttachableRuntime = {
+              transport,
+              initialized,
+              key,
+              reusable: true,
+              attach: (client, onExit) => bind(client, onExit),
+            }
+            if (!slot.claimed && this.slots.get(key) === slot && !this.closed) {
+              this.armIdleTimer(slot)
+            }
+            return runtime
+          } catch (error) {
+            this.evictSlot(slot)
+            await this.closeTransport(transport).catch(() => undefined)
+            throw error
+          }
+        })()
+        // Prevent unhandled rejection when background warmup fails or is evicted.
+        void slot.ready.catch(() => undefined)
+        return fingerprint
+      } catch {
+        return undefined
+      } finally {
+        if (this.warming.get(baseKey) === pending) {
+          this.warming.delete(baseKey)
         }
-        return runtime
-      } catch (error) {
-        this.evictSlot(slot)
-        await this.closeTransport(transport).catch(() => undefined)
-        throw error
       }
     })()
-    // Prevent unhandled rejection when background warmup fails or is evicted.
-    void slot.ready.catch(() => undefined)
+    this.warming.set(baseKey, pending)
   }
 
   /** Atomically claim and return a pre-warmed runtime for exclusive session ownership. */
@@ -571,7 +682,16 @@ export class StandbyRuntimePool {
     const launch = effectiveLaunch ?? this.launch
     if (this.closed) return undefined
     if (!isLaunchCwdIndependent(spawnCwd, launch, sessionEnv)) return undefined
-    const key = standbyPoolKey(launch, sessionEnv)
+    const baseKey = standbyPoolKey(launch, sessionEnv)
+    const pendingWarm = this.warming.get(baseKey)
+    const fingerprint = pendingWarm
+      ? await pendingWarm
+      : await this.resolveFingerprint(launch, {
+          env: sessionEnv,
+        }).catch(() => undefined)
+    if (this.closed) return undefined
+    const key = standbyPoolKey(launch, sessionEnv, fingerprint)
+    this.evictStaleSlots(baseKey, key)
     const slot = this.slots.get(key)
     if (!slot) return undefined
     slot.claimed = true
@@ -602,12 +722,12 @@ export class StandbyRuntimePool {
   }
 
   /** Return a clean, healthy, unprompted runtime to standby; returns `false` if caller must close it. */
-  recycle(
+  async recycle(
     runtime: AttachableRuntime,
     effectiveLaunch: ProviderLaunch | undefined,
     spawnCwd: string,
     sessionEnv: Readonly<Record<string, string>> = {},
-  ): boolean {
+  ): Promise<boolean> {
     const launch = effectiveLaunch ?? this.launch
     if (
       this.closed ||
@@ -618,7 +738,14 @@ export class StandbyRuntimePool {
     )
       return false
     if (!isLaunchCwdIndependent(spawnCwd, launch, sessionEnv)) return false
-    const key = standbyPoolKey(launch, sessionEnv)
+    const baseKey = standbyPoolKey(launch, sessionEnv)
+    const fingerprint = await this.resolveFingerprint(launch, {
+      env: sessionEnv,
+    }).catch(() => undefined)
+    if (this.closed || this.maxSlots <= 0 || runtime.transport.closed)
+      return false
+    const key = standbyPoolKey(launch, sessionEnv, fingerprint)
+    this.evictStaleSlots(baseKey, key)
     if (runtime.key !== key) return false
     const existing = this.slots.get(key)
     if (
@@ -633,6 +760,7 @@ export class StandbyRuntimePool {
 
     const slot: StandbySlot = {
       key,
+      baseKey,
       transport: runtime.transport,
       ready: Promise.resolve(runtime),
       idleTimer: undefined,
@@ -719,6 +847,15 @@ export class StandbyRuntimePool {
     slot.retired = true
     this.cancelIdleTimer(slot)
     if (this.slots.get(slot.key) === slot) this.slots.delete(slot.key)
+  }
+
+  private evictStaleSlots(baseKey: string, currentKey: string) {
+    for (const slot of [...this.slots.values()]) {
+      if (slot.baseKey === baseKey && slot.key !== currentKey) {
+        this.evictSlot(slot)
+        void this.closeTransport(slot.transport).catch(() => undefined)
+      }
+    }
   }
 
   private evictToFit() {

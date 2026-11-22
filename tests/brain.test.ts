@@ -15,6 +15,7 @@ import {
 import { join } from 'node:path'
 import {
   advanceForegroundCursor,
+  BackgroundWorkProbe,
   BrainNode,
   BrainTranscriptProjector,
   captureRuntimeEpoch,
@@ -6851,3 +6852,382 @@ test(
     )
   },
 )
+
+type RecordedFileRead = {
+  position: number | null
+  length: number
+  bytesRead: number
+}
+
+type RecordedTranscriptPass = {
+  reset: boolean
+  stepIndices: number[]
+  fileReads: RecordedFileRead[]
+}
+
+function createRecordingReaderFactory() {
+  const passes: RecordedTranscriptPass[] = []
+  let created = 0
+  let activeReads: RecordedFileRead[] = []
+  const recordingOpen: typeof open = async (path, flags, mode) => {
+    const handle = await open(path, flags, mode)
+    return {
+      stat: () => handle.stat(),
+      close: () => handle.close(),
+      read: async (
+        buffer: Buffer,
+        offset: number,
+        length: number,
+        position: number | null,
+      ) => {
+        const result = await handle.read(buffer, offset, length, position)
+        activeReads.push({ position, length, bytesRead: result.bytesRead })
+        return result
+      },
+    } as unknown as Awaited<ReturnType<typeof open>>
+  }
+  class RecordingTranscriptReader extends TranscriptReader {
+    constructor() {
+      super(recordingOpen)
+      created++
+    }
+    override async read(root: string, nativeId: string) {
+      const fileReads: RecordedFileRead[] = []
+      activeReads = fileReads
+      const result = await super.read(root, nativeId)
+      passes.push({
+        reset: result.reset,
+        stepIndices: result.rows.map((row) => Number(row.step_index)),
+        fileReads,
+      })
+      return result
+    }
+  }
+  return {
+    passes,
+    createdCount: () => created,
+    createReader: () => new RecordingTranscriptReader(),
+  }
+}
+
+test('BackgroundWorkProbe reads incrementally across appends and tracks background task lifecycle', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+  const spy = createRecordingReaderFactory()
+  const probe = new BackgroundWorkProbe(spy.createReader)
+  const taskId = `${parent}/task-bg-1`
+
+  const initialRows: Row[] = [
+    { step_index: 0, type: 'USER_INPUT', content: 'x'.repeat(16_384) },
+    done(1, 'idle'),
+  ]
+  const initialSize = Buffer.byteLength(encode(initialRows))
+  await f.put(parent, initialRows)
+
+  assert.equal(await probe.hasActiveWork(f.root, parent), false)
+  assert.equal(spy.createdCount(), 1)
+  assert.equal(spy.passes.length, 1)
+  assert.equal(spy.passes[0].reset, true)
+  assert.deepEqual(spy.passes[0].stepIndices, [0, 1])
+  assert.deepEqual(spy.passes[0].fileReads, [
+    { position: 0, length: initialSize, bytesRead: initialSize },
+  ])
+
+  const startTaskBytes = encode([
+    {
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          id: 'bg-1',
+          name: 'run_command',
+          args: { CommandLine: 'sleep 30' },
+        },
+      ],
+    },
+    {
+      step_index: 3,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: `Tool is running as a background task with task id: ${taskId}\n`,
+    },
+  ])
+  const startTaskSize = Buffer.byteLength(startTaskBytes)
+  await appendFile(f.path(parent), startTaskBytes)
+
+  assert.equal(await probe.hasActiveWork(f.root, parent), true)
+  assert.equal(spy.createdCount(), 1)
+  assert.equal(spy.passes.length, 2)
+  assert.equal(spy.passes[1].reset, false)
+  assert.deepEqual(spy.passes[1].stepIndices, [2, 3])
+  assert.deepEqual(spy.passes[1].fileReads.at(-1), {
+    position: initialSize,
+    length: startTaskSize,
+    bytesRead: startTaskSize,
+  })
+
+  const finishTaskBytes = encode([
+    {
+      step_index: 4,
+      type: 'SYSTEM_MESSAGE',
+      content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-08T17:00:00Z sender=${taskId} priority=MESSAGE_PRIORITY_HIGH content=Task id "${taskId}" finished with result:\nCommand exited with code 0.\n</SYSTEM_MESSAGE>`,
+    },
+    done(5, 'all done'),
+  ])
+  const finishTaskSize = Buffer.byteLength(finishTaskBytes)
+  await appendFile(f.path(parent), finishTaskBytes)
+
+  assert.equal(await probe.hasActiveWork(f.root, parent), false)
+  assert.equal(spy.createdCount(), 1)
+  assert.equal(spy.passes.length, 3)
+  assert.equal(spy.passes[2].reset, false)
+  assert.deepEqual(spy.passes[2].stepIndices, [4, 5])
+  assert.deepEqual(spy.passes[2].fileReads.at(-1), {
+    position: initialSize + startTaskSize,
+    length: finishTaskSize,
+    bytesRead: finishTaskSize,
+  })
+})
+
+test('BackgroundWorkProbe respects includeDaemons, recovers from O_TRUNC rewrites, and resets on runtimeEpoch change', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+  const spy = createRecordingReaderFactory()
+  const probe = new BackgroundWorkProbe(spy.createReader)
+  const daemonTaskId = `${parent}/task-daemon`
+  const rewriteTaskId = `${parent}/task-rewrite`
+
+  await f.put(parent, [
+    { step_index: 0, type: 'USER_INPUT', content: 'schedule cron' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          id: 'cron-1',
+          name: 'schedule',
+          args: {
+            CronExpression: '*/5 * * * *',
+            IsDaemon: true,
+            Prompt: 'tick',
+          },
+        },
+      ],
+    },
+    {
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: `Tool is running as a background task with task id: ${daemonTaskId}\n`,
+    },
+    done(3, 'scheduled'),
+  ])
+
+  assert.equal(
+    await probe.hasActiveWork(f.root, parent, { includeDaemons: false }),
+    false,
+  )
+  assert.equal(
+    await probe.hasActiveWork(f.root, parent, { includeDaemons: true }),
+    true,
+  )
+  assert.equal(spy.createdCount(), 1)
+  assert.equal(spy.passes[1].reset, false)
+  assert.deepEqual(spy.passes[1].stepIndices, [])
+
+  // In-place O_TRUNC rewrite replacing the daemon with a non-daemon background task.
+  await f.rewrite(parent, [
+    { step_index: 0, type: 'USER_INPUT', content: 'rewritten' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          id: 'bg-rw',
+          name: 'run_command',
+          args: { CommandLine: 'sleep 10' },
+        },
+      ],
+    },
+    {
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: `Tool is running as a background task with task id: ${rewriteTaskId}\n`,
+    },
+  ])
+
+  assert.equal(await probe.hasActiveWork(f.root, parent), true)
+  assert.equal(spy.createdCount(), 1)
+  assert.equal(spy.passes[2].reset, true)
+  assert.deepEqual(spy.passes[2].stepIndices, [0, 1, 2])
+
+  // Capturing a new runtimeEpoch fences the pre-epoch background task and resets probe state.
+  const epoch = await captureRuntimeEpoch(f.root, parent)
+  assert.ok(epoch)
+  assert.equal(
+    await probe.hasActiveWork(f.root, parent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    false,
+  )
+  assert.equal(spy.createdCount(), 2)
+  assert.equal(spy.passes[3].reset, true)
+
+  // Post-epoch unread/read wakeup tracking works incrementally and survives O_TRUNC under the same epoch.
+  await f.deliver(parent, child, 'fresh', true, 'msg-fresh')
+  assert.equal(
+    await probe.hasActiveWork(f.root, parent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    true,
+  )
+  assert.equal(spy.createdCount(), 2)
+  assert.equal(spy.passes[4].reset, false)
+
+  await appendFile(
+    f.path(parent),
+    encode([message(3, child, 'fresh'), done(4, 'handled')]),
+  )
+  assert.equal(
+    await probe.hasActiveWork(f.root, parent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    false,
+  )
+  assert.equal(spy.createdCount(), 2)
+  assert.equal(spy.passes[5].reset, false)
+  assert.deepEqual(spy.passes[5].stepIndices, [3, 4])
+
+  await f.rewrite(parent, [
+    { step_index: 0, type: 'USER_INPUT', content: 'rewritten' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          id: 'bg-rw',
+          name: 'run_command',
+          args: { CommandLine: 'sleep 10' },
+        },
+      ],
+    },
+    {
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: `Tool is running as a background task with task id: ${rewriteTaskId}\n`,
+    },
+    message(3, child, 'fresh'),
+    done(4, 'handled after rewrite'),
+  ])
+  assert.equal(
+    await probe.hasActiveWork(f.root, parent, {
+      includeDaemons: true,
+      runtimeEpoch: epoch,
+    }),
+    false,
+  )
+  assert.equal(spy.createdCount(), 2)
+  assert.equal(spy.passes[6].reset, true)
+})
+
+test('BackgroundWorkProbe.sync warms the cursor and serializes concurrent calls on the lane', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+  const spy = createRecordingReaderFactory()
+  const probe = new BackgroundWorkProbe(spy.createReader)
+  const taskId = `${parent}/task-sync`
+
+  const initialRows: Row[] = [
+    { step_index: 0, type: 'USER_INPUT', content: 'y'.repeat(16_384) },
+    done(1, 'warm'),
+  ]
+  const initialSize = Buffer.byteLength(encode(initialRows))
+  await f.put(parent, initialRows)
+
+  await probe.sync(f.root, parent)
+  assert.equal(spy.createdCount(), 1)
+  assert.equal(spy.passes.length, 1)
+  assert.equal(spy.passes[0].reset, true)
+  assert.deepEqual(spy.passes[0].stepIndices, [0, 1])
+
+  assert.equal(await probe.hasActiveWork(f.root, parent), false)
+  assert.equal(spy.createdCount(), 1)
+  assert.equal(spy.passes.length, 2)
+  assert.equal(spy.passes[1].reset, false)
+  assert.deepEqual(spy.passes[1].stepIndices, [])
+  const probeBytesRead = spy.passes[1].fileReads.reduce(
+    (sum, r) => sum + r.bytesRead,
+    0,
+  )
+  assert.ok(
+    probeBytesRead < initialSize,
+    `expected warmed hasActiveWork to avoid rescanning full ${initialSize}-byte transcript (read ${probeBytesRead})`,
+  )
+
+  // Concurrent sync() + hasActiveWork() serialize without interleaving on the shared reader.
+  const readerGate = createGatedChildReader(parent)
+  let inFlightReads = 0
+  let maxConcurrentReads = 0
+  const serializedOrder: string[] = []
+  const gatedProbe = new BackgroundWorkProbe(() => {
+    const inner = readerGate.createTranscriptReader()
+    return new (class extends TranscriptReader {
+      override async read(root: string, nativeId: string) {
+        inFlightReads++
+        maxConcurrentReads = Math.max(maxConcurrentReads, inFlightReads)
+        try {
+          return await inner.read(root, nativeId)
+        } finally {
+          inFlightReads--
+        }
+      }
+    })()
+  })
+  t.after(() => readerGate.release())
+  readerGate.arm()
+  const syncPromise = gatedProbe
+    .sync(f.root, parent)
+    .then(() => serializedOrder.push('sync'))
+  await readerGate.entered
+  await appendFile(
+    f.path(parent),
+    encode([
+      {
+        step_index: 2,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          {
+            id: 'bg-sync',
+            name: 'run_command',
+            args: { CommandLine: 'sleep 20' },
+          },
+        ],
+      },
+      {
+        step_index: 3,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: `Tool is running as a background task with task id: ${taskId}\n`,
+      },
+    ]),
+  )
+  const activePromise = gatedProbe.hasActiveWork(f.root, parent).then((res) => {
+    serializedOrder.push('hasActiveWork')
+    return res
+  })
+  readerGate.release()
+  const [, active] = await Promise.all([syncPromise, activePromise])
+  assert.equal(active, true)
+  assert.equal(maxConcurrentReads, 1)
+  assert.deepEqual(serializedOrder, ['sync', 'hasActiveWork'])
+})
