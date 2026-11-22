@@ -62,7 +62,6 @@ import {
   resolveSpawnCwd,
 } from './preflight.ts'
 import {
-  CONTROL_CLIENT,
   SKIP_PERMISSIONS_FLAG,
   createAttachableTransport,
   hasSkipPermissionsFlag,
@@ -1205,10 +1204,6 @@ async function createSession(
         key: standbyPoolKey(runLaunch, sessionEnv),
         reusable: isLaunchCwdIndependent(spawnCwd, runLaunch, sessionEnv),
         attach: (nextClient, nextOnExit) => bind(nextClient, nextOnExit),
-        detachToIdle: () =>
-          bind(CONTROL_CLIENT, () => {
-            void transport.close().catch(() => undefined)
-          }),
       }),
     }
   }
@@ -1229,7 +1224,7 @@ async function createSession(
     warmInitial.attach(sessionClient, sessionOnExit)
     trackSessionTransport(currentTransport)
   } else {
-    if (warmInitial) void warmInitial.transport.close().catch(() => undefined)
+    if (warmInitial) await warmInitial.transport.close().catch(() => undefined)
     const started = startColdRuntime(state.skipPermissions)
     currentTransport = started.transport
     try {
@@ -1421,8 +1416,15 @@ async function createSession(
           spawnCwd,
           sessionEnv,
         )
-        if (!isRetireAlive(obsolete)) {
-          if (warmNext) void warmNext.transport.close().catch(() => undefined)
+        let alive = false
+        try {
+          alive = isRetireAlive(obsolete)
+        } catch (error) {
+          if (warmNext) await warmNext.transport.close().catch(() => undefined)
+          throw error
+        }
+        if (!alive) {
+          if (warmNext) await warmNext.transport.close().catch(() => undefined)
           return
         }
         let next: ControlTransport
@@ -1439,7 +1441,7 @@ async function createSession(
           trackSessionTransport(next)
           replenishStandby(skipPermissions)
         } else {
-          if (warmNext) void warmNext.transport.close().catch(() => undefined)
+          if (warmNext) await warmNext.transport.close().catch(() => undefined)
           const started = startColdRuntime(skipPermissions)
           next = started.transport
           toAttachable = started.toAttachable
@@ -1745,6 +1747,12 @@ async function createSession(
             state.ready &&
             closeOk &&
             !state.failed &&
+            !state.skipPermissions &&
+            !hasSkipPermissionsFlag(launch) &&
+            controlActive === 0 &&
+            !state.loading &&
+            !state.interrupting &&
+            !retiring.has(currentTransport) &&
             state.prompts.size === 0 &&
             mcpServerNames.length === 0 &&
             currentAttachable !== undefined &&

@@ -850,8 +850,8 @@ test('StandbyRuntimePool warms with initialize + listSessions, joins in-flight w
       outcome: { outcome: 'selected', optionId: 'allow' },
     })
 
-    // Detach reverts to CONTROL_CLIENT so old session receives nothing further.
-    runtime.detachToIdle()
+    // Recycling reverts to CONTROL_CLIENT so the old session receives nothing further.
+    assert.equal(pool.recycle(runtime, launch, home, {}), true)
     await fake.created[0].client.sessionUpdate({
       sessionId: 'sess-2',
       update: {
@@ -868,7 +868,8 @@ test('StandbyRuntimePool warms with initialize + listSessions, joins in-flight w
     assert.deepEqual(idlePerm, { outcome: { outcome: 'cancelled' } })
     assert.deepEqual(exits, [])
 
-    await runtime.transport.close()
+    await pool.close()
+    assert.equal(fake.created[0].closeCalled(), 1)
   } finally {
     await pool.close()
     await rm(home, { recursive: true, force: true })
@@ -1530,6 +1531,397 @@ test('ProviderConnection.close shuts down active sessions, shared control runtim
     allPids.forEach(assertProcessExited)
   } finally {
     await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+function createControlledSessionConnect(
+  scripts: readonly {
+    newSessionId?: string
+    onSetConfigOption?: () => Promise<void>
+    onListSessions?: () => Promise<void>
+    onClose?: () => Promise<void>
+  }[],
+) {
+  const created: Array<{
+    closeCalled: () => number
+    triggerExit: (error: Error) => void
+  }> = []
+  const connect: typeof connectAcp = (_launch, _cwd, _env, client, onExit) => {
+    const script = scripts[created.length] ?? {}
+    const closedBarrier = deferred<void>()
+    let isClosed = false
+    let closeCalls = 0
+    let closing: Promise<void> | undefined
+    const configOptions = [
+      {
+        id: 'model',
+        name: 'Model',
+        type: 'select' as const,
+        currentValue: 'test',
+        options: [
+          { value: 'test', name: 'Test' },
+          { value: 'other', name: 'Other' },
+        ],
+      },
+      {
+        id: 'mode',
+        name: 'Mode',
+        category: 'mode' as const,
+        type: 'select' as const,
+        currentValue: 'default',
+        options: [
+          { value: 'default', name: 'Default' },
+          { value: 'accept-edits', name: 'Accept edits' },
+        ],
+      },
+    ]
+    const rpc = {
+      closed: closedBarrier.promise,
+      initialize: async () => ({
+        protocolVersion: 1,
+        agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
+        agentCapabilities: {
+          loadSession: true,
+          sessionCapabilities: { list: {}, resume: {} },
+        },
+      }),
+      newSession: async () => {
+        const sessionId =
+          script.newSessionId ?? '11111111-1111-4111-8111-111111111111'
+        void client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'available_commands_update',
+            availableCommands: [],
+          },
+        })
+        return { sessionId, configOptions }
+      },
+      loadSession: async () => ({ configOptions }),
+      resumeSession: async () => ({ configOptions }),
+      listSessions: async () => {
+        if (script.onListSessions) await script.onListSessions()
+        return { sessions: [] }
+      },
+      closeSession: async () => ({}),
+      setSessionConfigOption: async (params: {
+        configId: string
+        value: string
+      }) => {
+        if (script.onSetConfigOption) await script.onSetConfigOption()
+        return {
+          configOptions: configOptions.map((o) =>
+            o.id === params.configId ? { ...o, currentValue: params.value } : o,
+          ),
+        }
+      },
+      prompt: async () => ({ stopReason: 'end_turn' as const }),
+      cancel: async () => {},
+    } as unknown as ControlTransport['rpc']
+    const transport: ControlTransport = {
+      rpc,
+      exited: closedBarrier.promise,
+      stopped: closedBarrier.promise,
+      close: () => {
+        if (closing) return closing
+        closeCalls++
+        isClosed = true
+        closing = (async () => {
+          if (script.onClose) await script.onClose()
+          closedBarrier.resolve()
+        })()
+        return closing
+      },
+      request: async (op) => op,
+      get closed() {
+        return isClosed
+      },
+      get tier() {
+        return undefined
+      },
+      get models() {
+        return undefined
+      },
+    }
+    created.push({
+      closeCalled: () => closeCalls,
+      triggerExit: (error) => {
+        isClosed = true
+        onExit(error)
+      },
+    })
+    return transport
+  }
+  return { connect, created }
+}
+
+test('replaceRuntime racing with session.close awaits closing checked-out standby transport', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-replace-close-race-'))
+  const env = isolatedEnv(home)
+  const launch: ProviderLaunch = { command: 'agy', args: ['acp'], env }
+  const warmupEntered = deferred<void>()
+  const releaseWarmup = deferred<void>()
+  const takeEntered = deferred<void>()
+  const standbyCloseEntered = deferred<void>()
+  const releaseStandbyClose = deferred<void>()
+  const fake = createControlledSessionConnect([
+    // #1: initial full-access session
+    {},
+    // #2: standby runtime for default mode, paused during warmup and close
+    {
+      onListSessions: async () => {
+        warmupEntered.resolve()
+        await releaseWarmup.promise
+      },
+      onClose: async () => {
+        standbyCloseEntered.resolve()
+        await releaseStandbyClose.promise
+      },
+    },
+  ])
+  const onTake = [() => {}, () => takeEntered.resolve()]
+  class ObservingStandbyPool extends StandbyRuntimePool {
+    override take(...args: Parameters<StandbyRuntimePool['take']>) {
+      onTake.shift()?.()
+      return super.take(...args)
+    }
+  }
+  const pool = new ObservingStandbyPool({ launch, connectAcp: fake.connect })
+  const collector = createEventCollector()
+  const manager = new SessionManager({
+    launch,
+    usage: new AgyUsageSource({ env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: collector.emit,
+    connectAcp: fake.connect,
+    standby: pool,
+  })
+  try {
+    await manager.handle({
+      type: 'session.open',
+      requestId: 'open-fa',
+      sessionId: 'fa',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+        mode: 'full-access',
+      },
+      history: 'skip',
+    })
+    await collector.wait((e) => e.type === 'session.ready')
+
+    // Start warming default standby; leave its listSessions pending so replaceRuntime awaits take().
+    pool.warm(launch, home, {})
+    await warmupEntered.promise
+
+    // Toggle full-access -> default triggers replaceRuntime(), which enters standby.take().
+    let configureDone = false
+    const configuring = manager
+      .handle({
+        type: 'session.configure',
+        requestId: 'cfg-default',
+        sessionId: 'fa',
+        changes: { mode: 'default' },
+      })
+      .finally(() => {
+        configureDone = true
+      })
+    void configuring.catch(() => undefined)
+    await takeEntered.promise
+
+    // Close the session while replaceRuntime is awaiting standby.take().
+    await manager.handle({
+      type: 'session.close',
+      requestId: 'close-fa',
+      sessionId: 'fa',
+    })
+    releaseWarmup.resolve()
+
+    // replaceRuntime must await standby transport close before settling.
+    await standbyCloseEntered.promise
+    assert.equal(configureDone, false)
+    releaseStandbyClose.resolve()
+    await assert.rejects(configuring, /Session is closing/)
+    assert.equal(fake.created[1].closeCalled(), 1)
+  } finally {
+    await Promise.all([manager.close(), pool.close()])
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('unprompted full-access and --dangerously-skip-permissions drafts never recycle into StandbyRuntimePool', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-standby-no-fullaccess-'))
+  const rpcPidLog = join(home, 'rpc-pids.log')
+  const env = isolatedEnv(home, { AGY_TEST_RPC_PID_LOG: rpcPidLog })
+  const baseLaunch: ProviderLaunch = {
+    command: process.execPath,
+    args: [mockAcpPath],
+    env,
+  }
+  const skipLaunch: ProviderLaunch = {
+    command: process.execPath,
+    args: [mockAcpPath, '--dangerously-skip-permissions'],
+    env,
+  }
+  const pool = new StandbyRuntimePool({ launch: baseLaunch })
+  const skipPool = new StandbyRuntimePool({ launch: skipLaunch })
+  const collector = createEventCollector()
+  const manager = new SessionManager({
+    launch: baseLaunch,
+    usage: new AgyUsageSource({ env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: collector.emit,
+    standby: pool,
+  })
+  const skipManager = new SessionManager({
+    launch: skipLaunch,
+    usage: new AgyUsageSource({ env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: collector.emit,
+    standby: skipPool,
+  })
+  try {
+    // 1. Session opened in full-access mode must stop on close rather than recycling.
+    await manager.handle({
+      type: 'session.open',
+      requestId: 'open-fa',
+      sessionId: 'fa',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+        mode: 'full-access',
+      },
+      history: 'skip',
+    })
+    await collector.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 'fa',
+    )
+    const [faPid] = uniqueMethodPids(await readRpcPidLog(rpcPidLog), 'new')
+    await manager.handle({
+      type: 'session.close',
+      requestId: 'close-fa',
+      sessionId: 'fa',
+    })
+    await collector.wait(
+      (e) => e.type === 'session.closed' && e.sessionId === 'fa',
+    )
+    assertProcessExited(faPid)
+    assert.equal(await pool.take(skipLaunch, home, {}), undefined)
+    assert.equal(await pool.take(baseLaunch, home, {}), undefined)
+
+    // 2. Connection-level --dangerously-skip-permissions draft must also stop rather than recycling.
+    await skipManager.handle({
+      type: 'session.open',
+      requestId: 'open-skip',
+      sessionId: 'skip-draft',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+      history: 'skip',
+    })
+    await collector.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 'skip-draft',
+    )
+    const skipPid = uniqueMethodPids(await readRpcPidLog(rpcPidLog), 'new')[1]
+    await skipManager.handle({
+      type: 'session.close',
+      requestId: 'close-skip',
+      sessionId: 'skip-draft',
+    })
+    await collector.wait(
+      (e) => e.type === 'session.closed' && e.sessionId === 'skip-draft',
+    )
+    assertProcessExited(skipPid)
+    assert.equal(await skipPool.take(skipLaunch, home, {}), undefined)
+  } finally {
+    await Promise.all([
+      manager.close(),
+      skipManager.close(),
+      pool.close(),
+      skipPool.close(),
+    ])
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('draft session.close while session.configure is in flight stops instead of recycling', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-close-during-config-'))
+  const env = isolatedEnv(home)
+  const launch: ProviderLaunch = { command: 'agy', args: ['acp'], env }
+  const cfgEntered = deferred<void>()
+  const releaseCfg = deferred<void>()
+  const fake = createControlledSessionConnect([
+    {
+      onSetConfigOption: async () => {
+        cfgEntered.resolve()
+        await releaseCfg.promise
+      },
+    },
+  ])
+  const pool = new StandbyRuntimePool({ launch, connectAcp: fake.connect })
+  const collector = createEventCollector()
+  const manager = new SessionManager({
+    launch,
+    usage: new AgyUsageSource({ env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: collector.emit,
+    connectAcp: fake.connect,
+    standby: pool,
+  })
+  try {
+    await manager.handle({
+      type: 'session.open',
+      requestId: 'open-draft',
+      sessionId: 'draft',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+      history: 'skip',
+    })
+    await collector.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 'draft',
+    )
+
+    const configuring = manager
+      .handle({
+        type: 'session.configure',
+        requestId: 'cfg-model',
+        sessionId: 'draft',
+        changes: { model: 'other' },
+      })
+      .catch(() => undefined)
+    await cfgEntered.promise
+
+    await manager.handle({
+      type: 'session.close',
+      requestId: 'close-draft',
+      sessionId: 'draft',
+    })
+    await collector.wait(
+      (e) => e.type === 'session.closed' && e.sessionId === 'draft',
+    )
+    releaseCfg.resolve()
+    await configuring
+
+    assert.equal(fake.created[0].closeCalled(), 1)
+    assert.equal(await pool.take(launch, home, {}), undefined)
+  } finally {
+    await Promise.all([manager.close(), pool.close()])
     await rm(home, { recursive: true, force: true })
   }
 })

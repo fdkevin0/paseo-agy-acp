@@ -50,7 +50,6 @@ export interface AttachableRuntime {
   readonly key: string
   readonly reusable: boolean
   attach(client: AcpClient, onExit: (error: Error) => void): void
-  detachToIdle(): void
 }
 
 const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60_000
@@ -545,10 +544,6 @@ export class StandbyRuntimePool {
           key,
           reusable: true,
           attach: (client, onExit) => bind(client, onExit),
-          detachToIdle: () =>
-            bind(CONTROL_CLIENT, () => {
-              void transport.close().catch(() => undefined)
-            }),
         }
         if (!slot.claimed && this.slots.get(key) === slot && !this.closed) {
           this.armIdleTimer(slot)
@@ -615,7 +610,8 @@ export class StandbyRuntimePool {
       this.closed ||
       this.maxSlots <= 0 ||
       !runtime.reusable ||
-      runtime.transport.closed
+      runtime.transport.closed ||
+      hasSkipPermissionsFlag(launch)
     )
       return false
     if (!isLaunchCwdIndependent(spawnCwd, launch, sessionEnv)) return false
@@ -632,7 +628,6 @@ export class StandbyRuntimePool {
     if (existing) this.evictSlot(existing)
     this.evictToFit()
 
-    runtime.detachToIdle()
     const slot: StandbySlot = {
       key,
       transport: runtime.transport,
