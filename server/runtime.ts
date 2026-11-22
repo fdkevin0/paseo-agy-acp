@@ -1,13 +1,18 @@
-/** Shared ACP initialization and idle-reaped control runtime for stateless provider probes. */
+/** Shared ACP initialization, idle-reaped control runtime, and pre-warmed standby runtime pool. */
+import { createHash } from 'node:crypto'
+import { statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk/unstable'
 import type { ProviderLaunch } from '@getpaseo/plugin/server/provider'
 import { PACKAGE_VERSION } from './common.ts'
 import { agyVersionDiagnostic, isCwdIndependentLaunch } from './preflight.ts'
-import { connectAcp } from './transport.ts'
+import { connectAcp, type AcpClient } from './transport.ts'
 
 export type ControlTransport = ReturnType<typeof connectAcp>
+export type InitializedAcp = Awaited<ReturnType<typeof initializeAcp>>
+
+export const SKIP_PERMISSIONS_FLAG = '--dangerously-skip-permissions'
 
 export interface ControlLease {
   readonly transport: ControlTransport
@@ -31,19 +36,143 @@ export interface SharedControlRuntimeOptions {
   scheduler?: IdleTimerScheduler
 }
 
+export interface StandbyRuntimePoolOptions {
+  launch?: ProviderLaunch
+  connectAcp?: typeof connectAcp
+  idleTimeoutMs?: number
+  maxSlots?: number
+  scheduler?: IdleTimerScheduler
+}
+
+export interface AttachableRuntime {
+  readonly transport: ControlTransport
+  readonly initialized: InitializedAcp
+  readonly key: string
+  readonly reusable: boolean
+  attach(client: AcpClient, onExit: (error: Error) => void): void
+  detachToIdle(): void
+}
+
 const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60_000
+const DEFAULT_MAX_STANDBY_SLOTS = 4
 
 const defaultScheduler: IdleTimerScheduler = {
   setTimeout: (fn, ms) => setTimeout(fn, ms),
   clearTimeout: (handle) => clearTimeout(handle as NodeJS.Timeout),
 }
 
-const CONTROL_CLIENT = {
+export const CONTROL_CLIENT: AcpClient = {
   sessionUpdate: async () => {},
   requestPermission: async () => ({
     outcome: { outcome: 'cancelled' as const },
   }),
   requestElicitation: async () => ({ action: 'cancel' }),
+}
+
+/** Whether a launch configuration includes `--dangerously-skip-permissions`. */
+export function hasSkipPermissionsFlag(launch?: ProviderLaunch): boolean {
+  return Boolean(launch?.args?.includes(SKIP_PERMISSIONS_FLAG))
+}
+
+/** Whether a single ACP process is valid across working directories for this launch and env. */
+export function isLaunchCwdIndependent(
+  spawnCwd: string,
+  launch?: ProviderLaunch,
+  env: Readonly<Record<string, string>> = {},
+): boolean {
+  const fallbackHome = env.HOME ?? launch?.env?.HOME ?? homedir()
+  return (
+    isCwdIndependentLaunch(spawnCwd, fallbackHome, launch, env, fallbackHome) &&
+    isCwdIndependentLaunch(
+      spawnCwd,
+      join(spawnCwd, '__paseo_cwd_probe__'),
+      launch,
+      env,
+      fallbackHome,
+    )
+  )
+}
+
+/** Canonical SHA-256 standby pool key covering command, args, and resolved environment. */
+export function standbyPoolKey(
+  launch?: ProviderLaunch,
+  env: Readonly<Record<string, string>> = {},
+): string {
+  const merged: Record<string, string | undefined> = {
+    ...(launch?.env ?? process.env),
+    ...env,
+  }
+  const sortedEnv = Object.entries(merged)
+    .filter((entry): entry is [string, string] => entry[1] !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  return createHash('sha256')
+    .update(
+      JSON.stringify([
+        launch?.command ?? 'agy',
+        launch?.args ?? ['acp'],
+        sortedEnv,
+      ]),
+    )
+    .digest('hex')
+}
+
+function isExistingDirectorySync(path: string): boolean {
+  try {
+    return statSync(path).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+function resolveWarmCwd(
+  spawnCwd: string,
+  launch?: ProviderLaunch,
+  env: Readonly<Record<string, string>> = {},
+): string {
+  const fallbackHome = env.HOME ?? launch?.env?.HOME ?? homedir()
+  if (spawnCwd === fallbackHome) return spawnCwd
+  return isExistingDirectorySync(fallbackHome) ? fallbackHome : spawnCwd
+}
+
+/** Connect an ACP transport whose client and exit callbacks can be rebound without respawning. */
+export function createAttachableTransport(
+  connect: typeof connectAcp,
+  launch: ProviderLaunch | undefined,
+  cwd: string,
+  env: Readonly<Record<string, string>>,
+  initialClient: AcpClient,
+  initialOnExit: (error: Error) => void,
+): {
+  transport: ControlTransport
+  bind: (client: AcpClient, onExit: (error: Error) => void) => void
+} {
+  const binding = {
+    client: initialClient,
+    onExit: initialOnExit,
+  }
+  const transport = connect(
+    launch,
+    cwd,
+    env,
+    {
+      sessionUpdate: (params) => binding.client.sessionUpdate(params),
+      requestPermission: (params) => binding.client.requestPermission(params),
+      requestElicitation: (params) =>
+        binding.client.requestElicitation
+          ? binding.client.requestElicitation(params)
+          : Promise.resolve({ action: 'cancel' }),
+    },
+    (error) => {
+      binding.onExit(error)
+    },
+  )
+  return {
+    transport,
+    bind: (client, onExit) => {
+      binding.client = client
+      binding.onExit = onExit
+    },
+  }
 }
 
 /** Run ACP `initialize` and reject runtimes below the minimum supported `agy` version. */
@@ -97,23 +226,7 @@ export class SharedControlRuntime {
 
   /** Whether a single shared control runtime is valid across working directories for this launch. */
   isReusable(spawnCwd: string): boolean {
-    const fallbackHome = this.launch?.env?.HOME ?? homedir()
-    return (
-      isCwdIndependentLaunch(
-        spawnCwd,
-        fallbackHome,
-        this.launch,
-        {},
-        fallbackHome,
-      ) &&
-      isCwdIndependentLaunch(
-        spawnCwd,
-        join(spawnCwd, '__paseo_cwd_probe__'),
-        this.launch,
-        {},
-        fallbackHome,
-      )
-    )
+    return isLaunchCwdIndependent(spawnCwd, this.launch)
   }
 
   async run<T>(
@@ -316,6 +429,306 @@ export class SharedControlRuntime {
       return await fn(lease)
     } finally {
       await this.closeTransport(transport).catch(() => undefined)
+    }
+  }
+}
+
+interface StandbySlot {
+  readonly key: string
+  readonly transport: ControlTransport
+  ready: Promise<AttachableRuntime>
+  idleTimer: IdleTimerHandle | undefined
+  retired: boolean
+  exited: boolean
+  exitError: Error | undefined
+  claimed: boolean
+}
+
+/**
+ * Maintain a bounded, idle-reaped pool of pre-warmed `agy acp` runtimes keyed by launch
+ * command/args/environment for exclusive checkout by interactive sessions on cwd-independent
+ * launches.
+ */
+export class StandbyRuntimePool {
+  private readonly launch: ProviderLaunch | undefined
+  private readonly connect: typeof connectAcp
+  private readonly idleTimeoutMs: number
+  private readonly maxSlots: number
+  private readonly scheduler: IdleTimerScheduler
+  private readonly slots = new Map<string, StandbySlot>()
+  private readonly transports = new Set<ControlTransport>()
+  private readonly watchedStops = new WeakSet<ControlTransport>()
+  private closed = false
+  private closing: Promise<void> | undefined
+
+  constructor(options: StandbyRuntimePoolOptions = {}) {
+    this.launch = options.launch
+    this.connect = options.connectAcp ?? connectAcp
+    this.idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS
+    this.maxSlots = options.maxSlots ?? DEFAULT_MAX_STANDBY_SLOTS
+    this.scheduler = options.scheduler ?? defaultScheduler
+  }
+
+  /** Start warming one standby runtime in the background if the slot is empty and reusable. */
+  warm(
+    effectiveLaunch: ProviderLaunch | undefined,
+    spawnCwd: string,
+    sessionEnv: Readonly<Record<string, string>> = {},
+  ): void {
+    const launch = effectiveLaunch ?? this.launch
+    if (this.closed || this.maxSlots <= 0) return
+    if (!isLaunchCwdIndependent(spawnCwd, launch, sessionEnv)) return
+    const key = standbyPoolKey(launch, sessionEnv)
+    const existing = this.slots.get(key)
+    if (
+      existing &&
+      !existing.retired &&
+      !existing.exited &&
+      !existing.transport.closed
+    )
+      return
+    if (existing) this.evictSlot(existing)
+    this.evictToFit()
+
+    const warmCwd = resolveWarmCwd(spawnCwd, launch, sessionEnv)
+    let slot!: StandbySlot
+    const { transport, bind } = createAttachableTransport(
+      this.connect,
+      launch,
+      warmCwd,
+      sessionEnv,
+      CONTROL_CLIENT,
+      (error) => {
+        if (slot) {
+          slot.exited = true
+          slot.exitError = error
+          this.evictSlot(slot)
+        }
+        void this.closeTransport(transport).catch(() => undefined)
+      },
+    )
+    this.trackTransport(transport)
+    slot = {
+      key,
+      transport,
+      ready: undefined as unknown as Promise<AttachableRuntime>,
+      idleTimer: undefined,
+      retired: false,
+      exited: false,
+      exitError: undefined,
+      claimed: false,
+    }
+    this.slots.set(key, slot)
+    slot.ready = (async (): Promise<AttachableRuntime> => {
+      try {
+        const initialized = await initializeAcp(transport)
+        if (this.closed || slot.retired || slot.exited || transport.closed) {
+          throw (
+            slot.exitError ??
+            new Error('Standby ACP runtime closed during startup')
+          )
+        }
+        if (initialized.agentCapabilities?.sessionCapabilities?.list) {
+          await transport
+            .request(transport.rpc.listSessions({ cwd: warmCwd }))
+            .catch(() => undefined)
+        }
+        if (this.closed || slot.retired || slot.exited || transport.closed) {
+          throw (
+            slot.exitError ??
+            new Error('Standby ACP runtime closed during warmup')
+          )
+        }
+        const runtime: AttachableRuntime = {
+          transport,
+          initialized,
+          key,
+          reusable: true,
+          attach: (client, onExit) => bind(client, onExit),
+          detachToIdle: () =>
+            bind(CONTROL_CLIENT, () => {
+              void transport.close().catch(() => undefined)
+            }),
+        }
+        if (!slot.claimed && this.slots.get(key) === slot && !this.closed) {
+          this.armIdleTimer(slot)
+        }
+        return runtime
+      } catch (error) {
+        this.evictSlot(slot)
+        await this.closeTransport(transport).catch(() => undefined)
+        throw error
+      }
+    })()
+    // Prevent unhandled rejection when background warmup fails or is evicted.
+    void slot.ready.catch(() => undefined)
+  }
+
+  /** Atomically claim and return a pre-warmed runtime for exclusive session ownership. */
+  async take(
+    effectiveLaunch: ProviderLaunch | undefined,
+    spawnCwd: string,
+    sessionEnv: Readonly<Record<string, string>> = {},
+  ): Promise<AttachableRuntime | undefined> {
+    const launch = effectiveLaunch ?? this.launch
+    if (this.closed) return undefined
+    if (!isLaunchCwdIndependent(spawnCwd, launch, sessionEnv)) return undefined
+    const key = standbyPoolKey(launch, sessionEnv)
+    const slot = this.slots.get(key)
+    if (!slot) return undefined
+    slot.claimed = true
+    this.slots.delete(key)
+    this.cancelIdleTimer(slot)
+    if (slot.retired || slot.exited || slot.transport.closed) {
+      await this.closeTransport(slot.transport).catch(() => undefined)
+      return undefined
+    }
+    let runtime: AttachableRuntime
+    try {
+      runtime = await slot.ready
+    } catch {
+      await this.closeTransport(slot.transport).catch(() => undefined)
+      return undefined
+    }
+    if (
+      this.closed ||
+      slot.retired ||
+      slot.exited ||
+      runtime.transport.closed
+    ) {
+      await this.closeTransport(runtime.transport).catch(() => undefined)
+      return undefined
+    }
+    this.transports.delete(runtime.transport)
+    return runtime
+  }
+
+  /** Return a clean, healthy, unprompted runtime to standby; returns `false` if caller must close it. */
+  recycle(
+    runtime: AttachableRuntime,
+    effectiveLaunch: ProviderLaunch | undefined,
+    spawnCwd: string,
+    sessionEnv: Readonly<Record<string, string>> = {},
+  ): boolean {
+    const launch = effectiveLaunch ?? this.launch
+    if (
+      this.closed ||
+      this.maxSlots <= 0 ||
+      !runtime.reusable ||
+      runtime.transport.closed
+    )
+      return false
+    if (!isLaunchCwdIndependent(spawnCwd, launch, sessionEnv)) return false
+    const key = standbyPoolKey(launch, sessionEnv)
+    if (runtime.key !== key) return false
+    const existing = this.slots.get(key)
+    if (
+      existing &&
+      !existing.retired &&
+      !existing.exited &&
+      !existing.transport.closed
+    )
+      return false
+    if (existing) this.evictSlot(existing)
+    this.evictToFit()
+
+    runtime.detachToIdle()
+    const slot: StandbySlot = {
+      key,
+      transport: runtime.transport,
+      ready: Promise.resolve(runtime),
+      idleTimer: undefined,
+      retired: false,
+      exited: false,
+      exitError: undefined,
+      claimed: false,
+    }
+    runtime.attach(CONTROL_CLIENT, (error) => {
+      slot.exited = true
+      slot.exitError = error
+      this.evictSlot(slot)
+      void this.closeTransport(runtime.transport).catch(() => undefined)
+    })
+    this.trackTransport(runtime.transport)
+    this.slots.set(key, slot)
+    this.armIdleTimer(slot)
+    return true
+  }
+
+  close(): Promise<void> {
+    if (this.closing) return this.closing
+    this.closed = true
+    for (const slot of [...this.slots.values()]) this.evictSlot(slot)
+    this.slots.clear()
+    this.closing = Promise.all(
+      [...this.transports].map((transport) =>
+        this.closeTransport(transport).catch(() => undefined),
+      ),
+    ).then(() => undefined)
+    return this.closing
+  }
+
+  private trackTransport(transport: ControlTransport) {
+    this.transports.add(transport)
+    if (!this.watchedStops.has(transport)) {
+      this.watchedStops.add(transport)
+      void transport.stopped.then(
+        () => this.transports.delete(transport),
+        () => this.transports.delete(transport),
+      )
+    }
+  }
+
+  private async closeTransport(transport: ControlTransport): Promise<void> {
+    try {
+      await transport.close()
+    } finally {
+      this.transports.delete(transport)
+    }
+  }
+
+  private cancelIdleTimer(slot: StandbySlot) {
+    if (slot.idleTimer !== undefined) {
+      this.scheduler.clearTimeout(slot.idleTimer)
+      slot.idleTimer = undefined
+    }
+  }
+
+  private armIdleTimer(slot: StandbySlot) {
+    if (
+      this.closed ||
+      slot.retired ||
+      slot.exited ||
+      slot.claimed ||
+      this.slots.get(slot.key) !== slot ||
+      slot.transport.closed ||
+      !Number.isFinite(this.idleTimeoutMs) ||
+      this.idleTimeoutMs < 0
+    )
+      return
+    this.cancelIdleTimer(slot)
+    const timer = this.scheduler.setTimeout(() => {
+      if (slot.idleTimer === timer) slot.idleTimer = undefined
+      if (slot.claimed || slot.retired) return
+      this.evictSlot(slot)
+      void this.closeTransport(slot.transport).catch(() => undefined)
+    }, this.idleTimeoutMs)
+    timer.unref?.()
+    slot.idleTimer = timer
+  }
+
+  private evictSlot(slot: StandbySlot) {
+    slot.retired = true
+    this.cancelIdleTimer(slot)
+    if (this.slots.get(slot.key) === slot) this.slots.delete(slot.key)
+  }
+
+  private evictToFit() {
+    while (this.slots.size >= this.maxSlots) {
+      const oldest = this.slots.values().next().value
+      if (!oldest) break
+      this.evictSlot(oldest)
+      void this.closeTransport(oldest.transport).catch(() => undefined)
     }
   }
 }

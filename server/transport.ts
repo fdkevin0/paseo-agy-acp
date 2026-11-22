@@ -122,7 +122,7 @@ const TERMINATION_DEADLINE_MS = 1100
 const ACP_REQUEST_TIMEOUT_MS = 30_000
 const STDERR_DRAIN_MS = 200
 
-type AcpClient = {
+export type AcpClient = {
   sessionUpdate: (params: SessionNotification) => Promise<void>
   requestPermission: (
     params: RequestPermissionRequest,

@@ -19,13 +19,21 @@ import { dataDirectory } from '../server/preflight.ts'
 import { createProvider } from '../server/provider.ts'
 import {
   SharedControlRuntime,
+  StandbyRuntimePool,
+  isLaunchCwdIndependent,
+  standbyPoolKey,
   type ControlTransport,
   type IdleTimerHandle,
   type IdleTimerScheduler,
 } from '../server/runtime.ts'
-import type { connectAcp } from '../server/transport.ts'
+import { SessionManager } from '../server/session.ts'
+import type { AcpClient, connectAcp } from '../server/transport.ts'
 import { AgyUsageSource } from '../server/usage.ts'
-import { collectProviderEvents, isolatedEnv } from './helpers.ts'
+import {
+  collectProviderEvents,
+  createEventCollector,
+  isolatedEnv,
+} from './helpers.ts'
 
 const mockAcpPath = fileURLToPath(new URL('./mock-acp.ts', import.meta.url))
 
@@ -41,10 +49,14 @@ function deferred<T = void>() {
 
 interface FakeTransportRecord {
   readonly id: number
+  readonly launch: ProviderLaunch | undefined
   readonly cwd: string
+  readonly env: Readonly<Record<string, string>>
+  readonly client: AcpClient
   readonly transport: ControlTransport
   readonly closedBarrier: ReturnType<typeof deferred<void>>
   readonly closeCalled: () => number
+  readonly listCalls: () => Array<{ cwd?: string | null }>
   readonly triggerExit: (error: Error) => void
   setObserved: (next: {
     models?: ControlTransport['models']
@@ -54,15 +66,22 @@ interface FakeTransportRecord {
 
 function createFakeConnect(
   scripts?: readonly {
-    init?: () => Promise<{ agentInfo?: { version?: string } }>
+    init?: () => Promise<{
+      agentInfo?: { version?: string }
+      agentCapabilities?: Record<string, unknown>
+    }>
+    listSessions?: (params: { cwd?: string | null }) => Promise<{
+      sessions: unknown[]
+    }>
     close?: () => Promise<void>
   }[],
 ) {
   const created: FakeTransportRecord[] = []
-  const connect: typeof connectAcp = (_launch, cwd, _env, _client, onExit) => {
+  const connect: typeof connectAcp = (launch, cwd, env, client, onExit) => {
     const id = created.length + 1
     const script = scripts?.[id - 1]
     const closedBarrier = deferred<void>()
+    const recordedListCalls: Array<{ cwd?: string | null }> = []
     let isClosed = false
     let closeCalls = 0
     let closing: Promise<void> | undefined
@@ -73,8 +92,19 @@ function createFakeConnect(
       initialize: async () => {
         const result = script?.init
           ? await script.init()
-          : { agentInfo: { version: '1.5.12' } }
+          : {
+              agentInfo: { version: '1.5.12' },
+              agentCapabilities: {
+                loadSession: true,
+                sessionCapabilities: { list: {} },
+              },
+            }
         return { protocolVersion: 1, ...result }
+      },
+      listSessions: async (params: { cwd?: string | null }) => {
+        recordedListCalls.push(params)
+        if (script?.listSessions) return script.listSessions(params)
+        return { sessions: [] }
       },
     } as unknown as ControlTransport['rpc']
     const transport: ControlTransport = {
@@ -104,10 +134,14 @@ function createFakeConnect(
     }
     created.push({
       id,
+      launch,
       cwd,
+      env,
+      client,
       transport,
       closedBarrier,
       closeCalled: () => closeCalls,
+      listCalls: () => recordedListCalls,
       triggerExit: (error) => {
         isClosed = true
         onExit(error)
@@ -163,6 +197,29 @@ async function readPids(path: string): Promise<number[]> {
     .map((line) => Number(line))
 }
 
+async function readRpcPidLog(
+  path: string,
+): Promise<Array<{ pid: number; method: string }>> {
+  const raw = await readFile(path, 'utf8')
+  return raw
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => {
+      const [pid, method] = line.split(':')
+      return { pid: Number(pid), method }
+    })
+}
+
+function uniqueMethodPids(
+  entries: readonly { pid: number; method: string }[],
+  method: string,
+): number[] {
+  return [
+    ...new Set(entries.filter((e) => e.method === method).map((e) => e.pid)),
+  ]
+}
+
 function assertProcessAlive(pid: number) {
   assert.doesNotThrow(() => process.kill(pid, 0))
 }
@@ -195,6 +252,7 @@ async function createMockProvider(
 test('cwd-independent catalog refreshes and session listings reuse one ACP process PID and clean up temporary artifacts while staying alive', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-runtime-reuse-'))
   const pidLog = join(home, 'pids.log')
+  const rpcPidLog = join(home, 'rpc-pids.log')
   const callLog = join(home, 'calls.log')
   const appData = dataDirectory(undefined, { HOME: home })
   await mkdir(join(appData, 'conversations'), { recursive: true })
@@ -202,6 +260,7 @@ test('cwd-independent catalog refreshes and session listings reuse one ACP proce
   await writeFile(join(appData, 'conversations', 'summary.db'), 'keep')
   const h = await createMockProvider(home, {
     AGY_TEST_PID_LOG: pidLog,
+    AGY_TEST_RPC_PID_LOG: rpcPidLog,
     AGY_TEST_LOG: callLog,
     AGY_TEST_ARTIFACTS_DIR: appData,
   })
@@ -230,17 +289,27 @@ test('cwd-independent catalog refreshes and session listings reuse one ACP proce
     )
     assert.equal(list2.type, 'sessions')
 
-    const pids = await readPids(pidLog)
-    assert.equal(pids.length, 1)
-    assertProcessAlive(pids[0])
+    const rpcEntries = await readRpcPidLog(rpcPidLog)
+    const controlNewPids = uniqueMethodPids(rpcEntries, 'new')
+    assert.equal(controlNewPids.length, 1)
+    assertProcessAlive(controlNewPids[0])
+    assert.equal(
+      rpcEntries.filter(
+        (e) => e.pid === controlNewPids[0] && e.method === 'list',
+      ).length,
+      2,
+    )
     assert.equal(await readFile(callLog, 'utf8'), 'new\nclose\nnew\nclose\n')
     assert.deepEqual(await readdir(join(appData, 'conversations')), [
       'summary.db',
     ])
     assert.deepEqual(await readdir(join(appData, 'brain')), [])
 
+    const spawnedBeforeClose = await readPids(pidLog)
+    assert.ok(spawnedBeforeClose.length <= 2)
     await h.provider.close()
-    assertProcessExited(pids[0])
+    const allSpawned = await readPids(pidLog)
+    allSpawned.forEach(assertProcessExited)
   } finally {
     await h.provider.close()
     await rm(home, { recursive: true, force: true })
@@ -321,7 +390,7 @@ test('concurrent catalog probes for different cwds serialize on one shared trans
     })
 
     const h = await createMockProvider(home, {
-      AGY_TEST_PID_LOG: pidLog,
+      AGY_TEST_RPC_PID_LOG: pidLog,
       AGY_TEST_CATALOG_BY_CWD: '1',
     })
     try {
@@ -355,7 +424,11 @@ test('concurrent catalog probes for different cwds serialize on one shared trans
         catBeta.catalog.models[0].thinkingOptions?.map((o) => o.id),
         ['low'],
       )
-      assert.equal((await readPids(pidLog)).length, 1)
+      const catalogNewPids = uniqueMethodPids(
+        await readRpcPidLog(pidLog),
+        'new',
+      )
+      assert.equal(catalogNewPids.length, 1)
     } finally {
       await h.provider.close()
     }
@@ -404,20 +477,22 @@ test('unexpected exit or failed startup evicts the dead shared control transport
     })
     assert.equal(thirdId, 3)
 
+    const workDir = join(home, 'work')
+    await mkdir(workDir)
     const h = await createMockProvider(home, {
-      AGY_TEST_PID_LOG: pidLog,
+      AGY_TEST_RPC_PID_LOG: pidLog,
       AGY_TEST_CRASH_ON_LIST_FLAG: crashFlag,
     })
     try {
       await h.provider.send({ type: 'catalog', requestId: 'cat-1', cwd: home })
       await h.wait((e) => e.type === 'catalog' && e.requestId === 'cat-1')
-      const [pid1] = await readPids(pidLog)
+      const [pid1] = uniqueMethodPids(await readRpcPidLog(pidLog), 'new')
 
-      await writeFile(crashFlag, '1')
+      await writeFile(crashFlag, workDir)
       await h.provider.send({
         type: 'sessions',
         requestId: 'list-crash',
-        cwd: home,
+        cwd: workDir,
       })
       await h.wait(
         (e) => e.type === 'request.failed' && e.requestId === 'list-crash',
@@ -426,7 +501,7 @@ test('unexpected exit or failed startup evicts the dead shared control transport
       await h.provider.send({
         type: 'sessions',
         requestId: 'list-recover',
-        cwd: home,
+        cwd: workDir,
       })
       const recoveredList = await h.wait(
         (e) => e.type === 'sessions' && e.requestId === 'list-recover',
@@ -443,10 +518,10 @@ test('unexpected exit or failed startup evicts the dead shared control transport
       )
       assert.equal(recoveredCatalog.type, 'catalog')
 
-      const pids = await readPids(pidLog)
-      assert.equal(pids.length, 2)
-      assert.notEqual(pids[1], pid1)
-      assertProcessAlive(pids[1])
+      const controlPids = uniqueMethodPids(await readRpcPidLog(pidLog), 'new')
+      assert.equal(controlPids.length, 2)
+      assert.notEqual(controlPids[1], pid1)
+      assertProcessAlive(controlPids[1])
     } finally {
       await h.provider.close()
     }
@@ -466,7 +541,7 @@ test('session/close failure during probeCatalog still returns the catalog, retir
   await writeFile(join(appData, 'conversations', 'summary.db'), 'keep')
   await writeFile(closeErrorFlag, '1')
   const h = await createMockProvider(home, {
-    AGY_TEST_PID_LOG: pidLog,
+    AGY_TEST_RPC_PID_LOG: pidLog,
     AGY_TEST_CLOSE_ERROR_FLAG: closeErrorFlag,
     AGY_TEST_ARTIFACTS_DIR: appData,
   })
@@ -481,7 +556,7 @@ test('session/close failure during probeCatalog still returns the catalog, retir
       false,
     )
 
-    const [pid1] = await readPids(pidLog)
+    const [pid1] = uniqueMethodPids(await readRpcPidLog(pidLog), 'new')
     assertProcessExited(pid1)
     assert.deepEqual(await readdir(join(appData, 'conversations')), [
       'summary.db',
@@ -494,7 +569,7 @@ test('session/close failure during probeCatalog still returns the catalog, retir
     )
     assert.ok(cat2.type === 'catalog' && cat2.catalog.models.length > 0)
 
-    const pids = await readPids(pidLog)
+    const pids = uniqueMethodPids(await readRpcPidLog(pidLog), 'new')
     assert.equal(pids.length, 2)
     assert.notEqual(pids[1], pid1)
     assertProcessAlive(pids[1])
@@ -690,6 +765,771 @@ test('SharedControlRuntime.close shuts down idle, in-flight startup, and ephemer
       startupRuntime.close(),
       ephemeralRuntime.close(),
     ])
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('StandbyRuntimePool warms with initialize + listSessions, joins in-flight warmup, enforces exclusive take, and rebinds callbacks dynamically', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-standby-warm-'))
+  const workDir = join(home, 'project')
+  await mkdir(workDir)
+  const listGate = deferred<{ sessions: unknown[] }>()
+  const listEntered = deferred<void>()
+  const fake = createFakeConnect([
+    {
+      listSessions: () => {
+        listEntered.resolve()
+        return listGate.promise
+      },
+    },
+  ])
+  const manual = createManualScheduler()
+  const launch: ProviderLaunch = {
+    command: 'agy',
+    args: ['acp'],
+    env: isolatedEnv(home),
+  }
+  const pool = new StandbyRuntimePool({
+    launch,
+    connectAcp: fake.connect,
+    idleTimeoutMs: 30_000,
+    scheduler: manual.scheduler,
+  })
+  try {
+    pool.warm(launch, workDir, {})
+    // Duplicate warm while in-flight is a no-op.
+    pool.warm(launch, workDir, {})
+    assert.equal(fake.created.length, 1)
+    assert.equal(fake.created[0].cwd, home)
+    await listEntered.promise
+    assert.deepEqual(fake.created[0].listCalls(), [{ cwd: home }])
+
+    // Two concurrent takes: first claims and joins the in-flight warmup; second gets undefined immediately.
+    const firstTake = pool.take(launch, workDir, {})
+    const secondTake = pool.take(launch, workDir, {})
+    assert.equal(await secondTake, undefined)
+
+    listGate.resolve({ sessions: [] })
+    const runtime = await firstTake
+    assert.ok(runtime)
+    assert.equal(runtime.transport, fake.created[0].transport)
+    assert.equal(runtime.reusable, true)
+    assert.equal(manual.scheduled.length, 0)
+
+    // Verify dynamic client + exit callback rebinding.
+    const updates: string[] = []
+    const exits: string[] = []
+    runtime.attach(
+      {
+        sessionUpdate: async (n) => {
+          updates.push(n.sessionId)
+        },
+        requestPermission: async () => ({
+          outcome: { outcome: 'selected', optionId: 'allow' },
+        }),
+        requestElicitation: async () => ({ action: 'accept' }),
+      },
+      (error) => {
+        exits.push(error.message)
+      },
+    )
+    await fake.created[0].client.sessionUpdate({
+      sessionId: 'sess-1',
+      update: {
+        sessionUpdate: 'available_commands_update',
+        availableCommands: [],
+      },
+    })
+    assert.deepEqual(updates, ['sess-1'])
+    const perm = await fake.created[0].client.requestPermission({
+      sessionId: 'sess-1',
+      toolCall: { toolCallId: 't1', title: 'Tool' },
+      options: [],
+    })
+    assert.deepEqual(perm, {
+      outcome: { outcome: 'selected', optionId: 'allow' },
+    })
+
+    // Detach reverts to CONTROL_CLIENT so old session receives nothing further.
+    runtime.detachToIdle()
+    await fake.created[0].client.sessionUpdate({
+      sessionId: 'sess-2',
+      update: {
+        sessionUpdate: 'available_commands_update',
+        availableCommands: [],
+      },
+    })
+    assert.deepEqual(updates, ['sess-1'])
+    const idlePerm = await fake.created[0].client.requestPermission({
+      sessionId: 'sess-2',
+      toolCall: { toolCallId: 't2', title: 'Tool' },
+      options: [],
+    })
+    assert.deepEqual(idlePerm, { outcome: { outcome: 'cancelled' } })
+    assert.deepEqual(exits, [])
+
+    await runtime.transport.close()
+  } finally {
+    await pool.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('StandbyRuntimePool isolates skipPermissions and session env keys and rejects cwd-dependent launches', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-standby-keys-'))
+  const fake = createFakeConnect()
+  const baseLaunch: ProviderLaunch = {
+    command: 'agy',
+    args: ['acp'],
+    env: isolatedEnv(home),
+  }
+  const skipLaunch: ProviderLaunch = {
+    command: 'agy',
+    args: ['acp', '--dangerously-skip-permissions'],
+    env: isolatedEnv(home),
+  }
+  const relDirLaunch: ProviderLaunch = {
+    command: 'agy',
+    args: ['acp', '--gemini-dir', './rel-gemini'],
+    env: isolatedEnv(home),
+  }
+  const relCmdLaunch: ProviderLaunch = {
+    command: './agy',
+    args: ['acp'],
+    env: isolatedEnv(home),
+  }
+  const pool = new StandbyRuntimePool({
+    launch: baseLaunch,
+    connectAcp: fake.connect,
+  })
+  try {
+    assert.notEqual(
+      standbyPoolKey(baseLaunch, {}),
+      standbyPoolKey(skipLaunch, {}),
+    )
+    assert.notEqual(
+      standbyPoolKey(baseLaunch, { CUSTOM: 'a' }),
+      standbyPoolKey(baseLaunch, { CUSTOM: 'b' }),
+    )
+    assert.equal(isLaunchCwdIndependent(home, baseLaunch, {}), true)
+    assert.equal(isLaunchCwdIndependent(home, relDirLaunch, {}), false)
+    assert.equal(isLaunchCwdIndependent(home, relCmdLaunch, {}), false)
+
+    // Cwd-dependent launches never warm or take.
+    pool.warm(relDirLaunch, home, {})
+    pool.warm(relCmdLaunch, home, {})
+    assert.equal(fake.created.length, 0)
+    assert.equal(await pool.take(relDirLaunch, home, {}), undefined)
+    assert.equal(await pool.take(relCmdLaunch, home, {}), undefined)
+
+    // Warm base launch with empty env: skipPermissions and distinct session env cannot take it.
+    pool.warm(baseLaunch, home, {})
+    assert.equal(fake.created.length, 1)
+    assert.equal(await pool.take(skipLaunch, home, {}), undefined)
+    assert.equal(await pool.take(baseLaunch, home, { FOO: '1' }), undefined)
+
+    // Warm distinct session env and skipPermissions slots independently.
+    pool.warm(baseLaunch, home, { FOO: '1' })
+    pool.warm(skipLaunch, home, {})
+    assert.equal(fake.created.length, 3)
+
+    const baseRt = await pool.take(baseLaunch, home, {})
+    const envRt = await pool.take(baseLaunch, home, { FOO: '1' })
+    const skipRt = await pool.take(skipLaunch, home, {})
+    assert.equal(baseRt?.transport, fake.created[0].transport)
+    assert.equal(envRt?.transport, fake.created[1].transport)
+    assert.equal(skipRt?.transport, fake.created[2].transport)
+
+    // Recycling under a mismatched key or cwd-dependent launch is rejected.
+    assert.equal(pool.recycle(baseRt!, skipLaunch, home, {}), false)
+    assert.equal(pool.recycle(baseRt!, baseLaunch, home, { FOO: '1' }), false)
+    assert.equal(pool.recycle(baseRt!, relDirLaunch, home, {}), false)
+
+    await Promise.all([
+      baseRt!.transport.close(),
+      envRt!.transport.close(),
+      skipRt!.transport.close(),
+    ])
+  } finally {
+    await pool.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('StandbyRuntimePool evicts dead standby and failed warmup cleanly so take falls back to undefined', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-standby-fail-'))
+  const fake = createFakeConnect([
+    { init: async () => ({ agentInfo: { version: '1.5.9' } }) },
+    { init: async () => ({ agentInfo: { version: '1.5.12' } }) },
+    { init: async () => ({ agentInfo: { version: '1.5.12' } }) },
+  ])
+  const manual = createManualScheduler()
+  const launch: ProviderLaunch = {
+    command: 'agy',
+    args: ['acp'],
+    env: isolatedEnv(home),
+  }
+  const pool = new StandbyRuntimePool({
+    launch,
+    connectAcp: fake.connect,
+    idleTimeoutMs: 60_000,
+    scheduler: manual.scheduler,
+  })
+  try {
+    // 1. Failed warmup (unsupported version) closes transport and yields undefined on take.
+    pool.warm(launch, home, {})
+    assert.equal(await pool.take(launch, home, {}), undefined)
+    assert.equal(fake.created[0].closeCalled(), 1)
+
+    // 2. Healthy standby that exits while idle clears its timer, evicts itself, and yields undefined.
+    pool.warm(launch, home, {})
+    const readyRt = await pool.take(launch, home, {})
+    assert.ok(readyRt)
+    assert.equal(pool.recycle(readyRt, launch, home, {}), true)
+    assert.equal(manual.scheduled.length, 1)
+    assert.equal(manual.scheduled[0].unreffed, true)
+
+    fake.created[1].triggerExit(new Error('unexpected standby crash'))
+    assert.equal(manual.scheduled[0].cleared, true)
+    assert.equal(await pool.take(launch, home, {}), undefined)
+
+    // 3. Subsequent warm recovers cleanly.
+    pool.warm(launch, home, {})
+    const recovered = await pool.take(launch, home, {})
+    assert.equal(recovered?.transport, fake.created[2].transport)
+    await recovered!.transport.close()
+  } finally {
+    await pool.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('StandbyRuntimePool enforces maxSlots LRU eviction and unreffed idle reaping', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-standby-evict-'))
+  const fake = createFakeConnect()
+  const manual = createManualScheduler()
+  const launch: ProviderLaunch = {
+    command: 'agy',
+    args: ['acp'],
+    env: isolatedEnv(home),
+  }
+  const pool = new StandbyRuntimePool({
+    launch,
+    connectAcp: fake.connect,
+    maxSlots: 2,
+    idleTimeoutMs: 45_000,
+    scheduler: manual.scheduler,
+  })
+  try {
+    pool.warm(launch, home, { SLOT: '1' })
+    pool.warm(launch, home, { SLOT: '2' })
+    assert.equal(fake.created.length, 2)
+
+    // Touch slot 1 via take + recycle so slot 2 becomes oldest (LRU).
+    const slot1 = await pool.take(launch, home, { SLOT: '1' })
+    assert.equal(slot1?.transport, fake.created[0].transport)
+    assert.equal(pool.recycle(slot1!, launch, home, { SLOT: '1' }), true)
+
+    // Adding slot 3 evicts and closes slot 2 (oldest idle).
+    pool.warm(launch, home, { SLOT: '3' })
+    assert.equal(fake.created.length, 3)
+    await fake.created[1].closedBarrier.promise
+    assert.equal(fake.created[1].closeCalled(), 1)
+    assert.equal(await pool.take(launch, home, { SLOT: '2' }), undefined)
+
+    // Idle timer on recycled slot 1 is unreffed and closes slot 1 when fired.
+    const slot1Timer = manual.scheduled.find(
+      (s) => !s.cleared && s.ms === 45_000,
+    )
+    assert.ok(slot1Timer)
+    assert.equal(slot1Timer.unreffed, true)
+    slot1Timer.fn()
+    await fake.created[0].closedBarrier.promise
+    assert.equal(fake.created[0].closeCalled(), 1)
+    assert.equal(await pool.take(launch, home, { SLOT: '1' }), undefined)
+
+    // Slot 3 is still available and taking it cancels its idle timer.
+    const slot3 = await pool.take(launch, home, { SLOT: '3' })
+    assert.equal(slot3?.transport, fake.created[2].transport)
+    await slot3!.transport.close()
+  } finally {
+    await pool.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('StandbyRuntimePool.close shuts down idle, recycled, and in-flight-warming transports cleanly', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-standby-close-'))
+  const warmGate = deferred<{ agentInfo?: { version?: string } }>()
+  const warmEntered = deferred<void>()
+  const fake = createFakeConnect([
+    {},
+    {
+      init: () => {
+        warmEntered.resolve()
+        return warmGate.promise
+      },
+    },
+  ])
+  const manual = createManualScheduler()
+  const launch: ProviderLaunch = {
+    command: 'agy',
+    args: ['acp'],
+    env: isolatedEnv(home),
+  }
+  const pool = new StandbyRuntimePool({
+    launch,
+    connectAcp: fake.connect,
+    idleTimeoutMs: 60_000,
+    scheduler: manual.scheduler,
+  })
+  try {
+    // Ready standby (slot A) + in-flight warming standby (slot B).
+    pool.warm(launch, home, { SLOT: 'A' })
+    const rtA = await pool.take(launch, home, { SLOT: 'A' })
+    assert.ok(rtA)
+    assert.equal(pool.recycle(rtA, launch, home, { SLOT: 'A' }), true)
+
+    pool.warm(launch, home, { SLOT: 'B' })
+    await warmEntered.promise
+    const pendingTakeB = pool.take(launch, home, { SLOT: 'B' })
+
+    const closing = pool.close()
+    warmGate.resolve({ agentInfo: { version: '1.5.12' } })
+    await closing
+
+    assert.equal(await pendingTakeB, undefined)
+    assert.equal(fake.created[0].closeCalled(), 1)
+    assert.equal(fake.created[1].closeCalled(), 1)
+    assert.equal(
+      manual.scheduled.every((s) => s.cleared),
+      true,
+    )
+
+    // Idempotent close and post-close no-ops.
+    await pool.close()
+    pool.warm(launch, home, { SLOT: 'C' })
+    assert.equal(fake.created.length, 2)
+    assert.equal(await pool.take(launch, home, { SLOT: 'C' }), undefined)
+  } finally {
+    await pool.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('clean unprompted draft open+close recycles its PID into standby, removes temp artifacts while alive, and reuses it for new and persisted opens without stale bleed', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-standby-recycle-'))
+  const rpcPidLog = join(home, 'rpc-pids.log')
+  const appData = dataDirectory(undefined, { HOME: home })
+  await mkdir(join(appData, 'conversations'), { recursive: true })
+  await mkdir(join(appData, 'brain'), { recursive: true })
+  await writeFile(join(appData, 'conversations', 'summary.db'), 'keep')
+  const h = await createMockProvider(home, {
+    AGY_TEST_RPC_PID_LOG: rpcPidLog,
+    AGY_TEST_ARTIFACTS_DIR: appData,
+    AGY_TEST_STALE_EVENTS: '1',
+  })
+  const baseConfig = {
+    cwd: home,
+    env: {},
+    mcpServers: {},
+    settings: {},
+    persist: true,
+  }
+  try {
+    // Draft #1 opens cold, closes unprompted -> recycles PID into standby and cleans artifacts while alive.
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-draft-1',
+      sessionId: 'draft-1',
+      config: baseConfig,
+      history: 'skip',
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 'draft-1')
+    const [draft1Pid] = uniqueMethodPids(await readRpcPidLog(rpcPidLog), 'new')
+    assertProcessAlive(draft1Pid)
+
+    await h.provider.send({
+      type: 'session.close',
+      requestId: 'close-draft-1',
+      sessionId: 'draft-1',
+    })
+    await h.wait(
+      (e) => e.type === 'session.closed' && e.sessionId === 'draft-1',
+    )
+    assertProcessAlive(draft1Pid)
+    assert.deepEqual(await readdir(join(appData, 'conversations')), [
+      'summary.db',
+    ])
+    assert.deepEqual(await readdir(join(appData, 'brain')), [])
+
+    // Draft #2 checks out the EXACT SAME recycled PID, closes, and recycles it again.
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-draft-2',
+      sessionId: 'draft-2',
+      config: baseConfig,
+      history: 'skip',
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 'draft-2')
+    assert.deepEqual(uniqueMethodPids(await readRpcPidLog(rpcPidLog), 'new'), [
+      draft1Pid,
+    ])
+    await h.provider.send({
+      type: 'session.close',
+      requestId: 'close-draft-2',
+      sessionId: 'draft-2',
+    })
+    await h.wait(
+      (e) => e.type === 'session.closed' && e.sessionId === 'draft-2',
+    )
+    assertProcessAlive(draft1Pid)
+    assert.deepEqual(await readdir(join(appData, 'conversations')), [
+      'summary.db',
+    ])
+    assert.deepEqual(await readdir(join(appData, 'brain')), [])
+
+    // Persisted session.open checks out that EXACT SAME recycled PID for session/load.
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-persisted',
+      sessionId: 'persisted-1',
+      config: baseConfig,
+      persistence: {
+        version: 1,
+        data: { sessionId: '11111111-1111-4111-8111-111111111111' },
+      },
+      history: 'skip',
+    })
+    await h.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 'persisted-1',
+    )
+    assert.deepEqual(uniqueMethodPids(await readRpcPidLog(rpcPidLog), 'load'), [
+      draft1Pid,
+    ])
+    assert.equal(
+      h.events.some(
+        (e) =>
+          e.type === 'session.permission' ||
+          e.type === 'timeline.item' ||
+          e.type === 'session.usage',
+      ),
+      false,
+    )
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('unprompted session with configured MCP servers or session/close error does not recycle and stops process before cleanup', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-standby-norecycle-'))
+  const rpcPidLog = join(home, 'rpc-pids.log')
+  const closeErrorFlag = join(home, 'close-err')
+  const appData = dataDirectory(undefined, { HOME: home })
+  await mkdir(join(appData, 'conversations'), { recursive: true })
+  await mkdir(join(appData, 'brain'), { recursive: true })
+  await writeFile(join(appData, 'conversations', 'summary.db'), 'keep')
+  const h = await createMockProvider(home, {
+    AGY_TEST_RPC_PID_LOG: rpcPidLog,
+    AGY_TEST_ARTIFACTS_DIR: appData,
+    AGY_TEST_CLOSE_ERROR_FLAG: closeErrorFlag,
+  })
+  try {
+    // 1. Session with MCP servers must stop on close rather than recycling.
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-mcp',
+      sessionId: 'mcp-1',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {
+          demo: { type: 'http', url: 'https://example.invalid/mcp' },
+        },
+        settings: {},
+        persist: true,
+      },
+      history: 'skip',
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 'mcp-1')
+    const [mcpPid] = uniqueMethodPids(await readRpcPidLog(rpcPidLog), 'new')
+    await h.provider.send({
+      type: 'session.close',
+      requestId: 'close-mcp',
+      sessionId: 'mcp-1',
+    })
+    await h.wait((e) => e.type === 'session.closed' && e.sessionId === 'mcp-1')
+    assertProcessExited(mcpPid)
+    assert.deepEqual(await readdir(join(appData, 'conversations')), [
+      'summary.db',
+    ])
+
+    // 2. Session whose session/close fails must stop before artifact cleanup rather than recycling.
+    await writeFile(closeErrorFlag, '1')
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-err',
+      sessionId: 'err-1',
+      config: {
+        cwd: home,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: true,
+      },
+      history: 'skip',
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 'err-1')
+    const newPids = uniqueMethodPids(await readRpcPidLog(rpcPidLog), 'new')
+    assert.equal(newPids.length, 2)
+    const errPid = newPids[1]
+    await h.provider.send({
+      type: 'session.close',
+      requestId: 'close-err',
+      sessionId: 'err-1',
+    })
+    await h.wait((e) => e.type === 'session.closed' && e.sessionId === 'err-1')
+    assertProcessExited(errPid)
+    assert.deepEqual(await readdir(join(appData, 'conversations')), [
+      'summary.db',
+    ])
+    assert.deepEqual(await readdir(join(appData, 'brain')), [])
+  } finally {
+    await h.provider.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('prompted sessions do not recycle, first prompt and persisted open replenish non-full-access standby, and replaceRuntime consumes standby', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-standby-replenish-'))
+  const rpcPidLog = join(home, 'rpc-pids.log')
+  const env = isolatedEnv(home, { AGY_TEST_RPC_PID_LOG: rpcPidLog })
+  const launch: ProviderLaunch = {
+    command: process.execPath,
+    args: [mockAcpPath],
+    env,
+  }
+  const pool = new StandbyRuntimePool({ launch })
+  const collector = createEventCollector()
+  const manager = new SessionManager({
+    launch,
+    usage: new AgyUsageSource({ env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: collector.emit,
+    standby: pool,
+  })
+  const baseConfig = {
+    cwd: home,
+    env: {},
+    mcpServers: {},
+    settings: {},
+    persist: true,
+  }
+  try {
+    // 1. Full-access session open + prompt must NOT replenish a standby runtime.
+    await manager.handle({
+      type: 'session.open',
+      requestId: 'open-fa',
+      sessionId: 'fa',
+      config: { ...baseConfig, mode: 'full-access' },
+      history: 'skip',
+    })
+    await collector.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 'fa',
+    )
+    await manager.handle({
+      type: 'session.prompt',
+      sessionId: 'fa',
+      prompt: {
+        clientMessageId: 'fa-p1',
+        delivery: 'auto',
+        input: { type: 'message', content: [{ type: 'text', text: 'hi' }] },
+      },
+    })
+    await collector.wait(
+      (e) =>
+        e.type === 'session.turn' &&
+        e.sessionId === 'fa' &&
+        e.state === 'completed',
+    )
+    assert.equal(await pool.take(launch, home, {}), undefined)
+    await manager.handle({
+      type: 'session.close',
+      requestId: 'close-fa',
+      sessionId: 'fa',
+    })
+    await collector.wait(
+      (e) => e.type === 'session.closed' && e.sessionId === 'fa',
+    )
+
+    // 2. Normal session first prompt replenishes standby; closing prompted session stops its own PID.
+    await manager.handle({
+      type: 'session.open',
+      requestId: 'open-norm',
+      sessionId: 'norm',
+      config: baseConfig,
+      history: 'skip',
+    })
+    await collector.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 'norm',
+    )
+    const normPid = uniqueMethodPids(await readRpcPidLog(rpcPidLog), 'new')[1]
+    const normPrompt = manager.handle({
+      type: 'session.prompt',
+      sessionId: 'norm',
+      prompt: {
+        clientMessageId: 'norm-p1',
+        delivery: 'auto',
+        input: { type: 'message', content: [{ type: 'text', text: 'hello' }] },
+      },
+    })
+    const perm = await collector.wait(
+      (e) => e.type === 'session.permission' && e.sessionId === 'norm',
+    )
+    assert.ok(perm.type === 'session.permission')
+    await manager.handle({
+      type: 'session.permission',
+      sessionId: 'norm',
+      permissionId: perm.request.id,
+      response: { behavior: 'allow', selectedActionId: 'yes' },
+    })
+    await normPrompt
+    await collector.wait(
+      (e) =>
+        e.type === 'session.turn' &&
+        e.sessionId === 'norm' &&
+        e.state === 'completed',
+    )
+    await manager.handle({
+      type: 'session.close',
+      requestId: 'close-norm',
+      sessionId: 'norm',
+    })
+    await collector.wait(
+      (e) => e.type === 'session.closed' && e.sessionId === 'norm',
+    )
+    assertProcessExited(normPid)
+
+    // The replenished standby from norm's first prompt is checked out by a persisted open,
+    // which in turn replenishes a new standby!
+    const warmedFromPrompt = await pool.take(launch, home, {})
+    assert.ok(warmedFromPrompt)
+    assert.equal(pool.recycle(warmedFromPrompt, launch, home, {}), true)
+    const initPidsBeforePersisted = uniqueMethodPids(
+      await readRpcPidLog(rpcPidLog),
+      'initialize',
+    )
+    await manager.handle({
+      type: 'session.open',
+      requestId: 'open-persisted',
+      sessionId: 'persisted',
+      config: baseConfig,
+      persistence: {
+        version: 1,
+        data: { sessionId: '11111111-1111-4111-8111-111111111111' },
+      },
+      history: 'skip',
+    })
+    await collector.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 'persisted',
+    )
+    const persistedLoadPid = uniqueMethodPids(
+      await readRpcPidLog(rpcPidLog),
+      'load',
+    )[0]
+    assert.notEqual(persistedLoadPid, normPid)
+    assert.ok(initPidsBeforePersisted.includes(persistedLoadPid))
+
+    // 3. replaceRuntime() (full-access -> default) consumes the standby replenished by persisted open!
+    const replenishedBeforeRelaunch = await pool.take(launch, home, {})
+    assert.ok(replenishedBeforeRelaunch)
+    assert.equal(
+      pool.recycle(replenishedBeforeRelaunch, launch, home, {}),
+      true,
+    )
+    const standbyPidForRelaunch = uniqueMethodPids(
+      await readRpcPidLog(rpcPidLog),
+      'initialize',
+    ).at(-1)!
+    assert.notEqual(standbyPidForRelaunch, persistedLoadPid)
+
+    await manager.handle({
+      type: 'session.open',
+      requestId: 'open-fa2',
+      sessionId: 'fa2',
+      config: { ...baseConfig, mode: 'full-access' },
+      history: 'skip',
+    })
+    await collector.wait(
+      (e) => e.type === 'session.ready' && e.sessionId === 'fa2',
+    )
+    await manager.handle({
+      type: 'session.configure',
+      requestId: 'cfg-default',
+      sessionId: 'fa2',
+      changes: { mode: 'default' },
+    })
+    await collector.wait(
+      (e) => e.type === 'request.completed' && e.requestId === 'cfg-default',
+    )
+    const loadPids = uniqueMethodPids(await readRpcPidLog(rpcPidLog), 'load')
+    assert.equal(loadPids.includes(standbyPidForRelaunch), true)
+  } finally {
+    await Promise.all([manager.close(), pool.close()])
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('ProviderConnection.close shuts down active sessions, shared control runtime, and standby pool cleanly', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-provider-shutdown-'))
+  const pidLog = join(home, 'pids.log')
+  const h = await createMockProvider(home, { AGY_TEST_PID_LOG: pidLog })
+  const baseConfig = {
+    cwd: home,
+    env: {},
+    mcpServers: {},
+    settings: {},
+    persist: true,
+  }
+  try {
+    // 1. Catalog starts shared control runtime + warms standby.
+    await h.provider.send({ type: 'catalog', requestId: 'cat-1', cwd: home })
+    await h.wait((e) => e.type === 'catalog' && e.requestId === 'cat-1')
+
+    // 2. Persisted open takes standby and triggers a fresh background standby warmup.
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-p1',
+      sessionId: 'p1',
+      config: baseConfig,
+      persistence: {
+        version: 1,
+        data: { sessionId: '11111111-1111-4111-8111-111111111111' },
+      },
+      history: 'skip',
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 'p1')
+
+    // 3. Second active session runs concurrently.
+    await h.provider.send({
+      type: 'session.open',
+      requestId: 'open-s2',
+      sessionId: 's2',
+      config: baseConfig,
+      history: 'skip',
+    })
+    await h.wait((e) => e.type === 'session.ready' && e.sessionId === 's2')
+
+    const pidsBeforeClose = await readPids(pidLog)
+    assert.ok(pidsBeforeClose.length >= 3)
+    pidsBeforeClose.forEach(assertProcessAlive)
+
+    await h.provider.close()
+    const allPids = await readPids(pidLog)
+    allPids.forEach(assertProcessExited)
+  } finally {
+    await h.provider.close()
     await rm(home, { recursive: true, force: true })
   }
 })
