@@ -9,6 +9,7 @@ import {
 import { createHash } from 'node:crypto'
 import { join, sep } from 'node:path'
 import {
+  detachString,
   isAskQuestionName,
   isNativeToolName,
   nonnegative,
@@ -634,7 +635,7 @@ export class TranscriptReader {
           // Preserve bytes until a complete line is available, including split UTF-8 characters.
           this.remainder += buffer.subarray(0, bytesRead).toString('latin1')
           const lines = this.remainder.split('\n')
-          this.remainder = lines.pop()!
+          this.remainder = detachString(lines.pop()!)
           if (this.remainder.length > 8 * 1024 * 1024)
             throw new Error('Brain JSONL line exceeds 8 MiB')
           for (const line of lines) {

@@ -24,6 +24,7 @@ import type {
 } from '@getpaseo/plugin/server/provider'
 import {
   RequestPermissionRequestSchema,
+  extractSecurityWarning,
   isPreapprovedMcpTool,
   permissionKind,
   pickPermissionOption,
@@ -50,7 +51,11 @@ import {
   type RuntimeEpoch,
 } from './brain.ts'
 import { readLatestStepUsage, type TranscriptReader } from './brain-io.ts'
-import { readConversationCompactionWindow } from './conversation-db.ts'
+import {
+  captureConversationStepBaseline,
+  readConversationCompactionWindow,
+  readConversationStepError,
+} from './conversation-db.ts'
 import { toolDisplayName } from './mcp.ts'
 import { projectReplayHistory, type HistoryEntry } from './history.ts'
 import { SubagentRegistry } from './subagents.ts'
@@ -87,6 +92,7 @@ import {
   currentNativeMode,
   FULL_ACCESS_MODE_ID,
   hasPositivePromptUsage,
+  stripToolSummary,
   Timeline,
   toolDetail,
   promptContent,
@@ -314,6 +320,7 @@ export class SessionManager {
                     ...params,
                     sessionId: session.state.nativeId,
                   }),
+              canResume ? undefined : { idleTimeoutMs: 30_000 },
             )),
             sessionId: session.state.nativeId,
           }
@@ -1127,6 +1134,8 @@ async function createSession(
             : { outcome: 'cancelled' as const },
         })
       }
+      const displayInput = stripToolSummary(input.data) as typeof input.data
+      const securityWarning = extractSecurityWarning(request)
       return new Promise<RequestPermissionResponse>((resolve) => {
         const permissionId = randomUUID()
         permissions.set(permissionId, { type: 'acp', request, resolve })
@@ -1141,13 +1150,25 @@ async function createSession(
             ),
             kind,
             title: request.toolCall.title ?? undefined,
-            input: input.data,
+            ...(securityWarning
+              ? { description: securityWarning.description }
+              : {}),
+            input: displayInput,
             detail,
-            actions: request.options.map((o) => ({
-              id: o.optionId,
-              label: o.name,
-              behavior: o.kind.startsWith('allow') ? 'allow' : 'deny',
-            })),
+            actions: request.options.map((o) => {
+              const behavior = o.kind.startsWith('allow')
+                ? ('allow' as const)
+                : ('deny' as const)
+              return {
+                id: o.optionId,
+                label: o.name,
+                behavior,
+                ...(behavior === 'allow' &&
+                securityWarning?.warnedOptionIds.has(o.optionId)
+                  ? { variant: 'danger' as const }
+                  : {}),
+              }
+            }),
           },
         })
       })
@@ -1382,6 +1403,7 @@ async function createSession(
             canResume
               ? next.rpc.resumeSession(params)
               : next.rpc.loadSession(params),
+            canResume ? undefined : { idleTimeoutMs: 30_000 },
           )),
           sessionId: state.nativeId,
           models: next.models ?? prevModels,
@@ -2312,10 +2334,15 @@ async function promptSession(
     observationTransport = session.transport
     session.state.turnRunning = true
     started = true
-    const readStep = await readLastStepIndex(
-      session.brainRoot,
-      session.state.nativeId,
-    ).catch(() => -1)
+    const [readStep, stepErrorBaseline] = await Promise.all([
+      readLastStepIndex(session.brainRoot, session.state.nativeId).catch(
+        () => -1,
+      ),
+      captureConversationStepBaseline(
+        session.brainRoot,
+        session.state.nativeId,
+      ),
+    ])
     minStepIndex = Math.max(
       session.state.lastKnownStepIndex,
       session.state.runtimeEpoch?.afterStepIndex ?? -1,
@@ -2361,9 +2388,21 @@ async function promptSession(
       ? result.usage
       : undefined
     let status: 'completed' | 'canceled' | 'failed' =
-      result.stopReason === 'cancelled' ? 'canceled' : 'completed'
+      result.stopReason === 'cancelled'
+        ? 'canceled'
+        : result.stopReason === 'refusal'
+          ? 'failed'
+          : 'completed'
     let turnError: string | undefined
-    if (status === 'completed') {
+    if (result.stopReason === 'refusal') {
+      const hiddenError = await readConversationStepError(
+        session.brainRoot,
+        session.state.nativeId,
+        stepErrorBaseline,
+        result.stopReason,
+      )
+      turnError = hiddenError?.message ?? 'Request was refused.'
+    } else if (status === 'completed') {
       session.state.inSettle = true
       const settled = await settleBrainTurn(
         session.brainRoot,
@@ -2446,6 +2485,23 @@ async function promptSession(
               (await session.hasBackgroundWork().catch(() => false))))
         if (needsFailureCleanup) {
           await session.interrupt().catch(() => undefined)
+        }
+      }
+      if (
+        status === 'completed' &&
+        !turnAbort.signal.aborted &&
+        !session.state.closing &&
+        !session.state.failed
+      ) {
+        const hiddenError = await readConversationStepError(
+          session.brainRoot,
+          session.state.nativeId,
+          stepErrorBaseline,
+          result.stopReason,
+        )
+        if (hiddenError) {
+          status = 'failed'
+          turnError = hiddenError.message
         }
       }
     }

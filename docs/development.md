@@ -44,7 +44,7 @@ Paseo compiles the TypeScript plugin; no separate build output is required. Git/
 | `server/transport.ts`                                                     | ACP stdio process, `elicitation/create` interception, metadata capture and shutdown.              |
 | `server/mapping.ts`                                                       | Timeline state machine, configuration, attachment and context/token usage mapping.                |
 | `server/brain-io.ts`                                                      | Realpath-contained Brain file readers, `O_TRUNC` cursor detection and inbox/subagents.            |
-| `server/conversation-db.ts`                                               | Symlink-safe, stat-cached SQLite reader for native conversation `gen_metadata`.                   |
+| `server/conversation-db.ts`                                               | Symlink-safe, stat-cached SQLite reader for native `gen_metadata` and hidden `steps` API errors.  |
 | `server/brain-projector.ts`                                               | Pure state machine projecting Brain transcript steps and inbox messages into cards.               |
 | `server/brain.ts`                                                         | Turn-settlement polling loop (`settleBrainTurn`) and child transcript watcher.                    |
 | `server/preflight.ts`                                                     | Version checks, cache identity, data directory resolution and symlink-safe cleanup.               |

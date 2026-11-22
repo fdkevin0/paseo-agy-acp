@@ -7312,3 +7312,259 @@ test('BackgroundWorkProbe fails closed on corrupt appended JSONL and recovers fr
   assert.equal(await racedProbe.hasActiveWork(f.root, parent), true)
   assert.equal(readResponses.length, 0)
 })
+
+test('recurring schedule with CronExpression is classified as a standing daemon while whitespace-only cron and one-shot timers still block', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+
+  // 1. Recurring CronExpression with IsDaemon omitted settles, reports daemon-only work, and decrements on MaxIterations.
+  const cronOmittedId = `${parent}/task-cron-omitted`
+  await f.put(parent, [
+    { step_index: 0, type: 'USER_INPUT', content: 'start recurring cron' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          id: 'cron-omitted',
+          name: 'schedule',
+          args: {
+            CronExpression: '*/5 * * * *',
+            Prompt: 'poll status',
+            MaxIterations: 2,
+          },
+        },
+      ],
+    },
+    {
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: `Tool is running as a background task with task id: ${cronOmittedId}\n`,
+    },
+    done(3, 'Cron scheduled.'),
+  ])
+
+  assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
+    true,
+  )
+  const settledOmitted = await settleBrainTurn(f.root, parent, 'p', () => {}, {
+    minStepIndex: -1,
+  })
+  assert.equal(settledOmitted.status, 'completed')
+
+  await appendFile(
+    f.path(parent),
+    encode([message(4, cronOmittedId, 'poll status'), done(5, 'Tick #1')]),
+  )
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
+    true,
+  )
+
+  await appendFile(
+    f.path(parent),
+    encode([message(6, cronOmittedId, 'poll status'), done(7, 'Tick #2')]),
+  )
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
+    false,
+  )
+
+  // 2. Recurring CronExpression with IsDaemon: false also settles as a daemon and clears on manage_task(kill).
+  const cronFalseId = `${parent}/task-cron-false`
+  await appendFile(
+    f.path(parent),
+    encode([
+      { step_index: 8, type: 'USER_INPUT', content: 'start non-daemon cron' },
+      {
+        step_index: 9,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          {
+            id: 'cron-false',
+            name: 'schedule',
+            args: {
+              CronExpression: '0 * * * *',
+              IsDaemon: false,
+              Prompt: 'hourly check',
+            },
+          },
+        ],
+      },
+      {
+        step_index: 10,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: `Tool is running as a background task with task id: ${cronFalseId}\n`,
+      },
+      done(11, 'Hourly cron scheduled.'),
+    ]),
+  )
+  const settledFalse = await settleBrainTurn(f.root, parent, 'p', () => {}, {
+    minStepIndex: 7,
+  })
+  assert.equal(settledFalse.status, 'completed')
+  assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
+    true,
+  )
+
+  await appendFile(
+    f.path(parent),
+    encode([
+      { step_index: 12, type: 'USER_INPUT', content: 'stop hourly cron' },
+      {
+        step_index: 13,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          {
+            id: 'kill-cron',
+            name: 'manage_task',
+            args: { Action: 'kill', TaskId: cronFalseId },
+          },
+        ],
+      },
+      {
+        step_index: 14,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: `Killed task ${cronFalseId}`,
+      },
+      done(15, 'Stopped hourly cron.'),
+    ]),
+  )
+  assert.equal(
+    await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
+    false,
+  )
+
+  // 3. Whitespace-only CronExpression and one-shot DurationSeconds timer still register as blocking background tasks.
+  const blankCronProjector = new BrainTranscriptProjector(parent)
+  blankCronProjector.project({
+    step_index: 1,
+    type: 'PLANNER_RESPONSE',
+    tool_calls: [
+      {
+        id: 'cron-blank',
+        name: 'schedule',
+        args: { CronExpression: '   ', Prompt: 'not a cron' },
+      },
+    ],
+  })
+  blankCronProjector.project({
+    step_index: 2,
+    type: 'GENERIC',
+    status: 'RUNNING',
+    content: `Tool is running as a background task with task id: ${parent}/task-blank\n`,
+  })
+  assert.equal(blankCronProjector.hasBackground(), true)
+  assert.equal(blankCronProjector.hasDaemons(), false)
+
+  const timerProjector = new BrainTranscriptProjector(parent)
+  timerProjector.project({
+    step_index: 1,
+    type: 'PLANNER_RESPONSE',
+    tool_calls: [
+      {
+        id: 'oneshot-timer',
+        name: 'schedule',
+        args: { DurationSeconds: 60, Prompt: 'wake up once' },
+      },
+    ],
+  })
+  timerProjector.project({
+    step_index: 2,
+    type: 'GENERIC',
+    status: 'RUNNING',
+    content: `Tool is running as a background task with task id: ${parent}/task-timer\n`,
+  })
+  assert.equal(timerProjector.hasBackground(), true)
+  assert.equal(timerProjector.hasDaemons(), false)
+})
+
+test('settleBrainTurn resets stall watchdog after a host-sleep clock jump and still stalls on normal increments', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+  t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
+
+  const items: ProviderTimelineItem[] = []
+  const obs = new BrainTurnObservation(
+    f.root,
+    parent,
+    'p',
+    -1,
+    {
+      isCurrent: () => true,
+      onUsage: () => {},
+      onItem: (item) => items.push(item),
+    },
+    200,
+  )
+  const abort = new AbortController()
+  t.after(async () => {
+    abort.abort()
+    await obs.dispose()
+  })
+
+  await f.put(parent, [
+    { step_index: 1, type: 'USER_INPUT', content: 'run' },
+    { step_index: 2, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
+  ])
+
+  const steps = createStepTracker()
+  const step2Seen = steps.waitFor(2)
+  let settled = false
+  const running = alive(
+    settleBrainTurn(f.root, parent, 'p', (item) => items.push(item), {
+      signal: abort.signal,
+      observation: obs,
+      pollIntervalMs: 200,
+      stallTimeoutMs: 12_000,
+      onStep: steps.onStep,
+    }),
+  ).then((result) => {
+    settled = true
+    return result
+  })
+  t.after(async () => {
+    abort.abort()
+    await obs.dispose()
+    await running.catch(() => undefined)
+  })
+
+  await step2Seen
+  assert.equal(settled, false)
+
+  // Single wall-clock jump > expectedPollMs (200) + 10_000 exceeds stallTimeoutMs (12_000) but resets lastActivity.
+  t.mock.timers.tick(15_200)
+  await flushObs(obs)
+  assert.equal(
+    settled,
+    false,
+    'wall-clock jump beyond poll interval + 10s must reset stall watchdog instead of failing',
+  )
+
+  // Advancing in normal increments (< 10_200ms each) past stallTimeoutMs (12_000ms) stalls as expected.
+  t.mock.timers.tick(5_000)
+  await flushObs(obs)
+  assert.equal(settled, false)
+
+  t.mock.timers.tick(5_000)
+  await flushObs(obs)
+  assert.equal(settled, false)
+
+  t.mock.timers.tick(2_000)
+  await flushObs(obs)
+  const result = await running
+  assert.equal(result.status, 'failed')
+  assert.equal(result.stalled, true)
+  assert.match(String(result.error), /idle for 12s without a final response/)
+  assert.deepEqual(items.map(errorIdOrType), ['p:step:2:stalled'])
+})

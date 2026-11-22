@@ -34,6 +34,15 @@ export function resolveMcpToolIdentity(
       ? [{ server, tool: name.slice(prefix.length) }]
       : []
   })
+  // Built-in Paseo MCP fallback applies only when explicit servers produced no match,
+  // preserving explicit servers like `paseo_custom` while supporting history replay.
+  if (
+    candidates.length === 0 &&
+    name.startsWith('mcp_paseo_') &&
+    name.length > 'mcp_paseo_'.length
+  ) {
+    candidates.push({ server: 'paseo', tool: name.slice('mcp_paseo_'.length) })
+  }
   // Legacy adapter spellings; reject ambiguous boundaries rather than guessing.
   const parts = name.startsWith('mcp__')
     ? name.slice(5).split('__')

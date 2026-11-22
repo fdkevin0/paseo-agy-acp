@@ -199,6 +199,21 @@ function isTerminalToolStatus(status: unknown): boolean {
   )
 }
 
+/** Return a shallow copy omitting agy's display-only `toolSummary` string when present. */
+export function stripToolSummary(value: unknown): unknown {
+  if (
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    Object.hasOwn(value, 'toolSummary') &&
+    typeof (value as Record<string, unknown>).toolSummary === 'string'
+  ) {
+    const { toolSummary: _, ...rest } = value as Record<string, unknown>
+    return rest
+  }
+  return value
+}
+
 export function toolDetail(
   tool: Partial<ToolCall> | ToolCallUpdate,
 ): ProviderToolCallDetail {
@@ -432,7 +447,7 @@ export function toolDetail(
   }
   return {
     type: 'unknown',
-    input: sanitizeJsonValue(tool.rawInput ?? null),
+    input: sanitizeJsonValue(stripToolSummary(tool.rawInput ?? null)),
     output: sanitizeJsonValue(
       tool.rawOutput !== undefined ? tool.rawOutput : (tool.content ?? null),
     ),

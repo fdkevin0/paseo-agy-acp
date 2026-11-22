@@ -2,9 +2,11 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import elicitationFixtures from './fixtures/elicitation-form.json' with { type: 'json' }
 import {
+  extractSecurityWarning,
   isPreapprovedMcpTool as preapprovedMcpCall,
   permissionKind,
   pickPermissionOption,
+  RequestPermissionRequestSchema,
 } from '../server/permissions.ts'
 import {
   buildElicitationResponse,
@@ -44,7 +46,12 @@ const planDetail = { type: 'plan' as const, text: 'p' }
 const textDetail = (label: string) => ({ type: 'plain_text' as const, label })
 
 const classifyPermission = (
-  toolCall: { name?: string; title?: string; kind?: unknown },
+  toolCall: {
+    toolCallId?: string
+    name?: string
+    title?: string
+    kind?: unknown
+  },
   detail: Parameters<typeof permissionKind>[1],
   requestOptions = binary,
 ) => permissionKind({ options: requestOptions, toolCall }, detail)
@@ -494,4 +501,176 @@ test('an elicitation schema matches its Brain tool input by question and labels'
   assert.equal(sameNormalizedQuestions(asked, replayed), true)
   assert.equal(sameNormalizedQuestions(asked, wokenReplayed), false)
   assert.equal(sameNormalizedQuestions([], []), false)
+})
+
+test('RequestPermissionRequestSchema preserves _meta on request, toolCall, and options', () => {
+  const parsed = RequestPermissionRequestSchema.safeParse({
+    sessionId: 'sess-1',
+    _meta: { 'agy.security.warning': 'Top-level caution', custom: true },
+    toolCall: {
+      toolCallId: 'interaction_1',
+      title: 'Confirm choice',
+      _meta: { 'agy.security.warning': { title: 'Tool', message: 'Caution' } },
+    },
+    options: [
+      {
+        optionId: 'allow',
+        name: 'Allow',
+        kind: 'allow_once',
+        _meta: {
+          'agy.security.warning': {
+            title: 'Network',
+            message: 'Sends outbound request',
+          },
+        },
+      },
+      {
+        optionId: 'deny',
+        name: 'Deny',
+        kind: 'reject_once',
+        _meta: null,
+      },
+    ],
+  })
+  assert.equal(parsed.success, true)
+  assert.deepEqual(parsed.data?._meta, {
+    'agy.security.warning': 'Top-level caution',
+    custom: true,
+  })
+  assert.deepEqual(parsed.data?.toolCall._meta, {
+    'agy.security.warning': { title: 'Tool', message: 'Caution' },
+  })
+  assert.deepEqual(parsed.data?.options[0]._meta, {
+    'agy.security.warning': {
+      title: 'Network',
+      message: 'Sends outbound request',
+    },
+  })
+  assert.equal(parsed.data?.options[1]._meta, null)
+})
+
+test('permissionKind protects interaction_* toolCallIds as questions', () => {
+  assert.equal(
+    classifyPermission(
+      {
+        toolCallId: 'interaction_42',
+        title: 'run_command',
+        kind: 'execute',
+      },
+      textDetail('run_command'),
+    ),
+    'question',
+  )
+  assert.equal(
+    classifyPermission(
+      {
+        toolCallId: 'interaction_plan_confirm',
+        title: 'exit_plan_mode',
+        kind: 'switch_mode',
+      },
+      planDetail,
+    ),
+    'question',
+  )
+  assert.equal(
+    classifyPermission(
+      {
+        toolCallId: 'call_interaction_42',
+        title: 'run_command',
+        kind: 'execute',
+      },
+      textDetail('run_command'),
+    ),
+    'tool',
+  )
+})
+
+test('extractSecurityWarning formats, deduplicates, tracks warned options, and truncates safely by code points', () => {
+  assert.equal(
+    extractSecurityWarning({
+      options: [{ optionId: 'allow' }, { optionId: 'deny', _meta: null }],
+    }),
+    undefined,
+  )
+  assert.equal(
+    extractSecurityWarning({
+      _meta: { 'agy.security.warning': '   ' },
+      toolCall: {
+        _meta: { 'agy.security.warning': { title: ' ', message: '' } },
+      },
+      options: [{ optionId: 'allow', _meta: { 'agy.security.warning': 123 } }],
+    }),
+    undefined,
+  )
+
+  const deduped = extractSecurityWarning({
+    options: [
+      {
+        optionId: 'allow_once',
+        _meta: {
+          'agy.security.warning': {
+            title: '  Destructive  ',
+            message: '  Deletes files  ',
+          },
+        },
+      },
+      {
+        optionId: 'allow_always',
+        _meta: {
+          'agy.security.warning': {
+            title: 'Destructive',
+            message: 'Deletes files',
+          },
+        },
+      },
+      {
+        optionId: 'reject_once',
+        _meta: {},
+      },
+    ],
+  })
+  assert.equal(deduped?.description, 'Destructive: Deletes files')
+  assert.deepEqual(
+    [...(deduped?.warnedOptionIds ?? [])],
+    ['allow_once', 'allow_always'],
+  )
+
+  const layered = extractSecurityWarning({
+    _meta: { 'agy.security.warning': 'Request warning' },
+    toolCall: {
+      _meta: { 'agy.security.warning': { title: 'Tool title only' } },
+    },
+    options: [
+      {
+        optionId: 'opt_msg',
+        _meta: { 'agy.security.warning': { message: 'Option message only' } },
+      },
+    ],
+  })
+  assert.equal(
+    layered?.description,
+    'Request warning\nTool title only\nOption message only',
+  )
+  assert.deepEqual([...(layered?.warnedOptionIds ?? [])], ['opt_msg'])
+
+  const requestOnly = extractSecurityWarning({
+    _meta: { 'agy.security.warning': 'Global warning' },
+    options: [{ optionId: 'allow' }],
+  })
+  assert.equal(requestOnly?.description, 'Global warning')
+  assert.equal(requestOnly?.warnedOptionIds.size, 0)
+
+  const exact512 = '🔥'.repeat(512)
+  const exactResult = extractSecurityWarning({
+    options: [{ optionId: 'a', _meta: { 'agy.security.warning': exact512 } }],
+  })
+  assert.equal(exactResult?.description, exact512)
+  assert.equal([...(exactResult?.description ?? '')].length, 512)
+
+  const over512 = '🔥'.repeat(513)
+  const truncatedResult = extractSecurityWarning({
+    options: [{ optionId: 'a', _meta: { 'agy.security.warning': over512 } }],
+  })
+  assert.equal(truncatedResult?.description, `${'🔥'.repeat(511)}…`)
+  assert.equal([...(truncatedResult?.description ?? '')].length, 512)
 })

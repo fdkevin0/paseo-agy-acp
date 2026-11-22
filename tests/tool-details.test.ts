@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
 import type { SessionNotification } from '@agentclientprotocol/sdk'
 import { BrainTranscriptProjector } from '../server/brain.ts'
-import { Timeline, toolDetail } from '../server/mapping.ts'
+import { stripToolSummary, Timeline, toolDetail } from '../server/mapping.ts'
 
 type AcpUpdate = SessionNotification['update']
 type ToolCallDetail = ReturnType<typeof toolDetail>
@@ -1004,4 +1004,48 @@ test('legacy ACP Running/Run/? titles map to dedicated cards without overriding 
     }),
     unknownDetail({ Path: '/repo/a.ts' }, null),
   )
+})
+
+test('stripToolSummary omits top-level string toolSummary for display without mutating snapshots', () => {
+  const withSummary = { toolSummary: 'Inspect config', target: 'a.json' }
+  assert.deepEqual(stripToolSummary(withSummary), { target: 'a.json' })
+  assert.equal(withSummary.toolSummary, 'Inspect config')
+
+  assert.deepEqual(stripToolSummary({ toolSummary: '' }), {})
+
+  const nonStringSummary = { toolSummary: 42, target: 'a.json' }
+  assert.equal(stripToolSummary(nonStringSummary), nonStringSummary)
+
+  const nestedSummary = { nested: { toolSummary: 'keep' } }
+  assert.equal(stripToolSummary(nestedSummary), nestedSummary)
+
+  const inherited = Object.create({ toolSummary: 'inherited' })
+  assert.equal(stripToolSummary(inherited), inherited)
+
+  const arr = ['toolSummary']
+  assert.equal(stripToolSummary(arr), arr)
+  assert.equal(stripToolSummary(null), null)
+  assert.equal(stripToolSummary('toolSummary'), 'toolSummary')
+
+  const rawInput = { toolSummary: 'Lookup item', id: 7 }
+  assert.deepEqual(
+    toolDetail({ title: fixture.name, rawInput, rawOutput: null }),
+    unknownDetail({ id: 7 }, null),
+  )
+  assert.equal(rawInput.toolSummary, 'Lookup item')
+
+  const timeline = new Timeline('summary-test')
+  const item = timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'call-1',
+    title: fixture.name,
+    status: 'in_progress',
+    rawInput,
+  })
+  assert.ok(item?.type === 'tool_call')
+  assert.deepEqual(item.detail, unknownDetail({ id: 7 }, null))
+  assert.deepEqual(timeline.toolCallSnapshot('call-1')?.rawInput, {
+    toolSummary: 'Lookup item',
+    id: 7,
+  })
 })

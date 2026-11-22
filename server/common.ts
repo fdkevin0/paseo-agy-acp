@@ -148,6 +148,13 @@ export function mergeEnv(
   return result
 }
 
+/** Break V8 SlicedString parent retention for short substrings retained across polls or caches. */
+export function detachString(value: string): string {
+  return value.length === 0
+    ? ''
+    : Buffer.from(value, 'utf16le').toString('utf16le')
+}
+
 /** Insert or refresh `key` in `map`, evicting oldest entries when exceeding `limit`. */
 export function setBounded<K, V>(
   map: Map<K, V>,

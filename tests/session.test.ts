@@ -11,6 +11,7 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import type { SessionNotification } from '@agentclientprotocol/sdk/unstable'
 import {
@@ -3932,4 +3933,323 @@ test('notificationLane isolates single-notification failures and requestPermissi
   assert.ok(recovered?.type === 'timeline.item')
   assert.ok(recovered.item.type === 'assistant_message')
   assert.equal(recovered.item.text, 'poison recovered')
+})
+
+test('full-access still prompts on interaction_* permissions, surfaces agy.security.warning, and strips toolSummary from permission input', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-interaction-sec-warn-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const nativeId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+  const events: ProviderEvent[] = []
+  let acpClient!: import('../server/transport.ts').AcpClient
+  const env = isolatedEnv(home)
+  const manager = new SessionManager({
+    launch: { command: 'agy', args: ['acp'], env },
+    usage: new AgyUsageSource({ env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: (event) => events.push(event),
+    commandWaitTimeoutMs: 50,
+    connectAcp: (_l, _cwd, _e, client) => {
+      acpClient = client
+      const closed = new Promise<void>(() => {})
+      const rpc = {
+        closed,
+        initialize: async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
+          agentCapabilities: { loadSession: true },
+        }),
+        newSession: async () => {
+          void client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'available_commands_update',
+              availableCommands: [],
+            },
+          })
+          return {
+            sessionId: nativeId,
+            configOptions: [
+              {
+                id: 'mode',
+                name: 'Mode',
+                category: 'mode',
+                type: 'select',
+                currentValue: 'default',
+                options: [
+                  { value: 'default', name: 'Default' },
+                  { value: 'accept-edits', name: 'Accept Edits' },
+                ],
+              },
+            ],
+          }
+        },
+        setSessionConfigOption: async () => ({
+          configOptions: [
+            {
+              id: 'mode',
+              name: 'Mode',
+              category: 'mode',
+              type: 'select',
+              currentValue: 'accept-edits',
+              options: [
+                { value: 'default', name: 'Default' },
+                { value: 'accept-edits', name: 'Accept Edits' },
+              ],
+            },
+          ],
+        }),
+        closeSession: async () => ({}),
+        prompt: async () => {
+          const permPromise = acpClient.requestPermission({
+            sessionId: nativeId,
+            toolCall: {
+              toolCallId: 'interaction_confirm_delete',
+              title: 'Delete production database?',
+              rawInput: {
+                target: 'prod',
+                toolSummary: 'Delete prod DB',
+              },
+            },
+            options: [
+              {
+                optionId: 'allow_once',
+                name: 'Proceed',
+                kind: 'allow_once',
+                _meta: {
+                  'agy.security.warning': {
+                    title: 'Destructive action',
+                    message: 'This permanently deletes data.',
+                  },
+                },
+              },
+              {
+                optionId: 'reject_once',
+                name: 'Cancel',
+                kind: 'reject_once',
+              },
+            ],
+          })
+          const permEvent = events.findLast(
+            (e): e is Extract<ProviderEvent, { type: 'session.permission' }> =>
+              e.type === 'session.permission',
+          )
+          assert.ok(permEvent)
+          assert.equal(permEvent.request.kind, 'question')
+          assert.equal(
+            permEvent.request.description,
+            'Destructive action: This permanently deletes data.',
+          )
+          assert.deepEqual(permEvent.request.input, { target: 'prod' })
+          assert.deepEqual(permEvent.request.actions, [
+            {
+              id: 'allow_once',
+              label: 'Proceed',
+              behavior: 'allow',
+              variant: 'danger',
+            },
+            {
+              id: 'reject_once',
+              label: 'Cancel',
+              behavior: 'deny',
+            },
+          ])
+          await manager.handle({
+            type: 'session.permission',
+            sessionId: 's',
+            permissionId: permEvent.request.id,
+            response: { behavior: 'deny', selectedActionId: 'reject_once' },
+          })
+          assert.deepEqual(await permPromise, {
+            outcome: { outcome: 'selected', optionId: 'reject_once' },
+          })
+          return { stopReason: 'end_turn' as const }
+        },
+        cancel: async () => {},
+      } as unknown as ReturnType<
+        typeof import('../server/transport.ts').connectAcp
+      >['rpc']
+      return {
+        rpc,
+        exited: closed,
+        stopped: Promise.resolve(),
+        close: async () => {},
+        request: async <T>(op: Promise<T>) => op,
+        get closed() {
+          return false
+        },
+        get tier() {
+          return undefined
+        },
+        get models() {
+          return undefined
+        },
+      }
+    },
+  })
+  t.after(() => manager.close())
+  await manager.handle({
+    type: 'session.open',
+    requestId: 'open',
+    sessionId: 's',
+    history: 'skip',
+    config: {
+      cwd: home,
+      env: {},
+      mode: 'full-access',
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+  await manager.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId: 'm1',
+      delivery: 'auto',
+      input: { type: 'message', content: [{ type: 'text', text: 'delete' }] },
+    },
+  })
+})
+
+test('promptSession classifies stopReason refusal and hidden SQLite step_type 17 API errors as failed turns', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-hidden-sql-error-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const nativeId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+  const convDir = join(home, '.gemini/antigravity-cli/conversations')
+  await mkdir(convDir, { recursive: true })
+  const dbPath = join(convDir, `${nativeId}.db`)
+  const db = new DatabaseSync(dbPath)
+  t.after(() => db.close())
+  db.exec(
+    'CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL, step_payload BLOB)',
+  )
+  const insertStep = db.prepare(
+    'INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)',
+  )
+  const events: ProviderEvent[] = []
+  const env = isolatedEnv(home)
+  const promptSteps = [
+    async () => {
+      insertStep.run(
+        1,
+        17,
+        Buffer.from(
+          'reason:QUOTA_EXHAUSTED quotaResetDelay=2m30s quotaResetTimeStamp=2026-11-23T05:00:00Z',
+          'utf8',
+        ),
+      )
+      return { stopReason: 'refusal' as const }
+    },
+    async () => {
+      insertStep.run(
+        2,
+        17,
+        Buffer.from(
+          'messages.4.content.0.thinking.signature: Field required',
+          'utf8',
+        ),
+      )
+      return { stopReason: 'end_turn' as const }
+    },
+  ]
+  const manager = new SessionManager({
+    launch: { command: 'agy', args: ['acp'], env },
+    usage: new AgyUsageSource({ env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: (event) => events.push(event),
+    commandWaitTimeoutMs: 50,
+    connectAcp: (_l, _cwd, _e, client) => {
+      const closed = new Promise<void>(() => {})
+      const rpc = {
+        closed,
+        initialize: async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
+          agentCapabilities: { loadSession: true },
+        }),
+        newSession: async () => {
+          void client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'available_commands_update',
+              availableCommands: [],
+            },
+          })
+          return { sessionId: nativeId, configOptions: [] }
+        },
+        closeSession: async () => ({}),
+        prompt: () => promptSteps.shift()!(),
+        cancel: async () => {},
+      } as unknown as ReturnType<
+        typeof import('../server/transport.ts').connectAcp
+      >['rpc']
+      return {
+        rpc,
+        exited: closed,
+        stopped: Promise.resolve(),
+        close: async () => {},
+        request: async <T>(op: Promise<T>) => op,
+        get closed() {
+          return false
+        },
+        get tier() {
+          return undefined
+        },
+        get models() {
+          return undefined
+        },
+      }
+    },
+  })
+  t.after(() => manager.close())
+  await manager.handle({
+    type: 'session.open',
+    requestId: 'open',
+    sessionId: 's',
+    history: 'skip',
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+
+  // Turn 1: stopReason 'refusal' + QUOTA_EXHAUSTED step_type 17 fails with reset info.
+  await manager.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId: 'm-refusal',
+      delivery: 'auto',
+      input: { type: 'message', content: [{ type: 'text', text: 'one' }] },
+    },
+  })
+  const firstFailed = events.findLast(
+    (e): e is Extract<ProviderEvent, { type: 'session.turn' }> =>
+      e.type === 'session.turn' && e.state === 'failed',
+  )
+  assert.ok(firstFailed)
+  assert.match(firstFailed.error?.message ?? '', /quota|rate/i)
+  assert.match(firstFailed.error?.message ?? '', /2026-11-23T05:00:00Z/)
+
+  // Turn 2: stopReason 'end_turn' + hidden step_type 17 INVALID_THINKING_SIGNATURE fails clearly.
+  await manager.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId: 'm-hidden',
+      delivery: 'auto',
+      input: { type: 'message', content: [{ type: 'text', text: 'two' }] },
+    },
+  })
+  const secondFailed = events.findLast(
+    (e): e is Extract<ProviderEvent, { type: 'session.turn' }> =>
+      e.type === 'session.turn' && e.state === 'failed',
+  )
+  assert.ok(secondFailed)
+  assert.notEqual(secondFailed.turnId, firstFailed.turnId)
+  assert.match(secondFailed.error?.message ?? '', /new session/i)
 })

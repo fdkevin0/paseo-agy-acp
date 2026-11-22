@@ -5,7 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { RequestPermissionRequestSchema } from './permissions.ts'
 import { TransformStream, WritableStream } from 'node:stream/web'
 import { nativeModelsSchema, type SessionMetadata } from './mapping.ts'
-import { mergeEnv, record } from './common.ts'
+import { detachString, mergeEnv, record } from './common.ts'
 import { Readable, Writable } from 'node:stream'
 import {
   client as createAcpClient,
@@ -120,6 +120,7 @@ const SHUTDOWN_GRACE_MS = 300
 const SIGKILL_TIMEOUT_MS = 650
 const TERMINATION_DEADLINE_MS = 1100
 const ACP_REQUEST_TIMEOUT_MS = 30_000
+const ACP_REQUEST_MAX_TIMEOUT_MS = 5 * 60_000
 const STDERR_DRAIN_MS = 200
 
 export type AcpClient = {
@@ -160,7 +161,7 @@ export function connectAcp(
   let stopping = false
   let stderr = ''
   child.stderr.on('data', (chunk) => {
-    stderr = (stderr + chunk).slice(-4096)
+    stderr = detachString((stderr + chunk).slice(-4096))
   })
   const stderrClosed = new Promise<void>((resolve) => {
     child.stderr.once('end', resolve)
@@ -217,10 +218,18 @@ export function connectAcp(
   })
   let tier: z.infer<typeof tierSchema> | undefined
   let models: SessionMetadata['models']
-  const stream = ndJsonStream(
-    Writable.toWeb(child.stdin),
-    Readable.toWeb(child.stdout),
+  const wireReadListeners = new Set<() => void>()
+  const stdoutStream = Readable.toWeb(child.stdout).pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        if (chunk.byteLength > 0) {
+          for (const listener of wireReadListeners) listener()
+        }
+        controller.enqueue(chunk)
+      },
+    }),
   )
+  const stream = ndJsonStream(Writable.toWeb(child.stdin), stdoutStream)
   const writer = stream.writable.getWriter()
   const writable = new WritableStream({
     write: (message) => writer.write(message),
@@ -407,24 +416,53 @@ export function connectAcp(
   }
   async function request<T>(
     operation: Promise<T>,
-    options?: { timeoutMs?: number; fatalOnTimeout?: boolean },
+    options?: {
+      timeoutMs?: number
+      idleTimeoutMs?: number
+      maxTimeoutMs?: number
+      fatalOnTimeout?: boolean
+    },
   ): Promise<T> {
-    const timeoutMs = options?.timeoutMs ?? requestTimeoutMs
     const fatalOnTimeout = options?.fatalOnTimeout ?? true
+    const idleTimeoutMs = options?.idleTimeoutMs
     let timer: NodeJS.Timeout | undefined
+    let maxTimer: NodeJS.Timeout | undefined
+    let onWireRead: (() => void) | undefined
+    let settled = false
     try {
       return await Promise.race([
         operation,
         new Promise<never>((_, reject) => {
-          timer = setTimeout(() => {
+          const onTimeout = () => {
+            if (settled) return
+            settled = true
             const error = new Error('ACP request timed out')
             if (fatalOnTimeout) fail(error)
             reject(error)
-          }, timeoutMs)
+          }
+          if (idleTimeoutMs !== undefined) {
+            const maxTimeoutMs =
+              options?.maxTimeoutMs ?? ACP_REQUEST_MAX_TIMEOUT_MS
+            const armIdle = () => {
+              if (settled) return
+              clearTimeout(timer)
+              timer = setTimeout(onTimeout, idleTimeoutMs)
+            }
+            onWireRead = armIdle
+            wireReadListeners.add(onWireRead)
+            armIdle()
+            maxTimer = setTimeout(onTimeout, maxTimeoutMs)
+          } else {
+            const timeoutMs = options?.timeoutMs ?? requestTimeoutMs
+            timer = setTimeout(onTimeout, timeoutMs)
+          }
         }),
       ])
     } finally {
+      settled = true
       clearTimeout(timer)
+      clearTimeout(maxTimer)
+      if (onWireRead) wireReadListeners.delete(onWireRead)
     }
   }
   return {

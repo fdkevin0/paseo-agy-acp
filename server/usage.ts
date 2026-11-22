@@ -23,6 +23,7 @@ import {
 } from '@getpaseo/plugin/server/usage'
 import {
   definedProcessEnv,
+  detachString,
   formatErrorMessage,
   mergeEnv,
   setBounded,
@@ -178,7 +179,8 @@ async function readChunkEmail(
   const matches = [
     ...bytes.toString('utf8', 0, bytesRead).matchAll(AUTH_LOG_PATTERN),
   ]
-  return matches.at(-1)?.[1]
+  const email = matches.at(-1)?.[1]
+  return email === undefined ? undefined : detachString(email)
 }
 
 // shortcut: agy >=1.5 exposes no structured account email or lightweight keychain auth check in /usage JSON or ACP; drop log scanning once upstream adds one.
@@ -407,7 +409,7 @@ async function runUsageCommand(
     child.stderr?.on('data', (chunk: string) => {
       if (settled || aborting) return
       const next = stderr + chunk
-      stderr = next.slice(-MAX_USAGE_STDERR_BYTES)
+      stderr = detachString(next.slice(-MAX_USAGE_STDERR_BYTES))
       if (/Authentication required\b/i.test(next)) {
         abort(new Error('Authentication required; run agy to sign in'))
       }
