@@ -263,7 +263,17 @@ test('classifyStepError parses Go and agy 1.5 error formats and caps message len
     reachedModel: false,
   })
   assert.equal(longGoError?.kind, 'api_error')
-  assert.ok((longGoError?.message.length ?? 0) <= 512)
+  assert.ok([...(longGoError?.message ?? '')].length <= 512)
+
+  const surrogateGoError = classifyStepError({
+    stepType: 17,
+    payloadText: `Error 502, Message: ${'🔥'.repeat(600)}, Status: BAD_GATEWAY`,
+    stopReason: 'end_turn',
+    reachedModel: false,
+  })
+  assert.equal(surrogateGoError?.kind, 'api_error')
+  assert.equal([...(surrogateGoError?.message ?? '')].length, 512)
+  assert.equal(surrogateGoError?.message.endsWith('🔥…'), true)
 })
 
 test('classifyStepError handles refusal fallbacks, generic step 17 fallback, retry warnings, and non-17 steps', () => {
@@ -642,6 +652,7 @@ test('baseline capture and step error read fail closed on symlink escape, missin
   await symlink(outsidePath, join(convDir, `${ID_A}.db`))
   assert.deepEqual(await captureConversationStepBaseline(brainRoot, ID_A), {
     maxIdx: -1,
+    unreadable: true,
   })
   assert.equal(
     await readConversationStepError(
@@ -671,14 +682,19 @@ test('baseline capture and step error read fail closed on symlink escape, missin
   } finally {
     noStepsDb.close()
   }
-  assert.deepEqual(await captureConversationStepBaseline(brainRoot, ID_B), {
-    maxIdx: -1,
-  })
+  const missingStepsBaseline = await captureConversationStepBaseline(
+    brainRoot,
+    ID_B,
+  )
+  assert.equal(missingStepsBaseline.maxIdx, -1)
+  assert.equal(typeof missingStepsBaseline.dev, 'bigint')
+  assert.equal(typeof missingStepsBaseline.ino, 'bigint')
+  assert.equal(missingStepsBaseline.unreadable, undefined)
   assert.equal(
     await readConversationStepError(
       brainRoot,
       ID_B,
-      { maxIdx: -1 },
+      missingStepsBaseline,
       'end_turn',
     ),
     undefined,
@@ -688,7 +704,7 @@ test('baseline capture and step error read fail closed on symlink escape, missin
       await readConversationStepError(
         brainRoot,
         ID_B,
-        { maxIdx: -1 },
+        missingStepsBaseline,
         'refusal',
       )
     )?.kind,
@@ -697,14 +713,14 @@ test('baseline capture and step error read fail closed on symlink escape, missin
 
   // Corrupt DB
   await writeFile(join(convDir, `${ID_D}.db`), 'definitely-not-sqlite')
-  assert.deepEqual(await captureConversationStepBaseline(brainRoot, ID_D), {
-    maxIdx: -1,
-  })
+  const corruptBaseline = await captureConversationStepBaseline(brainRoot, ID_D)
+  assert.equal(corruptBaseline.maxIdx, -1)
+  assert.equal(corruptBaseline.unreadable, true)
   assert.equal(
     await readConversationStepError(
       brainRoot,
       ID_D,
-      { maxIdx: -1 },
+      corruptBaseline,
       'end_turn',
     ),
     undefined,
@@ -714,10 +730,132 @@ test('baseline capture and step error read fail closed on symlink escape, missin
       await readConversationStepError(
         brainRoot,
         ID_D,
-        { maxIdx: -1 },
+        corruptBaseline,
         'refusal',
       )
     )?.kind,
     'quota_exhausted',
   )
+})
+
+test('readConversationStepError ignores non-17 step_payload prose on refusal', async (t) => {
+  const { brainRoot, convDir } = await createEnv(t)
+  const dbPath = join(convDir, `${ID_A}.db`)
+  const db = new DatabaseSync(dbPath)
+  try {
+    db.exec(
+      'CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, step_payload BLOB, error_details BLOB)',
+    )
+    db.prepare(
+      'INSERT INTO steps (idx, step_type, step_payload, error_details) VALUES (?, ?, ?, ?)',
+    ).run(
+      0,
+      14,
+      Buffer.from(
+        'User asked about Error 500, Message: fake boom, Status: INTERNAL and HTTP 429 rate limit retryDelay="10s"',
+      ),
+      null,
+    )
+  } finally {
+    db.close()
+  }
+
+  const userOnlyRefusal = await readConversationStepError(
+    brainRoot,
+    ID_A,
+    { maxIdx: -1 },
+    'refusal',
+  )
+  assert.deepEqual(userOnlyRefusal, {
+    kind: 'quota_exhausted',
+    message:
+      'Request was refused before reaching the model (quota exhausted or rate limited).',
+    reachedModel: false,
+  })
+
+  const dbWrite = new DatabaseSync(dbPath)
+  try {
+    dbWrite
+      .prepare(
+        'INSERT INTO steps (idx, step_type, step_payload, error_details) VALUES (?, ?, ?, ?)',
+      )
+      .run(
+        1,
+        15,
+        Buffer.from(
+          'Assistant mentioned reason:QUOTA_EXHAUSTED and HTTP 429 rate limit in explanation before refusing',
+        ),
+        null,
+      )
+  } finally {
+    dbWrite.close()
+  }
+
+  const plannerRefusal = await readConversationStepError(
+    brainRoot,
+    ID_A,
+    { maxIdx: -1 },
+    'refusal',
+  )
+  assert.deepEqual(plannerRefusal, {
+    kind: 'refusal',
+    message: 'Model refused to complete the turn.',
+    reachedModel: true,
+  })
+})
+
+test('readConversationStepError does not re-attribute stale errors when baseline capture hits transient SQLite failure', async (t) => {
+  const { brainRoot, convDir } = await createEnv(t)
+  const dbPath = join(convDir, `${ID_B}.db`)
+  const db = new DatabaseSync(dbPath)
+  try {
+    db.exec(
+      'CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, step_payload BLOB)',
+    )
+    db.prepare(
+      'INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)',
+    ).run(
+      0,
+      17,
+      Buffer.from(
+        'Error 500, Message: stale prior-turn error, Status: INTERNAL',
+      ),
+    )
+  } finally {
+    db.close()
+  }
+
+  const baseline = await captureConversationStepBaseline(brainRoot, ID_B, {
+    openDb: () => {
+      throw new Error('SQLITE_BUSY')
+    },
+  })
+  assert.equal(baseline.unreadable, true)
+
+  let postOpenCalls = 0
+  const postOpenDb = (path: string) => {
+    postOpenCalls += 1
+    return new DatabaseSync(path, { readOnly: true })
+  }
+
+  assert.equal(
+    await readConversationStepError(brainRoot, ID_B, baseline, 'end_turn', {
+      openDb: postOpenDb,
+    }),
+    undefined,
+  )
+  assert.equal(postOpenCalls, 0)
+
+  assert.deepEqual(
+    await readConversationStepError(brainRoot, ID_B, baseline, 'refusal', {
+      openDb: postOpenDb,
+    }),
+    {
+      kind: 'quota_exhausted',
+      message:
+        'Request was refused before reaching the model (quota exhausted or rate limited).',
+      reachedModel: false,
+    },
+  )
+  assert.equal(postOpenCalls, 0)
 })

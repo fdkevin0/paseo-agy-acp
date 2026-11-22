@@ -243,6 +243,7 @@ export interface StepErrorBaseline {
   readonly maxIdx: number
   readonly dev?: bigint
   readonly ino?: bigint
+  readonly unreadable?: boolean
 }
 
 export type HiddenApiErrorKind =
@@ -301,9 +302,10 @@ function sanitizePrintable(raw: string): string {
 }
 
 function capDetachedMessage(raw: string): string {
+  const chars = [...raw]
   return detachString(
-    raw.length > MAX_ERROR_MESSAGE_LENGTH
-      ? `${raw.slice(0, MAX_ERROR_MESSAGE_LENGTH - 1)}…`
+    chars.length > MAX_ERROR_MESSAGE_LENGTH
+      ? `${chars.slice(0, MAX_ERROR_MESSAGE_LENGTH - 1).join('')}…`
       : raw,
   )
 }
@@ -379,9 +381,8 @@ export function classifyStepError(input: {
   if (text && INVALID_THINKING_SIGNATURE_PATTERN.test(text)) {
     return {
       kind: 'invalid_thinking_signature',
-      message: detachString(
+      message:
         'Corrupted thinking block signature remains in native session history. Start a new session to continue.',
-      ),
       ...(structured
         ? {
             statusCode: structured.statusCode,
@@ -443,14 +444,13 @@ export function classifyStepError(input: {
     return input.reachedModel
       ? {
           kind: 'refusal',
-          message: detachString('Model refused to complete the turn.'),
+          message: 'Model refused to complete the turn.',
           reachedModel: true,
         }
       : {
           kind: 'quota_exhausted',
-          message: detachString(
+          message:
             'Request was refused before reaching the model (quota exhausted or rate limited).',
-          ),
           reachedModel: false,
         }
   }
@@ -481,8 +481,8 @@ export async function captureConversationStepBaseline(
   let stat: ConversationDbStat
   try {
     stat = await resolveConversationDbStat(brainRoot, nativeId)
-  } catch {
-    return { maxIdx: -1 }
+  } catch (err) {
+    return isMissing(err) ? { maxIdx: -1 } : { maxIdx: -1, unreadable: true }
   }
   let db: DatabaseSync | undefined
   try {
@@ -493,7 +493,9 @@ export async function captureConversationStepBaseline(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'steps'",
       )
       .get()
-    if (hasSteps === undefined) return { maxIdx: -1 }
+    if (hasSteps === undefined) {
+      return { maxIdx: -1, dev: stat.dev, ino: stat.ino }
+    }
     const row = db
       .prepare('SELECT COALESCE(MAX(idx), -1) AS maxIdx FROM steps')
       .get() as { maxIdx?: unknown } | undefined
@@ -505,7 +507,7 @@ export async function captureConversationStepBaseline(
         : -1
     return { maxIdx, dev: stat.dev, ino: stat.ino }
   } catch {
-    return { maxIdx: -1 }
+    return { maxIdx: -1, dev: stat.dev, ino: stat.ino, unreadable: true }
   } finally {
     db?.close()
   }
@@ -523,7 +525,7 @@ export async function readConversationStepError(
     stopReason === 'refusal'
       ? classifyStepError({ stopReason: 'refusal', reachedModel: false })
       : undefined
-  if (!sessionIdPattern.test(nativeId)) return fallback()
+  if (baseline.unreadable || !sessionIdPattern.test(nativeId)) return fallback()
   let stat: ConversationDbStat
   try {
     stat = await resolveConversationDbStat(brainRoot, nativeId)
@@ -561,7 +563,8 @@ export async function readConversationStepError(
       typeof latest?.type === 'number' && Number.isInteger(latest.type)
         ? latest.type
         : undefined
-    const payloadPart = decodeSqlText(latest?.payload)
+    // Never feed untrusted user/assistant prose (`step_type !== 17`) into error classifiers.
+    const payloadPart = stepType === 17 ? decodeSqlText(latest?.payload) : ''
     const errDetailsPart = decodeSqlText(latest?.errDetails)
     const payloadText =
       payloadPart && errDetailsPart
