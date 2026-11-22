@@ -990,6 +990,17 @@ test('parseUsage and usageWindows enforce status, drop disabled buckets, and tri
       parseUsage(
         JSON.stringify({
           status: 'FAILED',
+          response: null,
+          command: null,
+        }),
+      ),
+    /FAILED/,
+  )
+  assert.throws(
+    () =>
+      parseUsage(
+        JSON.stringify({
+          status: 'FAILED',
           response: '   ',
           command: { data: { groups: [] } },
         }),

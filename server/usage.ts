@@ -57,8 +57,8 @@ const usageInputSchema = z.object({
 })
 
 const groupsSchema = z.object({
-  status: z.string().optional(),
-  response: z.string().optional(),
+  status: z.string().nullish(),
+  response: z.string().nullish(),
   command: z
     .object({
       data: z.object({
@@ -79,7 +79,7 @@ const groupsSchema = z.object({
         ),
       }),
     })
-    .optional(),
+    .nullish(),
 })
 
 /** Validate the CLI envelope before translating its quota groups. */
@@ -90,7 +90,7 @@ export function parseUsage(stdout: string) {
   } catch (error) {
     throw new Error('Unexpected /usage JSON output from agy', { cause: error })
   }
-  if (parsed.status !== undefined && parsed.status !== 'SUCCESS') {
+  if (parsed.status != null && parsed.status !== 'SUCCESS') {
     const detail = parsed.response?.trim()
     throw new Error(
       detail

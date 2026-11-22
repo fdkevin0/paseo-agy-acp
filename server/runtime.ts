@@ -249,6 +249,7 @@ export class SharedControlRuntime {
   private readonly transports = new Set<ControlTransport>()
   private serializedLane: Promise<void> = Promise.resolve()
   private closed = false
+  private closeController = new AbortController()
   private closing: Promise<void> | undefined
 
   constructor(options: SharedControlRuntimeOptions = {}) {
@@ -280,6 +281,7 @@ export class SharedControlRuntime {
   close(): Promise<void> {
     if (this.closing) return this.closing
     this.closed = true
+    this.closeController.abort(new Error('Provider connection is closed'))
     if (this.active) this.evict(this.active)
     this.closing = Promise.all(
       [...this.transports].map((transport) =>
@@ -378,9 +380,9 @@ export class SharedControlRuntime {
     const activeSlot = slot
     activeSlot.ready = (async () => {
       try {
-        await initializeAcp(transport)
+        await initializeAcp(transport, this.closeController.signal)
         if (this.closed) throw new Error('Provider connection is closed')
-        if (activeSlot.retired || transport.closed)
+        if (exitError || transport.closed)
           throw (
             exitError ?? new Error('ACP control runtime closed during startup')
           )
@@ -483,7 +485,7 @@ export class SharedControlRuntime {
     )
     this.trackTransport(transport)
     try {
-      await initializeAcp(transport)
+      await initializeAcp(transport, this.closeController.signal)
       if (this.closed) throw new Error('Provider connection is closed')
       const lease: ControlLease = {
         transport,
@@ -526,6 +528,7 @@ export class StandbyRuntimePool {
   private readonly transports = new Set<ControlTransport>()
   private readonly watchedStops = new WeakSet<ControlTransport>()
   private closed = false
+  private closeController = new AbortController()
   private closing: Promise<void> | undefined
 
   constructor(options: StandbyRuntimePoolOptions = {}) {
@@ -614,7 +617,10 @@ export class StandbyRuntimePool {
         this.slots.set(key, slot)
         slot.ready = (async (): Promise<AttachableRuntime> => {
           try {
-            const initialized = await initializeAcp(transport)
+            const initialized = await initializeAcp(
+              transport,
+              this.closeController.signal,
+            )
             if (
               this.closed ||
               slot.retired ||
@@ -784,6 +790,9 @@ export class StandbyRuntimePool {
   close(): Promise<void> {
     if (this.closing) return this.closing
     this.closed = true
+    this.closeController.abort(
+      new Error('Standby ACP runtime closed during startup'),
+    )
     for (const slot of [...this.slots.values()]) this.evictSlot(slot)
     this.slots.clear()
     this.closing = Promise.all(

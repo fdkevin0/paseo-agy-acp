@@ -7231,3 +7231,84 @@ test('BackgroundWorkProbe.sync warms the cursor and serializes concurrent calls 
   assert.equal(maxConcurrentReads, 1)
   assert.deepEqual(serializedOrder, ['sync', 'hasActiveWork'])
 })
+
+test('BackgroundWorkProbe fails closed on corrupt appended JSONL and recovers from raced empty-reset rewrites', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+  const parent = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+  const taskId = 'bg-corrupt-guard'
+
+  // 1. Corrupt appended JSONL line on a warm probe must reject (fail closed) rather than resetting node to false.
+  const corruptProbe = new BackgroundWorkProbe()
+  await f.put(parent, [
+    { step_index: 0, type: 'USER_INPUT', content: 'start' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          id: 'bg-1',
+          name: 'run_command',
+          args: { CommandLine: 'sleep 30' },
+        },
+      ],
+    },
+    {
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: `Tool is running as a background task with task id: ${taskId}\n`,
+    },
+  ])
+  assert.equal(await corruptProbe.hasActiveWork(f.root, parent), true)
+
+  await appendFile(f.path(parent), '{"step_index":3,"type":"broken"\n')
+  await assert.rejects(corruptProbe.hasActiveWork(f.root, parent), SyntaxError)
+
+  // 2. Raced mid-O_TRUNC rewrite returning { rows: [], reset: true } on first read retries once and ingests replacement rows.
+  const replacementRows = [
+    { step_index: 0, type: 'USER_INPUT', content: 'rewritten' },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          id: 'bg-2',
+          name: 'run_command',
+          args: { CommandLine: 'sleep 30' },
+        },
+      ],
+    },
+    {
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: `Tool is running as a background task with task id: ${taskId}\n`,
+    },
+  ]
+  const readResponses: Array<Awaited<ReturnType<TranscriptReader['read']>>> = [
+    {
+      rows: [
+        { step_index: 0, type: 'USER_INPUT', content: 'initial' },
+        done(1, 'idle'),
+      ],
+      reset: true,
+      mtimeMs: Date.now(),
+    },
+    { rows: [], reset: true, mtimeMs: Date.now() },
+    { rows: replacementRows, reset: true, mtimeMs: Date.now() },
+  ]
+  const racedProbe = new BackgroundWorkProbe(
+    () =>
+      new (class extends TranscriptReader {
+        override async read() {
+          return readResponses.shift()!
+        }
+      })(),
+  )
+  assert.equal(await racedProbe.hasActiveWork(f.root, parent), false)
+  assert.equal(await racedProbe.hasActiveWork(f.root, parent), true)
+  assert.equal(readResponses.length, 0)
+})

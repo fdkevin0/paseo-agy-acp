@@ -2431,3 +2431,55 @@ test('SessionManager.close during standby.take or cold initializeAcp aborts imme
     await rm(home, { recursive: true, force: true })
   }
 })
+
+test('SharedControlRuntime transparently retries an in-flight startup caller when binary fingerprint changes during initialize', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-shared-startup-fp-'))
+  const init1Entered = deferred<void>()
+  const init1Gate = deferred<{ agentInfo?: { version?: string } }>()
+  const fake = createFakeConnect([
+    {
+      init: () => {
+        init1Entered.resolve()
+        return init1Gate.promise
+      },
+    },
+    {
+      init: async () => ({ agentInfo: { version: '1.5.12' } }),
+    },
+  ])
+  let currentFingerprint = 'fp-v1'
+  const launch: ProviderLaunch = {
+    command: 'agy',
+    args: ['acp'],
+    env: isolatedEnv(home),
+  }
+  const runtime = new SharedControlRuntime({
+    launch,
+    connectAcp: fake.connect,
+    resolveFingerprint: async () => currentFingerprint,
+  })
+  try {
+    const caller1 = runtime.run(home, async ({ transport }) => transport)
+    await init1Entered.promise
+
+    // Binary upgrades while slot1 initialize is still pending; caller2 starts slot2 and retires slot1.
+    currentFingerprint = 'fp-v2'
+    const transport2 = await runtime.run(
+      home,
+      async ({ transport }) => transport,
+    )
+    assert.equal(transport2, fake.created[1].transport)
+    assert.equal(fake.created[0].closeCalled(), 0)
+
+    // Completing slot1 initialize lets caller1 drain slot1, close it, and transparently acquire slot2.
+    init1Gate.resolve({ agentInfo: { version: '1.5.12' } })
+    const transport1 = await caller1
+    assert.equal(transport1, fake.created[1].transport)
+    await fake.created[0].closedBarrier.promise
+    assert.equal(fake.created[0].closeCalled(), 1)
+    assert.equal(fake.created.length, 2)
+  } finally {
+    await runtime.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})

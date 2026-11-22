@@ -239,13 +239,22 @@ async function pollAndIngestProbeNode(
   subagents: SubagentRecord[]
   rowCount: number
 }> {
-  const [{ inbox: rawInbox, subagents }, readResult] = await Promise.all([
-    node.pollMetadata(root),
+  const readTranscript = () =>
     node.reader.read(root, nativeId).catch((error) => {
       if (isMissing(error)) return MISSING_TRANSCRIPT_READ
       throw error
-    }),
+    })
+  const [{ inbox: rawInbox, subagents }, firstRead] = await Promise.all([
+    node.pollMetadata(root),
+    readTranscript(),
   ])
+  // A warm incremental reader (offset > 0) reports { rows: [], reset: true } on either a mid-O_TRUNC
+  // raced write or a corrupt appended JSONL line. Retry once from byte 0 before resetting `node` so
+  // genuinely corrupt transcripts throw SyntaxError (fail-closed) and raced rewrites ingest the snapshot.
+  const readResult =
+    firstRead.reset && firstRead.rows.length === 0
+      ? { ...(await readTranscript()), reset: true }
+      : firstRead
   const restartAfterStep = runtimeEpoch?.afterStepIndex
   if (readResult.reset) {
     node.reset(rawInbox, subagents)
