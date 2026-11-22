@@ -963,6 +963,8 @@ export async function settleBrainTurn(
   stream.phase = 'settling'
   const startedAt = Date.now()
   let lastActivity = startedAt
+  let lastTick = startedAt
+  const expectedPollMs = Math.max(pollIntervalMs, stream.pollIntervalMs)
   let fingerprint = ''
   let foldVersion = 0
   let initial = true
@@ -1198,6 +1200,12 @@ export async function settleBrainTurn(
       if (!signal?.aborted && !deferReaderFault()) throw error
     })
     while (true) {
+      const now = Date.now()
+      // Reset the stall watchdog across host sleep/suspension gaps that jump past a normal poll wake.
+      if (now - lastTick > expectedPollMs + 10_000) {
+        lastActivity = now
+      }
+      lastTick = now
       const revision = stream.revision
       if (signal?.aborted) {
         if (

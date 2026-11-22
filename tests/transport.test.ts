@@ -311,3 +311,96 @@ test(
     await waitUntil(() => isProcessGone(psPid))
   },
 )
+
+test(
+  'transport request idleTimeoutMs resets on partial wire bytes while enforcing silence and maxTimeoutMs',
+  { timeout: 5000 },
+  async (t) => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-transport-idle-'))
+    const childScript = `
+    const readline = require('node:readline');
+    const rl = readline.createInterface({ input: process.stdin });
+    rl.on('line', (line) => {
+      const msg = JSON.parse(line);
+      if (msg.method === 'initialize') {
+        const body = JSON.stringify({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { protocolVersion: 1, agentCapabilities: {} },
+        }) + '\\n';
+        const parts = [
+          body.slice(0, 12),
+          body.slice(12, 24),
+          body.slice(24, 40),
+          body.slice(40, 56),
+          body.slice(56, 72),
+          body.slice(72),
+        ];
+        let i = 0;
+        const send = () => {
+          process.stdout.write(parts[i++]);
+          if (i < parts.length) setTimeout(send, 70);
+        };
+        send();
+      } else if (msg.method === 'session/prompt') {
+        process.stdout.write('{"jsonrpc":"2.0"');
+        setInterval(() => process.stdout.write(' '), 30);
+      }
+    });
+  `
+    let exitError: Error | undefined
+    const transport = connectAcp(
+      {
+        command: process.execPath,
+        args: ['-e', childScript],
+        env: isolatedEnv(home),
+      },
+      home,
+      {},
+      {
+        sessionUpdate: async () => {},
+        requestPermission: async () => ({
+          outcome: { outcome: 'cancelled' },
+        }),
+      },
+      (err) => {
+        exitError = err
+      },
+    )
+    t.after(async () => {
+      await transport.close()
+      await rm(home, { recursive: true, force: true })
+    })
+
+    // Partial chunks span ~350ms (> 250ms idleTimeoutMs) before newline completes the frame.
+    const init = await transport.request(
+      transport.rpc.initialize({ protocolVersion: 1, clientCapabilities: {} }),
+      { idleTimeoutMs: 250, maxTimeoutMs: 3000 },
+    )
+    assert.equal(init.protocolVersion, 1)
+    assert.equal(exitError, undefined)
+
+    // Complete silence times out at idleTimeoutMs well before maxTimeoutMs.
+    await assert.rejects(
+      transport.request(
+        transport.rpc.newSession({ cwd: home, mcpServers: [] }),
+        { idleTimeoutMs: 80, maxTimeoutMs: 5000, fatalOnTimeout: false },
+      ),
+      /ACP request timed out/,
+    )
+    assert.equal(exitError, undefined)
+
+    // Continuous partial bytes keep resetting idleTimeoutMs until maxTimeoutMs ceiling hits.
+    await assert.rejects(
+      transport.request(transport.rpc.prompt({ sessionId: 's1', prompt: [] }), {
+        idleTimeoutMs: 150,
+        maxTimeoutMs: 220,
+      }),
+      /ACP request timed out/,
+    )
+    assert.equal(
+      (exitError as Error | undefined)?.message,
+      'ACP request timed out',
+    )
+  },
+)

@@ -1,6 +1,7 @@
 import { toolDisplayName } from './mcp.ts'
 import {
   cleanToolName,
+  detachString,
   isNativeToolName,
   isAskQuestionName,
   record,
@@ -449,12 +450,13 @@ export class BrainTranscriptProjector {
       base.detail.type === 'sub_agent' &&
       base.detail.childSessionId
     ) {
+      const childId = detachString(base.detail.childSessionId)
       this.subagentTouches.push({
-        childId: base.detail.childSessionId,
+        childId,
         stepIndex: pending.stepIndex,
       })
       if (isNativeToolName(pending.name, 'send_message')) {
-        this.completedWakeups.set(pending.stepIndex, base.detail.childSessionId)
+        this.completedWakeups.set(pending.stepIndex, childId)
       }
     }
     const item: ProviderTimelineItem =
@@ -483,9 +485,15 @@ export class BrainTranscriptProjector {
           callId: pending.callId,
           source: pending.nativeIdentitySource,
         }
-      const taskId = text.match(backgroundTaskPattern)?.[1]
-      if (taskId) {
-        if (pending.args.IsDaemon === true) {
+      const rawTaskId = text.match(backgroundTaskPattern)?.[1]
+      if (rawTaskId) {
+        const taskId = detachString(rawTaskId)
+        const isStandingDaemon =
+          pending.args.IsDaemon === true ||
+          (isNativeToolName(pending.name, 'schedule') &&
+            typeof pending.args.CronExpression === 'string' &&
+            pending.args.CronExpression.trim().length > 0)
+        if (isStandingDaemon) {
           const max = Number(pending.args.MaxIterations)
           this.daemons.set(
             taskId,

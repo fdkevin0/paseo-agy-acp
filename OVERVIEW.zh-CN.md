@@ -24,4 +24,4 @@ Composer 上下文弹窗展示上下文占用和订阅配额。用量源 `agy` �
 
 没有原生 `usage_update` 测量值时，或回合进入 RPC 返回后的 Reactive Wakeup 阶段（此时 `agy` 不再发送 `usage_update` 通知）时，上下文占用基于 `transcript_full.jsonl` 的单步 Token 计数计算。当前 agy 的 print 模式不接受自定义 ACP 目录参数；带有此类参数的配额查询会返回错误，不会改查其他账号。子会话时间线依赖原生 Brain 状态与日志，不提供独立的会话控制。
 
-暂不支持运行中追加指令、回退、归档、结构化输出或 Artifacts 面板。仅当前台回合、挂起审批、活跃子会话、后台任务及常驻 `IsDaemon` 定时任务均处于空闲状态时，才允许宿主执行运行时空闲自动回收（`session.can_stop_runtime`）。
+暂不支持运行中追加指令、回退、归档、结构化输出或 Artifacts 面板。仅当前台回合、挂起审批、活跃子会话、后台任务及常驻 daemon / 周期 Cron 定时任务均处于空闲状态时，才允许宿主执行运行时空闲自动回收（`session.can_stop_runtime`）。

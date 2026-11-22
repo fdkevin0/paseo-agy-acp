@@ -215,3 +215,61 @@ test('native underscore names require a unique configured server, including coll
     false,
   )
 })
+
+test('built-in paseo server fallback applies only when explicit servers produce no underscore match', () => {
+  const paseoGrant = {
+    preapproved: [
+      { kind: 'mcp' as const, server: 'paseo', tool: 'get_agent_activity' },
+    ],
+  }
+  const customGrant = {
+    preapproved: [
+      { kind: 'mcp' as const, server: 'paseo_custom', tool: 'run' },
+    ],
+  }
+  const paseoCall = { title: 'Run default_api:mcp_paseo_get_agent_activity' }
+  assert.deepEqual(resolveMcpToolIdentity(paseoCall), {
+    server: 'paseo',
+    tool: 'get_agent_activity',
+  })
+  assert.deepEqual(resolveMcpToolIdentity(paseoCall, ['other']), {
+    server: 'paseo',
+    tool: 'get_agent_activity',
+  })
+  assert.equal(toolDisplayName(paseoCall), 'paseo.get_agent_activity')
+  assert.equal(isPreapprovedMcpTool(paseoCall, paseoGrant), true)
+
+  assert.equal(resolveMcpToolIdentity({ name: 'mcp_paseo_' }), undefined)
+
+  // Explicit paseo_custom wins without colliding with built-in paseo fallback.
+  const customCall = { name: 'mcp_paseo_custom_run' }
+  assert.deepEqual(resolveMcpToolIdentity(customCall, ['paseo_custom']), {
+    server: 'paseo_custom',
+    tool: 'run',
+  })
+  assert.equal(
+    toolDisplayName(customCall, ['paseo_custom']),
+    'paseo_custom.run',
+  )
+  assert.equal(
+    isPreapprovedMcpTool(customCall, customGrant, ['paseo_custom']),
+    true,
+  )
+  assert.deepEqual(
+    resolveMcpToolIdentity({ name: 'mcp_paseo_status' }, ['paseo_custom']),
+    { server: 'paseo', tool: 'status' },
+  )
+
+  // When both paseo and paseo_custom are explicitly configured, fail closed as ambiguous.
+  assert.equal(
+    resolveMcpToolIdentity(customCall, ['paseo', 'paseo_custom']),
+    undefined,
+  )
+  assert.equal(
+    isPreapprovedMcpTool(customCall, customGrant, ['paseo', 'paseo_custom']),
+    false,
+  )
+
+  // Legacy colon spelling still collides with built-in fallback and fails closed.
+  assert.equal(resolveMcpToolIdentity({ name: 'mcp_paseo_foo:bar' }), undefined)
+})
