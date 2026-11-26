@@ -25,6 +25,7 @@ import recordedWakeup from './fixtures/agy-1.5.12-wakeup.json' with { type: 'jso
 let nativeId = ''
 let lastSessionCwd = ''
 let afterPromptResponse: (() => Promise<void>) | undefined
+let startRecordedWakeup: (() => Promise<void>) | undefined
 let writeRecordedWakeupRows: (() => void) | undefined
 let finishRecordedReads: (() => Promise<void>) | undefined
 if (process.env.AGY_TEST_PID_FILE)
@@ -430,6 +431,13 @@ connection = agent()
   .onRequest(
     methods.agent.session.setConfigOption,
     async ({ params: { configId, value } }) => {
+      if (configId === 'fixture-start-wakeup') {
+        if (!startRecordedWakeup)
+          throw new Error('Recorded wakeup is not waiting to start')
+        await startRecordedWakeup()
+        startRecordedWakeup = undefined
+        return { configOptions }
+      }
       if (configId === 'fixture-write-wakeup-rows') {
         if (!writeRecordedWakeupRows)
           throw new Error('Recorded wakeup rows are not waiting')
@@ -501,6 +509,21 @@ connection = agent()
         writeSessionTranscript(sessionId, phase.rows)
         await sendUpdates(phase.updates)
         if (text !== 'recorded-next') {
+          let wakeupGate: Promise<void> | undefined
+          let markWakeupReady: (() => void) | undefined
+          if (text === 'recorded-wakeup-delayed-reads') {
+            let releaseWakeup!: () => void
+            wakeupGate = new Promise<void>((resolve) => {
+              releaseWakeup = resolve
+            })
+            const wakeupReady = new Promise<void>((resolve) => {
+              markWakeupReady = resolve
+            })
+            startRecordedWakeup = async () => {
+              releaseWakeup()
+              await wakeupReady
+            }
+          }
           afterPromptResponse = async () => {
             // This notification batch starts only after the sole prompt RPC returns.
             if (text === 'recorded-wakeup-denied-tool') {
@@ -582,6 +605,7 @@ connection = agent()
               return
             }
             if (text === 'recorded-wakeup-delayed-reads') {
+              await wakeupGate
               const readCompleted = (
                 u: (typeof recordedWakeup.wakeup.updates)[number],
               ) =>
@@ -594,6 +618,7 @@ connection = agent()
               await sendUpdates(
                 recordedWakeup.wakeup.updates.filter((u) => !readCompleted(u)),
               )
+              markWakeupReady?.()
             } else {
               writeSessionTranscript(sessionId, recordedWakeup.wakeup.rows)
               await sendUpdates(recordedWakeup.wakeup.updates)

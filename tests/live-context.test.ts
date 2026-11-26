@@ -33,6 +33,7 @@ import {
   compactionEvents,
   createEventCollector,
   deferred,
+  flushObs,
   HarnessSessionManager,
   isolatedEnv,
   toolCalls as collectToolCalls,
@@ -83,6 +84,7 @@ async function harness(
   let promptHandler: PromptHandler | undefined
   let realPrompt!: RpcPrompt
   let lastObservation!: TrackingObservation
+  let observationCreated = deferred<TrackingObservation>()
   const acpLog = join(home, 'acp.log')
   const env = isolatedEnv(home)
   const manager = new HarnessSessionManager({
@@ -106,8 +108,11 @@ async function harness(
     backgroundProbeTimeoutMs: options?.backgroundProbeTimeoutMs,
     observationPollIntervalMs: options?.observationPollIntervalMs,
     createTranscriptReader: options?.createTranscriptReader,
-    createObservation: (...args) =>
-      (lastObservation = new TrackingObservation(...args)),
+    createObservation: (...args) => {
+      lastObservation = new TrackingObservation(...args)
+      observationCreated.resolve(lastObservation)
+      return lastObservation
+    },
     connectAcp: wrapConnectAcp(
       () => promptHandler,
       (fn) => {
@@ -138,8 +143,9 @@ async function harness(
     writeFile(path, encode(rows) + partial)
   const append = (rows: Row[]) => appendFile(path, encode(rows))
   let sequence = 0
-  const prompt = (text = 'work') =>
-    manager.handle({
+  const prompt = (text = 'work') => {
+    observationCreated = deferred<TrackingObservation>()
+    return manager.handle({
       type: 'session.prompt',
       sessionId: 's',
       prompt: {
@@ -148,6 +154,7 @@ async function harness(
         input: { type: 'message', content: [{ type: 'text', text }] },
       },
     })
+  }
   const latest = () => {
     const event = events.findLast((event) => event.type === 'session.usage')
     assert.ok(event?.type === 'session.usage')
@@ -175,8 +182,11 @@ async function harness(
   const read = async () => {
     const observation = session.state.activeTurn?.observation
     assert.ok(observation)
-    await observation.poll()
-    await observation.poll()
+    await flushObs(observation)
+  }
+  const attached = async () => {
+    const observation = await observationCreated.promise
+    await observation.initialPoll.promise
   }
   const hold = async () => {
     const entered = deferred<void>(),
@@ -225,7 +235,7 @@ async function harness(
     permissions,
     wait,
     read,
-    attached: () => lastObservation.attached.promise,
+    attached,
     hold,
     holdLive,
   }
@@ -558,7 +568,7 @@ test(
       'same foreground native snapshot remains authoritative',
     )
     held.done.resolve({ stopReason: 'end_turn' })
-    await held.observation.attached.promise
+    await held.observation.initialPoll.promise
     const wake = [
       {
         step_index: 25,
@@ -721,20 +731,28 @@ test(
   'recorded result-less ACP completions retain read results Brain recovered first',
   { timeout: 5000 },
   async (t) => {
-    const { h, running, question } = await recordedQuestion(
-      t,
-      { observationPollIntervalMs: 60_000 },
-      'recorded-wakeup-delayed-reads',
-    )
+    const h = await harness(t, {
+      observationPollIntervalMs: 60_000,
+      logAcp: true,
+    })
+    const running = h.prompt('recorded-wakeup-delayed-reads')
+    await h.attached()
+    await h.session.transport.rpc.setSessionConfigOption({
+      sessionId: h.session.state.nativeId,
+      configId: 'fixture-start-wakeup',
+      value: 'start',
+    })
     const lastRead = (callId: string) =>
       h.toolCalls().findLast((item) => item.callId === callId)
     await h.wait(
       () =>
+        h.permissions().length === 1 &&
         lastRead('call_2')?.status === 'running' &&
         lastRead('call_3')?.status === 'running',
     )
+    const [question] = h.permissions()
+    assert.equal(question.request.kind, 'question')
     await h.session.drain()
-    await h.attached()
     await h.session.transport.rpc.setSessionConfigOption({
       sessionId: h.session.state.nativeId,
       configId: 'fixture-write-wakeup-rows',
@@ -795,7 +813,7 @@ async function recordedQuestionWithReaderFault(t: TestContext) {
   })
   const obs = setup.h.session.state.activeTurn
     ?.observation as TrackingObservation
-  await obs.attached.promise
+  await obs.initialPoll.promise
   await setup.h.read()
   const error = Object.assign(
     new Error('recorded question reader unavailable'),
@@ -1693,7 +1711,7 @@ test(
         totalTokens: 183_200,
       },
     })
-    await held.observation.attached.promise
+    await held.observation.initialPoll.promise
     await h.read()
     assert.equal(held.observation.phase, 'settling')
     assert.deepEqual(h.turns(), [])

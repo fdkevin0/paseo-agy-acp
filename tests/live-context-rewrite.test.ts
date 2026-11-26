@@ -33,6 +33,7 @@ import {
 import {
   createEventCollector,
   deferred,
+  flushObs,
   HarnessSessionManager,
   isolatedEnv,
   ScriptedTranscriptReader,
@@ -212,7 +213,7 @@ test('wakeup rewrite rebuilds the foreground phase and bills each woken step onc
     stopReason: 'end_turn',
     usage: { inputTokens: 15000, outputTokens: 1, totalTokens: 15001 },
   })
-  await obs.attached.promise
+  await obs.initialPoll.promise
 
   const wakeRows: Row[] = [
     {
@@ -230,7 +231,7 @@ test('wakeup rewrite rebuilds the foreground phase and bills each woken step onc
     },
   ]
   await h.append(wakeRows)
-  await obs.poll()
+  await flushObs(obs)
 
   const rewrittenWakeRows: Row[] = [
     wakeRows[0],
@@ -238,7 +239,7 @@ test('wakeup rewrite rebuilds the foreground phase and bills each woken step onc
     model(7, 40000, 'wakeup final step'),
   ]
   await h.write([...fgRows, ...rewrittenWakeRows])
-  await obs.poll()
+  await flushObs(obs)
   await turnPromise
 
   const finalUsage = [...h.events]
@@ -324,7 +325,7 @@ test('historical message deltas delivered after attach do not stall a completed 
     stallTimeoutMs: 1000,
   })
 
-  await obs.attached.promise
+  await obs.initialPoll.promise
   await appendFile(
     path,
     encode([
@@ -339,7 +340,7 @@ test('historical message deltas delivered after attach do not stall a completed 
       model(5, 200, 'turn 2 complete'),
     ]),
   )
-  await obs.poll()
+  await flushObs(obs)
 
   const res = await settlePromise
   await obs.dispose()
