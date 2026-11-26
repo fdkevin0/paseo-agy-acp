@@ -405,14 +405,27 @@ export function wrapConnectAcp(
   }
 }
 
-/** `BrainTurnObservation` subclass exposing an `attached` barrier for deterministic handoff tests. */
+/** `BrainTurnObservation` subclass exposing `attached` and post-attach `initialPoll` barriers for deterministic handoff tests. */
 export class TrackingObservation extends BrainTurnObservation {
   readonly attached = deferred<void>()
+  readonly initialPoll = deferred<void>()
+  private isAttached = false
   override async attach(
     consumer: Parameters<BrainTurnObservation['attach']>[0],
   ) {
     await super.attach(consumer)
+    this.isAttached = true
     this.attached.resolve()
+  }
+  override poll(): Promise<void> {
+    const pass = super.poll()
+    if (this.isAttached) {
+      void pass.then(
+        () => this.initialPoll.resolve(),
+        () => this.initialPoll.resolve(),
+      )
+    }
+    return pass
   }
 }
 

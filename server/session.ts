@@ -2421,7 +2421,8 @@ async function promptSession(
           onSubagents: session.subagents.rememberSubagents,
           minStepIndex,
           runtimeEpoch: session.state.runtimeEpoch,
-          acpToolCallIds: [...turn.toolCallIds],
+          // Pass the live Set by reference so post-RPC wakeup tool_call notifications remain visible while settling.
+          acpToolCallIds: turn.toolCallIds,
           drainAcp: session.drain,
           toolSnapshot: (id) => session.timeline.toolCallSnapshot(id),
           hasToolResult: (id) => session.timeline.hasToolResult(id),

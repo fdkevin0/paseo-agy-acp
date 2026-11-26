@@ -824,7 +824,8 @@ export async function settleBrainTurn(
     signal?: AbortSignal
     minStepIndex?: number
     pollIntervalMs?: number
-    acpToolCallIds?: readonly string[]
+    /** Live collection of ACP toolCallIds observed in this turn (mutated as post-RPC wakeup tool calls arrive). */
+    acpToolCallIds?: Iterable<string>
     /** Ordered ACP output observed before session/prompt returned, used to detect in-RPC inbox continuations. */
     foregroundAcp?: readonly ForegroundAcpSegment[]
     /** Whether post-RPC out-of-turn ACP notifications arrived after session/prompt resolved. */
@@ -1007,8 +1008,9 @@ export async function settleBrainTurn(
   let foregroundPrefixIds: readonly (string | undefined)[] = []
   const resolveLiveTools = (rows: readonly Record<string, unknown>[]) => {
     const slots = node.projector.observeRows(rows)
+    const liveToolCallIds = [...acpToolCallIds]
     const snapshots = new Map<string, Readonly<ToolCall>>()
-    for (const id of acpToolCallIds) {
+    for (const id of liveToolCallIds) {
       const snapshot = toolSnapshot?.(id)
       if (snapshot) snapshots.set(id, snapshot)
     }
@@ -1021,7 +1023,7 @@ export async function settleBrainTurn(
         snapshots,
         targetSlots,
       )
-    const turn = align(acpToolCallIds)
+    const turn = align(liveToolCallIds)
     node.projector.bindLiveToolCallIds(turn.alignedIds, turn.verifiedAcpToolIds)
     // ACP can send post-response calls while Brain still trails the full turn.
     // Verify the positional foreground prefix for billing only; it cannot bind tool identity.
@@ -1030,9 +1032,9 @@ export async function settleBrainTurn(
     const prefixCount = Math.min(validSlots.length, foregroundToolIds.length)
     const prefix = foregroundToolIds.slice(0, prefixCount)
     if (
-      validSlots.length < acpToolCallIds.length &&
+      validSlots.length < liveToolCallIds.length &&
       prefixCount > 0 &&
-      prefix.every((id, i) => id === acpToolCallIds[i])
+      prefix.every((id, i) => id === liveToolCallIds[i])
     ) {
       const prefixSlots = slots.slice(0, validSlots[prefixCount - 1].slot + 1)
       const foreground = align(prefix, prefixSlots)
