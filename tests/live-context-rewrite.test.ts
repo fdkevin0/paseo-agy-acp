@@ -211,7 +211,7 @@ async function harness(
         events.filter((event) => event.type === 'session.commands').length >=
         target,
     )
-    return { running, observation: session.state.observation! }
+    return { running, observation: session.state.activeTurn!.observation! }
   }
   return {
     home,

@@ -5180,3 +5180,460 @@ test('child-prefixed permissions and elicitations forward cleanly without cancel
   )
   assert.equal(turn2Terminal?.state, 'completed')
 })
+
+function createModelOnlyMockConnect(
+  nativeId: string,
+  spawnArgs: Array<readonly string[]>,
+  setConfigCalls: Array<{ configId: string; value: string }>,
+): typeof connectAcp {
+  return (launch, _cwd, _e, client) => {
+    spawnArgs.push(launch?.args ?? [])
+    let currentModel = 'small'
+    const configOptions = () => [
+      {
+        id: 'model',
+        name: 'Model',
+        category: 'model',
+        type: 'select' as const,
+        currentValue: currentModel,
+        options: [
+          { value: 'small', name: 'Small' },
+          { value: 'large', name: 'Large' },
+        ],
+      },
+    ]
+    const emitCommands = () => {
+      void client.sessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'available_commands_update',
+          availableCommands: [],
+        },
+      })
+    }
+    const closed = new Promise<void>(() => {})
+    const rpc = {
+      closed,
+      initialize: async () => ({
+        protocolVersion: 1,
+        agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
+        agentCapabilities: {
+          loadSession: true,
+          sessionCapabilities: { resume: {} },
+        },
+      }),
+      newSession: async () => {
+        emitCommands()
+        return { sessionId: nativeId, configOptions: configOptions() }
+      },
+      resumeSession: async () => {
+        emitCommands()
+        return { configOptions: configOptions() }
+      },
+      setSessionConfigOption: async (params: {
+        configId: string
+        value: string
+      }) => {
+        setConfigCalls.push({ configId: params.configId, value: params.value })
+        currentModel = params.value
+        return { configOptions: configOptions() }
+      },
+      closeSession: async () => ({}),
+    } as unknown as ReturnType<typeof connectAcp>['rpc']
+    return {
+      rpc,
+      exited: closed,
+      stopped: Promise.resolve(),
+      close: async () => {},
+      request: async <T>(op: Promise<T>) => op,
+      get closed() {
+        return false
+      },
+      get tier() {
+        return undefined
+      },
+      get models() {
+        return undefined
+      },
+    }
+  }
+}
+
+test('configureSession enables full-access even when native mode is unadvertised', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-fullaccess-nomode-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const env = isolatedEnv(home)
+  const nativeId = '11111111-1111-4111-8111-111111111121'
+  const collector = createEventCollector()
+  const spawnArgs: Array<readonly string[]> = []
+  const setConfigCalls: Array<{ configId: string; value: string }> = []
+  const manager = new SessionManager({
+    launch: { command: 'agy', args: ['acp'], env },
+    usage: new AgyUsageSource({ env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: collector.emit,
+    commandWaitTimeoutMs: 50,
+    connectAcp: createModelOnlyMockConnect(nativeId, spawnArgs, setConfigCalls),
+  })
+  t.after(() => manager.close())
+
+  await manager.handle({
+    type: 'session.open',
+    requestId: 'open-1',
+    sessionId: 's1',
+    history: 'skip',
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+  await manager.handle({
+    type: 'session.configure',
+    requestId: 'cfg-fa',
+    sessionId: 's1',
+    changes: { model: 'large', mode: 'full-access' },
+  })
+  const latestStrict = collector.events.findLast(
+    (e): e is Extract<ProviderEvent, { type: 'session.config' }> =>
+      e.type === 'session.config' && e.sessionId === 's1',
+  )
+  assert.equal(spawnArgs.length, 2)
+  assert.equal(spawnArgs[1].includes('--dangerously-skip-permissions'), true)
+  assert.deepEqual(setConfigCalls, [
+    { configId: 'model', value: 'large' },
+    { configId: 'model', value: 'large' },
+  ])
+  assert.equal(latestStrict?.config.model, 'large')
+  assert.equal(latestStrict?.config.mode, 'full-access')
+
+  await manager.handle({
+    type: 'session.open',
+    requestId: 'open-2',
+    sessionId: 's2',
+    history: 'skip',
+    persistence: { version: 1, data: { sessionId: nativeId } },
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      mode: 'full-access',
+      persist: true,
+    },
+  })
+  const latestRestore = collector.events.findLast(
+    (e): e is Extract<ProviderEvent, { type: 'session.config' }> =>
+      e.type === 'session.config' && e.sessionId === 's2',
+  )
+  assert.equal(latestRestore?.config.mode, 'full-access')
+})
+
+test('concurrent session.close during open startup prevents re-insertion and skips newSession RPC', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-close-mid-open-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const env = isolatedEnv(home)
+  const collector = createEventCollector()
+  let resolveInitEntered!: () => void
+  const initEntered = new Promise<void>((resolve) => {
+    resolveInitEntered = resolve
+  })
+  let releaseInit!: () => void
+  const initGate = new Promise<void>((resolve) => {
+    releaseInit = resolve
+  })
+  let newSessionCalls = 0
+  let closeCalls = 0
+
+  const manager = new SessionManager({
+    launch: { command: 'agy', args: ['acp'], env },
+    usage: new AgyUsageSource({ env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: collector.emit,
+    commandWaitTimeoutMs: 50,
+    connectAcp: () => {
+      let isClosed = false
+      const closed = new Promise<void>(() => {})
+      const rpc = {
+        closed,
+        initialize: async () => {
+          resolveInitEntered()
+          await initGate
+          return {
+            protocolVersion: 1,
+            agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
+            agentCapabilities: { loadSession: true },
+          }
+        },
+        newSession: async () => {
+          newSessionCalls += 1
+          return {
+            sessionId: '11111111-1111-4111-8111-111111111122',
+            configOptions: [],
+          }
+        },
+        closeSession: async () => ({}),
+      } as unknown as ReturnType<typeof connectAcp>['rpc']
+      return {
+        rpc,
+        exited: closed,
+        stopped: Promise.resolve(),
+        close: async () => {
+          isClosed = true
+          closeCalls += 1
+        },
+        request: async <T>(op: Promise<T>) => op,
+        get closed() {
+          return isClosed
+        },
+        get tier() {
+          return undefined
+        },
+        get models() {
+          return undefined
+        },
+      }
+    },
+  })
+  t.after(() => manager.close())
+
+  const openPromise = manager.handle({
+    type: 'session.open',
+    requestId: 'open-race',
+    sessionId: 's',
+    history: 'skip',
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+  await initEntered
+  const closePromise = manager.handle({
+    type: 'session.close',
+    requestId: 'close-early',
+    sessionId: 's',
+  })
+  releaseInit()
+
+  await closePromise
+  await assert.rejects(openPromise, /Session closed before open/)
+  assert.equal(newSessionCalls, 0)
+  assert.equal(closeCalls >= 1, true)
+  assert.equal(
+    collector.events.some(
+      (e) => e.type === 'request.completed' && e.requestId === 'close-early',
+    ),
+    true,
+  )
+  await assert.rejects(
+    manager.handle({
+      type: 'session.prompt',
+      sessionId: 's',
+      prompt: {
+        clientMessageId: 'after-close',
+        delivery: 'auto',
+        input: { type: 'message', content: [{ type: 'text', text: 'hi' }] },
+      },
+    }),
+    /Session is not open/,
+  )
+})
+
+test('activeTurn clears per-turn state when idle without leaking deniedToolCallIds into the next turn', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-turn-cleanup-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const env = isolatedEnv(home)
+  const nativeId = '11111111-1111-4111-8111-111111111123'
+  const collector = createEventCollector()
+  let acpClient!: Parameters<typeof connectAcp>[3]
+  const promptSteps = sequenceDouble([
+    async () => {
+      await acpClient.sessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'Working' },
+        },
+      })
+      await acpClient.sessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'shared-call',
+          title: 'Run run_command',
+          status: 'in_progress',
+          rawInput: { CommandLine: 'echo one' },
+        },
+      })
+      await acpClient.requestPermission({
+        sessionId: nativeId,
+        toolCall: {
+          toolCallId: 'shared-call',
+          title: 'Run run_command',
+          rawInput: { CommandLine: 'echo one' },
+        },
+        options: [
+          { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+          { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+        ],
+      })
+      return { stopReason: 'end_turn' as const }
+    },
+    async () => {
+      await acpClient.sessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'shared-call',
+          title: 'Run run_command',
+          status: 'in_progress',
+          rawInput: { CommandLine: 'echo two' },
+        },
+      })
+      await acpClient.sessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'shared-call',
+          status: 'failed',
+          rawOutput: 'command failed',
+        },
+      })
+      return { stopReason: 'end_turn' as const }
+    },
+  ])
+
+  const manager = new HarnessSessionManager({
+    launch: { command: 'agy', args: ['acp'], env },
+    usage: new AgyUsageSource({ env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: collector.emit,
+    commandWaitTimeoutMs: 50,
+    connectAcp: (_l, _cwd, _e, client) => {
+      acpClient = client
+      const closed = new Promise<void>(() => {})
+      const rpc = {
+        closed,
+        initialize: async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
+          agentCapabilities: { loadSession: true },
+        }),
+        newSession: async () => {
+          void client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'available_commands_update',
+              availableCommands: [],
+            },
+          })
+          return { sessionId: nativeId, configOptions: [] }
+        },
+        closeSession: async () => ({}),
+        prompt: () => promptSteps(),
+      } as unknown as ReturnType<typeof connectAcp>['rpc']
+      return {
+        rpc,
+        exited: closed,
+        stopped: Promise.resolve(),
+        close: async () => {},
+        request: async <T>(op: Promise<T>) => op,
+        get closed() {
+          return false
+        },
+        get tier() {
+          return undefined
+        },
+        get models() {
+          return undefined
+        },
+      }
+    },
+  })
+  t.after(() => manager.close())
+
+  await manager.handle({
+    type: 'session.open',
+    requestId: 'open',
+    sessionId: 's',
+    history: 'skip',
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+
+  const turn1 = manager.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId: 'm1',
+      delivery: 'auto',
+      input: { type: 'message', content: [{ type: 'text', text: 'first' }] },
+    },
+  })
+  const perm = (await collector.wait(
+    (e) => e.type === 'session.permission',
+  )) as Extract<ProviderEvent, { type: 'session.permission' }>
+  await manager.handle({
+    type: 'session.permission',
+    sessionId: 's',
+    permissionId: perm.request.id,
+    response: { behavior: 'deny' },
+  })
+  await turn1
+
+  const turn1Tool = collector.events.findLast(
+    (
+      e,
+    ): e is Extract<ProviderEvent, { type: 'timeline.item' }> & {
+      item: Extract<ProviderTimelineItem, { type: 'tool_call' }>
+    } =>
+      e.type === 'timeline.item' &&
+      e.item.type === 'tool_call' &&
+      e.item.callId === 'shared-call',
+  )?.item
+  assert.equal(turn1Tool?.status, 'canceled')
+  assert.equal(manager.session.state.activeTurn, null)
+
+  await manager.handle({
+    type: 'session.can_stop_runtime',
+    requestId: 'can-stop-idle',
+    sessionId: 's',
+  })
+  const canStopEvent = collector.events.findLast(
+    (e): e is Extract<ProviderEvent, { type: 'session.can_stop_runtime' }> =>
+      e.type === 'session.can_stop_runtime',
+  )
+  assert.equal(canStopEvent?.canStop, true)
+
+  await manager.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId: 'm2',
+      delivery: 'auto',
+      input: { type: 'message', content: [{ type: 'text', text: 'second' }] },
+    },
+  })
+  const turn2Tool = collector.events.findLast(
+    (
+      e,
+    ): e is Extract<ProviderEvent, { type: 'timeline.item' }> & {
+      item: Extract<ProviderTimelineItem, { type: 'tool_call' }>
+    } =>
+      e.type === 'timeline.item' &&
+      e.item.type === 'tool_call' &&
+      e.item.callId === 'shared-call',
+  )?.item
+  assert.equal(turn2Tool?.status, 'failed')
+  assert.equal(manager.session.state.activeTurn, null)
+})

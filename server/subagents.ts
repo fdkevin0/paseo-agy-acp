@@ -13,7 +13,7 @@ import { watchBrain, type BrainWatchHandle } from './brain.ts'
 export const isSubagentMessage = (name: string) =>
   isNativeToolName(name, 'send_message')
 
-export interface SubagentRegistryOptions {
+interface SubagentRegistryOptions {
   sessionId: string
   cwd: string
   brainRoot: string

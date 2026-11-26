@@ -45,7 +45,7 @@ export function agyVersionDiagnostic(version?: string): string | undefined {
 
 const DEFAULT_WINDOWS_PATHEXT = ['.exe', '.cmd', '.bat', '.com']
 
-export interface BinaryFingerprintOptions {
+interface BinaryFingerprintOptions {
   platform?: NodeJS.Platform
   fallbackHome?: string
   env?: Readonly<Record<string, string>>
@@ -241,21 +241,34 @@ export async function providerStatus(
   return probe
 }
 
+/** Canonical SHA-256 key covering command, args, resolved environment, and optional binary fingerprint. */
+export function hashLaunchKey(
+  launch?: ProviderLaunch,
+  env: Readonly<Record<string, string>> = {},
+  fingerprint?: string,
+): string {
+  const merged = mergeEnv(launch?.env ?? process.env, env)
+  const sortedEnv = Object.entries(merged).sort(([a], [b]) =>
+    a < b ? -1 : a > b ? 1 : 0,
+  )
+  return createHash('sha256')
+    .update(
+      JSON.stringify([
+        launch?.command ?? 'agy',
+        launch?.args ?? ['acp'],
+        sortedEnv,
+        ...(fingerprint !== undefined ? [fingerprint] : []),
+      ]),
+    )
+    .digest('hex')
+}
+
 /** Include the full launch environment without exposing its values in the cache key. */
 export function catalogCacheKey(
   launch?: ProviderLaunch,
   fingerprint?: string,
 ): string {
-  const env = Object.entries(launch?.env ?? process.env).sort(([a], [b]) =>
-    a.localeCompare(b),
-  )
-  const parts: unknown[] = [
-    launch?.command ?? 'agy',
-    launch?.args ?? ['acp'],
-    env,
-  ]
-  if (fingerprint) parts.push(fingerprint)
-  return createHash('sha256').update(JSON.stringify(parts)).digest('hex')
+  return hashLaunchKey(launch, {}, fingerprint || undefined)
 }
 
 /** Include the resolved executable fingerprint so binary upgrades invalidate host catalog caches. */
