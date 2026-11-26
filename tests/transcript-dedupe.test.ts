@@ -8,6 +8,7 @@ import {
   TranscriptReader,
   readTranscriptRows,
 } from '../server/brain-io.ts'
+import { encode } from './brain-fixtures.ts'
 
 const id = '11111111-1111-4111-8111-111111111111'
 const row = (step_index: number, content: string) => ({
@@ -16,8 +17,6 @@ const row = (step_index: number, content: string) => ({
   status: 'DONE',
   content,
 })
-const encode = (rows: object[]) =>
-  rows.map((r) => JSON.stringify(r) + '\n').join('')
 
 function createDedupeReader(root: string, nativeId: string) {
   const reader = new TranscriptReader()

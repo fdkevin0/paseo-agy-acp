@@ -1,28 +1,90 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  utimesSync,
+} from 'node:fs'
 import { mkdir, rename, utimes, writeFile } from 'node:fs/promises'
+import { connect, createServer, type Socket } from 'node:net'
 import { basename, dirname, join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
   ProviderEventSchema,
   type ProviderConnection,
   type ProviderEvent,
+  type ProviderTimelineItem,
 } from '@getpaseo/plugin/server/provider'
+import { TranscriptReader } from '../server/brain-io.ts'
+import {
+  BrainTurnObservation,
+  type BrainRead,
+} from '../server/brain-observer.ts'
+import { SessionManager } from '../server/session.ts'
+import { connectAcp } from '../server/transport.ts'
 
-/** Poll `predicate` until true or fail after `timeoutMs`. */
-export async function waitUntil(
-  predicate: () => boolean,
-  timeoutMs = 5000,
-  describeFailure?: () => string,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (!predicate()) {
-    assert.ok(
-      Date.now() < deadline,
-      describeFailure ? describeFailure() : 'Timed out waiting for condition',
-    )
-    await delay(10)
+/** Create an externally resolvable promise barrier. */
+export function deferred<T = void>() {
+  let resolve!: (value: T) => void
+  let reject!: (error: unknown) => void
+  const promise = new Promise<T>((yes, no) => {
+    resolve = yes
+    reject = no
+  })
+  return { promise, resolve, reject }
+}
+
+/** Return true when `pid` no longer exists in the OS process table. */
+export function isProcessGone(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return false
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH'
   }
+}
+
+/** Return true when `pid` has exited (including unreaped Linux zombies). */
+export function isProcessStopped(pid: number): boolean {
+  if (isProcessGone(pid)) return true
+  if (process.platform === 'linux') {
+    try {
+      return /^\d+ \([^)]*\) Z /.test(readFileSync(`/proc/${pid}/stat`, 'utf8'))
+    } catch {
+      return true
+    }
+  }
+  return false
+}
+
+/** Best-effort process-group signal that ignores already-exited targets. */
+export function killProcessGroupIgnoreMissing(
+  pid: number,
+  signal: NodeJS.Signals = 'SIGKILL',
+): void {
+  try {
+    process.kill(-pid, signal)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+  }
+}
+
+/** Wait for an external OS process to exit (scoped strictly to PID-exit checks). */
+export async function waitForPidExit(
+  pid: number,
+  timeoutMs = 5000,
+): Promise<void> {
+  const stepMs = 10
+  const maxSteps = Math.max(1, Math.ceil(timeoutMs / stepMs))
+  for (let step = 0; step < maxSteps; step++) {
+    if (isProcessStopped(pid)) return
+    await delay(stepMs)
+  }
+  assert.fail(`Timed out waiting for process ${pid} to exit`)
 }
 
 /** Collect emitted `ProviderEvent` items with push-based waiting. */
@@ -37,18 +99,17 @@ export function createEventCollector(onEvent?: (event: ProviderEvent) => void) {
     for (const notify of [...listeners]) notify()
   }
 
-  async function wait(
-    predicate: (event: ProviderEvent) => boolean,
+  async function waitCondition(
+    predicate: () => boolean,
     timeoutMs = 5000,
     assertHealthy?: () => void,
-  ): Promise<ProviderEvent> {
+  ): Promise<void> {
     assertHealthy?.()
-    const existing = events.find(predicate)
-    if (existing) return existing
+    if (predicate()) return
     let check!: () => void
     let timer!: ReturnType<typeof setTimeout>
     try {
-      return await new Promise<ProviderEvent>((resolve, reject) => {
+      await new Promise<void>((resolve, reject) => {
         check = () => {
           try {
             assertHealthy?.()
@@ -56,8 +117,7 @@ export function createEventCollector(onEvent?: (event: ProviderEvent) => void) {
             reject(err)
             return
           }
-          const match = events.find(predicate)
-          if (match) resolve(match)
+          if (predicate()) resolve()
         }
         timer = setTimeout(() => {
           try {
@@ -76,7 +136,24 @@ export function createEventCollector(onEvent?: (event: ProviderEvent) => void) {
     }
   }
 
-  return { events, emit, wait }
+  async function wait(
+    predicate: (event: ProviderEvent) => boolean,
+    timeoutMs = 5000,
+    assertHealthy?: () => void,
+  ): Promise<ProviderEvent> {
+    let matched: ProviderEvent | undefined
+    await waitCondition(
+      () => {
+        matched = events.find(predicate)
+        return matched !== undefined
+      },
+      timeoutMs,
+      assertHealthy,
+    )
+    return matched!
+  }
+
+  return { events, emit, wait, waitCondition }
 }
 
 /** Validate and collect all events emitted on a `ProviderConnection`. */
@@ -164,6 +241,35 @@ export async function writeFileAtomic(
   await rename(tmp, path)
 }
 
+/** Write a log file with a deterministic epoch-second `mtime` atomically. */
+export async function writeTimedLog(
+  path: string,
+  content: string,
+  epochSeconds: number,
+): Promise<void> {
+  await writeFileAtomic(path, content, new Date(epochSeconds * 1000))
+}
+
+/** Populate a SQLite DB into a temp sibling, set its `mtime`, and atomically swap it into `dbPath`. */
+export function writeTimedDb(
+  dbPath: string,
+  populate: (db: DatabaseSync) => void,
+  epochSeconds: number,
+): void {
+  const dir = dirname(dbPath)
+  mkdirSync(dir, { recursive: true })
+  const tmp = join(dir, `.${basename(dbPath)}.${randomUUID()}.tmp`)
+  if (existsSync(dbPath)) copyFileSync(dbPath, tmp)
+  const db = new DatabaseSync(tmp)
+  try {
+    populate(db)
+  } finally {
+    db.close()
+  }
+  utimesSync(tmp, epochSeconds, epochSeconds)
+  renameSync(tmp, dbPath)
+}
+
 /** Write JSONL rows to `<brainRoot>/<nativeId>/.system_generated/logs/transcript_full.jsonl`. */
 export async function writeBrainTranscript(
   brainRoot: string,
@@ -184,4 +290,179 @@ export async function writeBrainTranscript(
     await writeFile(path, payload)
   }
   return path
+}
+
+/** Deterministic Unix-socket IPC gate for synchronizing mock ACP subprocesses with tests. */
+export async function createSignalGate(dir: string, filename = 'gate.sock') {
+  const socketPath = join(dir, filename)
+  const firstEntered = deferred<string>()
+  let firstResolved = false
+  let released = false
+  const pendingSockets = new Set<Socket>()
+  const allSockets = new Set<Socket>()
+  const server = createServer((socket) => {
+    allSockets.add(socket)
+    socket.on('close', () => {
+      allSockets.delete(socket)
+      pendingSockets.delete(socket)
+    })
+    let buf = ''
+    socket.on('data', (chunk) => {
+      buf += chunk.toString('utf8')
+      const nl = buf.indexOf('\n')
+      if (nl < 0) return
+      const tag = buf.slice(0, nl).trim()
+      if (!firstResolved) {
+        firstResolved = true
+        firstEntered.resolve(tag)
+      }
+      if (released) socket.end('go\n')
+      else pendingSockets.add(socket)
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(socketPath, resolve))
+  return {
+    socketPath,
+    entered: firstEntered.promise,
+    release() {
+      released = true
+      for (const socket of pendingSockets) {
+        if (!socket.destroyed) socket.end('go\n')
+      }
+      pendingSockets.clear()
+    },
+    async close() {
+      for (const socket of allSockets) socket.destroy()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    },
+  }
+}
+
+/** Client side of `createSignalGate` for mock ACP subprocesses. */
+export function awaitSignalGate(
+  socketPath: string | undefined,
+  tag: string,
+): Promise<void> {
+  if (!socketPath) return Promise.resolve()
+  return new Promise<void>((resolve, reject) => {
+    const socket = connect(socketPath, () => {
+      socket.write(`${tag}\n`)
+    })
+    socket.once('data', () => {
+      socket.destroy()
+      resolve()
+    })
+    socket.once('end', () => {
+      socket.destroy()
+      resolve()
+    })
+    socket.once('error', reject)
+  })
+}
+
+export type RpcPrompt = ReturnType<typeof connectAcp>['rpc']['prompt']
+export type PromptHandler = (
+  params: Parameters<RpcPrompt>[0],
+  realPrompt: RpcPrompt,
+) => ReturnType<RpcPrompt>
+
+/** `SessionManager` subclass exposing the most recently started session for tests. */
+export class HarnessSessionManager extends SessionManager {
+  session!: Awaited<ReturnType<SessionManager['start']>>
+  override async start(...args: Parameters<SessionManager['start']>) {
+    this.session = await super.start(...args)
+    return this.session
+  }
+}
+
+/** Wrap `connectAcp` so tests can intercept `rpc.prompt` calls cleanly. */
+export function wrapConnectAcp(
+  getPromptHandler: () => PromptHandler | undefined,
+  onRealPrompt?: (realPrompt: RpcPrompt) => void,
+): typeof connectAcp {
+  return (...args) => {
+    const transport = connectAcp(...args)
+    const realPrompt = transport.rpc.prompt.bind(transport.rpc)
+    onRealPrompt?.(realPrompt)
+    const wrappedRpc = new Proxy(transport.rpc, {
+      get(target, prop) {
+        if (prop === 'prompt') {
+          return (params: Parameters<typeof realPrompt>[0]) => {
+            const handler = getPromptHandler()
+            return handler ? handler(params, realPrompt) : realPrompt(params)
+          }
+        }
+        const value = Reflect.get(target, prop, target)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    return new Proxy(transport, {
+      get(target, prop) {
+        if (prop === 'rpc') return wrappedRpc
+        return Reflect.get(target, prop, target)
+      },
+    })
+  }
+}
+
+/** `BrainTurnObservation` subclass exposing an `attached` barrier for deterministic handoff tests. */
+export class TrackingObservation extends BrainTurnObservation {
+  readonly attached = deferred<void>()
+  override async attach(
+    consumer: Parameters<BrainTurnObservation['attach']>[0],
+  ) {
+    await super.attach(consumer)
+    this.attached.resolve()
+  }
+}
+
+type ScriptedReadStep = BrainRead | (() => Promise<BrainRead>)
+
+/** Per-call scripted `TranscriptReader` double for deterministic read-sequence tests. */
+export class ScriptedTranscriptReader extends TranscriptReader {
+  reads = 0
+  private readonly nextRead: () => Promise<BrainRead>
+
+  constructor(steps: readonly ScriptedReadStep[]) {
+    super()
+    this.nextRead = sequenceDouble(
+      steps.map((step) =>
+        typeof step === 'function' ? step : async () => step,
+      ),
+    )
+  }
+
+  override async read(): Promise<BrainRead> {
+    this.reads++
+    return this.nextRead()
+  }
+}
+
+export type ToolCallTimelineItem = Extract<
+  ProviderTimelineItem,
+  { type: 'tool_call' }
+>
+
+/** Extract all `tool_call` timeline items from a collected `ProviderEvent` stream. */
+export function toolCalls(
+  events: readonly ProviderEvent[],
+): ToolCallTimelineItem[] {
+  return events
+    .filter(
+      (event): event is Extract<ProviderEvent, { type: 'timeline.item' }> =>
+        event.type === 'timeline.item',
+    )
+    .map((event) => event.item)
+    .filter((item): item is ToolCallTimelineItem => item.type === 'tool_call')
+}
+
+/** Extract all `compaction` timeline events from a collected `ProviderEvent` stream. */
+export function compactionEvents(events: readonly ProviderEvent[]) {
+  return events.filter(
+    (
+      event,
+    ): event is Extract<ProviderEvent, { type: 'timeline.item' }> & {
+      item: Extract<ProviderTimelineItem, { type: 'compaction' }>
+    } => event.type === 'timeline.item' && event.item.type === 'compaction',
+  )
 }

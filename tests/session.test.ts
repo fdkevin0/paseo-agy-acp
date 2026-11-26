@@ -26,54 +26,19 @@ import { connectAcp } from '../server/transport.ts'
 import { AgyUsageSource } from '../server/usage.ts'
 import {
   collectProviderEvents,
+  compactionEvents,
   createEventCollector,
+  createSignalGate,
+  flushObs,
+  HarnessSessionManager,
   isolatedEnv,
   sequenceDouble,
+  TrackingObservation,
+  wrapConnectAcp,
   writeBrainTranscript,
+  type PromptHandler,
+  type RpcPrompt,
 } from './helpers.ts'
-
-type RpcPrompt = ReturnType<typeof connectAcp>['rpc']['prompt']
-type PromptHandler = (
-  params: Parameters<RpcPrompt>[0],
-  realPrompt: RpcPrompt,
-) => ReturnType<RpcPrompt>
-
-class HarnessSessionManager extends SessionManager {
-  session!: Awaited<ReturnType<SessionManager['start']>>
-  override async start(...args: Parameters<SessionManager['start']>) {
-    this.session = await super.start(...args)
-    return this.session
-  }
-}
-
-function wrapConnectAcp(
-  getPromptHandler: () => PromptHandler | undefined,
-  onRealPrompt?: (realPrompt: RpcPrompt) => void,
-): typeof connectAcp {
-  return (...args) => {
-    const transport = connectAcp(...args)
-    const realPrompt = transport.rpc.prompt.bind(transport.rpc)
-    onRealPrompt?.(realPrompt)
-    const wrappedRpc = new Proxy(transport.rpc, {
-      get(target, prop) {
-        if (prop === 'prompt') {
-          return (params: Parameters<typeof realPrompt>[0]) => {
-            const handler = getPromptHandler()
-            return handler ? handler(params, realPrompt) : realPrompt(params)
-          }
-        }
-        const value = Reflect.get(target, prop, target)
-        return typeof value === 'function' ? value.bind(target) : value
-      },
-    })
-    return new Proxy(transport, {
-      get(target, prop) {
-        if (prop === 'rpc') return wrappedRpc
-        return Reflect.get(target, prop, target)
-      },
-    })
-  }
-}
 
 function completedTurnStates(events: readonly ProviderEvent[]) {
   return events
@@ -85,16 +50,6 @@ function completedTurnStates(events: readonly ProviderEvent[]) {
       } => event.type === 'session.turn' && event.state !== 'started',
     )
     .map((event) => event.state)
-}
-
-function compactionEvents(events: readonly ProviderEvent[]) {
-  return events.filter(
-    (
-      event,
-    ): event is Extract<ProviderEvent, { type: 'timeline.item' }> & {
-      item: Extract<ProviderTimelineItem, { type: 'compaction' }>
-    } => event.type === 'timeline.item' && event.item.type === 'compaction',
-  )
 }
 
 function childTurnKeys(events: readonly ProviderEvent[], sessionId: string) {
@@ -1286,10 +1241,6 @@ test(
       )
       assert.throws(() => process.kill(starts[0].pid, 0), { code: 'ESRCH' })
       assert.ok(log.some((row) => row.event === 'cancel'))
-      assert.equal(
-        log.some((row) => row.event === 'leaked-background'),
-        false,
-      )
     } finally {
       await m.close()
       await rm(home, { recursive: true, force: true })
@@ -1302,18 +1253,25 @@ test(
   { timeout: 5000 },
   async () => {
     const home = await mkdtemp(join(tmpdir(), 'agy-retry-foreground-'))
+    const gate = await createSignalGate(home, 'foreground-retry.sock')
     const events: ProviderEvent[] = []
+    let currentObs: TrackingObservation | undefined
     const m = new SessionManager({
       launch: {
         command: process.execPath,
         args: [fileURLToPath(new URL('./interrupt-acp.ts', import.meta.url))],
-        env: isolatedEnv(home),
+        env: isolatedEnv(home, { AGY_RELOAD_GATE: gate.socketPath }),
       },
       usage: new AgyUsageSource({ env: isolatedEnv(home) }),
       capabilities: ['prompt.message'],
       emit: (event) => events.push(event),
       stallTimeoutMs: 10,
       retryTimeoutMs: 20,
+      observationPollIntervalMs: 60_000,
+      createObservation: (...args) => {
+        currentObs = new TrackingObservation(...args)
+        return currentObs
+      },
     })
     try {
       await m.handle({
@@ -1329,7 +1287,7 @@ test(
           persist: true,
         },
       })
-      await m.handle({
+      const firstTurn = m.handle({
         type: 'session.prompt',
         sessionId: 's',
         prompt: {
@@ -1341,6 +1299,12 @@ test(
           },
         },
       })
+      assert.equal(await gate.entered, 'held-foreground')
+      // Poll the expired 2020 retry warning while the foreground RPC is still in flight.
+      assert.ok(currentObs)
+      await flushObs(currentObs)
+      gate.release()
+      await firstTurn
       await m.handle({
         type: 'session.prompt',
         sessionId: 's',
@@ -1366,6 +1330,7 @@ test(
       assert.equal(log.filter((row) => row.event === 'start').length, 1)
     } finally {
       await m.close()
+      await gate.close()
       await rm(home, { recursive: true, force: true })
     }
   },

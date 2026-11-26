@@ -3,10 +3,14 @@ import { spawn } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Readable, Writable } from 'node:stream'
+import { MessageChannel } from 'node:worker_threads'
 
+let stubbornKeepAlive: MessageChannel | undefined
 process.stdin.on('end', () => {
-  if (process.env.AGY_SHUTDOWN === 'stubborn') setInterval(() => {}, 1000)
-  else process.exit(0)
+  if (process.env.AGY_SHUTDOWN === 'stubborn') {
+    stubbornKeepAlive = new MessageChannel()
+    stubbornKeepAlive.port1.on('message', () => {})
+  } else process.exit(0)
 })
 agent()
   .onRequest(methods.agent.initialize, async () => ({

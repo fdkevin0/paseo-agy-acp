@@ -1,34 +1,27 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { mkdtemp, rm } from 'node:fs/promises'
-import { writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   PROVIDER_CAPABILITIES,
   type ProviderEvent,
-  type ProviderTimelineItem,
 } from '@getpaseo/plugin/server/provider'
 import { createProvider } from '../server/provider.ts'
 import { AgyUsageSource } from '../server/usage.ts'
-import { collectProviderEvents, isolatedEnv } from './helpers.ts'
+import {
+  collectProviderEvents,
+  createSignalGate,
+  isolatedEnv,
+  toolCalls,
+  type ToolCallTimelineItem,
+} from './helpers.ts'
 
 const CHILD_SESSION_ID = 's:child:22222222-2222-4222-8222-222222222222'
 
-type ToolCallItem = Extract<ProviderTimelineItem, { type: 'tool_call' }>
-type SubAgentToolCallItem = ToolCallItem & {
-  detail: Extract<ToolCallItem['detail'], { type: 'sub_agent' }>
-}
-
-function toolCalls(events: readonly ProviderEvent[]): ToolCallItem[] {
-  return events
-    .filter(
-      (event): event is Extract<ProviderEvent, { type: 'timeline.item' }> =>
-        event.type === 'timeline.item',
-    )
-    .map((event) => event.item)
-    .filter((item): item is ToolCallItem => item.type === 'tool_call')
+type SubAgentToolCallItem = ToolCallTimelineItem & {
+  detail: Extract<ToolCallTimelineItem['detail'], { type: 'sub_agent' }>
 }
 
 function subAgentToolCalls(
@@ -49,8 +42,10 @@ async function run(
   } = {},
 ) {
   const home = await mkdtemp(join(tmpdir(), 'agy-compat-'))
+  const gate = await createSignalGate(home, 'compat.sock')
   const env = isolatedEnv(home, {
     AGY_COMPAT_SCENARIO: scenario,
+    AGY_COMPAT_GATE: gate.socketPath,
   })
   const provider = await createProvider(new AgyUsageSource({ env })).connect({
     versions: [1],
@@ -68,11 +63,13 @@ async function run(
   } = collectProviderEvents(provider, (event) => {
     if (
       event.type === 'timeline.item' &&
-      event.item.type === 'tool_call' &&
-      event.item.callId === 'call_345678901' &&
-      event.item.status === 'completed'
+      ((event.item.type === 'tool_call' &&
+        event.item.callId === 'call_345678901' &&
+        event.item.status === 'completed') ||
+        (event.item.type === 'assistant_message' &&
+          event.item.text === 'waiting'))
     )
-      writeFileSync(join(home, 'message-observed'), '')
+      gate.release()
   })
   try {
     await provider.send({
@@ -123,6 +120,7 @@ async function run(
     verify(events)
   } finally {
     await provider.close()
+    await gate.close()
     afterClose?.(events)
     await rm(home, { recursive: true, force: true })
   }

@@ -5,19 +5,15 @@ import {
   type AgentConnection,
   type SessionUpdate,
 } from '@agentclientprotocol/sdk/unstable'
-import {
-  appendFileSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  writeFileSync,
-} from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Readable, Writable } from 'node:stream'
+import { awaitSignalGate } from './helpers.ts'
 
 const nativeId = '11111111-1111-4111-8111-111111111111'
 const childId = '22222222-2222-4222-8222-222222222222'
 const scenario = process.env.AGY_COMPAT_SCENARIO!
+const compatGate = process.env.AGY_COMPAT_GATE
 type Row = Record<string, unknown>
 const user = (step_index: number): Row => ({
   step_index,
@@ -188,12 +184,7 @@ async function tool(
   })
 }
 async function observedMessage() {
-  const deadline = Date.now() + 3000
-  while (!existsSync(join(process.env.HOME!, 'message-observed'))) {
-    if (Date.now() > deadline)
-      throw new Error('Message was not published during prompt')
-    await new Promise((resolve) => setTimeout(resolve, 5))
-  }
+  await awaitSignalGate(compatGate, 'message-observed')
 }
 function seedMessageChild() {
   writeSubagent(
@@ -207,13 +198,12 @@ function seedMessageChild() {
   transcript(childId, [childInit(nativeId), done(1)])
 }
 function commands() {
-  setTimeout(
+  setImmediate(
     () =>
       void update({
         sessionUpdate: 'available_commands_update',
         availableCommands: [],
       }),
-    0,
   )
 }
 async function invoke() {
@@ -343,7 +333,7 @@ connection = agent()
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: reply },
       })
-      setTimeout(() => {
+      void awaitSignalGate(compatGate, 'background-ready').then(() => {
         calls.forEach(({ id, output }, index) => {
           const stepIdx = index + 2
           const taskId = `${nativeId}/task-${stepIdx}`
@@ -373,7 +363,7 @@ connection = agent()
           ],
           true,
         )
-      }, 100)
+      })
     } else if (scenario === 'spawn-kill') {
       const input = { Prompt: 'work', Role: 'Child' }
       writeSubagent(nativeId, childId, 'SUBAGENT_STATE_KILLED', 2)

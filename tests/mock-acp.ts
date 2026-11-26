@@ -19,11 +19,13 @@ import {
 import { basename, join } from 'node:path'
 import { WritableStream } from 'node:stream/web'
 import { Readable, Writable } from 'node:stream'
+import { MessageChannel } from 'node:worker_threads'
 import recordedWakeup from './fixtures/agy-1.5.12-wakeup.json' with { type: 'json' }
 
 let nativeId = ''
 let lastSessionCwd = ''
 let afterPromptResponse: (() => Promise<void>) | undefined
+let writeRecordedWakeupRows: (() => void) | undefined
 let finishRecordedReads: (() => Promise<void>) | undefined
 if (process.env.AGY_TEST_PID_FILE)
   writeFileSync(process.env.AGY_TEST_PID_FILE, String(process.pid))
@@ -73,6 +75,7 @@ const configOptions = [
 ]
 const canceled = new Set<string>()
 const cancels = new Map<string, () => void>()
+const earlyCancelGates = new Map<string, () => void>()
 let wokenStepBase = 0
 let holdSeq = 0
 function writeSessionTranscript(
@@ -196,7 +199,7 @@ async function staleEvents(sessionId: string) {
 }
 function sendCommands(sessionId: string) {
   if (process.env.AGY_TEST_NO_COMMANDS) return
-  setTimeout(async () => {
+  setImmediate(async () => {
     if (process.env.AGY_TEST_STALE_EVENTS) await staleEvents(randomUUID())
     await client.sessionUpdate({
       sessionId,
@@ -207,7 +210,7 @@ function sendCommands(sessionId: string) {
         ],
       },
     })
-  }, 0)
+  })
 }
 connection = agent()
   .onRequest(methods.agent.initialize, async ({ params }) => {
@@ -427,6 +430,13 @@ connection = agent()
   .onRequest(
     methods.agent.session.setConfigOption,
     async ({ params: { configId, value } }) => {
+      if (configId === 'fixture-write-wakeup-rows') {
+        if (!writeRecordedWakeupRows)
+          throw new Error('Recorded wakeup rows are not waiting')
+        writeRecordedWakeupRows()
+        writeRecordedWakeupRows = undefined
+        return { configOptions }
+      }
       if (configId === 'fixture-release-reads') {
         if (!finishRecordedReads)
           throw new Error('Recorded reads are not waiting')
@@ -453,6 +463,7 @@ connection = agent()
     async ({ params: { sessionId } }) => {
       if (process.env.AGY_TEST_LOG_LOAD) log('cancel')
       canceled.add(sessionId)
+      earlyCancelGates.get(sessionId)?.()
       cancels.get(sessionId)?.()
     },
   )
@@ -570,19 +581,21 @@ connection = agent()
               ])
               return
             }
-            writeSessionTranscript(sessionId, recordedWakeup.wakeup.rows)
             if (text === 'recorded-wakeup-delayed-reads') {
               const readCompleted = (
                 u: (typeof recordedWakeup.wakeup.updates)[number],
               ) =>
                 u.sessionUpdate === 'tool_call_update' &&
                 (u.toolCallId === 'call_2' || u.toolCallId === 'call_3')
+              writeRecordedWakeupRows = () =>
+                writeSessionTranscript(sessionId, recordedWakeup.wakeup.rows)
               finishRecordedReads = () =>
                 sendUpdates(recordedWakeup.wakeup.updates.filter(readCompleted))
               await sendUpdates(
                 recordedWakeup.wakeup.updates.filter((u) => !readCompleted(u)),
               )
             } else {
+              writeSessionTranscript(sessionId, recordedWakeup.wakeup.rows)
               await sendUpdates(recordedWakeup.wakeup.updates)
             }
             const answer = await client.createElicitation({
@@ -1249,7 +1262,8 @@ connection = agent()
         },
       })
       if (text === 'disconnect') {
-        setInterval(() => {}, 1000)
+        const keepAlive = new MessageChannel()
+        keepAlive.port1.on('message', () => {})
         process.stdout.end()
         await new Promise(() => {})
       }
@@ -1578,8 +1592,15 @@ connection = agent()
         return { stopReason: 'end_turn' as const }
       }
       if (text === 'wait') {
-        if (process.env.AGY_TEST_CANCEL_DELAY)
-          await new Promise((resolve) => setTimeout(resolve, 30))
+        if (
+          process.env.AGY_TEST_CANCEL_BEFORE_REGISTER &&
+          !canceled.has(sessionId)
+        ) {
+          await new Promise<void>((resolve) => {
+            earlyCancelGates.set(sessionId, resolve)
+          })
+          earlyCancelGates.delete(sessionId)
+        }
         await new Promise<void>((resolve) => {
           if (canceled.has(sessionId)) resolve()
           else cancels.set(sessionId, resolve)

@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync } from 'node:fs'
+import { MessageChannel } from 'node:worker_threads'
 
 writeFileSync(
   process.env.AGY_USAGE_ARGS!,
@@ -13,7 +14,9 @@ if (process.env.AGY_USAGE_AUTH_HANG) {
       '  https://accounts.google.com/o/oauth2/auth?code_challenge=secret-pkce\n' +
       'Waiting for authentication (timeout 60s)...\n',
   )
-  setTimeout(() => {}, 30_000)
+  // Keep the process alive until aborted by the usage runner's auth-prompt detector.
+  const keepAlive = new MessageChannel()
+  keepAlive.port1.on('message', () => {})
 } else if (process.env.AGY_USAGE_FAIL) {
   process.stderr.write('Authentication required')
   process.exit(1)

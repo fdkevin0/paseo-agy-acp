@@ -419,7 +419,7 @@ test('observedAt anchors timestamp-less retry warnings, clamps future mtimeMs, s
 
   // O_TRUNC reset() preserves the original retryObservedAt deadline for an already-seen step.
   const rewriteNode = new BrainNode(id)
-  const initialMtime = Date.now() - 300_000
+  const initialMtime = started + RETRY_IDLE_TIMEOUT_MS - 300_000
   rewriteNode.ingest({ step_index: 1, type: 'USER_INPUT' }, initialMtime)
   rewriteNode.ingest(warning(2, 1), initialMtime)
   t.mock.timers.tick(RETRY_IDLE_TIMEOUT_MS - 300_000 - 1)
@@ -532,7 +532,9 @@ test('initial transcript reads anchor timestamp-less retry warnings to file mtim
       },
       warning(1, 1),
     ]
-    const expiredDate = new Date(Date.now() - 20 * 60_000)
+    const T0 = 1_700_000_000_000
+    t.mock.timers.enable({ apis: ['Date'], now: T0 })
+    const expiredDate = new Date(T0 - 20 * 60_000)
     await writeTranscript(childId, childRows, expiredDate)
 
     assert.equal(await hasActiveBackgroundWork(root, parentId), false)
@@ -563,8 +565,7 @@ test('initial transcript reads anchor timestamp-less retry warnings to file mtim
     assert.match(settled.error ?? '', /attempt 1/)
 
     // Live retry warning: O_TRUNC rewrite mid-window must not extend the retry deadline.
-    t.mock.timers.enable({ apis: ['Date'], now: Date.now() })
-    await writeTranscript(liveChildId, childRows)
+    await writeTranscript(liveChildId, childRows, new Date(T0))
     const liveEvents: ProviderEvent[] = []
     handle = watchBrain(
       root,
@@ -595,7 +596,9 @@ test('initial transcript reads anchor timestamp-less retry warnings to file mtim
   }
 })
 
-test('BrainTurnObservation pre-attach buffering preserves mtimeMs across multi-turn preamble reads', async () => {
+test('BrainTurnObservation pre-attach buffering preserves mtimeMs across multi-turn preamble reads', async (t) => {
+  const T0 = 1_700_000_000_000
+  t.mock.timers.enable({ apis: ['Date'], now: T0 })
   const root = await mkdtemp(join(tmpdir(), 'brain-retry-obs-'))
   const sessionId = '44444444-4444-4444-8444-444444444444'
   const writeRows = (rows: readonly Record<string, unknown>[], mtime?: Date) =>
@@ -623,7 +626,7 @@ test('BrainTurnObservation pre-attach buffering preserves mtimeMs across multi-t
     await observation.poll()
 
     // Turn 1 arrives and is buffered BEFORE settleBrainTurn calls attach().
-    const expiredDate = new Date(Date.now() - 20 * 60_000)
+    const expiredDate = new Date(T0 - 20 * 60_000)
     await writeRows(
       [
         { step_index: 0, type: 'USER_INPUT', content: 'turn 0' },
@@ -669,7 +672,8 @@ test('settleChildren handles ENOENT -> appeared and torn initial reads without p
   ) => writeBrainTranscript(root, sessionId, rows, mtime)
 
   try {
-    t.mock.timers.enable({ apis: ['Date'], now: Date.now() })
+    const T0 = 1_700_000_000_000
+    t.mock.timers.enable({ apis: ['Date'], now: T0 })
     // 1. settleChildren: child starts as ENOENT, then appears with warning + O_TRUNC rewrite.
     await writeTranscript(parentId, [
       { step_index: 0, type: 'USER_INPUT', content: 'start' },
@@ -745,7 +749,7 @@ test('settleChildren handles ENOENT -> appeared and torn initial reads without p
     assert.match(settled.error ?? '', new RegExp(`Subagent ${childId} failed`))
 
     // 2. watchBrain: torn initial read (no trailing newline -> rows: []) must not latch initialReadDone.
-    const expiredDate = new Date(Date.now() - 20 * 60_000)
+    const expiredDate = new Date(T0 - 20 * 60_000)
     const line0 = JSON.stringify({
       step_index: 0,
       type: 'SYSTEM_MESSAGE',
@@ -820,7 +824,9 @@ test('StepDedupe.fresh re-delivers steps when error or source mutates in place',
   )
 })
 
-test('BrainTurnObservation pre-attach buffering tracks observedAt per step without cross-poll contamination', async () => {
+test('BrainTurnObservation pre-attach buffering tracks observedAt per step without cross-poll contamination', async (t) => {
+  const T0 = 1_700_000_000_000
+  t.mock.timers.enable({ apis: ['Date'], now: T0 })
   const root = await mkdtemp(join(tmpdir(), 'brain-retry-per-step-'))
   const s1 = '88888888-8888-4888-8888-888888888888'
   const s2 = '99999999-9999-4999-8999-999999999999'
@@ -833,7 +839,7 @@ test('BrainTurnObservation pre-attach buffering tracks observedAt per step witho
   let obs1: BrainTurnObservation | undefined
   let obs2: BrainTurnObservation | undefined
   try {
-    const expiredDate = new Date(Date.now() - 20 * 60_000)
+    const expiredDate = new Date(T0 - 20 * 60_000)
 
     // Case 1: Poll 1 reads aged USER_INPUT (20m ago); Poll 2 appends fresh warning -> must NOT immediately expire.
     await writeRows(
@@ -924,7 +930,9 @@ test('BrainTurnObservation pre-attach buffering tracks observedAt per step witho
   }
 })
 
-test('BrainTurnObservation preserves retry observedAt across pre-attach empty O_TRUNC rewrites and refreshes on in-place mutation', async () => {
+test('BrainTurnObservation preserves retry observedAt across pre-attach empty O_TRUNC rewrites and refreshes on in-place mutation', async (t) => {
+  const T0 = 1_700_000_000_000
+  t.mock.timers.enable({ apis: ['Date'], now: T0 })
   const root = await mkdtemp(join(tmpdir(), 'brain-retry-preattach-otrunc-'))
   const s1 = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
   const s2 = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
@@ -939,7 +947,7 @@ test('BrainTurnObservation preserves retry observedAt across pre-attach empty O_
   let obs1: BrainTurnObservation | undefined
   let obs2: BrainTurnObservation | undefined
   try {
-    const expiredDate = new Date(Date.now() - 20 * 60_000)
+    const expiredDate = new Date(T0 - 20 * 60_000)
 
     // Case 1: Aged warning -> truncated empty -> identical rows restored with fresh mtimeMs -> still expires immediately.
     const rows1 = [
@@ -1029,10 +1037,11 @@ test('BrainTurnObservation preserves retry observedAt across pre-attach empty O_
 })
 
 test('turn floors drop replayed retry warnings and terminal failures below them', (t) => {
-  t.mock.timers.enable({ apis: ['Date'], now: 2_000_000 })
+  const now = 2_000_000
+  t.mock.timers.enable({ apis: ['Date'], now })
   const node = new BrainNode(id)
   const oldWarning = warning(2, 1)
-  node.ingest(oldWarning, Date.now() - RETRY_IDLE_TIMEOUT_MS)
+  node.ingest(oldWarning, now - RETRY_IDLE_TIMEOUT_MS)
   assert.match(node.failure()!, /No retry recovery/)
   node.advanceTurnFloor(2)
   node.reset(inbox, [])

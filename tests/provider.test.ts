@@ -12,7 +12,7 @@ import {
   type ProviderTimelineItem,
 } from '@getpaseo/plugin/server/provider'
 import { AgyUsageSource } from '../server/usage.ts'
-import { record } from '../server/common.ts'
+import { definedProcessEnv, record } from '../server/common.ts'
 import { dataDirectory } from '../server/preflight.ts'
 import { createProvider } from '../server/provider.ts'
 import { SessionManager } from '../server/session.ts'
@@ -1013,7 +1013,7 @@ test('cancel is sticky and uses fast path without relaunching after a completed 
     HOME: home,
     AGY_TEST_LOG: log,
     AGY_TEST_LOG_LOAD: '1',
-    AGY_TEST_CANCEL_DELAY: '1',
+    AGY_TEST_CANCEL_BEFORE_REGISTER: '1',
   })
   try {
     await h.provider.send({
@@ -1907,10 +1907,60 @@ test('Full Access without a launch override preserves process.env and missing cw
     assert.ok(launch)
     assert.equal(launch.command, 'agy')
     assert.deepEqual(launch.args, ['acp', '--dangerously-skip-permissions'])
-    const expectedEnv = Object.fromEntries(
-      Object.entries(process.env).filter(([, value]) => value !== undefined),
-    )
-    assert.deepEqual(launch.env, expectedEnv)
+    assert.deepEqual(launch.env, definedProcessEnv())
+
+    // Explicit launch env is preserved verbatim under Full Access without falling back to host env.
+    const explicitEnv = isolatedEnv(root, { CUSTOM_KEY: 'explicit' })
+    const explicitLaunches: Array<ProviderLaunch | undefined> = []
+    const explicitCollector = createEventCollector()
+    const explicitManager = new SessionManager({
+      launch: { command: 'agy', args: ['acp'], env: explicitEnv },
+      usage: new AgyUsageSource({ env: explicitEnv }),
+      capabilities: PROVIDER_CAPABILITIES,
+      emit: explicitCollector.emit,
+      connectAcp: (seenLaunch, cwd, env, client, onExit, opts) => {
+        explicitLaunches.push(seenLaunch)
+        return connectAcp(
+          {
+            command: process.execPath,
+            args: [mockPath],
+            env: isolatedEnv(root),
+          },
+          cwd,
+          env,
+          client,
+          onExit,
+          opts,
+        )
+      },
+    })
+    try {
+      await explicitManager.handle({
+        type: 'session.open',
+        requestId: 'open-full-explicit',
+        sessionId: 'full-explicit',
+        history: 'skip',
+        config: {
+          cwd: root,
+          env: { HOME: root },
+          mcpServers: {},
+          settings: {},
+          persist: false,
+          mode: 'full-access',
+        },
+      })
+      await explicitCollector.wait(
+        (e) => e.type === 'session.ready' && e.sessionId === 'full-explicit',
+      )
+      assert.equal(explicitLaunches.length, 1)
+      assert.deepEqual(explicitLaunches[0], {
+        command: 'agy',
+        args: ['acp', '--dangerously-skip-permissions'],
+        env: explicitEnv,
+      })
+    } finally {
+      await explicitManager.close()
+    }
   } finally {
     await manager.close()
     await rm(root, { recursive: true, force: true })

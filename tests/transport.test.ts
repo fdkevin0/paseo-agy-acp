@@ -16,28 +16,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { connectAcp } from '../server/transport.ts'
-import { isolatedEnv, waitUntil } from './helpers.ts'
-
-function isProcessGone(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-    return false
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'ESRCH'
-  }
-}
-
-function isProcessStopped(pid: number): boolean {
-  if (isProcessGone(pid)) return true
-  if (process.platform === 'linux') {
-    try {
-      return /^\d+ \([^)]*\) Z /.test(readFileSync(`/proc/${pid}/stat`, 'utf8'))
-    } catch {
-      return true
-    }
-  }
-  return false
-}
+import {
+  isolatedEnv,
+  killProcessGroupIgnoreMissing,
+  waitForPidExit,
+} from './helpers.ts'
 
 async function runShutdownTest(shutdown: 'graceful' | 'stubborn') {
   const home = await mkdtemp(join(tmpdir(), 'agy-transport-'))
@@ -80,7 +63,7 @@ async function runShutdownTest(shutdown: 'graceful' | 'stubborn') {
     commandPid = Number(await readFile(join(home, 'command.pid'), 'utf8'))
     process.kill(commandPid, 0)
     await transport.close()
-    await waitUntil(() => isProcessStopped(commandPid!))
+    await waitForPidExit(commandPid!)
     await unrelatedExited
     assert.equal(
       await stat(join(home, 'old-result')).then(
@@ -157,9 +140,7 @@ test(
         await transport.close()
         await transport.exited
       } finally {
-        try {
-          process.kill(-commandPid, 'SIGKILL')
-        } catch {}
+        killProcessGroupIgnoreMissing(commandPid)
       }
     } finally {
       await transport.close()
@@ -308,7 +289,7 @@ test(
     await transport.exited
     const psPid = Number(await readFile(invokedPath, 'utf8'))
     assert.ok(Number.isInteger(psPid) && psPid > 0)
-    await waitUntil(() => isProcessGone(psPid))
+    await waitForPidExit(psPid)
   },
 )
 

@@ -33,20 +33,11 @@ import { AgyUsageSource } from '../server/usage.ts'
 import {
   collectProviderEvents,
   createEventCollector,
+  deferred,
   isolatedEnv,
 } from './helpers.ts'
 
 const mockAcpPath = fileURLToPath(new URL('./mock-acp.ts', import.meta.url))
-
-function deferred<T = void>() {
-  let resolve!: (value: T | PromiseLike<T>) => void
-  let reject!: (reason?: unknown) => void
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res
-    reject = rej
-  })
-  return { promise, resolve, reject }
-}
 
 interface FakeTransportRecord {
   readonly id: number
@@ -229,6 +220,14 @@ function assertProcessExited(pid: number) {
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' })
 }
 
+function assertAllProcessesAlive(pids: readonly number[]) {
+  for (const pid of pids) assertProcessAlive(pid)
+}
+
+function assertAllProcessesExited(pids: readonly number[]) {
+  for (const pid of pids) assertProcessExited(pid)
+}
+
 async function createMockProvider(
   home: string,
   extraEnv: Record<string, string> = {},
@@ -310,7 +309,7 @@ test('cwd-independent catalog refreshes and session listings reuse one ACP proce
     assert.ok(spawnedBeforeClose.length <= 2)
     await h.provider.close()
     const allSpawned = await readPids(pidLog)
-    allSpawned.forEach(assertProcessExited)
+    assertAllProcessesExited(allSpawned)
   } finally {
     await h.provider.close()
     await rm(home, { recursive: true, force: true })
@@ -1571,11 +1570,11 @@ test('ProviderConnection.close shuts down active sessions, shared control runtim
 
     const pidsBeforeClose = await readPids(pidLog)
     assert.ok(pidsBeforeClose.length >= 3)
-    pidsBeforeClose.forEach(assertProcessAlive)
+    assertAllProcessesAlive(pidsBeforeClose)
 
     await h.provider.close()
     const allPids = await readPids(pidLog)
-    allPids.forEach(assertProcessExited)
+    assertAllProcessesExited(allPids)
   } finally {
     await h.provider.close()
     await rm(home, { recursive: true, force: true })
@@ -2297,7 +2296,7 @@ test('initializeAcp aborts immediately when signal aborts before or during initi
   ])
   const transport = fake.connect(
     undefined,
-    process.cwd(),
+    '/workspace',
     {},
     {
       sessionUpdate: async () => {},

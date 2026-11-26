@@ -6,14 +6,10 @@ import { test } from 'node:test'
 import type { ProviderEvent } from '@getpaseo/plugin/server/provider'
 import { watchBrain } from '../server/brain.ts'
 import { StepDedupe } from '../server/brain-io.ts'
+import { checkpointRow } from './brain-fixtures.ts'
 
 const native = '11111111-1111-4111-8111-111111111111'
-const checkpoint = (content: string) => ({
-  step_index: 1,
-  type: 'CHECKPOINT',
-  status: 'DONE',
-  content,
-})
+const checkpoint = (content: string) => checkpointRow(1, { content })
 
 test('checkpoint completion is semantic, not a summary revision or regressed status', () => {
   const dedupe = new StepDedupe()

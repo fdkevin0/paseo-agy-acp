@@ -15,7 +15,8 @@ import { alignReplayTools, mergeCompactionHistory } from '../server/history.ts'
 import { Timeline } from '../server/mapping.ts'
 import { SessionManager } from '../server/session.ts'
 import { AgyUsageSource } from '../server/usage.ts'
-import { isolatedEnv } from './helpers.ts'
+import { checkpointRow } from './brain-fixtures.ts'
+import { isolatedEnv, toolCalls as allToolCalls } from './helpers.ts'
 
 type SessionUpdate = SessionNotification['update']
 type ToolCallItem = Extract<ProviderTimelineItem, { type: 'tool_call' }>
@@ -28,12 +29,8 @@ const response = (step_index: number, content: string) => ({
   status: 'DONE',
   content,
 })
-const checkpoint = (step_index: number) => ({
-  step_index,
-  type: 'CHECKPOINT',
-  status: 'DONE',
-  created_at: '2026-01-01T00:00:01Z',
-})
+const checkpoint = (step_index: number) =>
+  checkpointRow(step_index, { created_at: '2026-01-01T00:00:01Z' })
 const text = (value: string) => ({
   sessionUpdate: 'agent_message_chunk',
   content: { type: 'text', text: value },
@@ -170,9 +167,7 @@ const labels = (events: ProviderEvent[]) =>
     item.type === 'assistant_message' ? item.text : item.type,
   )
 const toolCalls = (events: ProviderEvent[]): ToolCallItem[] =>
-  timeline(events)
-    .map(({ item }) => item)
-    .filter((item): item is ToolCallItem => item.type === 'tool_call')
+  allToolCalls(timeline(events))
 const terminalTurnStates = (events: ProviderEvent[]) =>
   events
     .filter(

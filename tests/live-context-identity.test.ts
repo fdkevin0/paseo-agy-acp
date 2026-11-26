@@ -2,12 +2,8 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { BrainTranscriptProjector } from '../server/brain-projector.ts'
 import { mergeCompactionHistory } from '../server/history.ts'
-import {
-  BrainTurnObservation,
-  type BrainRead,
-} from '../server/brain-observer.ts'
-import { TranscriptReader } from '../server/brain-io.ts'
-import { sequenceDouble } from './helpers.ts'
+import { BrainTurnObservation } from '../server/brain-observer.ts'
+import { ScriptedTranscriptReader } from './helpers.ts'
 
 const planner = (step_index: number, id?: string) => ({
   step_index,
@@ -24,17 +20,6 @@ const metadata = (step: number, id: string) => ({
   consumedNonUserCount: 0,
   stepCallIds: new Map([[step, id]]),
 })
-
-class ScriptedTranscriptReader extends TranscriptReader {
-  private readonly next: () => Promise<BrainRead>
-  constructor(reads: readonly BrainRead[]) {
-    super()
-    this.next = sequenceDouble(reads.map((read) => async () => read))
-  }
-  override read(): ReturnType<TranscriptReader['read']> {
-    return this.next()
-  }
-}
 
 test('raw checkpoint observation reconciles only confirmed snapshot deletion before step reuse', async () => {
   const items: unknown[] = []
