@@ -1,65 +1,59 @@
 # Development and releases
 
-Start with the [installation guide](../README.md#install) to use the plugin. For configuration, protocol behavior and operational limits, see the [reference](reference.md).
+Start with the [installation guide](../README.md#install) to use the plugin. See [reference](reference.md) for operator behavior and [architecture](architecture.md) for internal invariants.
 
 ## Development setup
-
-From a clone, install the locked development dependencies:
 
 ```sh
 npm ci --ignore-scripts
 ```
 
-Paseo compiles the TypeScript plugin; no separate build output is required. Git/local plugin preparation installs production dependencies only, so rerun the command above if preparation removed development tools.
+Paseo compiles TypeScript directly; no separate build step is needed. Git/local plugin installs prune dev dependencies, so rerun `npm ci --ignore-scripts` if dev tools were removed.
 
-## Protocol and identity primer
+## Architecture overview
 
-- **ACP vs. Brain**: Prompts, text and tool notifications, config options and interactive approvals flow over JSON-RPC stdio (`agy acp`). The minimum supported agy version is 1.5.16, which streams wakeup updates, completes `session/load` history replay before replying, and returns `-32002` for missing `session/load` conversations. Local Brain files under `<appDataDir>/brain/<nativeId>/.system_generated/` track background work and consumption outside the RPC.
-- **Session identities**:
-  - `sessionId`: Paseo's host-assigned session identifier (for example, `'s'`).
-  - `nativeId`: `agy`'s UUIDv4 conversation identifier on disk and over ACP.
-  - `<sessionId>:child:<nativeChildId>`: Provider-scoped read-only subsession identifier emitted via `session.opened` / `session.ready` for owned subagents (including multi-level grandchildren linked under their direct parent subsession ID).
+- `index.server.ts` registers provider `agy` and the shared `AgyUsageSource`.
+- `SharedControlRuntime` reuses one idle-reaped `agy acp` process for cwd-independent `catalog`/`sessions` probes; `StandbyRuntimePool` pre-warms isolated processes for interactive sessions.
+- `SessionManager` bridges ACP stdio events, permissions, and elicitations with Paseo while `BrainTurnObservation`, `settleBrainTurn`, and `SubagentRegistry` reconcile Brain logs and SQLite conversation state.
+- Subscription quota queries run `agy -p /usage --output-format json` independently without starting a model turn.
 
-## Request and session flow
-
-1. `index.server.ts` registers provider `agy` and a shared subscription usage source. The provider negotiates capabilities and creates a session manager, a shared control runtime (`SharedControlRuntime`), and a pre-warmed standby runtime pool (`StandbyRuntimePool`) for each connection.
-2. Stateless control operations (`catalog` and `sessions`) reuse a single lazily started, idle-reaped `agy acp` control process per connection for cwd-independent launches (falling back to one-shot runtimes for cwd-dependent launches). Catalog discovery serializes on the shared runtime, opens and closes a fresh unprompted ACP session (`session/new` + `session/close`), removes its temporary artifacts (retiring and stopping the control process first if `session/close` fails or the launch is cwd-dependent), deduplicates concurrent in-flight probes per working directory (bounded to 100 directories), and clears each entry once settled so subsequent host refreshes re-probe fresh models; session listing calls `session/list` without creating a native session. Successful `catalog`/`sessions` probes, persisted opens, first prompts on new sessions, and non-`full-access` standby relaunches warm one standby runtime in the background (5-minute idle reap, 4-slot LRU keyed by command/args/env, opted out for cwd-dependent or `--dangerously-skip-permissions` launches). Normal opens and relaunches check out a matching warm standby for exclusive 1:1 session ownership (or fall back to a cold start), create (`session/new`), resume (`session/resume` on `history: 'skip'` when supported) or load (`session/load`) a native session, apply requested configuration and wait for that session's live commands before publishing readiness. Command lists are never seeded from previous sessions.
-3. Prompts go to agy over stdio. Notifications and permission requests must match the current native session and are ignored or canceled during shutdown. Valid notifications become timeline snapshots, permissions, configuration and usage events; agy owns tool execution.
-4. Permission responses resolve the matching native request. Child conversation IDs start read-only Brain transcript and lifecycle tracking via `SubagentRegistry`. ACP and Brain tool snapshots share one identity via structured `.system_generated/` metadata (`sourceMetadata.tool.toolCall.id` and `spawnStepIndex`, with invocation-order fallback); canonical Brain results also fill missing ACP tool output during history replay. Pending ACP notifications are drained before the turn ends; Brain tracking keeps the turn open for native background work and Reactive Wakeup responses that outlive the ACP prompt response.
-5. Close cancels pending approvals and stops Brain polling (including closes arriving while `session.open` is still in flight). New unprompted sessions close natively and remove only their own temporary artifacts—recycling the healthy idle process back into `StandbyRuntimePool` when cwd-independent, non-`full-access`, ready, idle (no active control/relaunch/interrupt work), 0-MCP, and `session/close` succeeds (otherwise stopping the process first); catalog probes close natively and remove their temporary artifacts while keeping a healthy shared control runtime warm (retiring it on `session/close` failure or cwd-dependent launches). Other closes stop the process while preserving imported and prompted conversations. Protocol failure also terminates the child; connection shutdown awaits all tracked operations, the session manager, the shared control runtime, the standby pool, and owned transports.
-6. Subscription queries independently invoke agy's local `/usage` command using observed account and tier metadata. They do not start a model turn.
+See [architecture](architecture.md) for state machines, `RuntimeEpoch` fencing, `O_TRUNC` transcript recovery, and replay alignment.
 
 ## Source layout
 
-| File                                                                      | Responsibility                                                                                    |
-| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `index.server.ts`                                                         | Register the provider and shared usage source.                                                    |
-| `server/common.ts`                                                        | Shared primitives (`record`, `cleanToolName`, `setBounded`, `formatErrorMessage`, env).           |
-| `server/provider.ts`                                                      | Provider contract, capability negotiation, in-flight catalog deduplication and pending tracking.  |
-| `server/runtime.ts`                                                       | Shared ACP initialization/version guard, idle-reaped control runtime, and standby runtime pool.   |
-| `server/session.ts`                                                       | Session manager, notifications, prompts, permissions/elicitations and lifecycle.                  |
-| `server/subagents.ts`                                                     | Subagent ownership cache, multi-level subsession linking and child Brain watchers.                |
-| `server/questions.ts`                                                     | Normalize `elicitation/create` schemas and `ask_question` calls into `QuestionCard`s.             |
-| `server/permissions.ts`                                                   | Classify permission requests, MCP `toolPolicy` preapprovals and option selection.                 |
-| `server/transport.ts`                                                     | ACP stdio process, `elicitation/create` interception, metadata capture and shutdown.              |
-| `server/mapping.ts`                                                       | Timeline state machine, configuration, attachment and context/token usage mapping.                |
-| `server/brain-io.ts`                                                      | Realpath-contained Brain file readers, `O_TRUNC` cursor detection and inbox/subagents.            |
-| `server/conversation-db.ts`                                               | Symlink-safe, stat-cached SQLite reader for native `gen_metadata` and hidden `steps` API errors.  |
-| `server/brain-projector.ts`                                               | Pure state machine projecting Brain transcript steps and inbox messages into cards.               |
-| `server/brain.ts`                                                         | Turn-settlement polling loop (`settleBrainTurn`) and child transcript watcher.                    |
-| `server/preflight.ts`                                                     | Version checks, cache identity, data directory resolution and symlink-safe cleanup.               |
-| `server/usage.ts`                                                         | Account discovery, bounded login-log reads and subscription quota windows.                        |
-| `tests/helpers.ts`                                                        | Shared provider event collector and test harness utilities.                                       |
-| `tests/mock-acp.ts`, `tests/mock-usage.ts`                                | Offline CLI substitutes.                                                                          |
-| `tests/compat-acp.ts`, `tests/interrupt-acp.ts`, `tests/transport-acp.ts` | Native agy behavior models for Brain compatibility, interruption and process shutdown.            |
-| `tests/index.test.ts`, `tests/*.test.ts`                                  | Offline Tier 1 (`test:unit`) entry-point, mapping, permissions, lifecycle, Brain and quota tests. |
-| `tests/live/*.test.ts`                                                    | Tier 2 (`test:live`) real local `agy` CLI boundary checks in isolated temp homes.                 |
-| `tests/workflows.test.ts`                                                 | Execute release workflow scripts against local command substitutes.                               |
-| `.github/workflows/`                                                      | CI checks (`npm run verify`) and tagged npm/GitHub releases.                                      |
+| File                                                                        | Responsibility                                                                                                                   |
+| --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `index.server.ts`                                                           | Register provider `agy` and shared usage source.                                                                                 |
+| `server/common.ts`                                                          | Shared primitives, tool normalization, path/errno guards, bounded maps, env.                                                     |
+| `server/provider.ts`                                                        | Provider contract, capability negotiation, catalog dedupe, shutdown.                                                             |
+| `server/runtime.ts`                                                         | ACP init/version guard, `SharedControlRuntime`, `StandbyRuntimePool`, `TransportTracker`, `IdleTimer`, `closeDisposableSession`. |
+| `server/session.ts`                                                         | `SessionPhase` + `activeTurn` state machine, `acquireRuntime`, prompts, permissions, interrupt recovery.                         |
+| `server/subagents.ts`                                                       | Subagent ownership, multi-level subsession links, child Brain watchers.                                                          |
+| `server/questions.ts`                                                       | Normalize `elicitation/create` schemas and `ask_question` `QuestionCard`s.                                                       |
+| `server/permissions.ts`                                                     | Permission validation, classification, security warnings, MCP `toolPolicy`.                                                      |
+| `server/transport.ts`                                                       | ACP stdio child process, elicitation schema patch, process-group shutdown.                                                       |
+| `server/mapping.ts`                                                         | Timeline state machine, models/modes/thinking, attachments, context usage.                                                       |
+| `server/mcp.ts`                                                             | MCP identity resolution (`call_mcp_tool`, `mcp_<server>_<tool>`, `mcp_paseo_*`).                                                 |
+| `server/history.ts`                                                         | Replay tool alignment and verified compaction checkpoint insertion.                                                              |
+| `server/brain.ts`                                                           | `RuntimeEpoch`, `BackgroundWorkProbe`, `ForegroundReconciler`, turn settling.                                                    |
+| `server/brain-turns.ts`                                                     | Parent-turn correlation, `TurnBoundaryCache`, child re-wakeup turn floors.                                                       |
+| `server/brain-projector.ts`                                                 | Brain transcript row projection, unified tasks/daemons, inbox matching.                                                          |
+| `server/brain-observer.ts`                                                  | Incremental foreground `BrainTurnObservation` and `ModelUsageObserver`.                                                          |
+| `server/brain-io.ts`                                                        | Symlink-safe Brain readers, `O_TRUNC` `TranscriptReader`, `StepDedupe`.                                                          |
+| `server/conversation-db.ts`                                                 | Read-only stat-cached SQLite reader (`gen_metadata` window, `steps` errors).                                                     |
+| `server/preflight.ts`                                                       | Version probes, `hashLaunchKey` fingerprints, data dir, artifact cleanup.                                                        |
+| `server/usage.ts`                                                           | Account discovery, bounded login-log reads, subscription quota queries.                                                          |
+| `tests/helpers.ts`, `tests/brain-fixtures.ts`                               | Event collectors, `deferred`, `waitForPidExit`, signal gates, `HarnessSessionManager`, `wrapConnectAcp`, Brain/SQLite fixtures.  |
+| `tests/mock-acp.ts`, `tests/mock-usage.ts`                                  | Offline stdio ACP and `/usage` CLI substitutes.                                                                                  |
+| `tests/*-acp.ts` (`compat`, `interrupt`, `transport`, `compaction-history`) | Focused native `agy` models for correlation, interrupts, shutdown, replay.                                                       |
+| `tests/index.test.ts`, `tests/*.test.ts`                                    | Tier 1 (`test:unit`) offline tests using Node's native TypeScript runner.                                                        |
+| `tests/live/*.test.ts`                                                      | Tier 2 (`test:live`) real local `agy` CLI boundary checks in temp homes.                                                         |
+| `tests/workflows.test.ts`                                                   | Runs `.github/workflows/release.yml` shell blocks against local stubs.                                                           |
+| `.github/workflows/`                                                        | CI (`npm run verify`) and tagged npm/GitHub release automation.                                                                  |
 
 ## Verification
 
-### Offline checks
+### Offline and live checks
 
 ```sh
 npm run format
@@ -67,17 +61,13 @@ npm run verify
 npm run test:live
 ```
 
-`npm run verify` runs `npm run format:check`, `npm run check`, `npm test` (`npm run test:unit`, the offline Tier 1 suite), and `npm pack --dry-run --ignore-scripts`. `npm run test:live` runs the Tier 2 suite (`tests/live/*.test.ts`) against the local `agy` CLI in isolated temporary homes.
-
-`tests/compat-acp.ts` models observed native notifications: display titles, omitted tool output and transcript calls without IDs. `tests/fixtures/agy-1.5.12-wakeup.json` pairs sanitized ACP frames with matching Brain transcript rows from a real post-RPC background-task wakeup (exercising the out-of-turn post-RPC wakeup boundary that still applies in `agy` 1.5.16+ for `IsDaemon: true` tasks and external messages). The stdio fixture sends the recorded wakeup frames only after the prompt response, with no second prompt RPC. It covers two native file reads whose ACP completions omit their results, native elicitation, and the next prompt's independent usage. `tests/interrupt-acp.ts` models background work that outlives ordinary cancellation, so regression tests verify process shutdown and restoration rather than trusting a canceled UI state. `tests/transport-acp.ts` starts a detached command that outlives ACP EOF, so shutdown tests verify process-group cleanup, including hosts without `ps`.
-
-Tests run with Node's native TypeScript support and temporary files; they require no login or model quota. Workflow tests require Bash and stub `curl`, `gh` and `npm`, so they neither contact registries nor publish artifacts.
-
-Coverage includes tool terminalization, PascalCase arguments, FIFO and structured Brain results, history suppression, permissions, attachment mapping, fresh commands before readiness, stale notification/permission rejection, cancellation races, conditional interruption (fast-path `session/cancel` vs. background-owner relaunch), native step statuses (each step logged once; `CANCELED`/`INTERRUPTED`; superseded `PENDING`/`QUEUED`/`GENERATING` rows), in-place `O_TRUNC` rewrites (including an empty file mid-rewrite), stall timeouts and what suspends them, transcript flush grace, child cancellation ordering, killed-child close without reopening, resumed child watchers, protocol disconnect shutdown, catalog concurrency and cleanup containment. Usage tests cover per-step context occupancy from `transcript_full.jsonl`, native-measurement precedence, account discovery, quota mapping, deleted-workspace fallback and error handling. Workflow tests exercise tag/version validation, registry failures, manifest preparation and GitHub Release recovery.
+- `npm run verify` runs `format:check`, `tsc --noEmit`, `npm test` (`test:unit`, Tier 1 offline), and `npm pack --dry-run --ignore-scripts`.
+- `npm run test:live` runs Tier 2 (`tests/live/*.test.ts`) against the local `agy` CLI in isolated temp homes.
+- Offline tests need no login, network, or quota; workflow tests require Bash and stub `curl`, `gh`, and `npm`. Sanitized recordings live in `tests/fixtures/`.
 
 ### Live Paseo smoke checks
 
-Use an authenticated agy installation and a test daemon:
+With an authenticated `agy` installation and a test daemon:
 
 ```sh
 paseo plugin install .
@@ -88,61 +78,41 @@ paseo usage ls --json --refresh
 paseo plugin logs agy-acp
 ```
 
-Require `running` with no plugin error, a model catalog and an `available` agy quota report. The tier appears after successful native catalog discovery or session opening; a cached model list alone may not populate it. Draft commands should be available before the first prompt, and closing an unprompted draft session should leave no new session artifacts.
+Confirm `running` without plugin errors, a model catalog, and an `available` quota report (tier populates after live discovery or session open). Draft commands should appear before the first prompt, and closing an unprompted draft should leave no temporary artifacts.
 
-For a full conversation smoke test, use a disposable working directory, open a plan-mode agent, request a text-only reply, then close and import/reopen the native session to verify history. Exercise permission approval, denial, cancellation and rich tool cards separately. Model prompts consume account quota. Desktop/mobile UI acceptance is a manual check; offline tests do not verify layout or service access.
+For a full smoke check, open a plan-mode agent in a disposable directory, send a text-only prompt, then close and import/reopen to verify history. Test approval, denial, cancel, and tool cards separately. Desktop/mobile UI is a manual check.
 
 ## Packaging, CI, and releases
 
 ### Dependency locks and package contents
 
-Keep Paseo host libraries and type-only dependencies in `devDependencies`; the ACP SDK is a runtime dependency. `npm-shrinkwrap.json` locks Git preparation and the installed npm dependency tree. After dependency or version changes, synchronize it with `npm install --package-lock-only --ignore-scripts` and review the diff. npm automatically includes the shrinkwrap in published packages.
+Keep Paseo host libraries and types in `devDependencies`; `@agentclientprotocol/sdk` is the runtime dependency. After dependency or version changes, run `npm install --package-lock-only --ignore-scripts` and review `npm-shrinkwrap.json`.
 
-The source manifest's `build` runs `npm ci --omit=dev --ignore-scripts` for Git/local installations. npm already installs production dependencies, so the release workflow removes only `build` from `paseo-plugin.json` before packing and publishing. It preserves the other manifest fields and changes only the release runner's checkout. Manual npm packaging must perform the same preparation in a disposable checkout.
+`paseo-plugin.json` includes `build` (`npm ci --omit=dev --ignore-scripts`) for Git/local installs; the release workflow strips only `build` before packing for npm (repeat this in a disposable checkout for manual packing). Check `npm pack --dry-run --ignore-scripts` and an actual tarball to ensure manifest, icons, README/OVERVIEW pairs, license, `docs/`, `index.server.ts`, `server/`, and `npm-shrinkwrap.json` ship while tests, fixtures, caches, and credentials stay out. See Paseo's [plugin publishing guide](https://paseo.sh/docs/plugins/publishing).
 
-Inspect `npm pack --dry-run --ignore-scripts` for the manifest, icon, both overviews, README, license, linked docs, server entry, all imported runtime files and shrinkwrap. Tests, workflow fixtures, local transcripts, caches and credentials must stay outside the tarball. Also inspect an actual tarball before a release. Follow Paseo's [plugin publishing guide](https://paseo.sh/docs/plugins/publishing) when preparing a registry submission.
+### CI and releases
 
-### CI and tag validation
+- `ci.yml` runs on PRs, `main` pushes, and manual dispatch on Node 26 (`npm ci --ignore-scripts` + `npm run verify`).
+- `release.yml` runs on `vX.Y.Z` tag pushes or manual tag dispatch, rejecting branches, mismatched tags, and non-stable versions. HTTP 404 from npm publishes with OIDC provenance ([Trusted Publishing](https://docs.npmjs.com/trusted-publishers/) for `fdkevin0/paseo-agy-acp`, `release.yml`, `id-token: write`, npm >=11.5.1); HTTP 200 skips publish and runs GitHub Release recovery. Other HTTP/network errors fail closed.
 
-`ci.yml` checks pull requests, pushes to `main` and manual runs on Node 26. It installs the locked dependencies, checks formatting and types, runs the offline suite and verifies package contents.
+Release steps:
 
-`release.yml` runs for version-tag pushes or manual dispatch on an existing tag. It rejects branch dispatches, mismatched tags and non-stable versions before contacting npm. The tag must equal `v` plus `package.json`'s stable `X.Y.Z` version. Only a registry HTTP 404 means the version is absent; HTTP 200 marks it as already published. Authentication failures, server errors and timeouts stop the workflow.
-
-For an unpublished version, the job installs dependencies, verifies formatting/types/tests, prepares the npm manifest and checks the package before publishing publicly with provenance. Existing versions skip npm preparation/publication and proceed to GitHub Release recovery. Ordinary branch pushes do not trigger this release workflow.
-
-### Trusted Publishing and release procedure
-
-Configure npm [Trusted Publishing](https://docs.npmjs.com/trusted-publishers/) for owner `fdkevin0`, repository `paseo-agy-acp` and workflow filename `release.yml`. The publish job grants `id-token: write` and installs npm >=11.5.1 for OIDC authentication without repository token secrets. Repository ownership, npm package permissions and publisher setup must be configured before releasing.
-
-1. Bump the stable package version and synchronize the shrinkwrap.
-2. Run offline checks, inspect the prepared tarball and complete live smoke checks.
-3. Commit with a Conventional Commit message and review the final source and package contents.
-4. Push the reviewed version commit and matching `vX.Y.Z` tag when ready to publish. Never move a published tag or overwrite a published npm version.
-5. Verify the exact published package on a test daemon before submitting it to Paseo's registry.
+1. Bump `package.json` version and `PACKAGE_VERSION` in `server/common.ts`, then sync `npm-shrinkwrap.json`.
+2. Run `npm run verify`, `npm run test:live`, inspect the tarball, and run live smoke checks.
+3. Commit with a Conventional Commit message, push, and push the matching `vX.Y.Z` tag (never move a published tag or overwrite a published version).
+4. Verify the published package on a test daemon before submitting to Paseo's registry.
 
 ### Release recovery
 
-If npm publication succeeds but GitHub Release creation fails, rerun the tagged workflow or dispatch it with `gh workflow run release.yml --ref vX.Y.Z`. It detects the published npm version and skips republishing. An existing GitHub Release is left alone; a missing one is created with `gh release create --verify-tag`, so recovery cannot silently create a tag at the wrong commit. A failed create command fails the job.
-
-Resolve registry or authentication errors before retrying. If a published artifact is wrong, publish a corrected new version instead of changing the old tag or package.
+If npm publish succeeded but GitHub Release creation failed, rerun or dispatch `gh workflow run release.yml --ref vX.Y.Z`. It skips republishing, preserves any existing release, and creates a missing one with `gh release create --verify-tag`. Publish a new version rather than modifying a published tag or package.
 
 ## Documentation conventions
 
 Use progressive disclosure:
 
-- Keep the README focused on installation, the first successful run, capabilities and essential limitations.
-- Put launch settings and protocol/operational details in the reference; keep implementation, testing and release instructions here.
-- Keep listing overviews factual and user-facing, with purpose, operation, requirements, data flow and limits. They must not contain plugin-add or npm-install command examples.
-- Maintain `README.zh-CN.md` and `OVERVIEW.zh-CN.md` as complete translations of `README.md` and `OVERVIEW.md`; keep the rest of the project documentation in English.
-- Link to deeper explanations instead of duplicating them, and include every linked user document in the package's `files` list.
-- Use sample identities and paths; never commit account logs, local credentials or personal workstation paths.
-
-## MCP parity evidence
-
-The comparison baseline is Paseo v0.15.4 (`b2f00c7d3214257201040bcc8af5a3a3e21e21a5`), matching the pinned SDK. Its Codex `tool-call-mapper.ts` builds `server.tool` labels and `splitCodexMcpToolResultImages` replaces image content with placeholders; `codex-app-server-agent.ts` emits those images separately in live and restored timelines. This does not establish the installed daemon/app version or AGY result payloads.
-
-`tests/mcp.test.ts` and the mock ACP permission flow cover adapter compatibility boundaries, not captured MCP traffic. They verify explicit identity precedence, exact grants, descriptive-title rejection, ambiguous-name rejection, retained input/output, incremental updates and Brain replay. A completed result containing `isError: true` remains completed until upstream evidence justifies another rule. No shared daemon configuration or plugin reload is needed for the offline checks.
-
-AGY upstream evidence: isolated ACP `initialize` confirmed agent version 1.5.8 and protocol version 1. The inspected Linux x86_64 ELF SHA256 was `9db59b6371107b939befa9c507c0a24989fda974e75d81d8529f3689ef7322e5`. Go pclntab function ranges plus `objdump` establish `mcpcore.GetMcpToolNameWithPrefix` (0x8804e60): `fmt.Sprintf("%s_%s_", "mcp", server)` then `fmt.Sprintf("%s%s", prefix, tool)`; `CallMcpToolTool.parseCall` (call at 0x8fe0da0) uses required `ServerName`, `ToolName`, `Arguments` JSON fields; ACP `getToolKindTitleAndLocations` (0xa58a775–0xa58a781) prepends `Run ` to the original name before namespace cleanup for classification. Underscores are not escaped by this formatter, so only a unique configured server prefix can identify a direct call; multiple matching prefixes (including collisions with legacy formats) fail closed. Display labels never feed permission matching.
-
-The isolated `session/new` probe returned `-32000 Authentication required`; no credentials were copied and no model or MCP tool ran. Static `ACPServer.getToolOutput` (0xa5899e0) calls `steps.MCPToolResult` (0xa12b4e0) and builds text or an `mcp_tool_output` resource link, not a proven image transport. Existing resource-link attachment mapping remains in use. Media-offload code is a follow-up lead; complete original MCP image → Brain → ACP coverage, installed daemon/app versions and visual desktop/mobile checks remain unverified. Input `promptCapabilities.image` is not output-image evidence. No image extraction or `isError` normalization is claimed.
+- **`README.md` / `README.zh-CN.md`:** Lean user entry point (install, quick start, capabilities, essential limits, links to `docs/`). Maintain 100% EN/ZH parity.
+- **`OVERVIEW.md` / `OVERVIEW.zh-CN.md`:** Factual Paseo registry overview (no install CLI commands). Maintain 100% EN/ZH parity.
+- **`docs/reference.md`:** Scannable user/operator reference (English). Avoid internal code symbols and changelog prose.
+- **`docs/architecture.md`:** Contributor architecture and invariant reference for `agy >= 1.5.16` (English).
+- **`docs/development.md`:** Contributor setup, source layout, verification, packaging, and release runbook (English).
+- Link rather than duplicate, keep every linked user document in `package.json`'s `files`, and use sample identities/paths only.

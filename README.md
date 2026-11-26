@@ -2,7 +2,7 @@
 
 English · [简体中文](README.zh-CN.md)
 
-Use Antigravity in [Paseo](https://paseo.sh) through the native `agy` Agent Client Protocol. Open and resume conversations, approve tools, select models and track usage from Paseo desktop or mobile clients.
+Use Antigravity in [Paseo](https://paseo.sh) through the native `agy` Agent Client Protocol (ACP). Open and resume conversations, approve tools, select models, and track context and subscription usage from Paseo desktop or mobile clients.
 
 The plugin ID is `agy-acp`; its provider is `agy`, displayed as **Antigravity (ACP)**.
 
@@ -10,30 +10,23 @@ The plugin ID is `agy-acp`; its provider is `agy`, displayed as **Antigravity (A
 
 - Paseo **0.15.0 or later**, with plugins enabled.
 - Node.js **22.18 or later** and npm on the daemon host.
-- Antigravity CLI (`agy`) **1.5.16 or later**, already authenticated on that host. Run `agy` in a terminal to sign in before using the plugin.
+- Antigravity CLI (`agy`) **1.5.16 or later**, already authenticated on that host (run `agy` in a terminal to sign in first).
 
 ## Install
 
-From GitHub:
-
 ```sh
+# From GitHub
 paseo plugin install git:fdkevin0/paseo-agy-acp
-```
 
-From npm:
-
-```sh
+# From npm
 paseo plugin install npm:@fdkevin/paseo-agy-acp
-```
 
-From a local clone:
-
-```sh
+# From a local clone
 git clone https://github.com/fdkevin0/paseo-agy-acp.git
 paseo plugin install ./paseo-agy-acp
 ```
 
-See [development setup](docs/development.md#development-setup) for dependencies and local checks. For a remote daemon, add `--host <endpoint>`; local source paths and the agy executable must exist on that host.
+See [development setup](docs/development.md#development-setup) for local dependencies and checks. For a remote daemon, add `--host <endpoint>`; local source paths and the `agy` executable must exist on that host.
 
 ## Usage
 
@@ -41,13 +34,9 @@ See [development setup](docs/development.md#development-setup) for dependencies 
 paseo run --provider agy "Explain this repository"
 ```
 
-In Paseo, create an agent and select **Antigravity (ACP)**. Choose from the models, modes, thinking options and slash commands supplied by agy. Use session import to resume an existing native conversation.
+In Paseo, create an agent and select **Antigravity (ACP)**. Choose from the models, modes, thinking options, and slash commands supplied by `agy`, or use session import to resume an existing native conversation.
 
-View context occupancy and subscription quota in the Composer context popover, or check account quota from the CLI:
-
-```sh
-paseo usage ls --json
-```
+View context occupancy and subscription quota in the Composer context popover, or from the CLI with `paseo usage ls --json`.
 
 Manage the plugin:
 
@@ -76,25 +65,28 @@ Existing agents keep their original provider; they are not migrated. Remove the 
 
 ## Capabilities
 
-| Capability    | Behavior                                                                                                                                                                |
-| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Sessions      | Create, list, import and restore native conversations.                                                                                                                  |
-| Prompts       | Text, images, slash commands and attachment context.                                                                                                                    |
-| Configuration | Native models, modes (`default`, `auto` when advertised by `agy`, `accept-edits`, `plan`) plus **Full Access**, per-model thinking choices and appended system prompts. |
-| Permissions   | Native approval options with tool arguments, details, MCP `toolPolicy` preapprovals, or unattended auto-approval in **Full Access** mode.                               |
-| Timeline      | Streaming responses, reasoning, plans and rich tool cards.                                                                                                              |
-| Context       | Token counters, context occupancy and reported USD costs.                                                                                                               |
-| Subscription  | Gemini and Claude/GPT 5-hour and weekly quota windows.                                                                                                                  |
-| Subagents     | Native multi-level child links and read-only Brain transcript cards.                                                                                                    |
+| Capability    | Behavior                                                                                                                                 |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Sessions      | Create, list, import, and restore native conversations.                                                                                  |
+| Prompts       | Text, images, slash commands, and attachment context.                                                                                    |
+| Configuration | Native models, modes (`default`, `auto` when advertised, `accept-edits`, `plan`) plus **Full Access**, thinking choices, system prompts. |
+| Permissions   | Native approval cards with arguments, MCP `toolPolicy` preapprovals, or unattended auto-approval in **Full Access** mode.                |
+| Timeline      | Streaming responses, reasoning, plans, and rich tool cards.                                                                              |
+| Context       | Token counters, context occupancy, and reported USD costs.                                                                               |
+| Subscription  | Gemini and Claude/GPT 5-hour and weekly quota windows.                                                                                   |
+| Subagents     | Native multi-level child links and read-only Brain transcript cards.                                                                     |
 
-MCP cards show recognized calls as `server.tool` and use the same identity for exact preapproval grants, while retaining original arguments. Result-image extraction is not yet verified for AGY. See [MCP behavior and limits](docs/reference.md#attachments-and-tool-cards).
+## Essential limitations
 
-Steering, rewind, archive operations, structured output and Artifacts panels are unsupported. Child cards do not provide independent session control. Valid native `usage_update` notifications take precedence during the foreground phase. Later Reactive Wakeup model snapshots can refresh occupancy while retaining the same model's known native capacity. Without a reliable snapshot, context stays unchanged or unknown. Cumulative prompt counters remain separate from context occupancy. Current agy print mode rejects custom ACP directory flags for quota queries. See [reference limitations](docs/reference.md) for details.
+- **Unsupported Paseo features:** Steering, rewind, archive operations, structured output, Artifacts panels, and independent subagent session control are unsupported.
+- **MCP cards:** Recognized calls display as `server.tool` and use exact `toolPolicy` grants; result-image extraction is not enabled. See [MCP behavior](docs/reference.md#mcp-identity-and-preapprovals).
+- **Context and quota:** Context occupancy stays unchanged or unknown when no reliable snapshot is available; cumulative prompt counters remain separate. Current `agy` print mode rejects custom ACP directory flags for quota queries. See [context occupancy](docs/reference.md#context-window-occupancy) and [subscription quota](docs/reference.md#subscription-quota).
 
 ## More information
 
-- [Reference](docs/reference.md): launch settings, tool mappings, persistence, permissions, context and quota behavior.
-- [Development](docs/development.md): request flow, source layout, verification, packaging and releases.
+- [Reference](docs/reference.md): launch settings, modes, permissions, tool cards, persistence, context, and quota behavior.
+- [Development](docs/development.md): setup, source layout, verification, packaging, and releases.
+- [Architecture](docs/architecture.md): ACP, Brain, SQLite, and runtime pooling internals for contributors.
 - [Plugin listing overview](OVERVIEW.md) · [简体中文](OVERVIEW.zh-CN.md)
 
 ## License
