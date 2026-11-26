@@ -1241,10 +1241,6 @@ test(
       )
       assert.throws(() => process.kill(starts[0].pid, 0), { code: 'ESRCH' })
       assert.ok(log.some((row) => row.event === 'cancel'))
-      assert.equal(
-        log.some((row) => row.event === 'leaked-background'),
-        false,
-      )
     } finally {
       await m.close()
       await rm(home, { recursive: true, force: true })

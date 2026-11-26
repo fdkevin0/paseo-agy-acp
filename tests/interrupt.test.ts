@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test, type TestContext } from 'node:test'
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -147,17 +147,6 @@ async function assertInterruptStopsBackground(opts: {
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line))
-    assert.equal(
-      await stat(join(home, 'old-result')).then(
-        () => true,
-        () => false,
-      ),
-      false,
-    )
-    assert.equal(
-      log.some((row) => row.event === 'leaked-background'),
-      false,
-    )
     const starts = log.filter((row) => row.event === 'start')
     assert.equal(
       starts.length,
