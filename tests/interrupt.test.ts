@@ -147,18 +147,32 @@ async function assertInterruptStopsBackground(opts: {
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line))
-    const starts = log.filter((row) => row.event === 'start')
-    assert.equal(
-      starts.length,
-      2,
-      'interrupt must replace the runtime that owns background tasks',
-    )
-    assert.ok(
-      log.some((row) => row.event === 'exit' && row.pid === starts[0].pid),
-    )
-    assert.throws(() => process.kill(starts[0].pid, 0), { code: 'ESRCH' })
     const created = log.find((row) => row.event === 'new')
     const loaded = log.find((row) => row.event === 'load')
+    assert.ok(created)
+    assert.ok(loaded)
+    assert.equal(log.filter((row) => row.event === 'new').length, 1)
+    assert.equal(log.filter((row) => row.event === 'load').length, 1)
+    assert.notEqual(
+      loaded.pid,
+      created.pid,
+      'interrupt must replace the runtime that owns background tasks',
+    )
+    assertPidExited(log, created.pid)
+    assert.equal(
+      log.some((row) => row.event === 'exit' && row.pid === loaded.pid),
+      false,
+    )
+    const createdStart = log.find(
+      (row) => row.event === 'start' && row.pid === created.pid,
+    )
+    const loadedStart = log.find(
+      (row) => row.event === 'start' && row.pid === loaded.pid,
+    )
+    assert.ok(createdStart)
+    assert.ok(loadedStart)
+    assert.equal(createdStart.fullAccess, opts.expectedFullAccess)
+    assert.equal(loadedStart.fullAccess, opts.expectedFullAccess)
     assert.equal(loaded.nativeId, created.nativeId)
     const { sessionId: _sessionId, ...loadParams } = loaded.params
     assert.deepEqual(
@@ -168,12 +182,15 @@ async function assertInterruptStopsBackground(opts: {
     )
     const prompts = log.filter((row) => row.event === 'prompt')
     assert.equal(prompts.length, 2)
+    assert.equal(prompts[0].pid, created.pid)
+    assert.equal(prompts[1].pid, loaded.pid)
     assert.deepEqual(prompts[1].config, prompts[0].config)
     assert.deepEqual(prompts[1].config, {
       model: 'large',
       thought_level: 'high',
       mode: opts.expectedNativeMode,
     })
+    assert.equal(prompts[0].fullAccess, opts.expectedFullAccess)
     assert.equal(prompts[1].fullAccess, opts.expectedFullAccess)
     assert.deepEqual(assistantMessages(events), ['WAITING', 'NEW_REPLY'])
     assert.equal(
@@ -277,14 +294,20 @@ test(
           event.type === 'request.completed' && event.requestId === 'interrupt',
       )
       const finalLog = await log()
-      const starts = finalLog.filter((row) => row.event === 'start')
-      assert.equal(starts.length, 1)
+      const created = finalLog.find((row) => row.event === 'new')
+      assert.ok(created)
+      assert.equal(finalLog.filter((row) => row.event === 'new').length, 1)
+      assert.equal(
+        finalLog.some((row) => row.event === 'load' || row.event === 'resume'),
+        false,
+        'a closed session must not reload into a replacement runtime',
+      )
       assert.deepEqual(
-        finalLog,
-        closedLog,
+        finalLog.filter((row) => row.event !== 'start'),
+        closedLog.filter((row) => row.event !== 'start'),
         'a closed session must not launch another runtime',
       )
-      assertPidExited(finalLog, starts[0].pid)
+      assertPidExited(finalLog, created.pid)
     } finally {
       try {
         await provider.close()
@@ -332,10 +355,19 @@ test('interrupt without active background work uses native session/cancel fast p
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line))
-    assert.equal(log.filter((row) => row.event === 'start').length, 1)
-    assert.ok(log.some((row) => row.event === 'cancel'))
+    const created = log.find((row) => row.event === 'new')
+    assert.ok(created)
+    assert.equal(log.filter((row) => row.event === 'new').length, 1)
     assert.equal(
-      log.some((row) => row.event === 'load'),
+      log.some((row) => row.event === 'cancel' && row.pid === created.pid),
+      true,
+    )
+    assert.equal(
+      log.some((row) => row.event === 'exit' && row.pid === created.pid),
+      false,
+    )
+    assert.equal(
+      log.some((row) => row.event === 'load' || row.event === 'resume'),
       false,
     )
   } finally {
@@ -560,7 +592,14 @@ test('interrupt returns while reload is gated, serializes queued configure and p
 
   await assertCanStop(conn, 's', 'can-stop', true)
 
-  const preHangStarts = entries.filter((row) => row.event === 'start').length
+  const activePid = prompts[1].pid
+  const preHangLifecycleCount = entries.filter(
+    (row) =>
+      row.event === 'new' || row.event === 'load' || row.event === 'resume',
+  ).length
+  const preHangFullAccessStarts = entries.filter(
+    (row) => row.event === 'start' && row.fullAccess === true,
+  ).length
   await conn.provider.send(promptReq('s', 'hang'))
   await conn.until(assistantText('HANGING'))
   await conn.provider.send(interruptReq('s', 'interrupt-hang'))
@@ -571,13 +610,35 @@ test('interrupt returns while reload is gated, serializes queued configure and p
   )
   await conn.until(turnEvent('s', 'canceled', 2, conn.events))
   const afterHangEntries = await conn.log()
+  const hangPrompt = afterHangEntries.find(
+    (row) => row.event === 'prompt' && row.text === 'hang',
+  )
+  assert.ok(hangPrompt)
+  assert.equal(hangPrompt.pid, activePid)
   assert.equal(
-    afterHangEntries.filter((row) => row.event === 'start').length,
-    preHangStarts,
+    afterHangEntries.some(
+      (row) => row.event === 'cancel' && row.pid === activePid,
+    ),
+    true,
   )
   assert.equal(
-    afterHangEntries.some((row) => row.event === 'cancel'),
-    true,
+    afterHangEntries.some(
+      (row) => row.event === 'exit' && row.pid === activePid,
+    ),
+    false,
+  )
+  assert.equal(
+    afterHangEntries.filter(
+      (row) =>
+        row.event === 'new' || row.event === 'load' || row.event === 'resume',
+    ).length,
+    preHangLifecycleCount,
+  )
+  assert.equal(
+    afterHangEntries.filter(
+      (row) => row.event === 'start' && row.fullAccess === true,
+    ).length,
+    preHangFullAccessStarts,
   )
 })
 
@@ -845,14 +906,32 @@ test('retireAndRecover after native plan switch does not resurrect full-access s
   await conn.until(turnEvent('s-plan', 'completed'))
 
   const entries = await conn.log()
-  const starts = entries.filter((row) => row.event === 'start')
-  assert.equal(starts.length, 2)
-  assert.equal(starts[0].fullAccess, true)
-  assert.equal(starts[1].fullAccess, false)
+  const created = entries.find((row) => row.event === 'new')
+  const loaded = entries.find((row) => row.event === 'load')
+  assert.ok(created)
+  assert.ok(loaded)
+  assert.notEqual(loaded.pid, created.pid)
+  assertPidExited(entries, created.pid)
+  const createdStart = entries.find(
+    (row) => row.event === 'start' && row.pid === created.pid,
+  )
+  const loadedStart = entries.find(
+    (row) => row.event === 'start' && row.pid === loaded.pid,
+  )
+  assert.ok(createdStart)
+  assert.ok(loadedStart)
+  assert.equal(createdStart.fullAccess, true)
+  assert.equal(loadedStart.fullAccess, false)
+  assert.equal(
+    entries.filter((row) => row.event === 'start' && row.fullAccess === true)
+      .length,
+    1,
+  )
   const afterPrompt = entries.find(
     (row) => row.event === 'prompt' && row.text === 'after-plan-switch',
   )
   assert.ok(afterPrompt)
+  assert.equal(afterPrompt.pid, loaded.pid)
   assert.equal(afterPrompt.fullAccess, false)
   assert.equal(afterPrompt.config.mode, 'plan')
 })
