@@ -218,8 +218,8 @@ connection = agent()
     )
       log('cap:elicitation.form')
     const version = process.argv.includes('--dangerously-skip-permissions')
-      ? (process.env.AGY_TEST_RELAUNCH_VERSION ?? '1.5.12')
-      : (process.env.AGY_TEST_VERSION ?? '1.5.12')
+      ? (process.env.AGY_TEST_RELAUNCH_VERSION ?? '1.5.16')
+      : (process.env.AGY_TEST_VERSION ?? '1.5.16')
     return {
       protocolVersion: 1,
       ...(version === 'missing'

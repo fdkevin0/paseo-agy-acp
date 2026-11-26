@@ -1485,7 +1485,7 @@ test('mid-turn usage_update advancing sqlGenIdx preserves turnEstimatedTokens fo
         closed,
         initialize: async () => ({
           protocolVersion: 1,
-          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
+          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
           agentCapabilities: { loadSession: true },
         }),
         newSession: async () => {

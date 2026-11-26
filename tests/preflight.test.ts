@@ -18,7 +18,6 @@ import {
   binaryFingerprint,
   catalogCacheKey,
   dataDirectory,
-  hasLocalSessionArtifacts,
   providerStatus,
   removeSessionArtifacts,
   resolveCatalogCacheKey,
@@ -42,8 +41,8 @@ test('catalog key is environment-order independent and includes launch differenc
     catalogCacheKey({ ...launch, env: { A: 'changed', B: 'b' } }),
   )
   assert.notEqual(
-    catalogCacheKey(launch, '1.5.11'),
-    catalogCacheKey(launch, '1.5.12'),
+    catalogCacheKey(launch, '1.5.16'),
+    catalogCacheKey(launch, '1.5.17'),
   )
   assert.equal(
     dataDirectory({
@@ -108,75 +107,6 @@ test('catalog cleanup removes only its closed session and refuses symlinks', asy
   }
 })
 
-test('hasLocalSessionArtifacts detects local db or brain dir and refuses invalid IDs and symlinks', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'agy-artifacts-'))
-  try {
-    const data = join(root, 'app')
-    const outside = join(root, 'outside')
-    await mkdir(join(outside, 'brain', id), { recursive: true })
-    await writeFile(join(outside, `${id}.db`), 'outside')
-
-    assert.equal(await hasLocalSessionArtifacts(data, id), false)
-
-    await mkdir(join(data, 'conversations'), { recursive: true })
-    await mkdir(join(data, 'brain'), { recursive: true })
-    assert.equal(await hasLocalSessionArtifacts(data, id), false)
-
-    // Detects regular conversation .db file.
-    await writeFile(join(data, 'conversations', `${id}.db`), 'db')
-    assert.equal(await hasLocalSessionArtifacts(data, id), true)
-    assert.equal(await hasLocalSessionArtifacts(data, 'not-a-uuid'), false)
-    assert.equal(await hasLocalSessionArtifacts(data, '../escape'), false)
-    await rm(join(data, 'conversations', `${id}.db`))
-    assert.equal(await hasLocalSessionArtifacts(data, id), false)
-
-    // Detects real brain/<id> directory.
-    await mkdir(join(data, 'brain', id))
-    assert.equal(await hasLocalSessionArtifacts(data, id), true)
-    await rm(join(data, 'brain', id), { recursive: true })
-    assert.equal(await hasLocalSessionArtifacts(data, id), false)
-
-    // Rejects wrong entry types (directory at .db, regular file at brain/<id>).
-    await mkdir(join(data, 'conversations', `${id}.db`))
-    await writeFile(join(data, 'brain', id), 'file')
-    assert.equal(await hasLocalSessionArtifacts(data, id), false)
-    await rm(join(data, 'conversations', `${id}.db`), { recursive: true })
-    await rm(join(data, 'brain', id))
-
-    // Refuses symlinked leaf .db and symlinked leaf brain/<id>.
-    await symlink(
-      join(outside, `${id}.db`),
-      join(data, 'conversations', `${id}.db`),
-    )
-    assert.equal(await hasLocalSessionArtifacts(data, id), false)
-    await rm(join(data, 'conversations', `${id}.db`))
-
-    await symlink(join(outside, 'brain', id), join(data, 'brain', id))
-    assert.equal(await hasLocalSessionArtifacts(data, id), false)
-    await rm(join(data, 'brain', id))
-
-    // Refuses symlinked conversations/ and brain/ directories.
-    await rm(join(data, 'conversations'), { recursive: true })
-    await symlink(outside, join(data, 'conversations'))
-    assert.equal(await hasLocalSessionArtifacts(data, id), false)
-    await rm(join(data, 'conversations'))
-
-    await rm(join(data, 'brain'), { recursive: true })
-    await symlink(join(outside, 'brain'), join(data, 'brain'))
-    assert.equal(await hasLocalSessionArtifacts(data, id), false)
-
-    // Refuses symlinked appData root.
-    const externalApp = join(root, 'external-app')
-    await mkdir(join(externalApp, 'conversations'), { recursive: true })
-    await writeFile(join(externalApp, 'conversations', `${id}.db`), 'db')
-    const linkedApp = join(root, 'linked-app')
-    await symlink(externalApp, linkedApp)
-    assert.equal(await hasLocalSessionArtifacts(linkedApp, id), false)
-  } finally {
-    await rm(root, { recursive: true, force: true })
-  }
-})
-
 test('status reports missing executable clearly', async () => {
   const status = await providerStatus({
     command: '/nonexistent/agy-test',
@@ -187,14 +117,14 @@ test('status reports missing executable clearly', async () => {
   assert.match(status.diagnostic ?? '', /Cannot run agy/)
 })
 
-test('providerStatus accepts version >= 1.5.10, coalesces concurrent probes, caches unchanged binaries, and invalidates on removal', async () => {
+test('providerStatus accepts version >= 1.5.16, coalesces concurrent probes, caches unchanged binaries, and invalidates on removal', async () => {
   const tmp = await mkdtemp(join(tmpdir(), 'agy-version-ok-'))
   const fakeBin = join(tmp, 'fake-agy')
   const log = join(tmp, 'calls')
   const launch = { command: fakeBin, args: [], env: {} }
   await writeFile(
     fakeBin,
-    `#!/bin/sh\necho call >> "${log}"\necho "agy 1.5.10"\n`,
+    `#!/bin/sh\necho call >> "${log}"\necho "agy 1.5.16"\n`,
     { mode: 0o755 },
   )
   try {
@@ -221,10 +151,10 @@ test('providerStatus accepts version >= 1.5.10, coalesces concurrent probes, cac
   }
 })
 
-test('providerStatus rejects version < 1.5.10', async () => {
+test('providerStatus rejects version < 1.5.16', async () => {
   const tmp = await mkdtemp(join(tmpdir(), 'agy-version-old-'))
   const fakeBin = join(tmp, 'fake-agy-old')
-  await writeFile(fakeBin, '#!/bin/sh\necho "agy 1.5.9"\n', { mode: 0o755 })
+  await writeFile(fakeBin, '#!/bin/sh\necho "agy 1.5.15"\n', { mode: 0o755 })
   try {
     const status = await providerStatus({
       command: fakeBin,
@@ -232,7 +162,7 @@ test('providerStatus rejects version < 1.5.10', async () => {
       env: {},
     })
     assert.equal(status.available, false)
-    assert.match(status.diagnostic ?? '', /too old; requires >=1\.5\.10/)
+    assert.match(status.diagnostic ?? '', /too old; requires >=1\.5\.16/)
   } finally {
     await rm(tmp, { recursive: true, force: true })
   }
@@ -255,10 +185,10 @@ test('providerStatus reports diagnostic when version cannot be parsed', async ()
   }
 })
 
-test('providerStatus rejects 1.5.10 pre-release builds and dataDirectory ignores flag-like missing values', async () => {
+test('providerStatus rejects 1.5.16 pre-release builds and dataDirectory ignores flag-like missing values', async () => {
   const tmp = await mkdtemp(join(tmpdir(), 'agy-version-pre-'))
   const fakeBin = join(tmp, 'fake-agy-pre')
-  await writeFile(fakeBin, '#!/bin/sh\necho "agy 1.5.10-rc.1" >&2\n', {
+  await writeFile(fakeBin, '#!/bin/sh\necho "agy 1.5.16-rc.1" >&2\n', {
     mode: 0o755,
   })
   try {
@@ -268,7 +198,7 @@ test('providerStatus rejects 1.5.10 pre-release builds and dataDirectory ignores
       env: {},
     })
     assert.equal(status.available, false)
-    assert.match(status.diagnostic ?? '', /too old; requires >=1\.5\.10/)
+    assert.match(status.diagnostic ?? '', /too old; requires >=1\.5\.16/)
     assert.equal(
       dataDirectory(
         {
@@ -295,16 +225,16 @@ async function writeExecutable(path: string, script: string): Promise<void> {
 test('resolveCatalogCacheKey fingerprints the executable without spawning it and tracks upgrades via path or symlink', async () => {
   const tmp = await mkdtemp(join(tmpdir(), 'agy-catalog-key-'))
   const log = join(tmp, 'spawns')
-  const v1 = join(tmp, 'agy-1.5.11')
-  const v2 = join(tmp, 'agy-1.5.12')
+  const v1 = join(tmp, 'agy-1.5.16')
+  const v2 = join(tmp, 'agy-1.5.17')
   const binDir = join(tmp, 'bin')
   const dirShadow = join(tmp, 'shadow')
   const linked = join(binDir, 'agy')
   try {
     await mkdir(binDir)
     await mkdir(join(dirShadow, 'agy'), { recursive: true })
-    await writeExecutable(v1, `#!/bin/sh\necho ran >> "${log}"\necho 1.5.11\n`)
-    await writeExecutable(v2, `#!/bin/sh\necho ran >> "${log}"\necho 1.5.12\n`)
+    await writeExecutable(v1, `#!/bin/sh\necho ran >> "${log}"\necho 1.5.16\n`)
+    await writeExecutable(v2, `#!/bin/sh\necho ran >> "${log}"\necho 1.5.17\n`)
     await symlink(v1, linked)
 
     const launch = { command: linked, args: ['acp'], env: {} }
@@ -320,7 +250,7 @@ test('resolveCatalogCacheKey fingerprints the executable without spawning it and
     assert.notEqual(key2, catalogCacheKey(launch))
 
     // Replacing the target binary atomically changes the fingerprint immediately.
-    await writeExecutable(v2, `#!/bin/sh\necho ran >> "${log}"\necho 1.5.13\n`)
+    await writeExecutable(v2, `#!/bin/sh\necho ran >> "${log}"\necho 1.5.18\n`)
     const key3 = await resolveCatalogCacheKey(launch)
     assert.notEqual(key3, key2)
     await assert.rejects(access(log))
@@ -333,7 +263,7 @@ test('resolveCatalogCacheKey fingerprints the executable without spawning it and
     }
     const pathKey1 = await resolveCatalogCacheKey(pathLaunch)
     assert.notEqual(pathKey1, catalogCacheKey(pathLaunch))
-    await writeExecutable(v2, `#!/bin/sh\necho ran >> "${log}"\necho 1.5.14\n`)
+    await writeExecutable(v2, `#!/bin/sh\necho ran >> "${log}"\necho 1.5.19\n`)
     assert.notEqual(await resolveCatalogCacheKey(pathLaunch), pathKey1)
 
     // Missing or non-executable binaries fall back to the base cache key.
@@ -359,15 +289,15 @@ test('providerStatus invalidates cached availability immediately on binary downg
   const fakeBin = join(tmp, 'fake-agy')
   const launch = { command: fakeBin, args: ['acp'], env: {} }
   try {
-    await writeExecutable(fakeBin, '#!/bin/sh\necho "1.5.12"\n')
+    await writeExecutable(fakeBin, '#!/bin/sh\necho "1.5.16"\n')
     assert.equal((await providerStatus(launch)).available, true)
 
-    await writeExecutable(fakeBin, '#!/bin/sh\necho "1.5.9"\n')
+    await writeExecutable(fakeBin, '#!/bin/sh\necho "1.5.15"\n')
     const downgraded = await providerStatus(launch)
     assert.equal(downgraded.available, false)
-    assert.match(downgraded.diagnostic ?? '', /too old; requires >=1\.5\.10/)
+    assert.match(downgraded.diagnostic ?? '', /too old; requires >=1\.5\.16/)
 
-    await writeExecutable(fakeBin, '#!/bin/sh\necho "1.5.12"\n')
+    await writeExecutable(fakeBin, '#!/bin/sh\necho "1.5.16"\n')
     assert.equal((await providerStatus(launch)).available, true)
     await writeExecutable(fakeBin, '#!/bin/sh\necho "unparseable"\n')
     const unparseable = await providerStatus(launch)
@@ -377,12 +307,12 @@ test('providerStatus invalidates cached availability immediately on binary downg
       /Could not determine agy version/,
     )
 
-    await writeExecutable(fakeBin, '#!/bin/sh\necho "1.5.12"\n')
+    await writeExecutable(fakeBin, '#!/bin/sh\necho "1.5.16"\n')
     assert.equal((await providerStatus(launch)).available, true)
     await writeExecutable(fakeBin, '#!/bin/sh\nexit 1\n')
     assert.equal((await providerStatus(launch)).available, false)
 
-    await writeExecutable(fakeBin, '#!/bin/sh\necho "1.5.12"\n')
+    await writeExecutable(fakeBin, '#!/bin/sh\necho "1.5.16"\n')
     assert.equal((await providerStatus(launch)).available, true)
     await chmod(fakeBin, 0o644)
     assert.equal((await providerStatus(launch)).available, false)
@@ -477,7 +407,7 @@ test('resolveCatalogCacheKey handles case-insensitive Path, quoted entries, Wind
     const quotedBin = join(tmp, 'my bin')
     await mkdir(quotedBin, { recursive: true })
     const posixAgy = join(quotedBin, 'agy')
-    await writeExecutable(posixAgy, '#!/bin/sh\necho 1.5.12\n')
+    await writeExecutable(posixAgy, '#!/bin/sh\necho 1.5.16\n')
     const quotedLaunch = {
       command: 'agy',
       args: ['acp'],
@@ -488,7 +418,7 @@ test('resolveCatalogCacheKey handles case-insensitive Path, quoted entries, Wind
       fallbackHome: join(tmp, 'empty-home'),
     })
     assert.notEqual(quotedKey1, catalogCacheKey(quotedLaunch))
-    await writeExecutable(posixAgy, '#!/bin/sh\necho 1.5.13\n')
+    await writeExecutable(posixAgy, '#!/bin/sh\necho 1.5.17\n')
     assert.notEqual(
       await resolveCatalogCacheKey(quotedLaunch, {
         platform: 'linux',
@@ -502,7 +432,7 @@ test('resolveCatalogCacheKey handles case-insensitive Path, quoted entries, Wind
     const posixDefaultBin = join(posixHome, '.local', 'bin')
     await mkdir(posixDefaultBin, { recursive: true })
     const posixDefaultAgy = join(posixDefaultBin, 'agy')
-    await writeExecutable(posixDefaultAgy, '#!/bin/sh\necho 1.5.12\n')
+    await writeExecutable(posixDefaultAgy, '#!/bin/sh\necho 1.5.16\n')
     const posixFallbackLaunch = {
       command: 'agy',
       args: ['acp'],
@@ -513,7 +443,7 @@ test('resolveCatalogCacheKey handles case-insensitive Path, quoted entries, Wind
       { platform: 'linux', fallbackHome: join(tmp, 'unused-home') },
     )
     assert.notEqual(posixFallbackKey1, catalogCacheKey(posixFallbackLaunch))
-    await writeExecutable(posixDefaultAgy, '#!/bin/sh\necho 1.5.14\n')
+    await writeExecutable(posixDefaultAgy, '#!/bin/sh\necho 1.5.18\n')
     assert.notEqual(
       await resolveCatalogCacheKey(posixFallbackLaunch, {
         platform: 'linux',
@@ -830,8 +760,8 @@ test('binaryFingerprint recognizes uppercase AGY/AGY.EXE on win32 and honors opt
     await mkdir(binB)
     const agyA = join(binA, 'agy')
     const agyB = join(binB, 'agy')
-    await writeExecutable(agyA, '#!/bin/sh\necho 1.5.11\n')
-    await writeExecutable(agyB, '#!/bin/sh\necho 1.5.12-override\n')
+    await writeExecutable(agyA, '#!/bin/sh\necho 1.5.16\n')
+    await writeExecutable(agyB, '#!/bin/sh\necho 1.5.17-override\n')
 
     const posixLaunch = {
       command: 'agy',

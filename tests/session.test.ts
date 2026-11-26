@@ -13,7 +13,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
-import type { SessionNotification } from '@agentclientprotocol/sdk/unstable'
 import {
   PROVIDER_CAPABILITIES,
   type ProviderEvent,
@@ -966,7 +965,7 @@ const stream = ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(proce
 agent()
   .onRequest(methods.agent.initialize, async () => ({
     protocolVersion: 1,
-    agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
+    agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
     agentCapabilities: { loadSession: true },
   }))
   .onRequest(methods.agent.authenticate, async () => ({}))
@@ -1125,7 +1124,7 @@ const stream = ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(proce
 agent()
   .onRequest(methods.agent.initialize, async () => ({
     protocolVersion: 1,
-    agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
+    agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
     agentCapabilities: { loadSession: true },
   }))
   .onRequest(methods.agent.authenticate, async () => ({}))
@@ -1948,7 +1947,7 @@ stream.writable = new WritableStream({
 agent()
   .onRequest(methods.agent.initialize, async () => ({
     protocolVersion: 1,
-    agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
+    agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
     agentCapabilities: { loadSession: true },
   }))
   .onRequest(methods.agent.authenticate, async () => ({}))
@@ -3204,7 +3203,6 @@ async function createCommandWaitHarness(
     prefix: string
     resumeCapable?: boolean
     newSessionId?: string
-    loadNotifications?: readonly SessionNotification['update'][]
   },
 ) {
   const home = await mkdtemp(join(tmpdir(), options.prefix))
@@ -3225,7 +3223,7 @@ async function createCommandWaitHarness(
     const rpc = {
       initialize: async () => ({
         protocolVersion: 1,
-        agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
+        agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
         agentCapabilities: {
           loadSession: true,
           ...(options.resumeCapable
@@ -3238,15 +3236,7 @@ async function createCommandWaitHarness(
           options.newSessionId ?? '11111111-1111-4111-8111-111111111111',
         configOptions: [],
       }),
-      loadSession: async (params: { sessionId: string }) => {
-        for (const update of options.loadNotifications ?? []) {
-          void client.sessionUpdate({
-            sessionId: params.sessionId,
-            update,
-          })
-        }
-        return { configOptions: [] }
-      },
+      loadSession: async () => ({ configOptions: [] }),
       resumeSession: async () => ({ configOptions: [] }),
       closeSession: async () => ({}),
       setSessionConfigOption: async () => ({ configOptions: [] }),
@@ -3310,7 +3300,6 @@ async function createCommandWaitHarness(
   })
   return {
     home,
-    appData: join(home, '.gemini/antigravity-cli'),
     events,
     manager,
     enteredCommandWait,
@@ -3334,71 +3323,12 @@ async function createCommandWaitHarness(
 const persistedTestId = '22222222-2222-4222-8222-222222222222'
 
 test(
-  'persisted UUID session/load without local artifacts or history skips command wait and forwards late commands',
+  'persisted session/load waits for available_commands_update before readiness and forwards later updates',
   { timeout: 2000 },
   async (t) => {
     const h = await createCommandWaitHarness(t, {
-      prefix: 'agy-skip-cmd-wait-',
-      loadNotifications: [
-        { sessionUpdate: 'session_info_update', title: 'Evicted session' },
-        { sessionUpdate: 'config_option_update', configOptions: [] },
-        { sessionUpdate: 'usage_update', used: 100, size: 1000 },
-      ],
+      prefix: 'agy-wait-cmd-load-',
     })
-    await h.manager.handle({
-      type: 'session.open',
-      requestId: 'open',
-      sessionId: 's',
-      history: 'replay',
-      persistence: { version: 1, data: { sessionId: persistedTestId } },
-      config: {
-        cwd: h.home,
-        env: {},
-        mcpServers: {},
-        settings: {},
-        persist: true,
-      },
-    })
-    assert.equal(h.waitForCommandsCalls, 0)
-    assert.equal(
-      h.events.some((e) => e.type === 'session.ready'),
-      true,
-    )
-    assert.equal(
-      h.events.some((e) => e.type === 'session.commands'),
-      false,
-    )
-
-    await h.sendCommands(persistedTestId, [
-      { name: 'compact', description: 'Compact context' },
-    ])
-    const commandsEvent = h.events.find((e) => e.type === 'session.commands')
-    assert.deepEqual(commandsEvent, {
-      type: 'session.commands',
-      sessionId: 's',
-      commands: [
-        {
-          name: 'compact',
-          description: 'Compact context',
-          argumentHint: undefined,
-        },
-      ],
-    })
-  },
-)
-
-test(
-  'persisted UUID session/load with local conversation db still waits for available_commands_update',
-  { timeout: 2000 },
-  async (t) => {
-    const h = await createCommandWaitHarness(t, {
-      prefix: 'agy-wait-cmd-db-',
-    })
-    await mkdir(join(h.appData, 'conversations'), { recursive: true })
-    await writeFile(
-      join(h.appData, 'conversations', `${persistedTestId}.db`),
-      'db',
-    )
     const opening = h.manager.handle({
       type: 'session.open',
       requestId: 'open',
@@ -3427,132 +3357,29 @@ test(
       h.events.findIndex((e) => e.type === 'session.commands') <
         h.events.findIndex((e) => e.type === 'session.ready'),
     )
-  },
-)
 
-test(
-  'persisted UUID session/load with local brain directory still waits for available_commands_update',
-  { timeout: 2000 },
-  async (t) => {
-    const h = await createCommandWaitHarness(t, {
-      prefix: 'agy-wait-cmd-brain-',
-    })
-    await mkdir(join(h.appData, 'brain', persistedTestId), { recursive: true })
-    const opening = h.manager.handle({
-      type: 'session.open',
-      requestId: 'open',
+    await h.sendCommands(persistedTestId, [
+      { name: 'compact', description: 'Compact context' },
+    ])
+    const latestCommands = h.events.findLast(
+      (e) => e.type === 'session.commands',
+    )
+    assert.deepEqual(latestCommands, {
+      type: 'session.commands',
       sessionId: 's',
-      history: 'replay',
-      persistence: { version: 1, data: { sessionId: persistedTestId } },
-      config: {
-        cwd: h.home,
-        env: {},
-        mcpServers: {},
-        settings: {},
-        persist: true,
-      },
-    })
-    await h.enteredCommandWait
-    assert.equal(h.waitForCommandsCalls, 1)
-    assert.equal(
-      h.events.some((e) => e.type === 'session.ready'),
-      false,
-    )
-    await h.sendCommands(persistedTestId, [])
-    await opening
-    assert.ok(
-      h.events.findIndex((e) => e.type === 'session.commands') <
-        h.events.findIndex((e) => e.type === 'session.ready'),
-    )
-  },
-)
-
-test(
-  'persisted UUID session/load with replayed history still waits for commands even without local artifacts',
-  { timeout: 2000 },
-  async (t) => {
-    const h = await createCommandWaitHarness(t, {
-      prefix: 'agy-wait-cmd-history-replay-',
-      loadNotifications: [
+      commands: [
         {
-          sessionUpdate: 'user_message_chunk',
-          content: { type: 'text', text: 'hello from fallback import' },
+          name: 'compact',
+          description: 'Compact context',
+          argumentHint: undefined,
         },
       ],
     })
-    const opening = h.manager.handle({
-      type: 'session.open',
-      requestId: 'open',
-      sessionId: 's',
-      history: 'replay',
-      persistence: { version: 1, data: { sessionId: persistedTestId } },
-      config: {
-        cwd: h.home,
-        env: {},
-        mcpServers: {},
-        settings: {},
-        persist: true,
-      },
-    })
-    await h.enteredCommandWait
-    assert.equal(h.waitForCommandsCalls, 1)
-    assert.equal(
-      h.events.some((e) => e.type === 'session.ready'),
-      false,
-    )
-    await h.sendCommands(persistedTestId, [])
-    await opening
-    assert.ok(
-      h.events.findIndex((e) => e.type === 'session.commands') <
-        h.events.findIndex((e) => e.type === 'session.ready'),
-    )
   },
 )
 
 test(
-  'persisted UUID session/load with history skip still detects replayed history chunks and waits for commands',
-  { timeout: 2000 },
-  async (t) => {
-    const h = await createCommandWaitHarness(t, {
-      prefix: 'agy-wait-cmd-history-skip-',
-      loadNotifications: [
-        {
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: 'suppressed replay chunk' },
-        },
-      ],
-    })
-    const opening = h.manager.handle({
-      type: 'session.open',
-      requestId: 'open',
-      sessionId: 's',
-      history: 'skip',
-      persistence: { version: 1, data: { sessionId: persistedTestId } },
-      config: {
-        cwd: h.home,
-        env: {},
-        mcpServers: {},
-        settings: {},
-        persist: true,
-      },
-    })
-    await h.enteredCommandWait
-    assert.equal(h.waitForCommandsCalls, 1)
-    assert.equal(
-      h.events.some((e) => e.type === 'session.ready'),
-      false,
-    )
-    await h.sendCommands(persistedTestId, [])
-    await opening
-    assert.ok(
-      h.events.findIndex((e) => e.type === 'session.commands') <
-        h.events.findIndex((e) => e.type === 'session.ready'),
-    )
-  },
-)
-
-test(
-  'persisted UUID session/resume still waits for available_commands_update',
+  'persisted session/resume waits for available_commands_update before readiness',
   { timeout: 2000 },
   async (t) => {
     const h = await createCommandWaitHarness(t, {
@@ -3589,44 +3416,7 @@ test(
 )
 
 test(
-  'persisted non-UUID session/load still waits for available_commands_update',
-  { timeout: 2000 },
-  async (t) => {
-    const nonUuid = 'legacy-session-id'
-    const h = await createCommandWaitHarness(t, {
-      prefix: 'agy-wait-cmd-non-uuid-',
-    })
-    const opening = h.manager.handle({
-      type: 'session.open',
-      requestId: 'open',
-      sessionId: 's',
-      history: 'replay',
-      persistence: { version: 1, data: { sessionId: nonUuid } },
-      config: {
-        cwd: h.home,
-        env: {},
-        mcpServers: {},
-        settings: {},
-        persist: true,
-      },
-    })
-    await h.enteredCommandWait
-    assert.equal(h.waitForCommandsCalls, 1)
-    assert.equal(
-      h.events.some((e) => e.type === 'session.ready'),
-      false,
-    )
-    await h.sendCommands(nonUuid, [])
-    await opening
-    assert.ok(
-      h.events.findIndex((e) => e.type === 'session.commands') <
-        h.events.findIndex((e) => e.type === 'session.ready'),
-    )
-  },
-)
-
-test(
-  'new session/new still waits for available_commands_update',
+  'new session/new waits for available_commands_update before readiness',
   { timeout: 2000 },
   async (t) => {
     const newId = '33333333-3333-4333-8333-333333333333'
@@ -3694,7 +3484,7 @@ test('promptSession failure cleanup forwards runtimeEpoch and options.hasActiveB
         closed,
         initialize: async () => ({
           protocolVersion: 1,
-          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
+          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
           agentCapabilities: {
             loadSession: true,
             sessionCapabilities: { resume: {} },
@@ -3817,7 +3607,7 @@ test('notificationLane isolates single-notification failures and requestPermissi
         closed,
         initialize: async () => ({
           protocolVersion: 1,
-          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
+          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
           agentCapabilities: { loadSession: true },
         }),
         newSession: async () => {
@@ -3955,7 +3745,7 @@ test('full-access still prompts on interaction_* permissions, surfaces agy.secur
         closed,
         initialize: async () => ({
           protocolVersion: 1,
-          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
+          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
           agentCapabilities: { loadSession: true },
         }),
         newSession: async () => {
@@ -4165,7 +3955,7 @@ test('promptSession classifies stopReason refusal and hidden SQLite step_type 17
         closed,
         initialize: async () => ({
           protocolVersion: 1,
-          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
+          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
           agentCapabilities: { loadSession: true },
         }),
         newSession: async () => {

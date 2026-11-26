@@ -234,12 +234,11 @@ export function connectAcp(
   const writable = new WritableStream({
     write: (message) => writer.write(message),
   })
-  // SDK 1.9 strips legacy models from session responses; retain the validated inventory.
+  // The ACP SDK strips legacy models from session responses; retain the validated inventory.
   const readable = stream.readable.pipeThrough(
     new TransformStream({
       async transform(message, controller) {
-        // agy's multi-select items (`items: { anyOf }` without `type: 'string'`) fail SDK 1.9's
-        // CreateElicitationRequest validation, so answer them here instead of via Client.createElicitation.
+        // Intercept elicitation/create directly so agy's form schema extensions bypass SDK validation strictness.
         if (
           'method' in message &&
           message.method === 'elicitation/create' &&

@@ -7,7 +7,7 @@ process.stdin.on('end', () => process.exit(0))
 agent()
   .onRequest(methods.agent.initialize, async () => ({
     protocolVersion: 1,
-    agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
+    agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
     agentCapabilities: { loadSession: true },
   }))
   .onRequest(methods.agent.authenticate, async () => ({}))

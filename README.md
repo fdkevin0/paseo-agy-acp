@@ -10,7 +10,7 @@ The plugin ID is `agy-acp`; its provider is `agy`, displayed as **Antigravity (A
 
 - Paseo **0.15.0 or later**, with plugins enabled.
 - Node.js **22.18 or later** and npm on the daemon host.
-- Antigravity CLI (`agy`) **1.5.10 or later**, already authenticated on that host. Run `agy` in a terminal to sign in before using the plugin.
+- Antigravity CLI (`agy`) **1.5.16 or later**, already authenticated on that host. Run `agy` in a terminal to sign in before using the plugin.
 
 ## Install
 

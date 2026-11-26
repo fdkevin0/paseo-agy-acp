@@ -62,7 +62,6 @@ import { SubagentRegistry } from './subagents.ts'
 import {
   binaryFingerprint,
   dataDirectory,
-  hasLocalSessionArtifacts,
   removeSessionArtifacts,
   resolveSpawnCwd,
 } from './preflight.ts'
@@ -140,15 +139,6 @@ interface SessionOptions {
 const TIER_CACHE_LIMIT = 100
 const PROMPT_DEDUPE_LIMIT = 1000
 const permissionInputSchema = z.record(z.string(), z.json())
-const LOAD_HISTORY_UPDATES = new Set<
-  SessionNotification['update']['sessionUpdate']
->([
-  'user_message_chunk',
-  'agent_message_chunk',
-  'agent_thought_chunk',
-  'tool_call',
-  'tool_call_update',
-])
 
 function sessionRuntimeExitedError(failureError?: Error): Error {
   return new Error(
@@ -297,7 +287,6 @@ export class SessionManager {
         const params = sessionParams(input.config.cwd, input.config)
         session.state.persisted = Boolean(input.persistence)
         session.state.replay = input.history === 'replay'
-        let usedLoad = false
         if (input.persistence) {
           const canResume =
             input.history === 'skip' &&
@@ -307,7 +296,6 @@ export class SessionManager {
             )
           if (!canResume && !session.initialized.agentCapabilities?.loadSession)
             throw new Error('agy does not support session/load')
-          usedLoad = !canResume
           session.state.nativeId = data.sessionId as string
           session.state.metadata = {
             ...(await session.transport.request(
@@ -408,16 +396,7 @@ export class SessionManager {
           !session.state.closing &&
           !session.state.failed
         ) {
-          const skipCommandWait =
-            Boolean(input.persistence) &&
-            usedLoad &&
-            sessionIdPattern.test(session.state.nativeId) &&
-            !session.state.sawLoadHistory &&
-            !(await hasLocalSessionArtifacts(
-              session.appData,
-              session.state.nativeId,
-            ).catch(() => true))
-          if (!skipCommandWait) await session.waitForCommands()
+          await session.waitForCommands()
         }
         if (this.closed || session.state.closing || session.state.failed)
           throw (
@@ -594,7 +573,6 @@ async function createSession(
     silenced: false,
     closedEmitted: false,
     commandsReceived: false,
-    sawLoadHistory: false,
     skipPermissions: config?.mode === FULL_ACCESS_MODE_ID,
     turnHadContextUsage: false,
     turnHadModelOutput: false,
@@ -935,8 +913,6 @@ async function createSession(
         deferredUsage = true
       }
     } else {
-      if (state.loading && LOAD_HISTORY_UPDATES.has(u.sessionUpdate))
-        state.sawLoadHistory = true
       if (isSuppressingReplay()) return
       if (u.sessionUpdate === 'user_message_chunk' && !state.loading) {
         state.turnToolCallIds = []
