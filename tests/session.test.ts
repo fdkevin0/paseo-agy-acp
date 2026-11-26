@@ -4476,3 +4476,707 @@ test('1.5.16+ intra-RPC wakeup with silent trailing PLANNER_RESPONSE preserves P
   )
   assert.equal(recoveredRead.item.detail.content, 'report body')
 })
+
+test('child-prefixed tool_call updates are isolated on root across live turns and session/load attach without breaking Brain recovery or root-UUID calls', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-child-isolation-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const nativeId = '11111111-1111-4111-8111-111111111111'
+  const childId = '22222222-2222-4222-8222-222222222222'
+  const rootSelfCallId = `${nativeId.toUpperCase()}:call-root-self`
+  const brainRoot = join(home, '.gemini/antigravity-cli/brain')
+  const env = isolatedEnv(home)
+  const events: ProviderEvent[] = []
+  let acpClient!: import('../server/transport.ts').AcpClient
+
+  const manager = new SessionManager({
+    launch: { command: 'agy', args: ['acp'], env },
+    usage: new AgyUsageSource({ env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: (event) => events.push(event),
+    commandWaitTimeoutMs: 50,
+    connectAcp: (_l, _cwd, _e, client) => {
+      acpClient = client
+      const closed = new Promise<void>(() => {})
+      const rpc = {
+        closed,
+        initialize: async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
+          agentCapabilities: { loadSession: true },
+        }),
+        newSession: async () => {
+          void client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'available_commands_update',
+              availableCommands: [],
+            },
+          })
+          return { sessionId: nativeId, configOptions: [] }
+        },
+        closeSession: async () => ({}),
+        prompt: async () => {
+          await acpClient.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: `${childId}:call-child-1`,
+              title: 'Run run_command',
+              kind: 'execute',
+              status: 'in_progress',
+              rawInput: { CommandLine: 'echo child' },
+            },
+          })
+          await acpClient.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: `${childId}:call-child-1`,
+              status: 'completed',
+              rawOutput: 'child-out',
+            },
+          })
+          await acpClient.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'call-root-read',
+              title: 'Run read_file',
+              kind: 'read',
+              status: 'in_progress',
+              rawInput: { Path: '/repo/a.ts' },
+            },
+          })
+          await acpClient.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'call-root-read',
+              status: 'completed',
+            },
+          })
+          await acpClient.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: rootSelfCallId,
+              title: 'Run run_command',
+              kind: 'execute',
+              status: 'completed',
+              rawInput: { CommandLine: 'pwd' },
+              rawOutput: '/repo',
+            },
+          })
+          await acpClient.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'All done' },
+            },
+          })
+          await writeBrainTranscript(brainRoot, nativeId, [
+            { step_index: 1, type: 'USER_INPUT', content: 'go' },
+            {
+              step_index: 2,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              tool_calls: [
+                { name: 'read_file', args: { Path: '/repo/a.ts' } },
+                { name: 'run_command', args: { CommandLine: 'pwd' } },
+              ],
+            },
+            {
+              step_index: 3,
+              type: 'GENERIC',
+              status: 'DONE',
+              content: 'recovered file content',
+            },
+            {
+              step_index: 4,
+              type: 'GENERIC',
+              status: 'DONE',
+              content: '/repo',
+            },
+            {
+              step_index: 5,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'All done',
+            },
+          ])
+          return { stopReason: 'end_turn' as const }
+        },
+        cancel: async () => {},
+      } as unknown as ReturnType<typeof connectAcp>['rpc']
+      return {
+        rpc,
+        exited: closed,
+        stopped: Promise.resolve(),
+        close: async () => {},
+        request: async <T>(op: Promise<T>) => op,
+        get closed() {
+          return false
+        },
+        get tier() {
+          return undefined
+        },
+        get models() {
+          return undefined
+        },
+      }
+    },
+  })
+  t.after(() => manager.close())
+
+  await manager.handle({
+    type: 'session.open',
+    requestId: 'open-live',
+    sessionId: 's-live',
+    history: 'skip',
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+  await manager.handle({
+    type: 'session.prompt',
+    sessionId: 's-live',
+    prompt: {
+      clientMessageId: 'm-live',
+      delivery: 'auto',
+      input: { type: 'message', content: [{ type: 'text', text: 'go' }] },
+    },
+  })
+
+  const liveTools = events.filter(
+    (
+      e,
+    ): e is Extract<ProviderEvent, { type: 'timeline.item' }> & {
+      item: Extract<ProviderTimelineItem, { type: 'tool_call' }>
+    } => e.type === 'timeline.item' && e.item.type === 'tool_call',
+  )
+  assert.deepEqual(
+    liveTools.filter((e) => e.item.callId.startsWith(`${childId}:`)),
+    [],
+  )
+  const rootRead = liveTools.findLast(
+    (e) => e.item.callId === 'call-root-read',
+  )?.item
+  assert.ok(rootRead)
+  assert.deepEqual(rootRead.detail, {
+    type: 'read',
+    filePath: '/repo/a.ts',
+    content: 'recovered file content',
+    offset: undefined,
+    limit: undefined,
+  })
+  const rootSelf = liveTools.findLast(
+    (e) => e.item.callId === rootSelfCallId,
+  )?.item
+  assert.ok(rootSelf)
+  assert.equal(rootSelf.detail.type, 'shell')
+  const assistantIds = new Set(
+    events
+      .filter(
+        (
+          e,
+        ): e is Extract<ProviderEvent, { type: 'timeline.item' }> & {
+          item: Extract<ProviderTimelineItem, { type: 'assistant_message' }>
+        } => e.type === 'timeline.item' && e.item.type === 'assistant_message',
+      )
+      .map((e) => e.item.id),
+  )
+  assert.equal(assistantIds.size, 1)
+  const liveTurn = events.findLast(
+    (e): e is Extract<ProviderEvent, { type: 'session.turn' }> =>
+      e.type === 'session.turn',
+  )
+  assert.equal(liveTurn?.state, 'completed')
+
+  // Attach-time session/load replay drops child tool_call updates and cancels child prompts when !state.turn.
+  const attachEvents: ProviderEvent[] = []
+  let attachPermOutcome: unknown
+  let attachElicitOutcome: unknown
+  const attachManager = new SessionManager({
+    launch: { command: 'agy', args: ['acp'], env },
+    usage: new AgyUsageSource({ env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: (event) => attachEvents.push(event),
+    commandWaitTimeoutMs: 50,
+    connectAcp: (_l, _cwd, _e, client) => {
+      const closed = new Promise<void>(() => {})
+      const rpc = {
+        closed,
+        initialize: async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
+          agentCapabilities: { loadSession: true },
+        }),
+        loadSession: async () => {
+          void client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'available_commands_update',
+              availableCommands: [],
+            },
+          })
+          await client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: `${childId}:attach-child-1`,
+              title: 'Run run_command',
+              kind: 'execute',
+              status: 'in_progress',
+              rawInput: { CommandLine: 'echo attach-child' },
+            },
+          })
+          await client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: `${childId}:attach-child-1`,
+              status: 'completed',
+              rawOutput: 'done',
+            },
+          })
+          await client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'attach-root-1',
+              title: 'Run read_file',
+              kind: 'read',
+              status: 'completed',
+              rawInput: { Path: '/repo/a.ts' },
+              rawOutput: 'ok',
+            },
+          })
+          await client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'Attached reply' },
+            },
+          })
+          attachPermOutcome = await client.requestPermission({
+            sessionId: nativeId,
+            toolCall: {
+              toolCallId: `${childId}:attach-perm-1`,
+              title: 'Run run_command',
+              rawInput: { CommandLine: 'echo blocked' },
+            },
+            options: [
+              { optionId: 'allow_once', name: 'Allow', kind: 'allow_once' },
+              { optionId: 'reject_once', name: 'Deny', kind: 'reject_once' },
+            ],
+          })
+          attachElicitOutcome = await client.requestElicitation!({
+            sessionId: nativeId,
+            toolCallId: `${childId}:attach-ask-1`,
+            message: 'Attach-time child question?',
+            requestedSchema: {
+              type: 'object',
+              properties: {
+                q1: {
+                  type: 'string',
+                  title: 'Attach-time child question?',
+                  enum: ['Yes', 'No'],
+                },
+              },
+            },
+          })
+          return { configOptions: [] }
+        },
+        closeSession: async () => ({}),
+        prompt: async () => ({ stopReason: 'end_turn' as const }),
+        cancel: async () => {},
+      } as unknown as ReturnType<typeof connectAcp>['rpc']
+      return {
+        rpc,
+        exited: closed,
+        stopped: Promise.resolve(),
+        close: async () => {},
+        request: async <T>(op: Promise<T>) => op,
+        get closed() {
+          return false
+        },
+        get tier() {
+          return undefined
+        },
+        get models() {
+          return undefined
+        },
+      }
+    },
+  })
+  t.after(() => attachManager.close())
+
+  await attachManager.handle({
+    type: 'session.open',
+    requestId: 'open-attach',
+    sessionId: 's-attach',
+    history: 'replay',
+    persistence: { version: 1, data: { sessionId: nativeId } },
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+
+  const attachTools = attachEvents.filter(
+    (
+      e,
+    ): e is Extract<ProviderEvent, { type: 'timeline.item' }> & {
+      item: Extract<ProviderTimelineItem, { type: 'tool_call' }>
+    } => e.type === 'timeline.item' && e.item.type === 'tool_call',
+  )
+  assert.deepEqual(
+    attachTools.filter((e) => e.item.callId.startsWith(`${childId}:`)),
+    [],
+  )
+  assert.ok(attachTools.some((e) => e.item.callId === 'attach-root-1'))
+  assert.deepEqual(
+    attachEvents.filter((e) => e.type === 'session.permission'),
+    [],
+  )
+  assert.deepEqual(attachPermOutcome, {
+    outcome: { outcome: 'cancelled' },
+  })
+  assert.deepEqual(attachElicitOutcome, { action: 'cancel' })
+})
+
+test('child-prefixed permissions and elicitations forward cleanly without canceling parent wakeup or hijacking root handledElicitations', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-child-forward-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const nativeId = '33333333-3333-4333-8333-333333333333'
+  const childId = '44444444-4444-4444-8444-444444444444'
+  const brainRoot = join(home, '.gemini/antigravity-cli/brain')
+  const env = isolatedEnv(home)
+  const collector = createEventCollector()
+  let acpClient!: import('../server/transport.ts').AcpClient
+  let cancelCalls = 0
+
+  const turn1InitialRows: Record<string, unknown>[] = [
+    { step_index: 1, type: 'USER_INPUT', content: 'turn 1' },
+    {
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          id: 'turn1-ready',
+          name: 'run_command',
+          args: { CommandLine: 'echo ready' },
+        },
+        {
+          name: 'ask_question',
+          args: {
+            questions: [
+              { question: 'Proceed with deploy?', options: ['Yes', 'No'] },
+            ],
+          },
+        },
+      ],
+    },
+    { step_index: 3, type: 'GENERIC', status: 'DONE', content: 'ready' },
+  ]
+  const turn1FinalRows: Record<string, unknown>[] = [
+    ...turn1InitialRows,
+    { step_index: 4, type: 'GENERIC', status: 'DONE', content: 'No, wait' },
+    {
+      step_index: 5,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          id: 'turn1-post-answer',
+          name: 'run_command',
+          args: { CommandLine: 'echo after' },
+        },
+      ],
+    },
+    { step_index: 6, type: 'GENERIC', status: 'DONE', content: 'after' },
+    {
+      step_index: 7,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      content: 'Turn 1 complete',
+    },
+  ]
+
+  const promptSteps = sequenceDouble([
+    async () => {
+      const childPermPromise = acpClient.requestPermission({
+        sessionId: nativeId,
+        toolCall: {
+          toolCallId: `${childId}:perm-1`,
+          title: 'Run run_command',
+          rawInput: { CommandLine: 'rm -rf tmp' },
+        },
+        options: [
+          { optionId: 'allow_once', name: 'Allow', kind: 'allow_once' },
+          { optionId: 'reject_once', name: 'Deny', kind: 'reject_once' },
+        ],
+      })
+      const permEvent = (await collector.wait(
+        (e) => e.type === 'session.permission' && e.request.kind === 'tool',
+      )) as Extract<ProviderEvent, { type: 'session.permission' }>
+      await manager.handle({
+        type: 'session.permission',
+        sessionId: 's',
+        permissionId: permEvent.request.id,
+        response: { behavior: 'deny', selectedActionId: 'reject_once' },
+      })
+      assert.deepEqual(await childPermPromise, {
+        outcome: { outcome: 'selected', optionId: 'reject_once' },
+      })
+
+      const childAskPromise = acpClient.requestElicitation!({
+        sessionId: nativeId,
+        toolCallId: `${childId}:ask-1`,
+        message: 'Proceed with deploy?',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            q1: {
+              type: 'string',
+              title: 'Proceed with deploy?',
+              enum: ['Yes', 'No'],
+            },
+          },
+        },
+      })
+      const askEvent = (await collector.wait(
+        (e) => e.type === 'session.permission' && e.request.kind === 'question',
+      )) as Extract<ProviderEvent, { type: 'session.permission' }>
+      await manager.handle({
+        type: 'session.permission',
+        sessionId: 's',
+        permissionId: askEvent.request.id,
+        response: {
+          behavior: 'allow',
+          updatedInput: { answers: { 'Question 1': 'Yes' } },
+        },
+      })
+      assert.deepEqual(await childAskPromise, {
+        action: 'accept',
+        content: { q1: 'Yes' },
+      })
+
+      await writeBrainTranscript(brainRoot, nativeId, turn1InitialRows)
+      return { stopReason: 'end_turn' as const }
+    },
+    async () => {
+      await writeBrainTranscript(brainRoot, nativeId, [
+        ...turn1FinalRows,
+        { step_index: 8, type: 'USER_INPUT', content: 'turn 2' },
+        {
+          step_index: 9,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [
+            {
+              id: 'turn2-in-settle',
+              name: 'run_command',
+              args: { CommandLine: 'echo settle' },
+            },
+            {
+              id: 'root-wait-1',
+              name: 'run_command',
+              args: { CommandLine: 'echo wait' },
+            },
+          ],
+        },
+        { step_index: 10, type: 'GENERIC', status: 'DONE', content: 'settle' },
+      ])
+      return { stopReason: 'end_turn' as const }
+    },
+  ])
+
+  const manager = new SessionManager({
+    launch: { command: 'agy', args: ['acp'], env },
+    usage: new AgyUsageSource({ env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: collector.emit,
+    commandWaitTimeoutMs: 50,
+    connectAcp: (_l, _cwd, _e, client) => {
+      acpClient = client
+      const closed = new Promise<void>(() => {})
+      const rpc = {
+        closed,
+        initialize: async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
+          agentCapabilities: { loadSession: true },
+        }),
+        newSession: async () => {
+          void client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'available_commands_update',
+              availableCommands: [],
+            },
+          })
+          return { sessionId: nativeId, configOptions: [] }
+        },
+        closeSession: async () => ({}),
+        prompt: () => promptSteps(),
+        cancel: async () => {
+          cancelCalls += 1
+        },
+      } as unknown as ReturnType<typeof connectAcp>['rpc']
+      return {
+        rpc,
+        exited: closed,
+        stopped: Promise.resolve(),
+        close: async () => {},
+        request: async <T>(op: Promise<T>) => op,
+        get closed() {
+          return false
+        },
+        get tier() {
+          return undefined
+        },
+        get models() {
+          return undefined
+        },
+      }
+    },
+  })
+  t.after(() => manager.close())
+
+  await manager.handle({
+    type: 'session.open',
+    requestId: 'open',
+    sessionId: 's',
+    history: 'skip',
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+
+  // Turn 1: child permission & elicitation succeed; child answer must not hijack anonymous root ask_question.
+  const turn1Promise = manager.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId: 'm1',
+      delivery: 'auto',
+      input: { type: 'message', content: [{ type: 'text', text: 'turn 1' }] },
+    },
+  })
+  await collector.wait(
+    (e) =>
+      e.type === 'timeline.item' &&
+      e.item.type === 'tool_call' &&
+      e.item.callId === 'turn1-ready',
+  )
+  await writeBrainTranscript(brainRoot, nativeId, turn1FinalRows)
+  await turn1Promise
+
+  const postAnswerItem = collector.events.findLast(
+    (
+      e,
+    ): e is Extract<ProviderEvent, { type: 'timeline.item' }> & {
+      item: Extract<ProviderTimelineItem, { type: 'tool_call' }>
+    } =>
+      e.type === 'timeline.item' &&
+      e.item.type === 'tool_call' &&
+      e.item.callId === 'turn1-post-answer',
+  )?.item
+  assert.ok(postAnswerItem)
+  assert.equal(postAnswerItem.status, 'completed')
+
+  // Turn 2: declining a child elicitation during inSettle must not cancel the parent turn.
+  const turn2Promise = manager.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId: 'm2',
+      delivery: 'auto',
+      input: { type: 'message', content: [{ type: 'text', text: 'turn 2' }] },
+    },
+  })
+  await collector.wait(
+    (e) =>
+      e.type === 'timeline.item' &&
+      e.item.type === 'tool_call' &&
+      e.item.callId === 'turn2-in-settle',
+  )
+  const childDeclinePromise = acpClient.requestElicitation!({
+    sessionId: nativeId,
+    toolCallId: `${childId}:wakeup-ask-1`,
+    message: 'Child question during settle?',
+    requestedSchema: {
+      type: 'object',
+      properties: {
+        q1: {
+          type: 'string',
+          title: 'Child question during settle?',
+          enum: ['A', 'B'],
+        },
+      },
+    },
+  })
+  const childDeclineEvent = (await collector.wait(
+    (e) =>
+      e.type === 'session.permission' &&
+      e.request.title === 'Child question during settle?',
+  )) as Extract<ProviderEvent, { type: 'session.permission' }>
+  await manager.handle({
+    type: 'session.permission',
+    sessionId: 's',
+    permissionId: childDeclineEvent.request.id,
+    response: { behavior: 'deny' },
+  })
+  assert.deepEqual(await childDeclinePromise, { action: 'decline' })
+
+  await writeBrainTranscript(brainRoot, nativeId, [
+    ...turn1FinalRows,
+    { step_index: 8, type: 'USER_INPUT', content: 'turn 2' },
+    {
+      step_index: 9,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          id: 'turn2-in-settle',
+          name: 'run_command',
+          args: { CommandLine: 'echo settle' },
+        },
+        {
+          id: 'root-wait-1',
+          name: 'run_command',
+          args: { CommandLine: 'echo wait' },
+        },
+      ],
+    },
+    { step_index: 10, type: 'GENERIC', status: 'DONE', content: 'settle' },
+    { step_index: 11, type: 'GENERIC', status: 'DONE', content: 'wait done' },
+    {
+      step_index: 12,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      content: 'Turn 2 complete',
+    },
+  ])
+  await turn2Promise
+
+  assert.equal(cancelCalls, 0)
+  const turn2Terminal = collector.events.findLast(
+    (e): e is Extract<ProviderEvent, { type: 'session.turn' }> =>
+      e.type === 'session.turn',
+  )
+  assert.equal(turn2Terminal?.state, 'completed')
+})

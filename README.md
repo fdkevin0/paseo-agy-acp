@@ -76,16 +76,16 @@ Existing agents keep their original provider; they are not migrated. Remove the 
 
 ## Capabilities
 
-| Capability    | Behavior                                                                                                                                  |
-| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| Sessions      | Create, list, import and restore native conversations.                                                                                    |
-| Prompts       | Text, images, slash commands and attachment context.                                                                                      |
-| Configuration | Native models, modes (`default`, `accept-edits`, `plan`) plus **Full Access**, per-model thinking choices and appended system prompts.    |
-| Permissions   | Native approval options with tool arguments, details, MCP `toolPolicy` preapprovals, or unattended auto-approval in **Full Access** mode. |
-| Timeline      | Streaming responses, reasoning, plans and rich tool cards.                                                                                |
-| Context       | Token counters, context occupancy and reported USD costs.                                                                                 |
-| Subscription  | Gemini and Claude/GPT 5-hour and weekly quota windows.                                                                                    |
-| Subagents     | Native multi-level child links and read-only Brain transcript cards.                                                                      |
+| Capability    | Behavior                                                                                                                                                                |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Sessions      | Create, list, import and restore native conversations.                                                                                                                  |
+| Prompts       | Text, images, slash commands and attachment context.                                                                                                                    |
+| Configuration | Native models, modes (`default`, `auto` when advertised by `agy`, `accept-edits`, `plan`) plus **Full Access**, per-model thinking choices and appended system prompts. |
+| Permissions   | Native approval options with tool arguments, details, MCP `toolPolicy` preapprovals, or unattended auto-approval in **Full Access** mode.                               |
+| Timeline      | Streaming responses, reasoning, plans and rich tool cards.                                                                                                              |
+| Context       | Token counters, context occupancy and reported USD costs.                                                                                                               |
+| Subscription  | Gemini and Claude/GPT 5-hour and weekly quota windows.                                                                                                                  |
+| Subagents     | Native multi-level child links and read-only Brain transcript cards.                                                                                                    |
 
 MCP cards show recognized calls as `server.tool` and use the same identity for exact preapproval grants, while retaining original arguments. Result-image extraction is not yet verified for AGY. See [MCP behavior and limits](docs/reference.md#attachments-and-tool-cards).
 
