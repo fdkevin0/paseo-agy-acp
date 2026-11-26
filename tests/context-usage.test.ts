@@ -1618,3 +1618,189 @@ test('mid-turn usage_update advancing sqlGenIdx preserves turnEstimatedTokens fo
   assert.equal(usageEvents.at(-1)?.usage.contextWindowMaxTokens, 512_000)
   assert.equal(usageEvents.at(-1)?.usage.contextWindowUsedTokens, 88_000)
 })
+
+test('live usage_update refreshes SQLite max_context_tokens on the same model and skips DB opens when unchanged', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-context-live-refresh-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const nativeId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+  const brainRoot = join(home, '.gemini/antigravity-cli/brain')
+  const brainDir = join(brainRoot, nativeId, '.system_generated/logs')
+  await mkdir(brainDir, { recursive: true })
+  await writeFile(
+    join(brainDir, 'transcript_full.jsonl'),
+    JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      input_tokens: 100,
+      output_tokens: 10,
+    }) + '\n',
+  )
+  // Seed initial SQLite compaction window (e.g. from a prior TUI AGY_CLI_AUTO_COMPACT_OVERRIDE).
+  writeConversationDb(home, nativeId, {
+    gen: [{ idx: 0, data: encodeGenMetadataMaxContext(200_000) }],
+  })
+
+  // Direct stat-cache invariant: repeated unchanged reads perform zero additional SQLite opens.
+  let openCount = 0
+  const openDb = (path: string) => {
+    openCount++
+    return new DatabaseSync(path, { readOnly: true, timeout: 50 })
+  }
+  const firstRead = await readConversationCompactionWindow(
+    brainRoot,
+    nativeId,
+    -1,
+    { openDb },
+  )
+  assert.equal(firstRead.maxTokens, 200_000)
+  assert.equal(firstRead.genIdx, 0)
+  assert.equal(openCount, 1)
+
+  const cachedRead = await readConversationCompactionWindow(
+    brainRoot,
+    nativeId,
+    0,
+    { openDb },
+  )
+  assert.equal(cachedRead.maxTokens, undefined)
+  assert.equal(cachedRead.genIdx, 0)
+  assert.equal(openCount, 1)
+
+  const { events, emit } = createEventCollector()
+  const env = isolatedEnv(home)
+  const launch = { command: 'agy', args: ['acp'], env }
+  const streamingMaxDuringPrompt: Array<number | undefined> = []
+  const manager = new SessionManager({
+    launch,
+    usage: new AgyUsageSource({ env }),
+    capabilities: ['prompt.message', 'session.configure', 'permission'],
+    emit,
+    commandWaitTimeoutMs: 50,
+    connectAcp: (_l, _cwd, _e, client) => {
+      const closed = new Promise<void>(() => {})
+      const rpc = {
+        closed,
+        initialize: async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
+          agentCapabilities: {
+            loadSession: true,
+            sessionCapabilities: { resume: {} },
+          },
+        }),
+        resumeSession: async () => {
+          void client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'available_commands_update',
+              availableCommands: [],
+            },
+          })
+          return {
+            configOptions: [
+              {
+                id: 'model',
+                name: 'Model',
+                category: 'model',
+                type: 'select',
+                currentValue: 'model-a',
+                options: [{ value: 'model-a', name: 'Model A' }],
+              },
+            ],
+          }
+        },
+        closeSession: async () => ({}),
+        prompt: async () => {
+          await client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'usage_update',
+              used: 12_000,
+              size: 1_048_576,
+            },
+          })
+          const beforeUpdate = events.findLast(
+            (e) => e.type === 'session.usage',
+          )
+          assert.ok(beforeUpdate?.type === 'session.usage')
+          streamingMaxDuringPrompt.push(
+            beforeUpdate.usage.contextWindowMaxTokens,
+          )
+
+          // Mid-turn SQLite update for the same model (e.g. Orchestrator role switch or override change).
+          writeConversationDb(home, nativeId, {
+            gen: [{ idx: 1, data: encodeGenMetadataMaxContext(512_000) }],
+          })
+          await client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'usage_update',
+              used: 25_000,
+              size: 1_048_576,
+            },
+          })
+          const afterUpdate = events.findLast((e) => e.type === 'session.usage')
+          assert.ok(afterUpdate?.type === 'session.usage')
+          streamingMaxDuringPrompt.push(
+            afterUpdate.usage.contextWindowMaxTokens,
+          )
+          return { stopReason: 'end_turn' as const }
+        },
+        cancel: async () => {},
+      } as unknown as ReturnType<
+        typeof import('../server/transport.ts').connectAcp
+      >['rpc']
+      return {
+        rpc,
+        exited: closed,
+        stopped: Promise.resolve(),
+        close: async () => {},
+        request: async <T>(op: Promise<T>) => op,
+        get closed() {
+          return false
+        },
+        get tier() {
+          return undefined
+        },
+        get models() {
+          return undefined
+        },
+      }
+    },
+  })
+  t.after(() => manager.close())
+
+  await manager.handle({
+    type: 'session.open',
+    requestId: 'open',
+    sessionId: 's',
+    history: 'skip',
+    persistence: { version: 1, data: { sessionId: nativeId } },
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+      model: 'model-a',
+    },
+  })
+  const openUsage = events.findLast((e) => e.type === 'session.usage')
+  assert.ok(openUsage?.type === 'session.usage')
+  assert.equal(openUsage.usage.contextWindowMaxTokens, 200_000)
+
+  await manager.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId: 'm1',
+      delivery: 'auto',
+      input: { type: 'message', content: [{ type: 'text', text: 'go' }] },
+    },
+  })
+  assert.deepEqual(streamingMaxDuringPrompt, [200_000, 512_000])
+  const finalUsage = events.findLast((e) => e.type === 'session.usage')
+  assert.ok(finalUsage?.type === 'session.usage')
+  assert.equal(finalUsage.usage.contextWindowMaxTokens, 512_000)
+  assert.equal(finalUsage.usage.contextWindowUsedTokens, 25_000)
+})

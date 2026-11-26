@@ -37,7 +37,7 @@ import {
   writeFileAtomic,
 } from './helpers.ts'
 import recordedWakeup from './fixtures/agy-1.5.12-wakeup.json' with { type: 'json' }
-import { TranscriptReader } from '../server/brain-io.ts'
+import { isRestartNotice, TranscriptReader } from '../server/brain-io.ts'
 import { BrainTurnObservation } from '../server/brain-observer.ts'
 import {
   child,
@@ -7313,24 +7313,25 @@ test('BackgroundWorkProbe fails closed on corrupt appended JSONL and recovers fr
   assert.equal(readResponses.length, 0)
 })
 
-test('recurring schedule with CronExpression is classified as a standing daemon while whitespace-only cron and one-shot timers still block', async (t) => {
+test('schedule with IsDaemon: true is a standing daemon while non-daemon CronExpression stays blocking and counts down MaxIterations', async (t) => {
   const f = await fixture()
   t.after(() => f.close())
 
-  // 1. Recurring CronExpression with IsDaemon omitted settles, reports daemon-only work, and decrements on MaxIterations.
-  const cronOmittedId = `${parent}/task-cron-omitted`
+  // 1. Recurring CronExpression with IsDaemon: true settles immediately, reports daemon-only work, and decrements on MaxIterations.
+  const cronDaemonId = `${parent}/task-cron-daemon`
   await f.put(parent, [
-    { step_index: 0, type: 'USER_INPUT', content: 'start recurring cron' },
+    { step_index: 0, type: 'USER_INPUT', content: 'start daemon cron' },
     {
       step_index: 1,
       type: 'PLANNER_RESPONSE',
       status: 'DONE',
       tool_calls: [
         {
-          id: 'cron-omitted',
+          id: 'cron-daemon',
           name: 'schedule',
           args: {
             CronExpression: '*/5 * * * *',
+            IsDaemon: true,
             Prompt: 'poll status',
             MaxIterations: 2,
           },
@@ -7341,9 +7342,9 @@ test('recurring schedule with CronExpression is classified as a standing daemon 
       step_index: 2,
       type: 'GENERIC',
       status: 'RUNNING',
-      content: `Tool is running as a background task with task id: ${cronOmittedId}\n`,
+      content: `Tool is running as a background task with task id: ${cronDaemonId}\n`,
     },
-    done(3, 'Cron scheduled.'),
+    done(3, 'Daemon cron scheduled.'),
   ])
 
   assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
@@ -7351,14 +7352,14 @@ test('recurring schedule with CronExpression is classified as a standing daemon 
     await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
     true,
   )
-  const settledOmitted = await settleBrainTurn(f.root, parent, 'p', () => {}, {
+  const settledDaemon = await settleBrainTurn(f.root, parent, 'p', () => {}, {
     minStepIndex: -1,
   })
-  assert.equal(settledOmitted.status, 'completed')
+  assert.equal(settledDaemon.status, 'completed')
 
   await appendFile(
     f.path(parent),
-    encode([message(4, cronOmittedId, 'poll status'), done(5, 'Tick #1')]),
+    encode([message(4, cronDaemonId, 'poll status'), done(5, 'Tick #1')]),
   )
   assert.equal(
     await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
@@ -7367,21 +7368,77 @@ test('recurring schedule with CronExpression is classified as a standing daemon 
 
   await appendFile(
     f.path(parent),
-    encode([message(6, cronOmittedId, 'poll status'), done(7, 'Tick #2')]),
+    encode([message(6, cronDaemonId, 'poll status'), done(7, 'Tick #2')]),
   )
   assert.equal(
     await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
     false,
   )
 
-  // 2. Recurring CronExpression with IsDaemon: false also settles as a daemon and clears on manage_task(kill).
-  const cronFalseId = `${parent}/task-cron-false`
+  // 2. Non-daemon CronExpression (IsDaemon omitted) stays blocking in background across Tick #1 and clears after Tick #2.
+  const cronOmittedId = `${parent}/task-cron-omitted`
   await appendFile(
     f.path(parent),
     encode([
       { step_index: 8, type: 'USER_INPUT', content: 'start non-daemon cron' },
       {
         step_index: 9,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          {
+            id: 'cron-omitted',
+            name: 'schedule',
+            args: {
+              CronExpression: '*/5 * * * *',
+              Prompt: 'poll status',
+              MaxIterations: 2,
+              TimerCondition: 'any',
+            },
+          },
+        ],
+      },
+      {
+        step_index: 10,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: `Tool is running as a background task with task id: ${cronOmittedId}\n`,
+      },
+      done(11, 'Blocking cron scheduled.'),
+    ]),
+  )
+  assert.equal(await hasActiveBackgroundWork(f.root, parent), true)
+
+  // Unrelated sender does not early-cancel a cron, and Tick #1 decrements remainingIterations (2 -> 1) without deleting it.
+  await appendFile(
+    f.path(parent),
+    encode([
+      message(12, 'unrelated-sender', 'hello'),
+      message(13, cronOmittedId, 'poll status'),
+      done(14, 'Tick #1'),
+    ]),
+  )
+  assert.equal(await hasActiveBackgroundWork(f.root, parent), true)
+
+  // Tick #2 reaches MaxIterations (1 -> deleted), allowing the turn to settle cleanly.
+  await appendFile(
+    f.path(parent),
+    encode([message(15, cronOmittedId, 'poll status'), done(16, 'Tick #2')]),
+  )
+  assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
+  const settledOmitted = await settleBrainTurn(f.root, parent, 'p', () => {}, {
+    minStepIndex: 7,
+  })
+  assert.equal(settledOmitted.status, 'completed')
+
+  // 3. Unlimited non-daemon CronExpression (IsDaemon: false) stays blocking across ticks until manage_task(kill).
+  const cronFalseId = `${parent}/task-cron-false`
+  await appendFile(
+    f.path(parent),
+    encode([
+      { step_index: 17, type: 'USER_INPUT', content: 'start unlimited cron' },
+      {
+        step_index: 18,
         type: 'PLANNER_RESPONSE',
         status: 'DONE',
         tool_calls: [
@@ -7397,30 +7454,24 @@ test('recurring schedule with CronExpression is classified as a standing daemon 
         ],
       },
       {
-        step_index: 10,
+        step_index: 19,
         type: 'GENERIC',
         status: 'RUNNING',
         content: `Tool is running as a background task with task id: ${cronFalseId}\n`,
       },
-      done(11, 'Hourly cron scheduled.'),
+      done(20, 'Hourly cron scheduled.'),
+      message(21, cronFalseId, 'hourly check'),
+      done(22, 'Hourly tick #1'),
     ]),
   )
-  const settledFalse = await settleBrainTurn(f.root, parent, 'p', () => {}, {
-    minStepIndex: 7,
-  })
-  assert.equal(settledFalse.status, 'completed')
-  assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
-  assert.equal(
-    await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
-    true,
-  )
+  assert.equal(await hasActiveBackgroundWork(f.root, parent), true)
 
   await appendFile(
     f.path(parent),
     encode([
-      { step_index: 12, type: 'USER_INPUT', content: 'stop hourly cron' },
+      { step_index: 23, type: 'USER_INPUT', content: 'stop hourly cron' },
       {
-        step_index: 13,
+        step_index: 24,
         type: 'PLANNER_RESPONSE',
         status: 'DONE',
         tool_calls: [
@@ -7432,20 +7483,21 @@ test('recurring schedule with CronExpression is classified as a standing daemon 
         ],
       },
       {
-        step_index: 14,
+        step_index: 25,
         type: 'GENERIC',
         status: 'DONE',
         content: `Killed task ${cronFalseId}`,
       },
-      done(15, 'Stopped hourly cron.'),
+      done(26, 'Stopped hourly cron.'),
     ]),
   )
+  assert.equal(await hasActiveBackgroundWork(f.root, parent), false)
   assert.equal(
     await hasActiveBackgroundWork(f.root, parent, { includeDaemons: true }),
     false,
   )
 
-  // 3. Whitespace-only CronExpression and one-shot DurationSeconds timer still register as blocking background tasks.
+  // 4. Whitespace-only CronExpression and one-shot DurationSeconds timer register as blocking background tasks and clear on tick or TimerCondition.
   const blankCronProjector = new BrainTranscriptProjector(parent)
   blankCronProjector.project({
     step_index: 1,
@@ -7475,7 +7527,11 @@ test('recurring schedule with CronExpression is classified as a standing daemon 
       {
         id: 'oneshot-timer',
         name: 'schedule',
-        args: { DurationSeconds: 60, Prompt: 'wake up once' },
+        args: {
+          DurationSeconds: 60,
+          Prompt: 'wake up once',
+          TimerCondition: 'any',
+        },
       },
     ],
   })
@@ -7487,6 +7543,209 @@ test('recurring schedule with CronExpression is classified as a standing daemon 
   })
   assert.equal(timerProjector.hasBackground(), true)
   assert.equal(timerProjector.hasDaemons(), false)
+  const canceledTimerItems = timerProjector.project(
+    message(3, 'other-agent', 'wake early'),
+  )
+  assert.equal(timerProjector.hasBackground(), false)
+  assert.equal(canceledTimerItems[0]?.type, 'tool_call')
+  assert.equal(
+    canceledTimerItems[0]?.type === 'tool_call' && canceledTimerItems[0].status,
+    'canceled',
+  )
+})
+
+test('isRestartNotice matches background-only recovery variant and clears background and daemon tasks', () => {
+  const bgOnlyNotice = message(
+    4,
+    'system',
+    '[Notice] All your background tasks have been stopped due to server restart.',
+  )
+  assert.equal(isRestartNotice(bgOnlyNotice), true)
+  assert.equal(
+    isRestartNotice(
+      message(
+        4,
+        child,
+        '[Notice] All your background tasks have been stopped due to server restart.',
+      ),
+    ),
+    false,
+  )
+
+  const projector = new BrainTranscriptProjector(parent)
+  projector.project({
+    step_index: 1,
+    type: 'PLANNER_RESPONSE',
+    tool_calls: [
+      { id: 'bg-1', name: 'run_command', args: { CommandLine: 'watch' } },
+      {
+        id: 'daemon-1',
+        name: 'run_command',
+        args: { CommandLine: 'serve', IsDaemon: true },
+      },
+    ],
+  })
+  projector.project({
+    step_index: 2,
+    type: 'GENERIC',
+    status: 'RUNNING',
+    content: `Tool is running as a background task with task id: ${parent}/task-bg\n`,
+  })
+  projector.project({
+    step_index: 3,
+    type: 'GENERIC',
+    status: 'RUNNING',
+    content: `Tool is running as a background task with task id: ${parent}/task-daemon\n`,
+  })
+  assert.equal(projector.hasBackground(), true)
+  assert.equal(projector.hasDaemons(), true)
+  projector.project(bgOnlyNotice)
+  assert.equal(projector.hasBackground(), false)
+  assert.equal(projector.hasDaemons(), false)
+})
+
+test('1.5.16+ intra-RPC wakeup with NotificationTimeoutSeconds, Brain output recovery, and silent trailing PLANNER_RESPONSE avoids double-counting', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+  const taskId = `${parent}/task-notify`
+
+  await f.put(parent, [
+    { step_index: 1, type: 'USER_INPUT', content: 'run build' },
+    {
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          id: 'cmd-1',
+          name: 'run_command',
+          args: { CommandLine: 'build', NotificationTimeoutSeconds: 30 },
+        },
+      ],
+      input_tokens: 100,
+      output_tokens: 10,
+    },
+    {
+      step_index: 3,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: `Tool is running as a background task with task id: ${taskId}\n`,
+    },
+    { ...done(4, 'Started build.'), input_tokens: 120, output_tokens: 5 },
+    message(5, taskId, 'Background command is still running after 30s: build'),
+    { ...done(6, 'Still running.'), input_tokens: 140, output_tokens: 5 },
+  ])
+  // NotificationTimeoutSeconds progress notice must not clear the running background task.
+  assert.equal(await hasActiveBackgroundWork(f.root, parent), true)
+
+  await appendFile(
+    f.path(parent),
+    encode([
+      message(7, taskId, `Task id "${taskId}" finished with result:\nok`),
+      {
+        step_index: 8,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          {
+            id: 'read-1',
+            name: 'read_file',
+            args: { Path: '/tmp/report.txt' },
+          },
+        ],
+        input_tokens: 160,
+        output_tokens: 8,
+      },
+      {
+        step_index: 9,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'report body',
+      },
+      {
+        step_index: 10,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        input_tokens: 180,
+        output_tokens: 2,
+      },
+    ]),
+  )
+  const foregroundAcp: ForegroundAcpSegment[] = [
+    { type: 'tool_call', callId: 'cmd-1' },
+    { type: 'assistant_message', text: 'Started build.' },
+    { type: 'assistant_message', text: 'Still running.' },
+    { type: 'tool_call', callId: 'read-1' },
+  ]
+  const snapshots = new Map([
+    [
+      'cmd-1',
+      {
+        toolCallId: 'cmd-1',
+        title: 'run_command',
+        rawInput: { CommandLine: 'build', NotificationTimeoutSeconds: 30 },
+      },
+    ],
+    [
+      'read-1',
+      {
+        toolCallId: 'read-1',
+        title: 'read_file',
+        rawInput: { Path: '/tmp/report.txt' },
+      },
+    ],
+  ])
+  const intraItems: ProviderTimelineItem[] = []
+  const intra = await settleBrainTurn(
+    f.root,
+    parent,
+    'p',
+    (item) => intraItems.push(item),
+    {
+      minStepIndex: 0,
+      acpToolCallIds: ['cmd-1', 'read-1'],
+      foregroundAcp,
+      hasPostRpcAcp: () => false,
+      toolSnapshot: (id) => snapshots.get(id),
+    },
+  )
+  assert.equal(intra.status, 'completed')
+  assert.equal(intra.wokeUp, undefined)
+  assert.equal(intra.wakeupUsage, undefined)
+  const completedCmd = intraItems.find(
+    (item) => item.type === 'tool_call' && item.callId === 'cmd-1',
+  )
+  assert.ok(
+    completedCmd?.type === 'tool_call' &&
+      completedCmd.status === 'completed' &&
+      completedCmd.detail.type === 'shell',
+  )
+  assert.equal(completedCmd.detail.output, 'ok')
+  const recoveredRead = intraItems.find(
+    (item) => item.type === 'tool_call' && item.callId === 'read-1',
+  )
+  assert.ok(
+    recoveredRead?.type === 'tool_call' &&
+      recoveredRead.status === 'completed' &&
+      recoveredRead.detail.type === 'read',
+  )
+  assert.equal(recoveredRead.detail.content, 'report body')
+
+  // When post-RPC ACP activity was observed, a silent trailing step is still billed as post-RPC wakeup.
+  const post = await settleBrainTurn(f.root, parent, 'p', () => {}, {
+    minStepIndex: 0,
+    acpToolCallIds: ['cmd-1', 'read-1'],
+    foregroundAcp,
+    hasPostRpcAcp: () => true,
+    toolSnapshot: (id) => snapshots.get(id),
+  })
+  assert.equal(post.status, 'completed')
+  assert.equal(post.wokeUp, true)
+  assert.deepEqual(post.wakeupUsage, {
+    inputTokens: 180,
+    cachedReadTokens: 0,
+    outputTokens: 2,
+  })
 })
 
 test('settleBrainTurn resets stall watchdog after a host-sleep clock jump and still stalls on normal increments', async (t) => {

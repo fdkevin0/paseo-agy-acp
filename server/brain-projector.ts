@@ -103,6 +103,12 @@ function takePendingForGeneric<
   return pending.splice(matchIndex, 1)[0]
 }
 
+type BackgroundEntry = {
+  pending: PendingTool
+  isCron: boolean
+  remainingIterations: number
+}
+
 /** Project transcript_full.jsonl steps and correlate tools with structured Brain metadata. */
 export class BrainTranscriptProjector {
   private pending: PendingTool[] = []
@@ -116,7 +122,7 @@ export class BrainTranscriptProjector {
     source: NativeToolIdentitySource
   }
   private lastGenericMatched = false
-  private background = new Map<string, PendingTool>()
+  private background = new Map<string, BackgroundEntry>()
   private daemons = new Map<string, number>()
   private subagentTouches: { childId: string; stepIndex: number }[] = []
   private completedWakeups = new Map<number, string>()
@@ -488,19 +494,20 @@ export class BrainTranscriptProjector {
       const rawTaskId = text.match(backgroundTaskPattern)?.[1]
       if (rawTaskId) {
         const taskId = detachString(rawTaskId)
-        const isStandingDaemon =
-          pending.args.IsDaemon === true ||
-          (isNativeToolName(pending.name, 'schedule') &&
-            typeof pending.args.CronExpression === 'string' &&
-            pending.args.CronExpression.trim().length > 0)
-        if (isStandingDaemon) {
-          const max = Number(pending.args.MaxIterations)
-          this.daemons.set(
-            taskId,
-            Number.isInteger(max) && max > 0 ? max : Infinity,
-          )
+        const isCron =
+          isNativeToolName(pending.name, 'schedule') &&
+          typeof pending.args.CronExpression === 'string' &&
+          pending.args.CronExpression.trim().length > 0
+        const max = Number(pending.args.MaxIterations)
+        const maxIterations = Number.isInteger(max) && max > 0 ? max : Infinity
+        if (pending.args.IsDaemon === true) {
+          this.daemons.set(taskId, maxIterations)
         } else {
-          this.background.set(taskId, pending)
+          this.background.set(taskId, {
+            pending,
+            isCron,
+            remainingIterations: isCron ? maxIterations : 1,
+          })
         }
       }
       return []
@@ -659,28 +666,33 @@ export class BrainTranscriptProjector {
             if (remaining <= 1) this.daemons.delete(sender)
             else this.daemons.set(sender, remaining - 1)
           }
-          for (const [taskId, task] of this.background)
+          for (const [taskId, entry] of this.background) {
             if (
-              isNativeToolName(task.name, 'schedule') &&
-              !finishedIds.has(taskId) &&
-              (sender === taskId ||
-                task.args.TimerCondition === 'any' ||
-                task.args.TimerCondition === sender)
+              !isNativeToolName(entry.pending.name, 'schedule') ||
+              finishedIds.has(taskId)
+            )
+              continue
+            if (sender === taskId) {
+              if (entry.remainingIterations <= 1) this.background.delete(taskId)
+              else entry.remainingIterations -= 1
+            } else if (
+              !entry.isCron &&
+              (entry.pending.args.TimerCondition === 'any' ||
+                entry.pending.args.TimerCondition === sender)
             ) {
               this.background.delete(taskId)
-              if (sender !== taskId) {
-                canceledSchedules.push(
-                  ...this.finishOrDefer(task, null, 'canceled', ''),
-                )
-              }
+              canceledSchedules.push(
+                ...this.finishOrDefer(entry.pending, null, 'canceled', ''),
+              )
             }
+          }
         }
         if (taskResults.length > 0 || canceledSchedules.length > 0) {
           const completed: ProviderTimelineItem[] = [...canceledSchedules]
           for (const [, senderId, quotedId, outcome, output] of taskResults) {
             const key = this.background.has(quotedId) ? quotedId : senderId
-            const pending = this.background.get(key)
-            if (!pending) continue
+            const entry = this.background.get(key)
+            if (!entry) continue
             this.background.delete(key)
             const status =
               outcome === 'failed'
@@ -689,7 +701,7 @@ export class BrainTranscriptProjector {
                   ? 'canceled'
                   : 'completed'
             completed.push(
-              ...this.finishOrDefer(pending, output, status, output),
+              ...this.finishOrDefer(entry.pending, output, status, output),
             )
           }
           if (

@@ -870,6 +870,7 @@ export class Timeline {
   update(
     update: SessionUpdate,
     denied?: ReadonlySet<string>,
+    cancelFailed = false,
   ): ProviderTimelineItem | undefined {
     if (
       update.sessionUpdate === 'user_message_chunk' ||
@@ -993,11 +994,12 @@ export class Timeline {
       }
       const rawStatus = str((tool as { status?: unknown }).status)
       const isDenied = denied?.has(tool.toolCallId) === true
+      const isCanceledFailure =
+        tool.status === 'failed' && (isDenied || cancelFailed)
       const item: Extract<ProviderTimelineItem, { type: 'tool_call' }> =
-        isDenied &&
-        (tool.status === 'failed' ||
-          rawStatus === 'cancelled' ||
-          rawStatus === 'canceled')
+        isCanceledFailure ||
+        rawStatus === 'cancelled' ||
+        rawStatus === 'canceled'
           ? {
               ...base,
               status: 'canceled',
@@ -1012,17 +1014,11 @@ export class Timeline {
                   nonEmptyRawOutput(tool.rawOutput) ??
                   'Tool failed',
               }
-            : rawStatus === 'cancelled' || rawStatus === 'canceled'
-              ? {
-                  ...base,
-                  status: 'canceled',
-                  error: null,
-                }
-              : {
-                  ...base,
-                  status: tool.status === 'completed' ? 'completed' : 'running',
-                  error: null,
-                }
+            : {
+                ...base,
+                status: tool.status === 'completed' ? 'completed' : 'running',
+                error: null,
+              }
       this.track(item)
       return item
     }
