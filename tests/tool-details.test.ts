@@ -1049,3 +1049,158 @@ test('stripToolSummary omits top-level string toolSummary for display without mu
     id: 7,
   })
 })
+
+test('update_steps renders a plain_text checklist across raw, namespaced, legacy, and Brain replay shapes and falls back to unknown when malformed', () => {
+  const allStatuses = {
+    steps: [
+      { title: 'Inspect config', status: 'done' },
+      { title: 'Apply patch', status: 'in_progress' },
+      { title: 'Run checks', status: 'pending' },
+      { title: 'Optional cleanup', status: 'skipped' },
+      { title: 'Verify fallback', status: 'failed' },
+    ],
+  }
+  const expectedAll = {
+    type: 'plain_text' as const,
+    label: 'Steps',
+    text: [
+      '[x] Inspect config',
+      '[-] Apply patch',
+      '[ ] Run checks',
+      '[~] Optional cleanup',
+      '[!] Verify fallback',
+    ].join('\n'),
+  }
+
+  assert.deepEqual(
+    toolDetail({ title: 'update_steps', rawInput: allStatuses }),
+    expectedAll,
+  )
+  assert.deepEqual(
+    toolDetail({ title: 'Run update_steps', rawInput: allStatuses }),
+    expectedAll,
+  )
+  assert.deepEqual(
+    toolDetail({ title: 'default_api:update_steps', rawInput: allStatuses }),
+    expectedAll,
+  )
+  assert.deepEqual(
+    toolDetail({
+      name: 'default_api:update_steps',
+      title: 'Checklist update',
+      rawInput: allStatuses,
+    }),
+    expectedAll,
+  )
+
+  // Empty or malformed steps payloads fall back to unknown.
+  assert.deepEqual(
+    toolDetail({ title: 'update_steps', rawInput: { steps: [] } }),
+    unknownDetail({ steps: [] }, null),
+  )
+  assert.deepEqual(
+    toolDetail({ title: 'update_steps', rawInput: {} }),
+    unknownDetail({}, null),
+  )
+  assert.deepEqual(
+    toolDetail({ title: 'update_steps', rawInput: { steps: 'bad' } }),
+    unknownDetail({ steps: 'bad' }, null),
+  )
+  assert.deepEqual(
+    toolDetail({
+      title: 'update_steps',
+      rawInput: { steps: [{ title: '   ', status: 'done' }] },
+    }),
+    unknownDetail({ steps: [{ title: '   ', status: 'done' }] }, null),
+  )
+  assert.deepEqual(
+    toolDetail({
+      title: 'update_steps',
+      rawInput: {
+        steps: [
+          { title: 'Valid step', status: 'done' },
+          { title: 'Bad status', status: 'bogus' },
+        ],
+      },
+    }),
+    unknownDetail(
+      {
+        steps: [
+          { title: 'Valid step', status: 'done' },
+          { title: 'Bad status', status: 'bogus' },
+        ],
+      },
+      null,
+    ),
+  )
+  // Explicit foreign tool name takes precedence over legacy Run wrapper.
+  assert.deepEqual(
+    toolDetail({
+      name: 'mcp__srv__update_steps',
+      title: 'Run update_steps',
+      rawInput: allStatuses,
+    }),
+    unknownDetail(allStatuses, null),
+  )
+
+  // Brain replay projects update_steps as plain_text without disturbing sibling tool alignment.
+  const projector = new BrainTranscriptProjector('steps-replay')
+  const items = [
+    ...projector.project({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [
+        {
+          id: 'call-steps',
+          name: 'update_steps',
+          args: {
+            steps: [
+              { title: 'Step one', status: 'done' },
+              { title: 'Step two', status: 'in_progress' },
+            ],
+          },
+        },
+        {
+          id: 'call-read',
+          name: 'read_file',
+          args: { Path: '/repo/demo.ts' },
+        },
+      ],
+    }),
+    ...projector.project({
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: 'Steps updated',
+    }),
+    ...projector.project({
+      step_index: 3,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: 'export const ok = true',
+    }),
+  ]
+  const stepsItem = items.findLast(
+    (entry) => entry.type === 'tool_call' && entry.callId === 'call-steps',
+  )
+  const readItem = items.findLast(
+    (entry) => entry.type === 'tool_call' && entry.callId === 'call-read',
+  )
+  assert.ok(stepsItem?.type === 'tool_call')
+  assert.equal(stepsItem.status, 'completed')
+  assert.deepEqual(stepsItem.detail, {
+    type: 'plain_text',
+    label: 'Steps',
+    text: '[x] Step one\n[-] Step two',
+  })
+  assert.ok(readItem?.type === 'tool_call')
+  assert.equal(readItem.status, 'completed')
+  assert.deepEqual(readItem.detail, {
+    type: 'read',
+    filePath: '/repo/demo.ts',
+    content: 'export const ok = true',
+    offset: undefined,
+    limit: undefined,
+  })
+})

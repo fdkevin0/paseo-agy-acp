@@ -1389,3 +1389,92 @@ test('Timeline.update maps failed tool updates to canceled only when cancelFaile
   assert.equal(failed.error, 'exit status 1')
   assert.equal(timeline.isRunning(failed.id), false)
 })
+
+test('configState maps auto mode visuals only when advertised by agy', () => {
+  const withAuto = configState({
+    configOptions: [
+      {
+        type: 'select',
+        id: 'mode',
+        category: 'mode',
+        name: 'Mode',
+        currentValue: 'auto',
+        options: [
+          {
+            value: 'default',
+            name: 'Default',
+            description: 'Ask before edits',
+          },
+          {
+            value: 'auto',
+            name: 'Auto',
+            description: 'Approve safe actions automatically',
+          },
+          { value: 'accept-edits', name: 'Accept Edits' },
+          { value: 'plan', name: 'Plan' },
+        ],
+      },
+    ],
+  })
+  assert.equal(withAuto.mode, 'auto')
+  assert.deepEqual(withAuto.modes, [
+    {
+      id: 'default',
+      label: 'Default',
+      description: 'Ask before edits',
+      icon: 'Shield',
+      colorTier: 'safe',
+    },
+    {
+      id: 'auto',
+      label: 'Auto',
+      description: 'Approve safe actions automatically',
+      icon: 'ShieldCheck',
+      colorTier: 'moderate',
+    },
+    {
+      id: 'accept-edits',
+      label: 'Accept Edits',
+      description: undefined,
+      icon: 'ShieldPlus',
+      colorTier: 'moderate',
+    },
+    {
+      id: 'plan',
+      label: 'Plan',
+      description: undefined,
+      icon: 'ShieldEllipsis',
+      colorTier: 'planning',
+    },
+    {
+      id: 'full-access',
+      label: 'Full Access',
+      description:
+        'Approve file edits, commands and tool requests without asking.',
+      icon: 'ShieldOff',
+      colorTier: 'dangerous',
+      isUnattended: true,
+    },
+  ])
+
+  const withoutAuto = configState({
+    configOptions: [
+      {
+        type: 'select',
+        id: 'mode',
+        category: 'mode',
+        name: 'Mode',
+        currentValue: 'default',
+        options: [
+          { value: 'default', name: 'Default' },
+          { value: 'accept-edits', name: 'Accept Edits' },
+          { value: 'plan', name: 'Plan' },
+        ],
+      },
+    ],
+  })
+  assert.deepEqual(
+    withoutAuto.modes.map((m) => m.id),
+    ['default', 'accept-edits', 'plan', 'full-access'],
+  )
+})

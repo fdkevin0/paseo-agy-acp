@@ -40,6 +40,7 @@ const modeVisuals: Record<
   Pick<ProviderMode, 'icon' | 'colorTier' | 'isUnattended'>
 > = {
   default: { icon: 'Shield', colorTier: 'safe' },
+  auto: { icon: 'ShieldCheck', colorTier: 'moderate' },
   'accept-edits': { icon: 'ShieldPlus', colorTier: 'moderate' },
   plan: { icon: 'ShieldEllipsis', colorTier: 'planning' },
   [FULL_ACCESS_MODE_ID]: {
@@ -170,6 +171,7 @@ const nativeToolKinds: Record<string, ToolCall['kind']> = {
   send_message: 'other',
   ask_question: 'other',
   ask_user: 'other',
+  update_steps: 'other',
   run_command: 'execute',
   read_file: 'read',
   view_file: 'read',
@@ -187,6 +189,13 @@ const nativeToolKinds: Record<string, ToolCall['kind']> = {
   glob: 'search',
   search_web: 'search',
   web_search: 'search',
+}
+const stepStatusMarkers: Record<string, string> = {
+  pending: '[ ]',
+  in_progress: '[-]',
+  done: '[x]',
+  skipped: '[~]',
+  failed: '[!]',
 }
 const TOOL_SNAPSHOT_LIMIT = 1024
 
@@ -252,6 +261,34 @@ export function toolDetail(
         type: 'plain_text',
         label: rawName || 'ask_question',
         text: output ? `${formatted}\n\nAnswer:\n${output}` : formatted,
+      }
+    }
+  }
+  if (
+    name === 'update_steps' &&
+    Array.isArray(input.steps) &&
+    input.steps.length > 0
+  ) {
+    const lines: string[] = []
+    for (const entry of input.steps) {
+      const step = record(entry)
+      const title = text(step.title)
+      const status = str(step.status)
+      const marker =
+        status && Object.hasOwn(stepStatusMarkers, status)
+          ? stepStatusMarkers[status]
+          : undefined
+      if (!title || !marker) {
+        lines.length = 0
+        break
+      }
+      lines.push(`${marker} ${title}`)
+    }
+    if (lines.length > 0) {
+      return {
+        type: 'plain_text',
+        label: 'Steps',
+        text: lines.join('\n'),
       }
     }
   }

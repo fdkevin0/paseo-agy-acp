@@ -101,6 +101,19 @@ import {
   type StepUsage,
 } from './mapping.ts'
 
+const childToolCallIdPattern =
+  /^([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}):/i
+
+/** Whether a toolCallId is prefixed with a child/workflow conversation UUID distinct from root. */
+export function isChildToolCallId(
+  toolCallId: string | undefined,
+  rootNativeId: string,
+): boolean {
+  if (!toolCallId || !rootNativeId) return false
+  const match = childToolCallIdPattern.exec(toolCallId)
+  return match !== null && match[1].toLowerCase() !== rootNativeId.toLowerCase()
+}
+
 type Open = Extract<ProviderInput, { type: 'session.open' }>
 type Prompt = Extract<ProviderInput, { type: 'session.prompt' }>
 type PermissionResponseInput = Extract<
@@ -478,7 +491,13 @@ export class SessionManager {
           input.response.behavior,
           input.response.selectedActionId,
         )
-        if (!option || option.kind.startsWith('reject')) {
+        if (
+          (!option || option.kind.startsWith('reject')) &&
+          !isChildToolCallId(
+            permission.request.toolCall.toolCallId,
+            session.state.nativeId,
+          )
+        ) {
           session.state.deniedToolCallIds.add(
             permission.request.toolCall.toolCallId,
           )
@@ -928,6 +947,14 @@ async function createSession(
         timeline.boundary()
         return
       }
+      // 1.5.16+ forwards child/workflow tool updates on the root session prefixed
+      // with `<childConvUUID>:<origCallId>`; SubagentRegistry Brain watchers render children.
+      if (
+        (u.sessionUpdate === 'tool_call' ||
+          u.sessionUpdate === 'tool_call_update') &&
+        isChildToolCallId(u.toolCallId, state.nativeId)
+      )
+        return
       if (
         !state.loading &&
         state.turn &&
@@ -1027,7 +1054,9 @@ async function createSession(
     permissions.clear()
     for (const [permissionId, p] of entries) {
       if (p.type === 'acp') {
-        state.deniedToolCallIds.add(p.request.toolCall.toolCallId)
+        if (!isChildToolCallId(p.request.toolCall.toolCallId, state.nativeId)) {
+          state.deniedToolCallIds.add(p.request.toolCall.toolCallId)
+        }
         p.resolve({ outcome: { outcome: 'cancelled' } })
       } else {
         p.resolve(null)
@@ -1085,16 +1114,19 @@ async function createSession(
         },
       )
       if (!response) return { action: 'cancel' }
-      if (state.inSettle && response.behavior === 'deny')
-        state.wakeupQuestionDeclined = true
-      state.handledElicitations.push({
-        questions,
-        callId:
-          typeof params.toolCallId === 'string' ? params.toolCallId : undefined,
-        answerText: formatQuestionAnswersText(questions, response) || null,
-        wokeUp: state.inSettle,
-        declined: response.behavior === 'deny',
-      })
+      const callId =
+        typeof params.toolCallId === 'string' ? params.toolCallId : undefined
+      if (!isChildToolCallId(callId, state.nativeId)) {
+        if (state.inSettle && response.behavior === 'deny')
+          state.wakeupQuestionDeclined = true
+        state.handledElicitations.push({
+          questions,
+          callId,
+          answerText: formatQuestionAnswersText(questions, response) || null,
+          wokeUp: state.inSettle,
+          declined: response.behavior === 'deny',
+        })
+      }
       return buildElicitationResponse(questions, response)
     },
     requestPermission: (request: RequestPermissionRequest) => {
@@ -1123,7 +1155,11 @@ async function createSession(
       )
       if (kind !== 'question' && (state.metadata.fullAccess || preapproved)) {
         const allow = pickPermissionOption(request.options, 'allow')
-        if (!allow) state.deniedToolCallIds.add(request.toolCall.toolCallId)
+        if (
+          !allow &&
+          !isChildToolCallId(request.toolCall.toolCallId, state.nativeId)
+        )
+          state.deniedToolCallIds.add(request.toolCall.toolCallId)
         return Promise.resolve({
           outcome: allow
             ? { outcome: 'selected' as const, optionId: allow.optionId }
