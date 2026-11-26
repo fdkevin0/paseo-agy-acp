@@ -27,6 +27,7 @@ import {
   setBounded,
 } from './common.ts'
 import {
+  closeDisposableSession,
   hasSkipPermissionsFlag,
   SharedControlRuntime,
   StandbyRuntimePool,
@@ -230,16 +231,7 @@ async function probeCatalog(
         }
       } finally {
         if (nativeId) {
-          let closeOk = false
-          try {
-            await transport.request(
-              transport.rpc.closeSession({ sessionId: nativeId }),
-              { timeoutMs: 1500, fatalOnTimeout: false },
-            )
-            closeOk = !transport.closed
-          } catch {
-            closeOk = false
-          }
+          const closeOk = await closeDisposableSession(transport, nativeId)
           let canCleanup = closeOk
           if (!closeOk || !lease.reusable) {
             canCleanup = await lease.retire().then(
@@ -288,14 +280,10 @@ async function listSessions(
                 .includes(input.query.toLowerCase()),
           )
           .map((s) => {
-            const raw = record(s)
             const meta = record(s._meta)
-            const description = [
-              raw.description,
-              raw.lastPromptPreview,
-              meta.description,
-              meta.lastPromptPreview,
-            ].find((v): v is string => typeof v === 'string' && v.length > 0)
+            const description = [meta.description, meta.lastPromptPreview].find(
+              (v): v is string => typeof v === 'string' && v.length > 0,
+            )
             return {
               persistence: {
                 version: 1,

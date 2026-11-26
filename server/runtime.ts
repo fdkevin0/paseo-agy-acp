@@ -1,13 +1,13 @@
 /** Shared ACP initialization, idle-reaped control runtime, and pre-warmed standby runtime pool. */
-import { createHash } from 'node:crypto'
 import { statSync } from 'node:fs'
 import { join } from 'node:path'
 import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk/unstable'
 import type { ProviderLaunch } from '@getpaseo/plugin/server/provider'
-import { PACKAGE_VERSION, mergeEnv } from './common.ts'
+import { PACKAGE_VERSION } from './common.ts'
 import {
   agyVersionDiagnostic,
   binaryFingerprint,
+  hashLaunchKey,
   isCwdIndependentLaunch,
   resolveHome,
 } from './preflight.ts'
@@ -18,7 +18,7 @@ export type InitializedAcp = Awaited<ReturnType<typeof initializeAcp>>
 
 export const SKIP_PERMISSIONS_FLAG = '--dangerously-skip-permissions'
 
-export interface ControlLease {
+interface ControlLease {
   readonly transport: ControlTransport
   readonly reusable: boolean
   retire(): Promise<void>
@@ -33,7 +33,7 @@ export interface IdleTimerScheduler {
   clearTimeout(handle: IdleTimerHandle): void
 }
 
-export interface SharedControlRuntimeOptions {
+interface SharedControlRuntimeOptions {
   launch?: ProviderLaunch
   connectAcp?: typeof connectAcp
   idleTimeoutMs?: number
@@ -41,7 +41,7 @@ export interface SharedControlRuntimeOptions {
   resolveFingerprint?: typeof binaryFingerprint
 }
 
-export interface StandbyRuntimePoolOptions {
+interface StandbyRuntimePoolOptions {
   launch?: ProviderLaunch
   connectAcp?: typeof connectAcp
   idleTimeoutMs?: number
@@ -104,20 +104,7 @@ export function standbyPoolKey(
   env: Readonly<Record<string, string>> = {},
   fingerprint?: string,
 ): string {
-  const merged = mergeEnv(launch?.env ?? process.env, env)
-  const sortedEnv = Object.entries(merged).sort(([a], [b]) =>
-    a < b ? -1 : a > b ? 1 : 0,
-  )
-  return createHash('sha256')
-    .update(
-      JSON.stringify([
-        launch?.command ?? 'agy',
-        launch?.args ?? ['acp'],
-        sortedEnv,
-        ...(fingerprint !== undefined ? [fingerprint] : []),
-      ]),
-    )
-    .digest('hex')
+  return hashLaunchKey(launch, env, fingerprint)
 }
 
 function isExistingDirectorySync(path: string): boolean {
@@ -179,10 +166,116 @@ export function createAttachableTransport(
   }
 }
 
-function abortError(signal: AbortSignal): Error {
-  return signal.reason instanceof Error
-    ? signal.reason
-    : new Error('Provider connection is closed')
+export function abortError(
+  signal: AbortSignal,
+  fallback = 'Provider connection is closed',
+): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error(fallback)
+}
+
+export async function raceAbort<T>(
+  promise: Promise<T>,
+  signal: AbortSignal,
+  fallback?: string,
+): Promise<T> {
+  if (signal.aborted) {
+    void promise.catch(() => undefined)
+    throw abortError(signal, fallback)
+  }
+  let onAbort!: () => void
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(abortError(signal, fallback))
+  })
+  signal.addEventListener('abort', onAbort, { once: true })
+  try {
+    const value = await Promise.race([promise, aborted])
+    if (signal.aborted) throw abortError(signal, fallback)
+    return value
+  } finally {
+    signal.removeEventListener('abort', onAbort)
+  }
+}
+
+/** Best-effort close of a never-prompted ACP session; returns whether the transport remained healthy. */
+export async function closeDisposableSession(
+  transport: ControlTransport,
+  nativeId: string,
+): Promise<boolean> {
+  try {
+    await transport.request(
+      transport.rpc.closeSession({ sessionId: nativeId }),
+      { timeoutMs: 1500, fatalOnTimeout: false },
+    )
+    return !transport.closed
+  } catch {
+    return false
+  }
+}
+
+/** Track live ACP transports, auto-removing each once stopped and draining all on close. */
+export class TransportTracker {
+  private readonly active = new Set<ControlTransport>()
+  private readonly watchedStops = new WeakSet<ControlTransport>()
+
+  track(transport: ControlTransport): void {
+    this.active.add(transport)
+    if (!this.watchedStops.has(transport)) {
+      this.watchedStops.add(transport)
+      void transport.stopped.then(
+        () => this.active.delete(transport),
+        () => this.active.delete(transport),
+      )
+    }
+  }
+
+  untrack(transport: ControlTransport): void {
+    this.active.delete(transport)
+  }
+
+  async closeOne(transport: ControlTransport): Promise<void> {
+    try {
+      await transport.close()
+    } finally {
+      this.active.delete(transport)
+    }
+  }
+
+  closeAll(): Promise<void> {
+    return Promise.all(
+      [...this.active].map((transport) =>
+        this.closeOne(transport).catch(() => undefined),
+      ),
+    ).then(() => undefined)
+  }
+}
+
+class IdleTimer {
+  private handle: IdleTimerHandle | undefined
+  private readonly scheduler: IdleTimerScheduler
+  private readonly timeoutMs: number
+
+  constructor(scheduler: IdleTimerScheduler, timeoutMs: number) {
+    this.scheduler = scheduler
+    this.timeoutMs = timeoutMs
+  }
+
+  cancel(): void {
+    if (this.handle !== undefined) {
+      this.scheduler.clearTimeout(this.handle)
+      this.handle = undefined
+    }
+  }
+
+  arm(onExpire: () => void): void {
+    if (!Number.isFinite(this.timeoutMs) || this.timeoutMs < 0) return
+    this.cancel()
+    const handle = this.scheduler.setTimeout(() => {
+      if (this.handle === handle) this.handle = undefined
+      onExpire()
+    }, this.timeoutMs)
+    handle.unref?.()
+    this.handle = handle
+  }
 }
 
 /** Run ACP `initialize` and reject runtimes below the minimum supported `agy` version. */
@@ -202,24 +295,9 @@ export async function initializeAcp(
       },
     }),
   )
-  let initialized: Awaited<typeof initPromise>
-  if (signal) {
-    void initPromise.catch(() => undefined)
-    if (signal.aborted) throw abortError(signal)
-    let onAbort!: () => void
-    const aborted = new Promise<never>((_, reject) => {
-      onAbort = () => reject(abortError(signal))
-    })
-    signal.addEventListener('abort', onAbort, { once: true })
-    try {
-      initialized = await Promise.race([initPromise, aborted])
-    } finally {
-      signal.removeEventListener('abort', onAbort)
-    }
-    if (signal.aborted) throw abortError(signal)
-  } else {
-    initialized = await initPromise
-  }
+  const initialized = signal
+    ? await raceAbort(initPromise, signal)
+    : await initPromise
   const diagnostic = agyVersionDiagnostic(initialized.agentInfo?.version)
   if (diagnostic) throw new Error(diagnostic)
   return initialized
@@ -230,7 +308,7 @@ interface SharedSlot {
   transport: ControlTransport
   ready: Promise<void>
   inFlight: number
-  idleTimer: IdleTimerHandle | undefined
+  readonly idleTimer: IdleTimer
   retired: boolean
 }
 
@@ -246,7 +324,7 @@ export class SharedControlRuntime {
   private readonly scheduler: IdleTimerScheduler
   private readonly resolveFingerprint: typeof binaryFingerprint
   private active: SharedSlot | undefined
-  private readonly transports = new Set<ControlTransport>()
+  private readonly transports = new TransportTracker()
   private serializedLane: Promise<void> = Promise.resolve()
   private closed = false
   private closeController = new AbortController()
@@ -283,11 +361,7 @@ export class SharedControlRuntime {
     this.closed = true
     this.closeController.abort(new Error('Provider connection is closed'))
     if (this.active) this.evict(this.active)
-    this.closing = Promise.all(
-      [...this.transports].map((transport) =>
-        this.closeTransport(transport).catch(() => undefined),
-      ),
-    ).then(() => undefined)
+    this.closing = this.transports.closeAll()
     return this.closing
   }
 
@@ -300,54 +374,25 @@ export class SharedControlRuntime {
     return result
   }
 
-  private trackTransport(transport: ControlTransport) {
-    this.transports.add(transport)
-    void transport.stopped.then(
-      () => this.transports.delete(transport),
-      () => this.transports.delete(transport),
-    )
-  }
-
-  private async closeTransport(transport: ControlTransport): Promise<void> {
-    try {
-      await transport.close()
-    } finally {
-      this.transports.delete(transport)
-    }
-  }
-
-  private cancelIdleTimer(slot: SharedSlot) {
-    if (slot.idleTimer !== undefined) {
-      this.scheduler.clearTimeout(slot.idleTimer)
-      slot.idleTimer = undefined
-    }
-  }
-
   private armIdleTimer(slot: SharedSlot) {
     if (
       this.closed ||
       slot.retired ||
       this.active !== slot ||
       slot.inFlight > 0 ||
-      slot.transport.closed ||
-      !Number.isFinite(this.idleTimeoutMs) ||
-      this.idleTimeoutMs < 0
+      slot.transport.closed
     )
       return
-    this.cancelIdleTimer(slot)
-    const timer = this.scheduler.setTimeout(() => {
-      if (slot.idleTimer === timer) slot.idleTimer = undefined
+    slot.idleTimer.arm(() => {
       if (slot.inFlight > 0 || slot.retired) return
       this.evict(slot)
-      void this.closeTransport(slot.transport).catch(() => undefined)
-    }, this.idleTimeoutMs)
-    timer.unref?.()
-    slot.idleTimer = timer
+      void this.transports.closeOne(slot.transport).catch(() => undefined)
+    })
   }
 
   private evict(slot: SharedSlot) {
     slot.retired = true
-    this.cancelIdleTimer(slot)
+    slot.idleTimer.cancel()
     if (this.active === slot) this.active = undefined
   }
 
@@ -365,7 +410,7 @@ export class SharedControlRuntime {
       (error) => {
         exitError = error
         if (slot) this.evict(slot)
-        void this.closeTransport(transport).catch(() => undefined)
+        void this.transports.closeOne(transport).catch(() => undefined)
       },
     )
     slot = {
@@ -373,10 +418,10 @@ export class SharedControlRuntime {
       transport,
       ready: undefined as unknown as Promise<void>,
       inFlight: 0,
-      idleTimer: undefined,
+      idleTimer: new IdleTimer(this.scheduler, this.idleTimeoutMs),
       retired: false,
     }
-    this.trackTransport(transport)
+    this.transports.track(transport)
     const activeSlot = slot
     activeSlot.ready = (async () => {
       try {
@@ -388,7 +433,7 @@ export class SharedControlRuntime {
           )
       } catch (error) {
         this.evict(activeSlot)
-        await this.closeTransport(transport).catch(() => undefined)
+        await this.transports.closeOne(transport).catch(() => undefined)
         throw error
       }
     })()
@@ -413,7 +458,7 @@ export class SharedControlRuntime {
       ) {
         this.evict(slot)
         if (slot.inFlight === 0) {
-          void this.closeTransport(slot.transport).catch(() => undefined)
+          void this.transports.closeOne(slot.transport).catch(() => undefined)
         }
         slot = undefined
       }
@@ -421,7 +466,7 @@ export class SharedControlRuntime {
         slot = this.startShared(spawnCwd, fingerprint)
         this.active = slot
       }
-      this.cancelIdleTimer(slot)
+      slot.idleTimer.cancel()
       slot.inFlight++
       try {
         await slot.ready
@@ -436,7 +481,7 @@ export class SharedControlRuntime {
       if (slot.retired || slot.transport.closed) {
         slot.inFlight--
         if (slot.inFlight === 0 && slot.retired) {
-          void this.closeTransport(slot.transport).catch(() => undefined)
+          void this.transports.closeOne(slot.transport).catch(() => undefined)
         }
         if (this.active === slot) this.evict(slot)
         continue
@@ -455,7 +500,7 @@ export class SharedControlRuntime {
       reusable: true,
       retire: () => {
         this.evict(slot)
-        return this.closeTransport(slot.transport)
+        return this.transports.closeOne(slot.transport)
       },
     }
     try {
@@ -464,7 +509,7 @@ export class SharedControlRuntime {
       slot.inFlight--
       if (slot.inFlight === 0) {
         if (slot.retired) {
-          void this.closeTransport(slot.transport).catch(() => undefined)
+          void this.transports.closeOne(slot.transport).catch(() => undefined)
         } else {
           this.armIdleTimer(slot)
         }
@@ -483,18 +528,18 @@ export class SharedControlRuntime {
       CONTROL_CLIENT,
       () => {},
     )
-    this.trackTransport(transport)
+    this.transports.track(transport)
     try {
       await initializeAcp(transport, this.closeController.signal)
       if (this.closed) throw new Error('Provider connection is closed')
       const lease: ControlLease = {
         transport,
         reusable: false,
-        retire: () => this.closeTransport(transport),
+        retire: () => this.transports.closeOne(transport),
       }
       return await fn(lease)
     } finally {
-      await this.closeTransport(transport).catch(() => undefined)
+      await this.transports.closeOne(transport).catch(() => undefined)
     }
   }
 }
@@ -504,7 +549,7 @@ interface StandbySlot {
   readonly baseKey: string
   readonly transport: ControlTransport
   ready: Promise<AttachableRuntime>
-  idleTimer: IdleTimerHandle | undefined
+  readonly idleTimer: IdleTimer
   retired: boolean
   exited: boolean
   exitError: Error | undefined
@@ -525,8 +570,7 @@ export class StandbyRuntimePool {
   private readonly resolveFingerprint: typeof binaryFingerprint
   private readonly slots = new Map<string, StandbySlot>()
   private readonly warming = new Map<string, Promise<string | undefined>>()
-  private readonly transports = new Set<ControlTransport>()
-  private readonly watchedStops = new WeakSet<ControlTransport>()
+  private readonly transports = new TransportTracker()
   private closed = false
   private closeController = new AbortController()
   private closing: Promise<void> | undefined
@@ -568,9 +612,6 @@ export class StandbyRuntimePool {
         const fingerprint = await this.resolveFingerprint(launch, {
           env: sessionEnv,
         }).catch(() => undefined)
-        if (this.warming.get(baseKey) === pending) {
-          this.warming.delete(baseKey)
-        }
         if (this.closed || this.maxSlots <= 0) return fingerprint
         const key = standbyPoolKey(launch, sessionEnv, fingerprint)
         this.evictStaleSlots(baseKey, key)
@@ -599,16 +640,16 @@ export class StandbyRuntimePool {
               slot.exitError = error
               this.evictSlot(slot)
             }
-            void this.closeTransport(transport).catch(() => undefined)
+            void this.transports.closeOne(transport).catch(() => undefined)
           },
         )
-        this.trackTransport(transport)
+        this.transports.track(transport)
         slot = {
           key,
           baseKey,
           transport,
           ready: undefined as unknown as Promise<AttachableRuntime>,
-          idleTimer: undefined,
+          idleTimer: new IdleTimer(this.scheduler, this.idleTimeoutMs),
           retired: false,
           exited: false,
           exitError: undefined,
@@ -661,7 +702,7 @@ export class StandbyRuntimePool {
             return runtime
           } catch (error) {
             this.evictSlot(slot)
-            await this.closeTransport(transport).catch(() => undefined)
+            await this.transports.closeOne(transport).catch(() => undefined)
             throw error
           }
         })()
@@ -702,16 +743,16 @@ export class StandbyRuntimePool {
     if (!slot) return undefined
     slot.claimed = true
     this.slots.delete(key)
-    this.cancelIdleTimer(slot)
+    slot.idleTimer.cancel()
     if (slot.retired || slot.exited || slot.transport.closed) {
-      await this.closeTransport(slot.transport).catch(() => undefined)
+      await this.transports.closeOne(slot.transport).catch(() => undefined)
       return undefined
     }
     let runtime: AttachableRuntime
     try {
       runtime = await slot.ready
     } catch {
-      await this.closeTransport(slot.transport).catch(() => undefined)
+      await this.transports.closeOne(slot.transport).catch(() => undefined)
       return undefined
     }
     if (
@@ -720,10 +761,10 @@ export class StandbyRuntimePool {
       slot.exited ||
       runtime.transport.closed
     ) {
-      await this.closeTransport(runtime.transport).catch(() => undefined)
+      await this.transports.closeOne(runtime.transport).catch(() => undefined)
       return undefined
     }
-    this.transports.delete(runtime.transport)
+    this.transports.untrack(runtime.transport)
     return runtime
   }
 
@@ -769,7 +810,7 @@ export class StandbyRuntimePool {
       baseKey,
       transport: runtime.transport,
       ready: Promise.resolve(runtime),
-      idleTimer: undefined,
+      idleTimer: new IdleTimer(this.scheduler, this.idleTimeoutMs),
       retired: false,
       exited: false,
       exitError: undefined,
@@ -779,9 +820,9 @@ export class StandbyRuntimePool {
       slot.exited = true
       slot.exitError = error
       this.evictSlot(slot)
-      void this.closeTransport(runtime.transport).catch(() => undefined)
+      void this.transports.closeOne(runtime.transport).catch(() => undefined)
     })
-    this.trackTransport(runtime.transport)
+    this.transports.track(runtime.transport)
     this.slots.set(key, slot)
     this.armIdleTimer(slot)
     return true
@@ -795,38 +836,8 @@ export class StandbyRuntimePool {
     )
     for (const slot of [...this.slots.values()]) this.evictSlot(slot)
     this.slots.clear()
-    this.closing = Promise.all(
-      [...this.transports].map((transport) =>
-        this.closeTransport(transport).catch(() => undefined),
-      ),
-    ).then(() => undefined)
+    this.closing = this.transports.closeAll()
     return this.closing
-  }
-
-  private trackTransport(transport: ControlTransport) {
-    this.transports.add(transport)
-    if (!this.watchedStops.has(transport)) {
-      this.watchedStops.add(transport)
-      void transport.stopped.then(
-        () => this.transports.delete(transport),
-        () => this.transports.delete(transport),
-      )
-    }
-  }
-
-  private async closeTransport(transport: ControlTransport): Promise<void> {
-    try {
-      await transport.close()
-    } finally {
-      this.transports.delete(transport)
-    }
-  }
-
-  private cancelIdleTimer(slot: StandbySlot) {
-    if (slot.idleTimer !== undefined) {
-      this.scheduler.clearTimeout(slot.idleTimer)
-      slot.idleTimer = undefined
-    }
   }
 
   private armIdleTimer(slot: StandbySlot) {
@@ -836,25 +847,19 @@ export class StandbyRuntimePool {
       slot.exited ||
       slot.claimed ||
       this.slots.get(slot.key) !== slot ||
-      slot.transport.closed ||
-      !Number.isFinite(this.idleTimeoutMs) ||
-      this.idleTimeoutMs < 0
+      slot.transport.closed
     )
       return
-    this.cancelIdleTimer(slot)
-    const timer = this.scheduler.setTimeout(() => {
-      if (slot.idleTimer === timer) slot.idleTimer = undefined
+    slot.idleTimer.arm(() => {
       if (slot.claimed || slot.retired) return
       this.evictSlot(slot)
-      void this.closeTransport(slot.transport).catch(() => undefined)
-    }, this.idleTimeoutMs)
-    timer.unref?.()
-    slot.idleTimer = timer
+      void this.transports.closeOne(slot.transport).catch(() => undefined)
+    })
   }
 
   private evictSlot(slot: StandbySlot) {
     slot.retired = true
-    this.cancelIdleTimer(slot)
+    slot.idleTimer.cancel()
     if (this.slots.get(slot.key) === slot) this.slots.delete(slot.key)
   }
 
@@ -862,7 +867,7 @@ export class StandbyRuntimePool {
     for (const slot of [...this.slots.values()]) {
       if (slot.baseKey === baseKey && slot.key !== currentKey) {
         this.evictSlot(slot)
-        void this.closeTransport(slot.transport).catch(() => undefined)
+        void this.transports.closeOne(slot.transport).catch(() => undefined)
       }
     }
   }
@@ -872,7 +877,7 @@ export class StandbyRuntimePool {
       const oldest = this.slots.values().next().value
       if (!oldest) break
       this.evictSlot(oldest)
-      void this.closeTransport(oldest.transport).catch(() => undefined)
+      void this.transports.closeOne(oldest.transport).catch(() => undefined)
     }
   }
 }

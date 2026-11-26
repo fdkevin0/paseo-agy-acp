@@ -123,6 +123,11 @@ const ACP_REQUEST_TIMEOUT_MS = 30_000
 const ACP_REQUEST_MAX_TIMEOUT_MS = 5 * 60_000
 const STDERR_DRAIN_MS = 200
 
+const tierSchema = z.object({
+  id: z.string().optional(),
+  name: z.string().optional(),
+})
+
 export type AcpClient = {
   sessionUpdate: (params: SessionNotification) => Promise<void>
   requestPermission: (
@@ -212,10 +217,6 @@ export function connectAcp(
       fail(formatExitError('ACP process exited'))
     })
   })
-  const tierSchema = z.object({
-    id: z.string().optional(),
-    name: z.string().optional(),
-  })
   let tier: z.infer<typeof tierSchema> | undefined
   let models: SessionMetadata['models']
   const wireReadListeners = new Set<() => void>()
@@ -245,11 +246,10 @@ export function connectAcp(
           'id' in message
         ) {
           const id = message.id
-          void (
+          void (async () =>
             stopping || !client.requestElicitation
-              ? Promise.resolve({ action: 'cancel' })
-              : client.requestElicitation(record(message.params))
-          )
+              ? { action: 'cancel' }
+              : await client.requestElicitation(record(message.params)))()
             .catch(() => ({ action: 'cancel' }))
             .then((result) =>
               writer.write({

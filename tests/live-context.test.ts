@@ -274,7 +274,7 @@ async function harness(
     })
   }
   const read = async () => {
-    const observation = session.state.observation
+    const observation = session.state.activeTurn?.observation
     assert.ok(observation)
     await observation.poll()
     await observation.poll()
@@ -393,7 +393,9 @@ test(
       questions: [{ question: 'same question', options: ['A', 'B'] }],
     }
     const questions = normalizeAskQuestionInput(args)
-    h.session.state.handledElicitations.push({
+    const activeTurn = h.session.state.activeTurn
+    assert.ok(activeTurn)
+    activeTurn.handledElicitations.push({
       questions,
       answerText: 'A',
       wokeUp: false,
@@ -415,7 +417,7 @@ test(
       model(5, 20, ''),
     ])
     await h.read()
-    assert.equal(h.session.state.handledElicitations.length, 1)
+    assert.equal(activeTurn.handledElicitations.length, 1)
     assert.equal(
       h.events.some(
         (event) =>
@@ -423,7 +425,8 @@ test(
       ),
       false,
     )
-    h.session.state.turnToolCallIds.push('native-command', 'native-question')
+    activeTurn.toolCallIds.add('native-command')
+    activeTurn.toolCallIds.add('native-question')
     h.session.timeline.update({
       sessionUpdate: 'tool_call',
       toolCallId: 'native-command',
@@ -447,7 +450,8 @@ test(
       tools.some((item) => item.callId.startsWith('tool-')),
       false,
     )
-    assert.equal(h.session.state.handledElicitations.length, 0)
+    assert.equal(activeTurn.handledElicitations.length, 0)
+    assert.equal(h.session.state.activeTurn, null)
     assert.equal(
       h.events.some((event) => event.type === 'session.permission'),
       false,
@@ -878,7 +882,8 @@ async function recordedQuestionWithReaderFault(t: TestContext) {
     createTranscriptReader: () => reader,
     observationPollIntervalMs: 60_000,
   })
-  const obs = setup.h.session.state.observation as TrackingObservation
+  const obs = setup.h.session.state.activeTurn
+    ?.observation as TrackingObservation
   await obs.attached.promise
   await setup.h.read()
   const error = Object.assign(
@@ -1655,7 +1660,9 @@ test(
       questions: [{ question: 'Deploy target?', options: ['Staging', 'Prod'] }],
     }
     const held = await h.hold()
-    h.session.state.turnToolCallIds.push('acp-ask', 'acp-exit', 'acp-cmd')
+    h.session.state.activeTurn!.toolCallIds.add('acp-ask')
+    h.session.state.activeTurn!.toolCallIds.add('acp-exit')
+    h.session.state.activeTurn!.toolCallIds.add('acp-cmd')
     h.session.timeline.update({
       sessionUpdate: 'tool_call',
       toolCallId: 'acp-ask',

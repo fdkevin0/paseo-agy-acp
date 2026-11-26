@@ -18,7 +18,7 @@ export interface NormalizedQuestion {
   allowOther: boolean
 }
 
-export type QuestionResponse = {
+type QuestionResponse = {
   behavior: 'allow' | 'deny'
   updatedInput?: Record<string, unknown>
 }
