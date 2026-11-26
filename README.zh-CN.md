@@ -2,7 +2,7 @@
 
 [English](README.md) · 简体中文
 
-通过原生 `agy` Agent Client Protocol (ACP) 在 [Paseo](https://paseo.sh) 中使用 Antigravity。支持从 Paseo 桌面端或移动端打开与恢复会话、审批工具权限、切换模型及查看上下文与订阅配额用量。
+通过原生 `agy` Agent Client Protocol (ACP) 在 [Paseo](https://paseo.sh) 中使用 Antigravity。支持从 Paseo 桌面端或移动端打开与恢复会话、审批工具权限、切换模型，以及查看上下文占用与订阅配额用量。
 
 插件 ID 为 `agy-acp`；Provider ID 为 `agy`，显示名称为 **Antigravity (ACP)**。
 
@@ -10,25 +10,18 @@
 
 - Paseo **0.15.0 或更高版本**，且已启用插件功能。
 - daemon 主机已安装 Node.js **22.18 或更高版本** 及 npm。
-- daemon 主机已安装并完成登录的 Antigravity CLI (`agy`) **1.5.16 或更高版本**。使用本插件前，请先在终端运行 `agy` 完成账号登录。
+- daemon 主机已安装并完成登录的 Antigravity CLI (`agy`) **1.5.16 或更高版本**（使用前请先在终端运行 `agy` 完成登录）。
 
 ## 安装
 
-从 GitHub 安装：
-
 ```sh
+# 从 GitHub 安装
 paseo plugin install git:fdkevin0/paseo-agy-acp
-```
 
-从 npm 安装：
-
-```sh
+# 从 npm 安装
 paseo plugin install npm:@fdkevin/paseo-agy-acp
-```
 
-从本地克隆安装：
-
-```sh
+# 从本地克隆安装
 git clone https://github.com/fdkevin0/paseo-agy-acp.git
 paseo plugin install ./paseo-agy-acp
 ```
@@ -43,11 +36,7 @@ paseo run --provider agy "Explain this repository"
 
 在 Paseo 中创建 Agent 并选择 **Antigravity (ACP)**，即可使用由 `agy` 提供的模型、模式、思考等级与原生斜杠命令，或通过会话导入功能恢复已有的原生会话。
 
-可在 Composer 上下文弹窗中查看上下文占用与订阅配额，或通过 CLI 查询账号配额：
-
-```sh
-paseo usage ls --json
-```
+可在 Composer 上下文弹窗中查看上下文占用与订阅配额，或通过 CLI 运行 `paseo usage ls --json` 查询账号配额。
 
 插件管理命令：
 
@@ -76,25 +65,28 @@ paseo usage ls --json
 
 ## 支持能力
 
-| 能力     | 行为说明                                                                                                                                            |
-| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 会话     | 创建、列出、导入并恢复原生会话。                                                                                                                    |
-| 提示词   | 支持文本、图片、斜杠命令与附件上下文。                                                                                                              |
-| 配置     | 原生模型、模式（`default`、`agy` 提供时的 `auto`、`accept-edits`、`plan`）与 **Full Access** 全权限模式、按模型区分的思考等级选项及附加系统提示词。 |
-| 权限审批 | 原生审批选项（展示工具参数与详情卡片）、MCP `toolPolicy` 预批准，或 **Full Access** 模式下的免确认自动放行。                                        |
-| 时间线   | 流式回复、推理过程、执行计划与丰富工具卡片。                                                                                                        |
-| 上下文   | Token 计数、上下文窗口占用及已报告的美元费用。                                                                                                      |
-| 订阅配额 | Gemini 与 Claude/GPT 模型组的 5 小时及每周配额窗口。                                                                                                |
-| 子 Agent | 原生多层级子会话链接与只读 Brain 日志时间线卡片。                                                                                                   |
+| 能力     | 行为说明                                                                                                                            |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| 会话     | 创建、列出、导入并恢复原生会话。                                                                                                    |
+| 提示词   | 支持文本、图片、斜杠命令与附件上下文。                                                                                              |
+| 配置     | 原生模型、模式（`default`、`agy` 提供时的 `auto`、`accept-edits`、`plan`）与 **Full Access** 全权限模式、思考等级与附加系统提示词。 |
+| 权限审批 | 原生审批卡片（展示工具参数与详情）、MCP `toolPolicy` 预批准，或 **Full Access** 模式下的免确认自动放行。                            |
+| 时间线   | 流式回复、推理过程、执行计划与丰富工具卡片。                                                                                        |
+| 上下文   | Token 计数、上下文窗口占用及已报告的美元费用。                                                                                      |
+| 订阅配额 | Gemini 与 Claude/GPT 模型组的 5 小时及每周配额窗口。                                                                                |
+| 子 Agent | 原生多层级子会话链接与只读 Brain 日志时间线卡片。                                                                                   |
 
-MCP 卡片将可识别的调用显示为 `server.tool`，精确预批准使用同一身份解析，并保留原始参数。目前尚未验证 AGY 的结果图片提取。详见 [MCP 行为与限制](docs/reference.md#attachments-and-tool-cards)。
+## 主要限制
 
-暂不支持运行中追加指令（steering）、回退（rewind）、归档操作、结构化输出或 Artifacts 面板。子会话卡片不提供独立的会话控制。前台阶段优先采用有效原生 `usage_update` 上下文通知；后续 Reactive Wakeup 模型快照可更新占用，并保留同模型已知的原生窗口上限。缺少可靠快照时保留已有上下文或保持未知，累计回合消耗单独统计。当前 `agy` 的 print 模式不接受用于配额查询的自定义 ACP 目录参数。详见[参考文档](docs/reference.md)。
+- **暂不支持的 Paseo 能力**：运行中追加指令（steering）、回退（rewind）、归档操作、结构化输出、Artifacts 面板以及独立的子会话控制均暂不支持。
+- **MCP 工具卡片**：可识别的调用显示为 `server.tool` 并使用精确 `toolPolicy` 预批准；未启用结果图片提取。详见 [MCP 身份与预批准](docs/reference.md#mcp-identity-and-preapprovals)。
+- **上下文与配额**：缺少可靠快照时，上下文占用保持不变或未知，累计回合 Token 消耗单独统计。当前 `agy` 的 print 模式不接受用于配额查询的自定义 ACP 目录参数。详见[上下文窗口占用](docs/reference.md#context-window-occupancy)与[订阅配额](docs/reference.md#subscription-quota)。
 
 ## 更多信息
 
-- [参考文档](docs/reference.md)：启动配置、工具映射、持久化、权限审批、上下文与配额行为说明。
-- [开发与发布](docs/development.md)：请求流程、源码结构、测试验证、打包与发布流程。
+- [参考文档](docs/reference.md)：启动配置、模式与权限、工具卡片、持久化、上下文与配额行为说明。
+- [开发与发布](docs/development.md)：开发环境、源码结构、测试验证、打包与发布流程。
+- [架构说明](docs/architecture.md)：面向贡献者的 ACP、Brain、SQLite 与运行时池内部设计。
 - [插件市场概览 (English)](OVERVIEW.md) · [插件市场概览 (简体中文)](OVERVIEW.zh-CN.md)
 
 ## 许可证
