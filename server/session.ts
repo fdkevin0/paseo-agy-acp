@@ -148,6 +148,14 @@ function sessionRuntimeExitedError(failureError?: Error): Error {
   )
 }
 
+function isUserCancelAbort(signal: AbortSignal | undefined): boolean {
+  return Boolean(
+    signal?.aborted &&
+    signal.reason instanceof Error &&
+    signal.reason.name === 'AbortError',
+  )
+}
+
 async function raceAbort<T>(
   promise: Promise<T>,
   signal: AbortSignal,
@@ -576,6 +584,7 @@ async function createSession(
     skipPermissions: config?.mode === FULL_ACCESS_MODE_ID,
     turnHadContextUsage: false,
     turnHadModelOutput: false,
+    turnSawPostRpcAcp: false,
     inSettle: false,
     handledElicitations: [] as Array<{
       questions: NormalizedQuestion[]
@@ -893,15 +902,14 @@ async function createSession(
     } else if (u.sessionUpdate === 'usage_update') {
       const next = contextUsage(u)
       if (!next) return
+      if (!state.loading && state.turn && !foreground)
+        state.turnSawPostRpcAcp = true
       const model = currentModelId(state.metadata)
       setBounded(nativeWindowSizes, model, u.size, 100)
       // agy writes server-issued max_context_tokens to SQLite before/as steps emit usage_update;
-      // refresh once per model so Turn 1 does not show the raw API cap, and skip once cached.
-      if (
-        !state.loading &&
-        state.nativeId &&
-        !compactionWindowSizes.has(model)
-      ) {
+      // readConversationCompactionWindow is O(1) stat-cached on .db/.db-wal, so refreshing on every
+      // live usage_update picks up mid-turn/TUI AGY_CLI_AUTO_COMPACT_OVERRIDE or Orchestrator switches.
+      if (!state.loading && state.nativeId) {
         await refreshCompactionWindow({ model }).catch(() => undefined)
         if (state.closing || state.failed) return
       }
@@ -920,6 +928,16 @@ async function createSession(
         timeline.boundary()
         return
       }
+      if (
+        !state.loading &&
+        state.turn &&
+        !foreground &&
+        (u.sessionUpdate === 'agent_message_chunk' ||
+          u.sessionUpdate === 'agent_thought_chunk' ||
+          u.sessionUpdate === 'tool_call' ||
+          u.sessionUpdate === 'tool_call_update')
+      )
+        state.turnSawPostRpcAcp = true
       const isNewToolCall =
         u.sessionUpdate === 'tool_call' &&
         !state.turnToolCallIds.includes(u.toolCallId)
@@ -958,7 +976,9 @@ async function createSession(
       )
         state.turnHadModelOutput = true
       // Timeline.update already tracks the ACP item.
-      const item = timeline.update(u, state.deniedToolCallIds)
+      const cancelFailed =
+        !state.failed && isUserCancelAbort(state.turnAbort?.signal)
+      const item = timeline.update(u, state.deniedToolCallIds, cancelFailed)
       if (item) {
         if (!(await subagents.prepareMessageItem(item))) return
         if (
@@ -1732,7 +1752,10 @@ async function createSession(
         if (controlActive > 0) return
         // Children stay registered when canceled so they are neither reopened nor left unclosed.
         const canceling = subagents.cancelRunning()
-        // Native session/cancel leaves background tasks alive; stop their owner when background work is active.
+        // agy 1.5.16+ session/cancel (ForceStopTree) uses a 5s CancelGrace (exceeding Paseo's 2s
+        // interrupt budget), can leave detached OS process groups on timeout, and leaves subagent
+        // metadata as SUBAGENT_STATE_ALIVE instead of writing SUBAGENT_STATE_KILLED; retire and
+        // reload the runtime (with a fresh RuntimeEpoch) when children or background work are active.
         const task = runControl(async (defer) => {
           const needsRelaunch = await raceTimeout(
             Promise.all([
@@ -2102,6 +2125,7 @@ async function promptSession(
   session.state.turnFinished = false
   session.state.turnHadContextUsage = false
   session.state.turnHadModelOutput = false
+  session.state.turnSawPostRpcAcp = false
   session.state.turnEstimatedTokens = undefined
   session.state.inSettle = false
   session.state.handledElicitations = []
@@ -2194,10 +2218,6 @@ async function promptSession(
     !session.state.silenced &&
     session.state.nativeId === nativeId &&
     session.transport === observationTransport
-  const isUserCancelAbort = () =>
-    turnAbort.signal.aborted &&
-    turnAbort.signal.reason instanceof Error &&
-    turnAbort.signal.reason.name === 'AbortError'
   const stopObservation = () => observation?.stop()
   turnAbort.signal.addEventListener('abort', stopObservation, { once: true })
   const waitPrompt = async () => {
@@ -2401,6 +2421,7 @@ async function promptSession(
             turnWakeupUsage = wakeup.wakeupUsage
           },
           foregroundAcp: [...session.state.turnForegroundAcp],
+          hasPostRpcAcp: () => session.state.turnSawPostRpcAcp,
           deniedToolCallIds: session.state.deniedToolCallIds,
           shouldUpdateTool: (item) =>
             session.timeline.isRunning(item.id) ||
@@ -2494,7 +2515,8 @@ async function promptSession(
     if (!session.state.closing && session.state.failed)
       throw sessionRuntimeExitedError(session.state.failureError)
     if (turnAbort.signal.aborted) {
-      if (!isUserCancelAbort()) turnAbort.signal.throwIfAborted()
+      if (!isUserCancelAbort(turnAbort.signal))
+        turnAbort.signal.throwIfAborted()
       // Stall or child failures cancel the runtime for cleanup without changing their terminal status.
       if (status !== 'failed') status = 'canceled'
     }
@@ -2521,7 +2543,9 @@ async function promptSession(
       restartError ??
       error
     pendingFinish =
-      !session.state.failed && !restartError && isUserCancelAbort()
+      !session.state.failed &&
+      !restartError &&
+      isUserCancelAbort(turnAbort.signal)
         ? { status: 'canceled' }
         : { status: 'failed', error: formatErrorMessage(failure) }
   } finally {
@@ -2539,6 +2563,7 @@ async function promptSession(
           return
         session.state.turnRunning = false
         session.state.inSettle = false
+        session.state.turnSawPostRpcAcp = false
         session.state.turnEstimatedTokens = undefined
         session.state.handledElicitations = []
         session.state.wakeupQuestionDeclined = false

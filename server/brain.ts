@@ -720,21 +720,28 @@ type ForegroundReconcilePhase =
 /**
  * Reconciles Brain transcript steps against ACP output observed during the foreground session/prompt RPC.
  *
- * Provenance (`agy` v1.5.7 `(*ACPServer).runPromptTurn`): high-priority inbox completions that arrive
- * before `session/prompt` returns are drained inside the same RPC, streamed via `sendStateStepUpdates`,
- * billed into `PromptResponse.usage`, and advance `seenStepCount`/`consumedStepUsage` so Turn N+1 never
- * replays them. Decoupling this state machine from `node.wokeUp` preserves `node.isWokenWorking()` stall
- * timeouts and unstreamed `SYSTEM_MESSAGE` background completions without re-emitting or double-billing
- * steps already covered by the foreground ACP stream.
+ * Provenance (`agy` 1.5.16+ `(*Server).promptTurn` / `outOfTurnCallbacks` / `sendStepUpdatesForGen`):
+ * non-daemon background tasks, subagents, non-daemon crons, and high-priority inbox continuations stay
+ * inside the open `session/prompt` RPC, stream via in-turn `sendStepUpdatesForGen` (`RecordStepUsage`),
+ * and sum into `PromptResponse.usage` while marking steps consumed. Out-of-turn wakeups (`IsDaemon: true`
+ * or external messages arriving after `session/prompt` returns) stream via `outOfTurnCallbacks`
+ * (`MarkStepUsageConsumed`, never `RecordStepUsage`). Decoupling this state machine from `node.wokeUp`
+ * preserves `node.isWokenWorking()` stall timeouts and unstreamed `SYSTEM_MESSAGE` background completions
+ * without re-emitting or double-billing steps already covered by the foreground ACP stream.
  */
 class ForegroundReconciler {
   private readonly foregroundAcp: readonly ForegroundAcpSegment[]
+  private readonly hasPostRpcAcp?: () => boolean
   private phase: ForegroundReconcilePhase = 'foreground'
   private cursor: ForegroundCursor = { index: 0, offset: 0 }
   private sawRetrySinceMatch = false
 
-  constructor(foregroundAcp: readonly ForegroundAcpSegment[]) {
+  constructor(
+    foregroundAcp: readonly ForegroundAcpSegment[],
+    hasPostRpcAcp?: () => boolean,
+  ) {
     this.foregroundAcp = foregroundAcp
+    this.hasPostRpcAcp = hasPostRpcAcp
   }
 
   get postRpc(): boolean {
@@ -791,7 +798,10 @@ class ForegroundReconciler {
     items: readonly ForegroundAcpSegment[],
   ): boolean {
     if (items.length === 0) {
-      return this.cursor.index < this.foregroundAcp.length
+      return (
+        this.cursor.index < this.foregroundAcp.length ||
+        (this.foregroundAcp.length > 0 && this.hasPostRpcAcp?.() === false)
+      )
     }
     let next: ForegroundCursor | undefined = this.cursor
     for (let i = 0; i < items.length && next; i++) {
@@ -831,6 +841,7 @@ export async function settleBrainTurn(
     pollIntervalMs = 200,
     acpToolCallIds = [],
     foregroundAcp = [],
+    hasPostRpcAcp,
     drainAcp,
     toolSnapshot,
     hasToolResult,
@@ -865,6 +876,8 @@ export async function settleBrainTurn(
     acpToolCallIds?: readonly string[]
     /** Ordered ACP output observed before session/prompt returned, used to detect in-RPC inbox continuations. */
     foregroundAcp?: readonly ForegroundAcpSegment[]
+    /** Whether post-RPC out-of-turn ACP notifications arrived after session/prompt resolved. */
+    hasPostRpcAcp?: () => boolean
     drainAcp?: () => Promise<void>
     toolSnapshot?: (id: string) => Readonly<ToolCall> | undefined
     hasToolResult?: (id: string) => boolean
@@ -906,7 +919,7 @@ export async function settleBrainTurn(
     minStepIndex,
     runtimeEpoch?.afterStepIndex ?? -1,
   )
-  const fgReconciler = new ForegroundReconciler(foregroundAcp)
+  const fgReconciler = new ForegroundReconciler(foregroundAcp, hasPostRpcAcp)
   const foregroundToolIds = foregroundAcp.flatMap((seg) =>
     seg.type === 'tool_call' ? [seg.callId] : [],
   )

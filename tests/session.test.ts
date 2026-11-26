@@ -4043,3 +4043,436 @@ test('promptSession classifies stopReason refusal and hidden SQLite step_type 17
   assert.notEqual(secondFailed.turnId, firstFailed.turnId)
   assert.match(secondFailed.error?.message ?? '', /new session/i)
 })
+
+test('fast-path session.interrupt maps SweepPendingToolCalls failed update to canceled while genuine failure stays failed', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-cancel-sweep-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const nativeId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+  const { events, emit, wait } = createEventCollector()
+  const env = isolatedEnv(home)
+  const launch = { command: 'agy', args: ['acp'], env }
+  let releaseCancel!: () => void
+  const cancelGate = new Promise<void>((resolve) => {
+    releaseCancel = resolve
+  })
+  let clientRef!: Parameters<
+    NonNullable<ConstructorParameters<typeof SessionManager>[0]['connectAcp']>
+  >[3]
+  const promptTurns = [
+    async () => {
+      await clientRef.sessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'call-swept',
+          title: 'run_command',
+          kind: 'execute',
+          status: 'in_progress',
+          rawInput: { CommandLine: 'long-task' },
+        },
+      })
+      await cancelGate
+      return { stopReason: 'cancelled' as const }
+    },
+    async () => {
+      await clientRef.sessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'call-real-fail',
+          title: 'run_command',
+          kind: 'execute',
+          status: 'in_progress',
+          rawInput: { CommandLine: 'exit 1' },
+        },
+      })
+      await clientRef.sessionUpdate({
+        sessionId: nativeId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'call-real-fail',
+          status: 'failed',
+          rawOutput: 'command failed',
+        },
+      })
+      return { stopReason: 'end_turn' as const }
+    },
+  ]
+  const manager = new SessionManager({
+    launch,
+    usage: new AgyUsageSource({ env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit,
+    commandWaitTimeoutMs: 50,
+    hasActiveBackgroundWork: async () => false,
+    connectAcp: (_l, _cwd, _e, client) => {
+      clientRef = client
+      const closed = new Promise<void>(() => {})
+      const rpc = {
+        closed,
+        initialize: async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
+          agentCapabilities: {
+            loadSession: true,
+            sessionCapabilities: { resume: {} },
+          },
+        }),
+        newSession: async () => {
+          void client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'available_commands_update',
+              availableCommands: [],
+            },
+          })
+          return { sessionId: nativeId, configOptions: [] }
+        },
+        closeSession: async () => ({}),
+        prompt: async () => {
+          const turn = promptTurns.shift()
+          assert.ok(turn)
+          return turn()
+        },
+        cancel: async () => {
+          await client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'call-swept',
+              status: 'failed',
+            },
+          })
+          releaseCancel()
+        },
+      } as unknown as ReturnType<
+        typeof import('../server/transport.ts').connectAcp
+      >['rpc']
+      return {
+        rpc,
+        exited: closed,
+        stopped: Promise.resolve(),
+        close: async () => {},
+        request: async <T>(op: Promise<T>) => op,
+        get closed() {
+          return false
+        },
+        get tier() {
+          return undefined
+        },
+        get models() {
+          return undefined
+        },
+      }
+    },
+  })
+  t.after(() => manager.close())
+  await manager.handle({
+    type: 'session.open',
+    requestId: 'open',
+    sessionId: 's',
+    history: 'skip',
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+
+  const canceledPrompt = manager.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId: 'm-cancel',
+      delivery: 'auto',
+      input: { type: 'message', content: [{ type: 'text', text: 'cancel' }] },
+    },
+  })
+  await wait(
+    (e) =>
+      e.type === 'timeline.item' &&
+      e.item.type === 'tool_call' &&
+      e.item.callId === 'call-swept' &&
+      e.item.status === 'running',
+  )
+  await manager.handle({
+    type: 'session.interrupt',
+    requestId: 'interrupt-1',
+    sessionId: 's',
+  })
+  await canceledPrompt
+
+  const sweptFinal = events.findLast(
+    (e) =>
+      e.type === 'timeline.item' &&
+      e.item.type === 'tool_call' &&
+      e.item.callId === 'call-swept',
+  )
+  assert.ok(
+    sweptFinal?.type === 'timeline.item' &&
+      sweptFinal.item.type === 'tool_call',
+  )
+  assert.equal(sweptFinal.item.status, 'canceled')
+  assert.equal(sweptFinal.item.error, null)
+
+  await manager.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId: 'm-fail',
+      delivery: 'auto',
+      input: { type: 'message', content: [{ type: 'text', text: 'fail' }] },
+    },
+  })
+  const realFinal = events.findLast(
+    (e) =>
+      e.type === 'timeline.item' &&
+      e.item.type === 'tool_call' &&
+      e.item.callId === 'call-real-fail',
+  )
+  assert.ok(
+    realFinal?.type === 'timeline.item' && realFinal.item.type === 'tool_call',
+  )
+  assert.equal(realFinal.item.status, 'failed')
+  assert.equal(realFinal.item.error, 'command failed')
+})
+
+test('1.5.16+ intra-RPC wakeup with silent trailing PLANNER_RESPONSE preserves PromptResponse.usage without double-counting', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-intra-rpc-silent-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const nativeId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+  const brainRoot = join(home, '.gemini/antigravity-cli/brain')
+  const taskId = `${nativeId}/task-1`
+  const events: ProviderEvent[] = []
+  const env = isolatedEnv(home)
+  const launch = { command: 'agy', args: ['acp'], env }
+  const manager = new SessionManager({
+    launch,
+    usage: new AgyUsageSource({ env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: (event) => events.push(event),
+    commandWaitTimeoutMs: 50,
+    connectAcp: (_l, _cwd, _e, client) => {
+      const closed = new Promise<void>(() => {})
+      const rpc = {
+        closed,
+        initialize: async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
+          agentCapabilities: { loadSession: true },
+        }),
+        newSession: async () => {
+          void client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'available_commands_update',
+              availableCommands: [],
+            },
+          })
+          return { sessionId: nativeId, configOptions: [] }
+        },
+        closeSession: async () => ({}),
+        prompt: async () => {
+          await client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'cmd-1',
+              title: 'run_command',
+              kind: 'execute',
+              status: 'in_progress',
+              rawInput: {
+                CommandLine: 'build',
+                NotificationTimeoutSeconds: 30,
+              },
+            },
+          })
+          await client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'Started build.' },
+            },
+          })
+          await client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'Still running.' },
+            },
+          })
+          await client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'read-1',
+              title: 'read_file',
+              kind: 'read',
+              status: 'completed',
+              rawInput: { Path: '/tmp/report.txt' },
+            },
+          })
+          await client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'usage_update',
+              used: 450,
+              size: 1_000_000,
+            },
+          })
+          await writeBrainTranscript(brainRoot, nativeId, [
+            { step_index: 1, type: 'USER_INPUT', content: 'run build' },
+            {
+              step_index: 2,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              tool_calls: [
+                {
+                  id: 'cmd-1',
+                  name: 'run_command',
+                  args: {
+                    CommandLine: 'build',
+                    NotificationTimeoutSeconds: 30,
+                  },
+                },
+              ],
+              input_tokens: 100,
+              output_tokens: 10,
+            },
+            {
+              step_index: 3,
+              type: 'GENERIC',
+              status: 'RUNNING',
+              content: `Tool is running as a background task with task id: ${taskId}\n`,
+            },
+            {
+              step_index: 4,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'Started build.',
+              input_tokens: 120,
+              output_tokens: 5,
+            },
+            {
+              step_index: 5,
+              type: 'SYSTEM_MESSAGE',
+              content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-26T00:00:00Z sender=${taskId} priority=MESSAGE_PRIORITY_HIGH content=Background command is still running after 30s: build\n</SYSTEM_MESSAGE>`,
+            },
+            {
+              step_index: 6,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'Still running.',
+              input_tokens: 140,
+              output_tokens: 5,
+            },
+            {
+              step_index: 7,
+              type: 'SYSTEM_MESSAGE',
+              content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-26T00:00:01Z sender=${taskId} priority=MESSAGE_PRIORITY_HIGH content=Task id "${taskId}" finished with result:\nok\n</SYSTEM_MESSAGE>`,
+            },
+            {
+              step_index: 8,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              tool_calls: [
+                {
+                  id: 'read-1',
+                  name: 'read_file',
+                  args: { Path: '/tmp/report.txt' },
+                },
+              ],
+              input_tokens: 160,
+              output_tokens: 8,
+            },
+            {
+              step_index: 9,
+              type: 'GENERIC',
+              status: 'DONE',
+              content: 'report body',
+            },
+            {
+              step_index: 10,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              input_tokens: 180,
+              output_tokens: 2,
+            },
+          ])
+          return {
+            stopReason: 'end_turn' as const,
+            usage: {
+              inputTokens: 700,
+              outputTokens: 30,
+              totalTokens: 730,
+            },
+          }
+        },
+        cancel: async () => {},
+      } as unknown as ReturnType<
+        typeof import('../server/transport.ts').connectAcp
+      >['rpc']
+      return {
+        rpc,
+        exited: closed,
+        stopped: Promise.resolve(),
+        close: async () => {},
+        request: async <T>(op: Promise<T>) => op,
+        get closed() {
+          return false
+        },
+        get tier() {
+          return undefined
+        },
+        get models() {
+          return undefined
+        },
+      }
+    },
+  })
+  t.after(() => manager.close())
+  await manager.handle({
+    type: 'session.open',
+    requestId: 'open',
+    sessionId: 's',
+    history: 'skip',
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+  await manager.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId: 'm-intra',
+      delivery: 'auto',
+      input: {
+        type: 'message',
+        content: [{ type: 'text', text: 'run build' }],
+      },
+    },
+  })
+  const finalUsage = events.findLast((e) => e.type === 'session.usage')
+  assert.ok(finalUsage?.type === 'session.usage')
+  assert.equal(finalUsage.usage.inputTokens, 700)
+  assert.equal(finalUsage.usage.outputTokens, 30)
+  assert.equal(finalUsage.usage.contextWindowUsedTokens, 450)
+  const recoveredRead = events.findLast(
+    (e) =>
+      e.type === 'timeline.item' &&
+      e.item.type === 'tool_call' &&
+      e.item.callId === 'read-1',
+  )
+  assert.ok(
+    recoveredRead?.type === 'timeline.item' &&
+      recoveredRead.item.type === 'tool_call' &&
+      recoveredRead.item.detail.type === 'read',
+  )
+  assert.equal(recoveredRead.item.detail.content, 'report body')
+})

@@ -66,7 +66,7 @@ export type InboxState = {
 }
 
 const restartNoticePattern =
-  /\bsender=system\b[^\n]*\scontent=\[Notice\] All your subagents and background tasks have been stopped/
+  /\bsender=system\b[^\n]*\scontent=\[Notice\] All your (?:subagents and )?background tasks have been stopped/
 
 // agy 1.5.7 cortex/planexecute handoff notices (Brain SYSTEM_MESSAGE rows carry no structured subtype).
 const PLAN_EXECUTE_NOTICE_PREFIXES = [

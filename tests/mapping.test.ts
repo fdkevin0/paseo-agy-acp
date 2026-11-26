@@ -1345,3 +1345,47 @@ test('currentModelId and currentNativeMode match configState without building fu
   assert.equal(currentNativeMode(fullAccessMeta), 'plan')
   assert.equal(configState(fullAccessMeta).mode, 'full-access')
 })
+
+test('Timeline.update maps failed tool updates to canceled only when cancelFailed is true', () => {
+  const timeline = new Timeline('sess-cancel')
+  timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'call-sweep',
+    title: 'run_command',
+    kind: 'execute',
+    status: 'in_progress',
+    rawInput: { CommandLine: 'sleep 30' },
+  })
+  const swept = timeline.update(
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'call-sweep',
+      status: 'failed',
+    },
+    undefined,
+    true,
+  )
+  assert.ok(swept?.type === 'tool_call')
+  assert.equal(swept.status, 'canceled')
+  assert.equal(swept.error, null)
+  assert.equal(timeline.isRunning(swept.id), false)
+
+  timeline.update({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'call-fail',
+    title: 'run_command',
+    kind: 'execute',
+    status: 'in_progress',
+    rawInput: { CommandLine: 'false' },
+  })
+  const failed = timeline.update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'call-fail',
+    status: 'failed',
+    rawOutput: 'exit status 1',
+  })
+  assert.ok(failed?.type === 'tool_call')
+  assert.equal(failed.status, 'failed')
+  assert.equal(failed.error, 'exit status 1')
+  assert.equal(timeline.isRunning(failed.id), false)
+})
