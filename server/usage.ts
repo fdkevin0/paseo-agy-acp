@@ -7,7 +7,7 @@ import {
   stat,
   type FileHandle,
 } from 'node:fs/promises'
-import { join, sep } from 'node:path'
+import { join } from 'node:path'
 import { z } from 'zod'
 import { spawnProcess, terminateProcess } from '@getpaseo/plugin/server'
 import type { ProviderLaunch } from '@getpaseo/plugin/server/provider'
@@ -25,6 +25,7 @@ import {
   definedProcessEnv,
   detachString,
   formatErrorMessage,
+  isContainedIn,
   mergeEnv,
   record,
   setBounded,
@@ -45,11 +46,6 @@ const MAX_USAGE_STDOUT_BYTES = 1024 * 1024
 const MAX_USAGE_STDERR_BYTES = 4096
 const AUTH_LOG_PATTERN =
   /(?:applyAuthResult:\s*email=|OAuth:\s*authenticated successfully as\s+)([^\s,]+)(?=[,\s])/g
-
-function isContainedIn(target: string, base: string): boolean {
-  const prefix = base === sep ? sep : base + sep
-  return target.startsWith(prefix)
-}
 
 function windowOrder(window: string): number {
   return window === '5h' ? 0 : window === 'weekly' ? 1 : 2
@@ -175,12 +171,12 @@ async function readChunkEmail(
   file: FileHandle,
   offset: number,
   length: number,
+  atEof: boolean,
 ): Promise<string | undefined> {
   const bytes = Buffer.alloc(length)
   const { bytesRead } = await file.read(bytes, 0, length, offset)
-  const matches = [
-    ...bytes.toString('utf8', 0, bytesRead).matchAll(AUTH_LOG_PATTERN),
-  ]
+  const chunk = `${bytes.toString('utf8', 0, bytesRead)}${atEof ? '\n' : ''}`
+  const matches = [...chunk.matchAll(AUTH_LOG_PATTERN)]
   const email = matches.at(-1)?.[1]
   return email === undefined ? undefined : detachString(email)
 }
@@ -262,10 +258,15 @@ export async function readLoggedEmail(
         const info = await file.stat()
         if (!info.isFile() || info.size <= 0) continue
         const tailLen = Math.min(info.size, LOG_CHUNK_SIZE)
-        const tailHit = await readChunkEmail(file, info.size - tailLen, tailLen)
+        const tailHit = await readChunkEmail(
+          file,
+          info.size - tailLen,
+          tailLen,
+          true,
+        )
         if (tailHit) return tailHit
         if (info.size > LOG_CHUNK_SIZE) {
-          const headHit = await readChunkEmail(file, 0, LOG_CHUNK_SIZE)
+          const headHit = await readChunkEmail(file, 0, LOG_CHUNK_SIZE, false)
           if (headHit) return headHit
         }
       } finally {
@@ -277,7 +278,7 @@ export async function readLoggedEmail(
   }
 }
 
-/** agy >=1.5 keeps credentials in the OS keychain; the token file is the legacy store. */
+/** agy prefers the OS keychain and falls back to this token file when keychain storage is unavailable. */
 async function hasTokenFile(dataDir: string): Promise<boolean> {
   try {
     if (!(await lstat(dataDir)).isDirectory()) return false
@@ -310,7 +311,8 @@ function usageArgs(args: readonly string[]): string[] {
     const arg = args[i]
     if (VALUE_FLAGS.has(arg)) {
       result.push(arg)
-      if (i + 1 < args.length) result.push(args[++i])
+      if (i + 1 < args.length && !args[i + 1].startsWith('-'))
+        result.push(args[++i])
       continue
     }
     if (!removedAcp && arg === 'acp') {
@@ -326,7 +328,7 @@ function usageArgs(args: readonly string[]): string[] {
 const NO_QUOTA_ERROR_PATTERN =
   /not available with a Gemini API key|no quota summary is available/i
 
-export class UsageCommandError extends Error {
+class UsageCommandError extends Error {
   readonly code: number | null
   readonly signal: NodeJS.Signals | null
   readonly stdout: string
@@ -351,9 +353,7 @@ export class UsageCommandError extends Error {
 }
 
 /** Extract a user-facing detail when `agy /usage` exits with code 2 because the account has no quota. */
-export function extractNoQuotaDetail(
-  error: UsageCommandError,
-): string | undefined {
+function extractNoQuotaDetail(error: UsageCommandError): string | undefined {
   if (error.code !== 2 || error.signal !== null) return undefined
   let detail: string | undefined
   const trimmedStdout = error.stdout.trim()
@@ -492,13 +492,13 @@ async function runUsageCommand(
   })
 }
 
-export interface AgyUsageOptions {
+interface AgyUsageOptions {
   env?: Readonly<Record<string, string>>
 }
 
 /** Share native launch/account observations with Paseo's subscription usage surface. */
 export class AgyUsageSource {
-  readonly tiers = new Map<string, string>()
+  private readonly tiers = new Map<string, string>()
   private readonly envOverride?: Readonly<Record<string, string>>
   private launches = new Map<
     string,
@@ -516,6 +516,15 @@ export class AgyUsageSource {
 
   private baseEnv(): Record<string, string> {
     return this.envOverride ? { ...this.envOverride } : definedProcessEnv()
+  }
+
+  tier(dir: string): string | undefined {
+    return this.tiers.get(dir)
+  }
+
+  rememberTier(dir: string, tier?: string): void {
+    if (tier === undefined) this.tiers.delete(dir)
+    else setBounded(this.tiers, dir, tier, ACCOUNT_CACHE_LIMIT)
   }
 
   remember(

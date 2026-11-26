@@ -1,23 +1,30 @@
 import { lstat, realpath } from 'node:fs/promises'
-import { dirname, join, sep } from 'node:path'
+import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { BrainEscapeError, isMissing, isRetryWarning } from './brain-io.ts'
-import { detachString, sessionIdPattern, setBounded } from './common.ts'
+import { BrainEscapeError, isRetryWarningMessage } from './brain-io.ts'
+import {
+  detachString,
+  isContainedIn,
+  isMissing,
+  sessionIdPattern,
+  setBounded,
+  truncateDetached,
+} from './common.ts'
 
-export type ConversationDbStat = {
+type ConversationDbStat = {
   dbPath: string
   dev: bigint
   ino: bigint
   fingerprint: string
 }
 
-export type CompactionWindowResult = {
+type CompactionWindowResult = {
   maxTokens?: number
   estimatedTokens?: number
   genIdx: number
 }
 
-export type ReadConversationCompactionWindowOptions = {
+type ReadConversationCompactionWindowOptions = {
   openDb?: (path: string) => DatabaseSync
 }
 
@@ -94,7 +101,7 @@ function readProtoVarintPath(
   return match
 }
 
-export async function resolveConversationDbStat(
+async function resolveConversationDbStat(
   brainRoot: string,
   nativeId: string,
 ): Promise<ConversationDbStat> {
@@ -104,8 +111,7 @@ export async function resolveConversationDbStat(
   if (convInfo.isSymbolicLink() || !convInfo.isDirectory())
     throw new BrainEscapeError()
   const convRoot = await realpath(convCandidate)
-  const appPrefix = appRoot === sep ? sep : appRoot + sep
-  if (!convRoot.startsWith(appPrefix)) throw new BrainEscapeError()
+  if (!isContainedIn(convRoot, appRoot)) throw new BrainEscapeError()
   const candidate = join(convRoot, `${nativeId}.db`)
   const info = await lstat(candidate, { bigint: true })
   if (info.isSymbolicLink() || !info.isFile()) throw new BrainEscapeError()
@@ -124,8 +130,7 @@ export async function resolveConversationDbStat(
     }
   }
   const resolved = await realpath(candidate)
-  const prefix = convRoot === sep ? sep : convRoot + sep
-  if (!resolved.startsWith(prefix)) throw new BrainEscapeError()
+  if (!isContainedIn(resolved, convRoot)) throw new BrainEscapeError()
   return {
     dbPath: resolved,
     dev: info.dev,
@@ -157,6 +162,19 @@ function defaultOpenDb(path: string): DatabaseSync {
   })
 }
 
+function withConversationDb<T>(
+  dbPath: string,
+  openDb: ((path: string) => DatabaseSync) | undefined,
+  fn: (db: DatabaseSync) => T,
+): T {
+  const db = (openDb ?? defaultOpenDb)(dbPath)
+  try {
+    return fn(db)
+  } finally {
+    db.close()
+  }
+}
+
 /** Read server-issued max_context_tokens and estimated_tokens_used from conversations/<nativeId>.db gen_metadata after minGenIdx. */
 export async function readConversationCompactionWindow(
   brainRoot: string,
@@ -178,53 +196,57 @@ export async function readConversationCompactionWindow(
     if (minGenIdx >= hit.result.genIdx) return { genIdx: minGenIdx }
   }
   let genIdx = minGenIdx
-  let db: DatabaseSync | undefined
   try {
-    const openDb = options?.openDb ?? defaultOpenDb
-    db = openDb(stat.dbPath)
-    const hasTable = db
-      .prepare(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gen_metadata'",
-      )
-      .get()
-    let maxTokens: number | undefined
-    let estimatedTokens: number | undefined
-    if (hasTable !== undefined) {
-      // Single snapshot-atomic query strictly ordered by idx DESC:
-      // - Prevents cross-query WAL snapshot splits between max(idx) and row data.
-      // - Avoids size-prioritized ordering that would skip the full latest row for stale older rows.
-      const stmt = db.prepare(
-        'SELECT idx, data FROM gen_metadata WHERE idx > ? ORDER BY idx DESC',
-      )
-      for (const row of stmt.iterate(minGenIdx) as Iterable<{
-        idx?: unknown
-        data?: unknown
-      }>) {
-        if (
-          typeof row.idx === 'number' &&
-          Number.isInteger(row.idx) &&
-          row.idx >= 0
-        ) {
-          genIdx = Math.max(genIdx, row.idx)
+    const result = withConversationDb(stat.dbPath, options?.openDb, (db) => {
+      const hasTable = db
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gen_metadata'",
+        )
+        .get()
+      let maxTokens: number | undefined
+      let estimatedTokens: number | undefined
+      if (hasTable !== undefined) {
+        // Single snapshot-atomic query strictly ordered by idx DESC:
+        // - Prevents cross-query WAL snapshot splits between max(idx) and row data.
+        // - Avoids size-prioritized ordering that would skip the full latest row for stale older rows.
+        const stmt = db.prepare(
+          'SELECT idx, data FROM gen_metadata WHERE idx > ? ORDER BY idx DESC',
+        )
+        for (const row of stmt.iterate(minGenIdx) as Iterable<{
+          idx?: unknown
+          data?: unknown
+        }>) {
+          if (
+            typeof row.idx === 'number' &&
+            Number.isInteger(row.idx) &&
+            row.idx >= 0
+          ) {
+            genIdx = Math.max(genIdx, row.idx)
+          }
+          if (!(row.data instanceof Uint8Array)) continue
+          if (maxTokens === undefined) {
+            maxTokens = readProtoVarintPath(
+              row.data,
+              GEN_MAX_CONTEXT_TOKENS_PATH,
+            )
+          }
+          if (estimatedTokens === undefined) {
+            estimatedTokens = readProtoVarintPath(
+              row.data,
+              GEN_ESTIMATED_TOKENS_PATH,
+            )
+          }
+          // Stop at the newest row with maxTokens so older estimatedTokens cannot leak,
+          // while allowing a newer estimated-only row to pair with the latest prior maxTokens.
+          if (maxTokens !== undefined) break
         }
-        if (!(row.data instanceof Uint8Array)) continue
-        if (maxTokens === undefined) {
-          maxTokens = readProtoVarintPath(row.data, GEN_MAX_CONTEXT_TOKENS_PATH)
-        }
-        if (estimatedTokens === undefined) {
-          estimatedTokens = readProtoVarintPath(
-            row.data,
-            GEN_ESTIMATED_TOKENS_PATH,
-          )
-        }
-        if (maxTokens !== undefined) break
       }
-    }
-    const result: CompactionWindowResult = {
-      ...(maxTokens !== undefined ? { maxTokens } : {}),
-      ...(estimatedTokens !== undefined ? { estimatedTokens } : {}),
-      genIdx,
-    }
+      return {
+        ...(maxTokens !== undefined ? { maxTokens } : {}),
+        ...(estimatedTokens !== undefined ? { estimatedTokens } : {}),
+        genIdx,
+      }
+    })
     setBounded(
       compactionCache,
       stat.dbPath,
@@ -234,22 +256,20 @@ export async function readConversationCompactionWindow(
     return result
   } catch {
     return { genIdx }
-  } finally {
-    db?.close()
   }
 }
 
-export interface StepErrorBaseline {
+interface StepErrorBaseline {
   readonly maxIdx: number
   readonly dev?: bigint
   readonly ino?: bigint
   readonly unreadable?: boolean
 }
 
-export type HiddenApiErrorKind =
+type HiddenApiErrorKind =
   'quota_exhausted' | 'invalid_thinking_signature' | 'api_error' | 'refusal'
 
-export interface HiddenApiError {
+interface HiddenApiError {
   readonly kind: HiddenApiErrorKind
   readonly message: string
   readonly retryAfterMs?: number
@@ -275,21 +295,26 @@ const QUOTA_RESET_DELAY_PATTERN =
 const GO_ERROR_PATTERN = /Error (\d{3}), Message: (.+?), Status: ([A-Z_]+)/s
 const AGY_ERROR_PATTERN = /(?<![A-Z_])([A-Z_]+) \(code (\d{3})\): (\P{Cc}+)/u
 
+const GO_UNIT_TO_MS: Readonly<Record<string, (value: number) => number>> = {
+  ns: (v) => v / 1_000_000,
+  µs: (v) => v / 1_000,
+  μs: (v) => v / 1_000,
+  ms: (v) => v,
+  s: (v) => v * 1_000,
+  m: (v) => v * 60_000,
+  h: (v) => v * 3_600_000,
+}
+
 /** Parse a nonnegative Go duration string (e.g. `1h2m3.5s`, `500µs`, `500μs`) into milliseconds. */
 export function parseGoDurationMs(raw: string): number | undefined {
   if (!GO_DURATION_PATTERN.test(raw)) return undefined
   let totalMs = 0
   for (const match of raw.matchAll(GO_DURATION_PART_PATTERN)) {
     const value = Number(match[1])
-    if (!Number.isFinite(value) || value < 0) return undefined
-    const unit = match[2]
-    if (unit === 'ns') totalMs += value / 1_000_000
-    else if (unit === 'µs' || unit === 'μs') totalMs += value / 1_000
-    else if (unit === 'ms') totalMs += value
-    else if (unit === 's') totalMs += value * 1_000
-    else if (unit === 'm') totalMs += value * 60_000
-    else if (unit === 'h') totalMs += value * 3_600_000
-    else return undefined
+    const convert = GO_UNIT_TO_MS[match[2]]
+    if (!Number.isFinite(value) || value < 0 || convert === undefined)
+      return undefined
+    totalMs += convert(value)
   }
   return Number.isFinite(totalMs) && totalMs >= 0 ? totalMs : undefined
 }
@@ -301,37 +326,13 @@ function sanitizePrintable(raw: string): string {
     .trim()
 }
 
-function capDetachedMessage(raw: string): string {
-  const chars = [...raw]
-  return detachString(
-    chars.length > MAX_ERROR_MESSAGE_LENGTH
-      ? `${chars.slice(0, MAX_ERROR_MESSAGE_LENGTH - 1).join('')}…`
-      : raw,
-  )
-}
-
 function isNonTerminalRetryPayload(raw: string): boolean {
   const trimmed = raw.trim()
-  if (
-    isRetryWarning({
-      type: 'ERROR_MESSAGE',
-      status: 'DONE',
-      content: trimmed,
-    })
-  ) {
-    return true
-  }
+  if (isRetryWarningMessage(trimmed)) return true
   const stripped = raw
     .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\uFFFD]+/g, '')
     .trim()
-  return (
-    stripped !== trimmed &&
-    isRetryWarning({
-      type: 'ERROR_MESSAGE',
-      status: 'DONE',
-      content: stripped,
-    })
-  )
+  return stripped !== trimmed && isRetryWarningMessage(stripped)
 }
 
 function parseStructuredApiError(text: string):
@@ -414,7 +415,7 @@ export function classifyStepError(input: {
         : 'Quota exhausted or rate limited.'
     return {
       kind: 'quota_exhausted',
-      message: capDetachedMessage(message),
+      message: truncateDetached(message, MAX_ERROR_MESSAGE_LENGTH),
       ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
       ...(resetAtMatch ? { resetAt: detachString(resetAtMatch) } : {}),
       ...(structured
@@ -433,7 +434,7 @@ export function classifyStepError(input: {
       : `${structured.statusName} (${structured.statusCode})`
     return {
       kind: 'api_error',
-      message: capDetachedMessage(summary),
+      message: truncateDetached(summary, MAX_ERROR_MESSAGE_LENGTH),
       statusCode: structured.statusCode,
       statusName: detachString(structured.statusName),
       reachedModel: input.reachedModel,
@@ -458,8 +459,9 @@ export function classifyStepError(input: {
   const summary = sanitizePrintable(text)
   return {
     kind: 'api_error',
-    message: capDetachedMessage(
+    message: truncateDetached(
       summary || 'Upstream API error recorded by agy',
+      MAX_ERROR_MESSAGE_LENGTH,
     ),
     reachedModel: input.reachedModel,
   }
@@ -484,32 +486,29 @@ export async function captureConversationStepBaseline(
   } catch (err) {
     return isMissing(err) ? { maxIdx: -1 } : { maxIdx: -1, unreadable: true }
   }
-  let db: DatabaseSync | undefined
   try {
-    const openDb = options?.openDb ?? defaultOpenDb
-    db = openDb(stat.dbPath)
-    const hasSteps = db
-      .prepare(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'steps'",
-      )
-      .get()
-    if (hasSteps === undefined) {
-      return { maxIdx: -1, dev: stat.dev, ino: stat.ino }
-    }
-    const row = db
-      .prepare('SELECT COALESCE(MAX(idx), -1) AS maxIdx FROM steps')
-      .get() as { maxIdx?: unknown } | undefined
-    const maxIdx =
-      typeof row?.maxIdx === 'number' &&
-      Number.isInteger(row.maxIdx) &&
-      row.maxIdx >= -1
-        ? row.maxIdx
-        : -1
-    return { maxIdx, dev: stat.dev, ino: stat.ino }
+    return withConversationDb(stat.dbPath, options?.openDb, (db) => {
+      const hasSteps = db
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'steps'",
+        )
+        .get()
+      if (hasSteps === undefined) {
+        return { maxIdx: -1, dev: stat.dev, ino: stat.ino }
+      }
+      const row = db
+        .prepare('SELECT COALESCE(MAX(idx), -1) AS maxIdx FROM steps')
+        .get() as { maxIdx?: unknown } | undefined
+      const maxIdx =
+        typeof row?.maxIdx === 'number' &&
+        Number.isInteger(row.maxIdx) &&
+        row.maxIdx >= -1
+          ? row.maxIdx
+          : -1
+      return { maxIdx, dev: stat.dev, ino: stat.ino }
+    })
   } catch {
     return { maxIdx: -1, dev: stat.dev, ino: stat.ino, unreadable: true }
-  } finally {
-    db?.close()
   }
 }
 
@@ -538,47 +537,48 @@ export async function readConversationStepError(
   ) {
     return fallback()
   }
-  let db: DatabaseSync | undefined
   try {
-    const openDb = options?.openDb ?? defaultOpenDb
-    db = openDb(stat.dbPath)
-    const columns = db.prepare('PRAGMA table_info(steps)').all() as Array<{
-      name?: unknown
-    }>
-    if (columns.length === 0) return fallback()
-    const hasErrorDetails = columns.some((col) => col.name === 'error_details')
-    const latest = db
-      .prepare(
-        hasErrorDetails
-          ? 'SELECT step_type AS type, substr(step_payload, 1, 16384) AS payload, substr(error_details, 1, 8192) AS errDetails FROM steps WHERE idx > ? ORDER BY idx DESC LIMIT 1'
-          : 'SELECT step_type AS type, substr(step_payload, 1, 16384) AS payload FROM steps WHERE idx > ? ORDER BY idx DESC LIMIT 1',
+    return withConversationDb(stat.dbPath, options?.openDb, (db) => {
+      const columns = db.prepare('PRAGMA table_info(steps)').all() as Array<{
+        name?: unknown
+      }>
+      if (columns.length === 0) return fallback()
+      const hasErrorDetails = columns.some(
+        (col) => col.name === 'error_details',
       )
-      .get(baseline.maxIdx) as
-      { type?: unknown; payload?: unknown; errDetails?: unknown } | undefined
-    const reachedModel =
-      db
-        .prepare('SELECT 1 FROM steps WHERE idx > ? AND step_type = 15 LIMIT 1')
-        .get(baseline.maxIdx) !== undefined
-    const stepType =
-      typeof latest?.type === 'number' && Number.isInteger(latest.type)
-        ? latest.type
-        : undefined
-    // Never feed untrusted user/assistant prose (`step_type !== 17`) into error classifiers.
-    const payloadPart = stepType === 17 ? decodeSqlText(latest?.payload) : ''
-    const errDetailsPart = decodeSqlText(latest?.errDetails)
-    const payloadText =
-      payloadPart && errDetailsPart
-        ? `${payloadPart}\n${errDetailsPart}`
-        : payloadPart || errDetailsPart || undefined
-    return classifyStepError({
-      stepType,
-      payloadText,
-      stopReason,
-      reachedModel,
+      const latest = db
+        .prepare(
+          hasErrorDetails
+            ? 'SELECT step_type AS type, substr(step_payload, 1, 16384) AS payload, substr(error_details, 1, 8192) AS errDetails FROM steps WHERE idx > ? ORDER BY idx DESC LIMIT 1'
+            : 'SELECT step_type AS type, substr(step_payload, 1, 16384) AS payload FROM steps WHERE idx > ? ORDER BY idx DESC LIMIT 1',
+        )
+        .get(baseline.maxIdx) as
+        { type?: unknown; payload?: unknown; errDetails?: unknown } | undefined
+      const reachedModel =
+        db
+          .prepare(
+            'SELECT 1 FROM steps WHERE idx > ? AND step_type = 15 LIMIT 1',
+          )
+          .get(baseline.maxIdx) !== undefined
+      const stepType =
+        typeof latest?.type === 'number' && Number.isInteger(latest.type)
+          ? latest.type
+          : undefined
+      // Never feed untrusted user/assistant prose (`step_type !== 17`) into error classifiers.
+      const payloadPart = stepType === 17 ? decodeSqlText(latest?.payload) : ''
+      const errDetailsPart = decodeSqlText(latest?.errDetails)
+      const payloadText =
+        payloadPart && errDetailsPart
+          ? `${payloadPart}\n${errDetailsPart}`
+          : payloadPart || errDetailsPart || undefined
+      return classifyStepError({
+        stepType,
+        payloadText,
+        stopReason,
+        reachedModel,
+      })
     })
   } catch {
     return fallback()
-  } finally {
-    db?.close()
   }
 }

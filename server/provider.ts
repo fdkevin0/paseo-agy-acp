@@ -215,8 +215,7 @@ async function probeCatalog(
         )
         nativeId = response.sessionId
         const dir = usage.remember(launch, {}, cwd)
-        if (transport.tier?.name)
-          setBounded(usage.tiers, dir, transport.tier.name, CATALOG_CACHE_LIMIT)
+        if (transport.tier?.name) usage.rememberTier(dir, transport.tier.name)
         const config = configState({
           ...response,
           models: transport.models,

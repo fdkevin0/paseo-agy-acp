@@ -3,13 +3,12 @@ import type {
   ProviderTimelineItem,
 } from '@getpaseo/plugin/server/provider'
 import { isNativeToolName, sessionIdPattern } from './common.ts'
-import type { TranscriptReader } from './brain-io.ts'
 import {
   readSubagents,
-  watchBrain,
-  type BrainWatchHandle,
   type SubagentRecord,
-} from './brain.ts'
+  type TranscriptReader,
+} from './brain-io.ts'
+import { watchBrain, type BrainWatchHandle } from './brain.ts'
 
 export const isSubagentMessage = (name: string) =>
   isNativeToolName(name, 'send_message')

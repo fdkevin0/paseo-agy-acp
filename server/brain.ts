@@ -29,10 +29,8 @@ import { alignReplayTools } from './history.ts'
 import {
   StepDedupe,
   countRowMessages,
-  extractCheckpointPreTokens,
   extractRowMessageSignatures,
   extractStepUsage,
-  isMissing,
   isRestartNotice,
   isRetryWarning,
   isWakeupMessage,
@@ -47,22 +45,9 @@ import {
 } from './brain-io.ts'
 import {
   BrainNode,
-  BrainTranscriptProjector,
   activeChildIdsForTurn,
   type PendingTool,
 } from './brain-projector.ts'
-
-export {
-  BrainNode,
-  BrainTranscriptProjector,
-  countRowMessages,
-  extractCheckpointPreTokens,
-  readInboxState,
-  readLastStepIndex,
-  readSubagents,
-  readTranscriptRows,
-  type SubagentRecord,
-}
 import {
   readTurnBoundaryBefore,
   resolveChildTurnState,
@@ -96,7 +81,7 @@ export type RuntimeEpoch = {
   ignoredSubagentIds: ReadonlySet<string>
 }
 
-export function adjustInboxForEpoch(
+function adjustInboxForEpoch(
   inbox: InboxState,
   epoch?: RuntimeEpoch,
   postEpochSignatures?: ReadonlyMap<string, number>,
@@ -215,12 +200,6 @@ export async function captureRuntimeEpoch(
   )
 }
 
-const MISSING_TRANSCRIPT_READ: BrainRead = {
-  rows: [],
-  reset: false,
-  mtimeMs: undefined,
-}
-
 function applyEpochFloor(node: BrainNode, restartAfterStep?: number) {
   if (restartAfterStep !== undefined && restartAfterStep >= 0) {
     node.turnStartStep = restartAfterStep
@@ -230,7 +209,6 @@ function applyEpochFloor(node: BrainNode, restartAfterStep?: number) {
 
 async function pollAndIngestProbeNode(
   root: string,
-  nativeId: string,
   node: BrainNode,
   runtimeEpoch?: RuntimeEpoch,
   postEpochSignatures?: Map<string, number>,
@@ -239,38 +217,24 @@ async function pollAndIngestProbeNode(
   subagents: SubagentRecord[]
   rowCount: number
 }> {
-  const readTranscript = () =>
-    node.reader.read(root, nativeId).catch((error) => {
-      if (isMissing(error)) return MISSING_TRANSCRIPT_READ
-      throw error
-    })
-  const [{ inbox: rawInbox, subagents }, firstRead] = await Promise.all([
-    node.pollMetadata(root),
-    readTranscript(),
-  ])
-  // A warm incremental reader (offset > 0) reports { rows: [], reset: true } on either a mid-O_TRUNC
-  // raced write or a corrupt appended JSONL line. Retry once from byte 0 before resetting `node` so
-  // genuinely corrupt transcripts throw SyntaxError (fail-closed) and raced rewrites ingest the snapshot.
-  const readResult =
-    firstRead.reset && firstRead.rows.length === 0
-      ? { ...(await readTranscript()), reset: true }
-      : firstRead
   const restartAfterStep = runtimeEpoch?.afterStepIndex
-  if (readResult.reset) {
-    node.reset(rawInbox, subagents)
-    applyEpochFloor(node, restartAfterStep)
-    postEpochSignatures?.clear()
-    node.initialReadDone = false
-  }
-  if (readResult.snapshotStepIndices) {
-    node.pruneRetrySteps(readResult.snapshotStepIndices)
-  }
+  const {
+    inbox: rawInbox,
+    subagents,
+    rows,
+    observedAt,
+  } = await node.pollTranscript(root, {
+    retryEmptyReset: true,
+    resetInitialReadOnReset: true,
+    onReset: () => {
+      applyEpochFloor(node, restartAfterStep)
+      postEpochSignatures?.clear()
+    },
+  })
   const eligibleRows =
     restartAfterStep !== undefined && restartAfterStep >= 0
-      ? readResult.rows.filter(
-          (row) => Number(row.step_index) > restartAfterStep,
-        )
-      : readResult.rows
+      ? rows.filter((row) => Number(row.step_index) > restartAfterStep)
+      : rows
   if (postEpochSignatures) {
     for (const row of eligibleRows) {
       for (const sig of extractRowMessageSignatures(row)) {
@@ -278,15 +242,13 @@ async function pollAndIngestProbeNode(
       }
     }
   }
-  const observedAt = node.initialReadDone ? undefined : readResult.mtimeMs
-  if (readResult.rows.length > 0) node.initialReadDone = true
   node.projector.observeRows(eligibleRows)
   for (const row of eligibleRows) {
     // The restarted runtime left no woken turn running.
     if (isRestartNotice(row)) node.resetPhase()
     node.ingest(row, observedAt)
   }
-  return { rawInbox, subagents, rowCount: readResult.rows.length }
+  return { rawInbox, subagents, rowCount: rows.length }
 }
 
 async function evaluateActiveBackgroundWork(
@@ -361,7 +323,7 @@ async function evaluateActiveBackgroundWork(
   return false
 }
 
-export type BackgroundWorkProbeOptions = {
+type BackgroundWorkProbeOptions = {
   includeDaemons?: boolean
   retryTimeoutMs?: number
   runtimeEpoch?: RuntimeEpoch
@@ -422,7 +384,6 @@ export class BackgroundWorkProbe {
       const node = this.ensureNode(nativeId, options.runtimeEpoch)
       const { rawInbox, subagents } = await pollAndIngestProbeNode(
         root,
-        nativeId,
         node,
         this.epoch,
         this.postEpochSignatures,
@@ -449,7 +410,6 @@ export class BackgroundWorkProbe {
       const node = this.ensureNode(nativeId, runtimeEpoch)
       await pollAndIngestProbeNode(
         root,
-        nativeId,
         node,
         this.epoch,
         this.postEpochSignatures,
@@ -479,7 +439,6 @@ export async function hasActiveBackgroundWork(
     applyEpochFloor(node, runtimeEpoch?.afterStepIndex)
     const { rawInbox, subagents, rowCount } = await pollAndIngestProbeNode(
       root,
-      nativeId,
       node,
       runtimeEpoch,
       postEpochSignatures,
@@ -544,44 +503,36 @@ async function settleChildren(options: {
         child = new BrainNode(childId)
         parentNode.children.set(childId, child)
       }
-      const { inbox: childInbox, subagents: childSubagents } =
-        await child.pollMetadata(root)
-      try {
-        const { rows, reset, snapshotStepIndices, mtimeMs } =
-          await child.reader.read(root, childId)
-        const observedAt = child.initialReadDone ? undefined : mtimeMs
-        if (rows.length > 0) child.initialReadDone = true
-        if (snapshotStepIndices) child.pruneRetrySteps(snapshotStepIndices)
-        if (reset) child.reset(childInbox, childSubagents)
-        child.projector.observeRows(rows)
-        for (const row of rows) child.ingest(row, observedAt)
-      } catch (error) {
-        if (isMissing(error)) {
-          const childTurn = childTurnOf(
-            parentNode,
-            parentMinStepIndex,
-            parentSubagents,
-            childId,
-            child,
-            childInbox,
-          )
-          if (childTurn.status === 'active') {
-            const failure = child.failure(
-              retryTimeoutMs,
-              childTurn.minStepIndex,
-            )
-            if (failure)
-              return {
-                settled: false,
-                error: `Subagent ${childId} failed: ${failure}`,
-                stalled: child.retryPending(childTurn.minStepIndex),
-              }
-          }
-          settled = false
-          continue
+      const {
+        inbox: childInbox,
+        subagents: childSubagents,
+        rows,
+        missing,
+        observedAt,
+      } = await child.pollTranscript(root)
+      if (missing) {
+        const childTurn = childTurnOf(
+          parentNode,
+          parentMinStepIndex,
+          parentSubagents,
+          childId,
+          child,
+          childInbox,
+        )
+        if (childTurn.status === 'active') {
+          const failure = child.failure(retryTimeoutMs, childTurn.minStepIndex)
+          if (failure)
+            return {
+              settled: false,
+              error: `Subagent ${childId} failed: ${failure}`,
+              stalled: child.retryPending(childTurn.minStepIndex),
+            }
         }
-        throw error
+        settled = false
+        continue
       }
+      child.projector.observeRows(rows)
+      for (const row of rows) child.ingest(row, observedAt)
       const childTurn = childTurnOf(
         parentNode,
         parentMinStepIndex,
@@ -648,7 +599,7 @@ export type ForegroundAcpSegment =
   | { type: 'assistant_message'; text: string }
   | { type: 'tool_call'; callId: string }
 
-export type ForegroundCursor = { index: number; offset: number }
+type ForegroundCursor = { index: number; offset: number }
 
 export function advanceForegroundCursor(
   segments: readonly ForegroundAcpSegment[],
@@ -1446,19 +1397,26 @@ export function watchBrain(
   }
   async function pollOnce() {
     try {
-      const { inbox, subagents } = await node.pollMetadata(root)
+      const {
+        inbox,
+        subagents,
+        rows,
+        reset,
+        missing,
+        snapshotStepIndices,
+        observedAt,
+      } = await node.pollTranscript(root, {
+        onReset: () => boundaryCache.clear(),
+        onSnapshot: (steps) => dedupe.prune(steps),
+      })
       onSubagents?.(subagents)
-      const { rows, reset, snapshotStepIndices, mtimeMs } =
-        await node.reader.read(root, nativeId)
-      const observedAt = node.initialReadDone ? undefined : mtimeMs
-      if (rows.length > 0) node.initialReadDone = true
-      if (snapshotStepIndices) {
-        dedupe.prune(snapshotStepIndices)
-        node.pruneRetrySteps(snapshotStepIndices)
-      }
-      if (reset) {
-        node.reset(inbox, subagents)
-        boundaryCache.clear()
+      if (missing) {
+        if (node.retryPending()) {
+          const failure = node.failure(retryTimeoutMs)
+          if (failure) finishTurn('failed', failure)
+        } else if (isParentTurnActive && !isParentTurnActive())
+          finishTurn('completed')
+        return
       }
       // The initial spawn message names the conversation that owns this session's turns; every
       // correlation below keys off it so the inbox filter and the transcript-row sender check agree.
@@ -1581,14 +1539,6 @@ export function watchBrain(
         }
       }
     } catch (error) {
-      if (isMissing(error)) {
-        if (node.retryPending()) {
-          const failure = node.failure(retryTimeoutMs)
-          if (failure) finishTurn('failed', failure)
-        } else if (isParentTurnActive && !isParentTurnActive())
-          finishTurn('completed')
-        return
-      }
       if (!warned && !stopped) {
         warned = true
         emit({

@@ -67,7 +67,7 @@ test('permissionKind classifies questions, mode switches, plans and tools', () =
   )
   assert.equal(
     classifyPermission({ title: 'ask_user' }, textDetail('ask_user')),
-    'question',
+    'tool',
   )
   assert.equal(
     classifyPermission(
@@ -174,6 +174,20 @@ test('permissionKind classifies questions, mode switches, plans and tools', () =
   )
   assert.equal(
     classifyPermission(
+      { title: 'Run mcp_srv_switch_mode', kind: 'switch_mode' },
+      textDetail('Run mcp_srv_switch_mode'),
+    ),
+    'tool',
+  )
+  assert.equal(
+    classifyPermission(
+      { title: 'Run default_api:mcp_srv_switch_mode', kind: 'switch_mode' },
+      textDetail('Run default_api:mcp_srv_switch_mode'),
+    ),
+    'tool',
+  )
+  assert.equal(
+    classifyPermission(
       { title: 'srv:switch_mode', kind: 'switch_mode' },
       textDetail('srv:switch_mode'),
     ),
@@ -210,15 +224,26 @@ const isPreapprovedMcpTool = (
   title: string,
   rawInput: Record<string, unknown>,
   policy: Parameters<typeof preapprovedMcpCall>[1],
-) => preapprovedMcpCall({ title, rawInput }, policy)
+  serverNames?: readonly string[],
+) => preapprovedMcpCall({ title, rawInput }, policy, serverNames)
 
 test('isPreapprovedMcpTool enforces policy presence, exact direct/lazy grant matching, and namespace trust', () => {
   const policy = {
     preapproved: [{ kind: 'mcp' as const, server: 'rea', tool: 'open' }],
   }
-  assert.equal(isPreapprovedMcpTool('mcp__rea__open', {}, undefined), false)
-  assert.equal(isPreapprovedMcpTool('mcp__rea__open', {}, policy), true)
-  assert.equal(isPreapprovedMcpTool('mcp__rea__close', {}, policy), false)
+  assert.equal(
+    isPreapprovedMcpTool('mcp_rea_open', {}, undefined, ['rea']),
+    false,
+  )
+  assert.equal(isPreapprovedMcpTool('mcp_rea_open', {}, policy, ['rea']), true)
+  assert.equal(
+    isPreapprovedMcpTool('mcp_rea_close', {}, policy, ['rea']),
+    false,
+  )
+  assert.equal(
+    isPreapprovedMcpTool('mcp__rea__open', {}, policy, ['rea']),
+    false,
+  )
   assert.equal(
     isPreapprovedMcpTool(
       'call_mcp_tool',

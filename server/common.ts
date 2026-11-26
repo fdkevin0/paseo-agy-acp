@@ -1,4 +1,5 @@
 /** Shared primitives, type guards, bounded caches, and formatting helpers. */
+import { sep } from 'node:path'
 
 // Paseo's server bundler forbids importing root files outside client/, server/, or shared/;
 // tests/index.test.ts enforces parity with package.json#version.
@@ -13,12 +14,12 @@ export function cleanToolName(name: string): string {
 }
 
 /** Strip agy's outer ACP `Run <name>` title wrapper, then drop `default_api:`. */
-export function unwrapToolTitle(title: string): string {
+function unwrapToolTitle(title: string): string {
   return cleanToolName(title.replace(/^Run\s+/i, ''))
 }
 
 /** Normalize a tool identity from an explicit raw name or an ACP `Run <name>` title. */
-function normalizeToolCandidate(
+export function normalizeToolCandidate(
   explicitRawName: string | undefined,
   title: string | null | undefined,
 ): string {
@@ -27,7 +28,7 @@ function normalizeToolCandidate(
     : unwrapToolTitle(title ?? '')
 }
 
-/** Match native lifecycle identities, including agy's legacy ACP `Run` title. */
+/** Match native lifecycle identities, including agy's ACP `Run` title wrapper. */
 export function isNativeToolName(
   name: string,
   expected:
@@ -42,11 +43,10 @@ export function isNativeToolName(
 
 /** Whether a native tool name is agy's interactive question tool. */
 export function isAskQuestionName(name: string): boolean {
-  return /^ask_(?:question|user)$/i.test(cleanToolName(name))
+  return /^ask_question$/i.test(cleanToolName(name))
 }
 
-export type PlanModeToolName =
-  'switch_mode' | 'exit_plan_mode' | 'enter_plan_mode'
+type PlanModeToolName = 'switch_mode' | 'exit_plan_mode' | 'enter_plan_mode'
 
 /** Whether a tool name or ACP title explicitly identifies a non-native MCP tool. */
 function isForeignToolIdentity(
@@ -54,7 +54,7 @@ function isForeignToolIdentity(
   title: string | null | undefined,
 ): boolean {
   const raw = normalizeToolCandidate(explicitRawName, title)
-  if (/^mcp__|^call_mcp_tool$/i.test(raw)) return true
+  if (/^mcp_|^call_mcp_tool$/i.test(raw)) return true
   const colon = raw.indexOf(':')
   if (colon <= 0) return false
   const prefix = raw.slice(0, colon).toLowerCase()
@@ -66,7 +66,7 @@ function isForeignToolIdentity(
 }
 
 /**
- * Classify agy's mode/plan handoff tools across raw names, `contrib:`, legacy `Run ` titles,
+ * Classify agy's mode/plan handoff tools across raw names, `contrib:`, `Run ` titles,
  * and unnamed native `kind === 'switch_mode'` snapshots (rejecting foreign MCP identities).
  */
 export function classifyPlanModeTool(
@@ -153,6 +153,28 @@ export function detachString(value: string): string {
   return value.length === 0
     ? ''
     : Buffer.from(value, 'utf16le').toString('utf16le')
+}
+
+/** Truncate by Unicode code points and detach from parent string backing. */
+export function truncateDetached(value: string, maxChars = 512): string {
+  const chars = [...value]
+  return detachString(
+    chars.length > maxChars
+      ? `${chars.slice(0, maxChars - 1).join('')}…`
+      : value,
+  )
+}
+
+/** Whether a resolved path stays strictly inside `base`. */
+export function isContainedIn(target: string, base: string): boolean {
+  const prefix = base === sep ? sep : base + sep
+  return target.startsWith(prefix)
+}
+
+/** Whether an errno exception indicates a missing path or non-directory parent. */
+export function isMissing(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code
+  return code === 'ENOENT' || code === 'ENOTDIR'
 }
 
 /** Insert or refresh `key` in `map`, evicting oldest entries when exceeding `limit`. */

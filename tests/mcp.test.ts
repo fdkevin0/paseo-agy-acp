@@ -3,23 +3,23 @@ import { test } from 'node:test'
 import { resolveMcpToolIdentity, toolDisplayName } from '../server/mcp.ts'
 import { isPreapprovedMcpTool } from '../server/permissions.ts'
 import { Timeline, toolDetail } from '../server/mapping.ts'
-import { BrainTranscriptProjector } from '../server/brain.ts'
+import { BrainTranscriptProjector } from '../server/brain-projector.ts'
 
 const policy = {
   preapproved: [{ kind: 'mcp' as const, server: 'srv', tool: 'lookup' }],
 }
 const identity = { server: 'srv', tool: 'lookup' }
 
-function expectResolvedMcpCall(title: string) {
+function expectResolvedMcpCall(title: string, servers: readonly string[] = []) {
   const rawInput = {
     ServerName: 'srv',
     ToolName: 'lookup',
     Arguments: { q: 'x' },
   }
   const call = { title, rawInput }
-  assert.deepEqual(resolveMcpToolIdentity(call), identity)
-  assert.equal(toolDisplayName(call), 'srv.lookup')
-  assert.equal(isPreapprovedMcpTool(call, policy), true)
+  assert.deepEqual(resolveMcpToolIdentity(call, servers), identity)
+  assert.equal(toolDisplayName(call, servers), 'srv.lookup')
+  assert.equal(isPreapprovedMcpTool(call, policy, servers), true)
   assert.deepEqual(toolDetail(call), {
     type: 'unknown',
     input: rawInput,
@@ -88,52 +88,73 @@ function expectRejectedUnderscoreServers(
 
 // Synthetic boundary cases; these are not captured AGY MCP transcripts.
 test('one MCP resolver drives display and exact grants without rewriting input', () => {
-  expectResolvedMcpCall('mcp__srv__lookup')
-  expectResolvedMcpCall('default_api:mcp__srv__lookup')
-  expectResolvedMcpCall('Run mcp__srv__lookup')
-  expectResolvedMcpCall('Run default_api:mcp__srv__lookup')
-  expectResolvedMcpCall('srv:lookup')
+  expectResolvedMcpCall('mcp_srv_lookup', ['srv'])
+  expectResolvedMcpCall('default_api:mcp_srv_lookup', ['srv'])
+  expectResolvedMcpCall('Run mcp_srv_lookup', ['srv'])
+  expectResolvedMcpCall('Run default_api:mcp_srv_lookup', ['srv'])
   expectResolvedMcpCall('call_mcp_tool')
   expectResolvedMcpCall('Run default_api:call_mcp_tool')
+
+  // Unbacked Claude/colon compat spellings never resolve or grant access.
+  assert.equal(resolveMcpToolIdentity({ name: 'mcp__srv__lookup' }), undefined)
+  assert.equal(resolveMcpToolIdentity({ name: 'srv:lookup' }), undefined)
+  assert.equal(resolveMcpToolIdentity({ name: 'swarm:spawn' }), undefined)
+  assert.equal(
+    isPreapprovedMcpTool({ name: 'mcp__srv__lookup' }, policy, ['srv']),
+    false,
+  )
+  assert.equal(
+    isPreapprovedMcpTool({ name: 'srv:lookup' }, policy, ['srv']),
+    false,
+  )
 })
 
 test('explicit identity wins over descriptive titles and cannot widen grants', () => {
   assert.equal(
     isPreapprovedMcpTool(
-      { name: 'mcp__srv__lookup', title: 'Look up a record' },
+      { name: 'mcp_srv_lookup', title: 'Look up a record' },
       policy,
+      ['srv'],
     ),
     true,
   )
   assert.equal(
     isPreapprovedMcpTool(
-      { name: 'native_tool', title: 'Run mcp__srv__lookup' },
+      { name: 'native_tool', title: 'Run mcp_srv_lookup' },
       policy,
+      ['srv'],
     ),
     false,
   )
   assert.equal(
-    isPreapprovedMcpTool({ name: '', title: 'mcp__srv__lookup' }, policy),
+    isPreapprovedMcpTool({ name: '', title: 'mcp_srv_lookup' }, policy, [
+      'srv',
+    ]),
     false,
   )
   assert.equal(
     isPreapprovedMcpTool(
-      { name: 'mcp__srv__other', title: 'mcp__srv__lookup' },
+      { name: 'mcp_srv_other', title: 'mcp_srv_lookup' },
       policy,
+      ['srv'],
     ),
     false,
   )
   assert.equal(
-    isPreapprovedMcpTool({ title: 'Run mcp__other__lookup' }, policy),
+    isPreapprovedMcpTool({ title: 'Run mcp_other_lookup' }, policy, [
+      'srv',
+      'other',
+    ]),
     false,
   )
   assert.equal(
-    isPreapprovedMcpTool({ title: 'Run mcp__srv__lookup extra' }, policy),
+    isPreapprovedMcpTool({ title: 'Run mcp_srv_lookup extra' }, policy, [
+      'srv',
+    ]),
     false,
   )
-  assert.equal(isPreapprovedMcpTool({ title: 'srv.lookup' }, policy), false)
   assert.equal(
-    isPreapprovedMcpTool({ title: 'mcp__srv__lookup__extra' }, policy),
+    isPreapprovedMcpTool({ title: 'srv.lookup' }, policy, ['srv']),
     false,
   )
   assert.equal(
@@ -178,13 +199,11 @@ test('explicit identity wins over descriptive titles and cannot widen grants', (
 })
 
 test('ACP updates and Brain replay use the same MCP label and retain input/output/status', () => {
-  expectLiveAndReplayMcpParity('default_api:mcp__srv__lookup')
   expectLiveAndReplayMcpParity('default_api:mcp_srv_lookup')
   expectLiveAndReplayMcpParity('default_api:call_mcp_tool')
 })
 
-// Format established from AGY 1.5.8 GetMcpToolNameWithPrefix; values are synthetic.
-test('native underscore names require a unique configured server, including collision with legacy encoding', () => {
+test('native underscore names require a unique configured server', () => {
   const call = { title: 'Run default_api:mcp_srv_one_lookup_item' }
   const grant = {
     preapproved: [
@@ -200,10 +219,6 @@ test('native underscore names require a unique configured server, including coll
   expectRejectedUnderscoreServers(call, grant, [])
   expectRejectedUnderscoreServers(call, grant, ['other'])
   expectRejectedUnderscoreServers(call, grant, ['srv', 'srv_one'])
-  assert.equal(
-    resolveMcpToolIdentity({ name: 'mcp__srv__lookup' }, ['_srv']),
-    undefined,
-  )
   assert.deepEqual(
     resolveMcpToolIdentity({ name: 'mcp__srv_lookup' }, ['_srv']),
     { server: '_srv', tool: 'lookup' },
@@ -269,7 +284,4 @@ test('built-in paseo server fallback applies only when explicit servers produce 
     isPreapprovedMcpTool(customCall, customGrant, ['paseo', 'paseo_custom']),
     false,
   )
-
-  // Legacy colon spelling still collides with built-in fallback and fails closed.
-  assert.equal(resolveMcpToolIdentity({ name: 'mcp_paseo_foo:bar' }), undefined)
 })

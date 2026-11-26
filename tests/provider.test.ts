@@ -706,7 +706,7 @@ test('delayed commands precede readiness on both new and restored sessions; tier
       data: { sessionId: 'native-test' },
     })
     assert.equal(
-      h.usage.tiers.get(dataDirectory(undefined, { HOME: home })),
+      h.usage.tier(dataDirectory(undefined, { HOME: home })),
       'Google AI Ultra',
     )
   } finally {

@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { BrainNode } from '../server/brain.ts'
+import { BrainEscapeError } from '../server/brain-io.ts'
+import { BrainNode } from '../server/brain-projector.ts'
 import {
   readTurnBoundaryBefore,
   resolveChildTurnState,
@@ -207,4 +209,45 @@ test('readTurnBoundaryBefore resolves re-woken child boundary against tagged anc
   } finally {
     await f.close()
   }
+})
+
+test('readTurnBoundaryBefore fails closed on corrupt JSONL and symlink escapes without caching emptyRows', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+  const outside = await mkdtemp(join(tmpdir(), 'agy-turn-escape-'))
+  t.after(() => rm(outside, { recursive: true, force: true }))
+  const cache: TurnBoundaryCache = new Map()
+
+  const logsDir = join(f.root, parent, '.system_generated/logs')
+  await mkdir(logsDir, { recursive: true })
+  await writeFile(f.path(parent), '{"step_index":0,broken\n')
+
+  await assert.rejects(
+    readTurnBoundaryBefore(f.root, parent, 5, cache),
+    SyntaxError,
+  )
+  assert.equal(cache.size, 0)
+
+  await f.put(parent, [
+    { step_index: 0, type: 'USER_INPUT', content: 'turn 1' },
+    done(1, 't1'),
+  ])
+  assert.deepEqual(await readTurnBoundaryBefore(f.root, parent, 5, cache), {
+    boundary: 0,
+    ready: true,
+  })
+
+  const escapedFile = join(outside, 'transcript.jsonl')
+  await writeFile(
+    escapedFile,
+    `${JSON.stringify({ step_index: 0, type: 'USER_INPUT', content: 'x' })}\n`,
+  )
+  const childLogs = join(f.root, child, '.system_generated/logs')
+  await mkdir(childLogs, { recursive: true })
+  await symlink(escapedFile, f.path(child))
+
+  await assert.rejects(
+    readTurnBoundaryBefore(f.root, child, 5, cache),
+    BrainEscapeError,
+  )
 })

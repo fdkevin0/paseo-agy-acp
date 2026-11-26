@@ -1,4 +1,5 @@
 import type { ProviderTimelineItem } from '@getpaseo/plugin/server/provider'
+import { isMissing } from './common.ts'
 import {
   TranscriptReader,
   StepDedupe,
@@ -6,7 +7,6 @@ import {
   extractCheckpointPreTokens,
   extractRowMessageSignatures,
   extractStepUsage,
-  isMissing,
   stepErrorMessage,
 } from './brain-io.ts'
 import type { StepUsage } from './mapping.ts'
@@ -16,10 +16,20 @@ export type BrainRead = Awaited<ReturnType<TranscriptReader['read']>> & {
   observedAtByStep?: ReadonlyMap<number, number>
 }
 
+function sameStepUsage(a: StepUsage | undefined, b: StepUsage): boolean {
+  return (
+    a !== undefined &&
+    a.inputTokens === b.inputTokens &&
+    a.outputTokens === b.outputTokens &&
+    a.cachedReadTokens === b.cachedReadTokens &&
+    a.cachedWriteTokens === b.cachedWriteTokens
+  )
+}
+
 /** Numeric observations are independent of text/tool dedupe and never accumulate consumption. */
 export class ModelUsageObserver {
   private candidate?: { stepIndex: number; usage: StepUsage }
-  private published?: { stepIndex: number; signature: string }
+  private published?: StepUsage
   private replacing = false
   latest?: StepUsage
   latestStepIndex = -1
@@ -64,12 +74,11 @@ export class ModelUsageObserver {
       return
     this.latest = candidate.usage
     this.latestStepIndex = candidate.stepIndex
-    const signature = JSON.stringify(candidate.usage)
     if (
-      signature !== this.published?.signature &&
+      !sameStepUsage(this.published, candidate.usage) &&
       this.publish(candidate.usage) !== false
     )
-      this.published = { stepIndex: candidate.stepIndex, signature }
+      this.published = candidate.usage
   }
 }
 
@@ -270,8 +279,10 @@ export class BrainTurnObservation {
       if (read.snapshotStepIndices)
         this.bufferSnapshot = new Set(read.snapshotStepIndices)
       if (this.bufferSnapshot)
-        for (const row of read.rows)
-          this.bufferSnapshot.add(Number(row.step_index))
+        for (const row of read.rows) {
+          const step = Number(row.step_index)
+          if (Number.isInteger(step)) this.bufferSnapshot.add(step)
+        }
     }
     if (this.isDisposed()) return
     const observed = this.drainingRead
