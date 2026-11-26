@@ -15,72 +15,40 @@ import type {
   ProviderEvent,
   ProviderTimelineItem,
 } from '@getpaseo/plugin/server/provider'
-import { SessionManager } from '../server/session.ts'
-import { connectAcp } from '../server/transport.ts'
 import { AgyUsageSource } from '../server/usage.ts'
 import {
   ModelUsageObserver,
   BrainTurnObservation,
-  type BrainRead,
 } from '../server/brain-observer.ts'
 import { TranscriptReader } from '../server/brain-io.ts'
 import { settleBrainTurn } from '../server/brain.ts'
 import { BrainTranscriptProjector } from '../server/brain-projector.ts'
-import { createEventCollector, isolatedEnv, sequenceDouble } from './helpers.ts'
+import {
+  checkpointRow,
+  encode,
+  modelRow,
+  userRow,
+  type Row,
+} from './brain-fixtures.ts'
+import {
+  createEventCollector,
+  deferred,
+  HarnessSessionManager,
+  isolatedEnv,
+  ScriptedTranscriptReader,
+  sequenceDouble,
+  TrackingObservation,
+  wrapConnectAcp,
+  type PromptHandler,
+  type RpcPrompt,
+} from './helpers.ts'
 
-function deferred<T>() {
-  let resolve!: (value: T) => void
-  let reject!: (error: unknown) => void
-  const promise = new Promise<T>((yes, no) => {
-    resolve = yes
-    reject = no
-  })
-  return { promise, resolve, reject }
-}
+type Result = Awaited<ReturnType<RpcPrompt>>
 
-type Result = {
-  stopReason: 'end_turn' | 'cancelled'
-  usage?: { inputTokens: number; outputTokens: number; totalTokens: number }
-}
-type Row = Record<string, unknown>
-const encode = (rows: Row[]) =>
-  rows.map((row) => JSON.stringify(row) + '\n').join('')
-const user = (step_index: number, content = 'work'): Row => ({
-  step_index,
-  type: 'USER_INPUT',
-  content,
-})
-const model = (
-  step_index: number,
-  input_tokens: number,
-  content = 'model text',
-): Row => ({
-  step_index,
-  type: 'PLANNER_RESPONSE',
-  status: 'DONE',
-  input_tokens,
-  output_tokens: 1,
-  content,
-})
-const checkpoint = (step_index: number, content = 'summary'): Row => ({
-  step_index,
-  type: 'CHECKPOINT',
-  status: 'DONE',
-  content,
-})
-
-type PromptHandler = (
-  params: Parameters<ReturnType<typeof connectAcp>['rpc']['prompt']>[0],
-  realPrompt: ReturnType<typeof connectAcp>['rpc']['prompt'],
-) => Promise<Result>
-
-class HarnessSessionManager extends SessionManager {
-  session!: Awaited<ReturnType<SessionManager['start']>>
-  override async start(...args: Parameters<SessionManager['start']>) {
-    this.session = await super.start(...args)
-    return this.session
-  }
-}
+const user = userRow
+const model = modelRow
+const checkpoint = (step_index: number, content = 'summary'): Row =>
+  checkpointRow(step_index, { content })
 
 class RecordingTranscriptReader extends TranscriptReader {
   private readonly rewriteRows: Record<string, unknown>[][]
@@ -92,54 +60,6 @@ class RecordingTranscriptReader extends TranscriptReader {
     const r = await super.read(root, nativeId)
     if (r.reset) this.rewriteRows.push(r.rows)
     return r
-  }
-}
-
-class ScriptedTranscriptReader extends TranscriptReader {
-  private readonly next: () => Promise<BrainRead>
-  constructor(reads: readonly BrainRead[]) {
-    super()
-    this.next = sequenceDouble(reads.map((read) => async () => read))
-  }
-  override read(): ReturnType<TranscriptReader['read']> {
-    return this.next()
-  }
-}
-
-class TrackingObservation extends BrainTurnObservation {
-  readonly attached = deferred<void>()
-  override async attach(
-    consumer: Parameters<BrainTurnObservation['attach']>[0],
-  ) {
-    await super.attach(consumer)
-    this.attached.resolve()
-  }
-}
-
-function wrapConnectAcp(
-  getPromptHandler: () => PromptHandler | undefined,
-): typeof connectAcp {
-  return (...args) => {
-    const transport = connectAcp(...args)
-    const realPrompt = transport.rpc.prompt.bind(transport.rpc)
-    const wrappedRpc = new Proxy(transport.rpc, {
-      get(target, prop) {
-        if (prop === 'prompt') {
-          return (params: Parameters<typeof realPrompt>[0]) => {
-            const handler = getPromptHandler()
-            return handler ? handler(params, realPrompt) : realPrompt(params)
-          }
-        }
-        const value = Reflect.get(target, prop, target)
-        return typeof value === 'function' ? value.bind(target) : value
-      },
-    })
-    return new Proxy(transport, {
-      get(target, prop) {
-        if (prop === 'rpc') return wrappedRpc
-        return Reflect.get(target, prop, target)
-      },
-    })
   }
 }
 

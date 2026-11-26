@@ -13,7 +13,6 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { ProviderEvent } from '@getpaseo/plugin/server/provider'
 import { SessionManager } from '../server/session.ts'
-import { connectAcp } from '../server/transport.ts'
 import { AgyUsageSource } from '../server/usage.ts'
 import {
   ModelUsageObserver,
@@ -23,77 +22,31 @@ import { TranscriptReader } from '../server/brain-io.ts'
 import { watchBrain } from '../server/brain.ts'
 import { BrainTranscriptProjector } from '../server/brain-projector.ts'
 import { normalizeAskQuestionInput } from '../server/questions.ts'
-import { isolatedEnv } from './helpers.ts'
+import {
+  checkpointRow,
+  encode,
+  modelRow,
+  userRow,
+  type Row,
+} from './brain-fixtures.ts'
+import {
+  compactionEvents,
+  createEventCollector,
+  deferred,
+  HarnessSessionManager,
+  isolatedEnv,
+  toolCalls as collectToolCalls,
+  TrackingObservation,
+  wrapConnectAcp,
+  type PromptHandler,
+  type RpcPrompt,
+} from './helpers.ts'
 
-function deferred<T>() {
-  let resolve!: (value: T) => void
-  let reject!: (error: unknown) => void
-  const promise = new Promise<T>((yes, no) => {
-    resolve = yes
-    reject = no
-  })
-  return { promise, resolve, reject }
-}
-type Result = {
-  stopReason: 'end_turn' | 'cancelled'
-  usage?: {
-    inputTokens: number
-    outputTokens: number
-    totalTokens: number
-    cachedReadTokens?: number
-  }
-}
-type Row = Record<string, unknown>
-const encode = (rows: Row[]) =>
-  rows.map((row) => JSON.stringify(row) + '\n').join('')
-const user = (step_index: number): Row => ({
-  step_index,
-  type: 'USER_INPUT',
-  content: 'work',
-})
-const model = (
-  step_index: number,
-  input_tokens: number,
-  content = 'model text',
-): Row => ({
-  step_index,
-  type: 'PLANNER_RESPONSE',
-  status: 'DONE',
-  input_tokens,
-  output_tokens: 1,
-  content,
-})
-const checkpoint = (step_index: number, content = 'summary'): Row => ({
-  step_index,
-  type: 'CHECKPOINT',
-  status: 'DONE',
-  content,
-  input_tokens: 999999,
-})
-
-type RpcPrompt = ReturnType<typeof connectAcp>['rpc']['prompt']
-type PromptHandler = (
-  params: Parameters<RpcPrompt>[0],
-  realPrompt: RpcPrompt,
-) => Promise<Result>
-
-class HarnessSessionManager extends SessionManager {
-  session!: Awaited<ReturnType<SessionManager['start']>>
-  override async start(...args: Parameters<SessionManager['start']>) {
-    this.session = await super.start(...args)
-    return this.session
-  }
-}
-
-class TrackingObservation extends BrainTurnObservation {
-  readonly attached = deferred<void>()
-  override async attach(
-    consumer: Parameters<BrainTurnObservation['attach']>[0],
-  ) {
-    await super.attach(consumer)
-    this.attached.resolve()
-  }
-}
+type Result = Awaited<ReturnType<RpcPrompt>>
+const user = userRow
+const model = modelRow
+const checkpoint = (step_index: number, content = 'summary'): Row =>
+  checkpointRow(step_index, { content, input_tokens: 999999 })
 
 class SwappableTranscriptReader extends TranscriptReader {
   impl: TranscriptReader['read'] = (root, id) => super.read(root, id)
@@ -111,35 +64,6 @@ class SwappableTranscriptReader extends TranscriptReader {
   }
 }
 
-function wrapConnectAcp(
-  getPromptHandler: () => PromptHandler | undefined,
-  onRealPrompt: (realPrompt: RpcPrompt) => void,
-): typeof connectAcp {
-  return (...args) => {
-    const transport = connectAcp(...args)
-    const realPrompt = transport.rpc.prompt.bind(transport.rpc)
-    onRealPrompt(realPrompt)
-    const wrappedRpc = new Proxy(transport.rpc, {
-      get(target, prop) {
-        if (prop === 'prompt') {
-          return (params: Parameters<typeof realPrompt>[0]) => {
-            const handler = getPromptHandler()
-            return handler ? handler(params, realPrompt) : realPrompt(params)
-          }
-        }
-        const value = Reflect.get(target, prop, target)
-        return typeof value === 'function' ? value.bind(target) : value
-      },
-    })
-    return new Proxy(transport, {
-      get(target, prop) {
-        if (prop === 'rpc') return wrappedRpc
-        return Reflect.get(target, prop, target)
-      },
-    })
-  }
-}
-
 async function harness(
   t: TestContext,
   options?: {
@@ -154,8 +78,8 @@ async function harness(
   },
 ) {
   const home = await mkdtemp(join(tmpdir(), 'agy-live-context-'))
-  const events: ProviderEvent[] = []
-  const listeners = new Set<() => void>()
+  const collector = createEventCollector()
+  const { events } = collector
   let promptHandler: PromptHandler | undefined
   let realPrompt!: RpcPrompt
   let lastObservation!: TrackingObservation
@@ -176,10 +100,7 @@ async function harness(
     },
     usage: new AgyUsageSource({ env }),
     capabilities: ['prompt.message', 'permission'],
-    emit: (event) => {
-      events.push(structuredClone(event))
-      for (const listener of listeners) listener()
-    },
+    emit: collector.emit,
     hasActiveBackgroundWork: options?.hasActiveBackgroundWork,
     cancelConvergenceTimeoutMs: options?.cancelConvergenceTimeoutMs,
     backgroundProbeTimeoutMs: options?.backgroundProbeTimeoutMs,
@@ -238,41 +159,19 @@ async function harness(
         ? [event.state]
         : [],
     )
-  const compactions = () =>
-    events.flatMap((event) =>
-      event.type === 'timeline.item' && event.item.type === 'compaction'
-        ? [event]
-        : [],
-    )
+  const compactions = () => compactionEvents(events)
   const assistantMessages = () =>
     events.flatMap((event) =>
       event.type === 'timeline.item' && event.item.type === 'assistant_message'
         ? [event.item]
         : [],
     )
-  const toolCalls = () =>
-    events.flatMap((event) =>
-      event.type === 'timeline.item' && event.item.type === 'tool_call'
-        ? [event.item]
-        : [],
-    )
+  const toolCalls = () => collectToolCalls(events)
   const permissions = () =>
     events.flatMap((event) =>
       event.type === 'session.permission' ? [event] : [],
     )
-  const wait = async (predicate: () => boolean) => {
-    if (predicate()) return
-    await new Promise<void>((resolve) => {
-      const check = () => {
-        if (predicate()) {
-          listeners.delete(check)
-          resolve()
-        }
-      }
-      listeners.add(check)
-      check()
-    })
-  }
+  const wait = (predicate: () => boolean) => collector.waitCondition(predicate)
   const read = async () => {
     const observation = session.state.activeTurn?.observation
     assert.ok(observation)
@@ -326,6 +225,7 @@ async function harness(
     permissions,
     wait,
     read,
+    attached: () => lastObservation.attached.promise,
     hold,
     holdLive,
   }
@@ -827,6 +727,7 @@ test(
       'recorded-wakeup-delayed-reads',
     )
     await h.session.drain()
+    await h.attached()
     await h.read()
     const lastRead = (callId: string) =>
       h.toolCalls().findLast((item) => item.callId === callId)

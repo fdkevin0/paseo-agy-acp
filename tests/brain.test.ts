@@ -13,6 +13,7 @@ import {
   symlink,
 } from 'node:fs/promises'
 import { join } from 'node:path'
+import { MessageChannel } from 'node:worker_threads'
 import {
   advanceForegroundCursor,
   BackgroundWorkProbe,
@@ -24,10 +25,11 @@ import {
   type ForegroundAcpSegment,
 } from '../server/brain.ts'
 import {
+  compactionEvents,
   createEventCollector,
   flushObs,
   sequenceDouble,
-  waitUntil,
+  toolCalls,
   writeFileAtomic,
 } from './helpers.ts'
 import recordedWakeup from './fixtures/agy-1.5.12-wakeup.json' with { type: 'json' }
@@ -63,13 +65,19 @@ import type {
   ProviderTimelineItem,
 } from '@getpaseo/plugin/server/provider'
 
+const T0 = 1_700_000_000_000
+
 /** settleBrainTurn's poll timer is unref'd; hold the event loop open while awaiting it. */
 function alive<T>(promise: Promise<T>): Promise<T> {
-  const keepAlive = setInterval(() => {}, 1000)
-  return promise.finally(() => clearInterval(keepAlive))
+  const { port1, port2 } = new MessageChannel()
+  port1.on('message', () => {})
+  return promise.finally(() => {
+    port1.close()
+    port2.close()
+  })
 }
-function until(predicate: () => boolean) {
-  return waitUntil(predicate, 5000, () => 'Expected event did not arrive')
+function closeHandles(handles: readonly BrainWatchHandle[]): void {
+  for (const close of handles) close()
 }
 function manualObs(
   root: string,
@@ -192,12 +200,6 @@ function turnAndReplySummary(events: readonly ProviderEvent[]): string[] {
       result.push(e.item.text)
   }
   return result
-}
-function compactionEvents(events: readonly ProviderEvent[]) {
-  return events.filter(
-    (e): e is Extract<ProviderEvent, { type: 'timeline.item' }> =>
-      e.type === 'timeline.item' && e.item.type === 'compaction',
-  )
 }
 
 test('parent waits for the terminal child report, then its own response, without timestamp assumptions', async () => {
@@ -347,7 +349,7 @@ test('parent waits for the terminal child report, then its own response, without
 
 test('nested child completion uses delivered reports and sending to parent never creates a dependency cycle', async () => {
   const f = await fixture()
-  const events: ProviderEvent[] = []
+  const collector = createEventCollector()
   let stop: BrainWatchHandle | undefined
   try {
     await f.subagent(child, grandchild)
@@ -363,11 +365,9 @@ test('nested child completion uses delivered reports and sending to parent never
       message(5, grandchild, 'Grandchild report'),
       ...report(parent, 'Child report', 6),
     ])
-    stop = watchBrain(f.root, child, 'c', (event) => events.push(event), 5)
-    await until(() =>
-      events.some(
-        (event) => event.type === 'session.turn' && event.state === 'completed',
-      ),
+    stop = watchBrain(f.root, child, 'c', collector.emit, 5)
+    await collector.wait(
+      (event) => event.type === 'session.turn' && event.state === 'completed',
     )
     await f.deliver(parent, child, 'Child report', true)
     await f.put(parent, [
@@ -411,14 +411,15 @@ test('quoted restart notices do not clear background work', () => {
 
 test('watching retains split UTF-8 records, resets on replacement and truncation, and supports cancel', async () => {
   const f = await fixture()
-  const events: ProviderEvent[] = []
+  const collector = createEventCollector()
+  const { events } = collector
   let stop: BrainWatchHandle | undefined
   try {
     await f.put(child, [])
     const bytes = Buffer.from(encode([done(1, '你好')]))
     const split = bytes.indexOf(Buffer.from('你')) + 1
     await writeFile(f.path(child), bytes.subarray(0, split))
-    stop = watchBrain(f.root, child, 'c', (event) => events.push(event), 5)
+    stop = watchBrain(f.root, child, 'c', collector.emit, 5)
     await stop.ready
     assert.equal(events.length, 0)
     await appendFile(f.path(child), bytes.subarray(split))
@@ -429,18 +430,16 @@ test('watching retains split UTF-8 records, resets on replacement and truncation
           event.item.type === 'assistant_message' &&
           event.item.text === text,
       )
-    await until(() => textSeen('你好'))
-    await until(() =>
-      events.some(
-        (event) => event.type === 'session.turn' && event.state === 'completed',
-      ),
+    await collector.waitCondition(() => textSeen('你好'))
+    await collector.wait(
+      (event) => event.type === 'session.turn' && event.state === 'completed',
     )
     await writeFile(
       f.path(child) + '.new',
       encode([done(2, 'replacement is longer')]),
     )
     await rename(f.path(child) + '.new', f.path(child))
-    await until(() => textSeen('replacement is longer'))
+    await collector.waitCondition(() => textSeen('replacement is longer'))
     await writeFile(f.path(child), encode([done(3, 'short')]))
     await stop.flush()
     assert.equal(textSeen('short'), true)
@@ -464,7 +463,7 @@ test('watching retains split UTF-8 records, resets on replacement and truncation
         { step_index: 7, type: 'ERROR_MESSAGE', content: 'Subagent failed' },
       ]),
     )
-    await until(() =>
+    await collector.waitCondition(() =>
       events
         .slice(beforeFollowUp)
         .some(
@@ -670,7 +669,7 @@ test('Brain matches FIFO tool results without fake assistant bubbles or mutating
 
 test('child failure fails the waiting parent instead of leaving it running', async () => {
   const f = await fixture()
-  const events: ProviderEvent[] = []
+  const collector = createEventCollector()
   let stop: BrainWatchHandle | undefined
   try {
     await f.put(parent, invoke(child))
@@ -682,11 +681,9 @@ test('child failure fails the waiting parent instead of leaving it running', asy
     const result = await settleBrainTurn(f.root, parent, 'p', () => {})
     assert.equal(result.status, 'failed')
     assert.match(result.error ?? '', /Child crashed/)
-    stop = watchBrain(f.root, parent, 'p', (event) => events.push(event), 5)
-    await until(() =>
-      events.some(
-        (event) => event.type === 'session.turn' && event.state === 'failed',
-      ),
+    stop = watchBrain(f.root, parent, 'p', collector.emit, 5)
+    await collector.wait(
+      (event) => event.type === 'session.turn' && event.state === 'failed',
     )
   } finally {
     stop?.()
@@ -1971,19 +1968,15 @@ test('readLastStepIndex reads the tail past large rows and torn writes', async (
 
 test('a resumed child watcher skips its history and continues turn IDs', async () => {
   const f = await fixture()
-  const events: ProviderEvent[] = []
+  const collector = createEventCollector()
+  const { events } = collector
   let handle: BrainWatchHandle | undefined
   try {
     await f.put(child, [message(0, parent, 'work'), done(1, 'First reply')])
-    handle = watchBrain(
-      f.root,
-      child,
-      'c',
-      (event) => events.push(event),
-      5,
-      () => true,
-      { afterStep: 1, turnSeq: 3 },
-    )
+    handle = watchBrain(f.root, child, 'c', collector.emit, 5, () => true, {
+      afterStep: 1,
+      turnSeq: 3,
+    })
     await handle.ready
     assert.equal(
       events.length,
@@ -1994,8 +1987,8 @@ test('a resumed child watcher skips its history and continues turn IDs', async (
       f.path(child),
       encode([message(2, parent, 'more'), done(3, 'Second reply')]),
     )
-    await until(() =>
-      events.some((e) => e.type === 'session.turn' && e.state === 'completed'),
+    await collector.wait(
+      (e) => e.type === 'session.turn' && e.state === 'completed',
     )
     assert.deepEqual(turnAndReplySummary(events), [
       'c:turn:4:started',
@@ -2131,6 +2124,7 @@ test(
     const f = await fixture()
     const events: ProviderEvent[] = []
     let handle: BrainWatchHandle | undefined
+    const pollEvents = new EventEmitter()
     let polls = 0
     try {
       const rows = [
@@ -2153,6 +2147,7 @@ test(
         undefined,
         () => {
           polls++
+          pollEvents.emit(String(polls))
         },
       )
       await handle.ready
@@ -2160,7 +2155,7 @@ test(
       try {
         await file.truncate(0)
         const target = polls + 2
-        await until(() => polls >= target)
+        await once(pollEvents, String(target))
         await file.write(
           encode([
             ...rows,
@@ -2274,7 +2269,8 @@ test('stopped calls never linger: restart notices and new responses drop them', 
 
 test('a child woken after an interrupted tool call completes its new turn', async () => {
   const f = await fixture()
-  const events: ProviderEvent[] = []
+  const collector = createEventCollector()
+  const { events } = collector
   let handle: BrainWatchHandle | undefined
   try {
     // Child transcripts have no USER_INPUT: a wakeup is a SYSTEM_MESSAGE.
@@ -2287,9 +2283,25 @@ test('a child woken after an interrupted tool call completes its new turn', asyn
       { step_index: 5, type: 'GENERIC', status: 'DONE', content: 'out' },
       done(6, 'Finished'),
     ])
-    handle = watchBrain(f.root, child, 'c', (event) => events.push(event), 5)
-    await until(() =>
-      events.some((e) => e.type === 'session.turn' && e.state === 'completed'),
+    handle = watchBrain(f.root, child, 'c', collector.emit, 5)
+    await collector.wait(
+      (e) => e.type === 'session.turn' && e.state === 'completed',
+    )
+    assert.deepEqual(assistantTextsFromEvents(events), ['Finished'])
+    const finalByCallId = new Map(
+      toolCalls(events).map((call) => [call.callId, call]),
+    )
+    const freshCall = finalByCallId.get('fresh')
+    const stoppedCall = finalByCallId.get('stopped')
+    assert.ok(
+      freshCall?.status === 'completed' &&
+        freshCall.detail.type === 'unknown' &&
+        freshCall.detail.output === 'out',
+    )
+    assert.ok(
+      stoppedCall?.detail.type === 'unknown' &&
+        stoppedCall.detail.output === null,
+      'interrupted tool must not steal the post-wakeup tool result',
     )
   } finally {
     handle?.()
@@ -2300,7 +2312,8 @@ test('a child woken after an interrupted tool call completes its new turn', asyn
 test('resuming after a drained cancel neither repeats nor skips child rows', async () => {
   const f = await fixture()
   const first: ProviderEvent[] = []
-  const second: ProviderEvent[] = []
+  const secondCollector = createEventCollector()
+  const second = secondCollector.events
   let resumed: BrainWatchHandle | undefined
   try {
     await f.put(child, [message(0, parent, 'work')])
@@ -2315,7 +2328,7 @@ test('resuming after a drained cancel neither repeats nor skips child rows', asy
       f.root,
       child,
       'c',
-      (e) => second.push(e),
+      secondCollector.emit,
       5,
       () => true,
       old.resumePoint(),
@@ -2325,8 +2338,8 @@ test('resuming after a drained cancel neither repeats nor skips child rows', asy
       f.path(child),
       encode([message(2, parent, 'again'), done(3, 'After resume')]),
     )
-    await until(() =>
-      second.some((e) => e.type === 'session.turn' && e.state === 'completed'),
+    await secondCollector.wait(
+      (e) => e.type === 'session.turn' && e.state === 'completed',
     )
     assert.deepEqual(assistantTextsFromEvents(first), ['Before cancel'])
     assert.deepEqual(assistantTextsFromEvents(second), ['After resume'])
@@ -3567,7 +3580,8 @@ test('expired retries do not hide retained processes, daemon policy, unread mess
   }
 })
 
-test('child registry forwards the shared retry policy to its watcher', async () => {
+test('child registry forwards the shared retry policy to its watcher', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: T0 })
   const f = await fixture()
   const events: ProviderEvent[] = []
   const registry = new SubagentRegistry({
@@ -3583,9 +3597,7 @@ test('child registry forwards the shared retry policy to its watcher', async () 
     retryTimeoutMs: 50,
   })
   try {
-    await f.put(child, [
-      interrupted(1, new Date(Date.now() - 1000).toISOString()),
-    ])
+    await f.put(child, [interrupted(1, new Date(T0 - 1000).toISOString())])
     registry.linkSubsession('p', parent, {
       type: 'tool_call',
       id: 'spawn',
@@ -3613,13 +3625,13 @@ test('child registry forwards the shared retry policy to its watcher', async () 
 
 test('SubagentRegistry resumeChild racing cancelRunning and cancelAll does not resurrect stopped watchers', async (t) => {
   const f = await fixture()
-  const events: ProviderEvent[] = []
+  const collector = createEventCollector()
   const registry = new SubagentRegistry({
     sessionId: 'p',
     cwd: f.root,
     brainRoot: f.root,
     capabilities: ['session.subsession'],
-    emit: (event) => events.push(event),
+    emit: collector.emit,
     getNativeId: () => parent,
     isParentTurnActive: () => true,
     isLoading: () => false,
@@ -3642,13 +3654,11 @@ test('SubagentRegistry resumeChild racing cancelRunning and cancelAll does not r
     error: null,
     detail: { type: 'sub_agent', childSessionId: child, log: '' },
   })
-  await until(() =>
-    events.some(
-      (event) =>
-        event.type === 'session.turn' &&
-        event.sessionId === `p:child:${child}` &&
-        event.state === 'started',
-    ),
+  await collector.wait(
+    (event) =>
+      event.type === 'session.turn' &&
+      event.sessionId === `p:child:${child}` &&
+      event.state === 'started',
   )
 
   await Promise.all(registry.cancelRunning())
@@ -3691,13 +3701,11 @@ test('SubagentRegistry resumeChild racing cancelRunning and cancelAll does not r
     error: null,
     detail: { type: 'sub_agent', childSessionId: child, log: '' },
   })
-  await until(() =>
-    events.some(
-      (event) =>
-        event.type === 'session.turn' &&
-        event.sessionId === `p:child:${child}` &&
-        event.state === 'completed',
-    ),
+  await collector.wait(
+    (event) =>
+      event.type === 'session.turn' &&
+      event.sessionId === `p:child:${child}` &&
+      event.state === 'completed',
   )
   assert.equal(registry.hasRunningChildren(), false)
 })
@@ -5066,15 +5074,13 @@ test('re-waking a child across turns isolates prior failed grandchildren while r
 
     assert.equal(await hasActiveBackgroundWork(f.root, parent), true)
 
-    let turn2Settled = false
-    running = settleBrainTurn(f.root, parent, 'p', () => {}, {
-      signal: abort.signal,
-      minStepIndex: 4,
-      pollIntervalMs: 5,
-    }).then((res) => {
-      turn2Settled = true
-      return res
-    })
+    running = alive(
+      settleBrainTurn(f.root, parent, 'p', () => {}, {
+        signal: abort.signal,
+        minStepIndex: 4,
+        pollIntervalMs: 5,
+      }),
+    )
     // Finish grandchild2 -> child -> parent (deliver inbox messages before sender completion rows).
     await f.deliver(child, grandchild2, 'gc2 finished', true, 'gc2-done')
     await appendFile(
@@ -5097,7 +5103,6 @@ test('re-waking a child across turns isolates prior failed grandchildren while r
       encode([message(13, child, 'turn 2 complete'), done(14, 'done turn 2')]),
     )
 
-    await waitUntil(() => turn2Settled)
     assert.equal(((await running) as { status: string }).status, 'completed')
     await handle!.flush()
     assert.equal(handle!.isRunning(), false)
@@ -5185,16 +5190,14 @@ test('re-waking a child after Turn-1 retry timeout succeeds without Turn-1 retry
     ]
     await f.put(parent, parentTurn2)
 
-    let turn2Result: { status: string; error?: string } | undefined
-    running = settleBrainTurn(f.root, parent, 'p', () => {}, {
-      signal: abort.signal,
-      minStepIndex: 7,
-      pollIntervalMs: 5,
-      retryTimeoutMs: 40,
-    }).then((res) => {
-      turn2Result = res
-      return res
-    })
+    running = alive(
+      settleBrainTurn(f.root, parent, 'p', () => {}, {
+        signal: abort.signal,
+        minStepIndex: 7,
+        pollIntervalMs: 5,
+        retryTimeoutMs: 40,
+      }),
+    )
     // Deliver u2 and complete child + parent in Turn 2 without clearing retryStep=3 except via childMinStep scoping.
     await f.deliver(child, parent, 'wake 2', true, 'u2', {
       conversationId: parent,
@@ -5220,7 +5223,6 @@ test('re-waking a child after Turn-1 retry timeout succeeds without Turn-1 retry
       encode([message(12, child, 'recovered in turn 2'), done(13, 'all done')]),
     )
 
-    await waitUntil(() => turn2Result !== undefined)
     assert.equal(((await running) as { status: string }).status, 'completed')
     await handle!.flush()
     assert.equal(handle!.isRunning(), false)
@@ -5416,12 +5418,12 @@ test('watchBrain fresh replay on nested Turn-2 re-wakeup isolates Turn-1 failed 
       message(0, parent, 'init peer'),
       done(1, 'peer turn 1 done'),
     ])
-    const peerEvents: ProviderEvent[] = []
+    const peerCollector = createEventCollector()
     const peerHandle = watchBrain(
       f.root,
       peerChild,
       'peer',
-      (e) => peerEvents.push(e),
+      peerCollector.emit,
       5,
     )
     handles.push(peerHandle)
@@ -5436,16 +5438,14 @@ test('watchBrain fresh replay on nested Turn-2 re-wakeup isolates Turn-1 failed 
       f.path(peerChild),
       encode([message(2, child, 'peer ping'), done(3, 'peer turn 2 done')]),
     )
-    await waitUntil(() =>
-      peerEvents.some(
-        (e) =>
-          e.type === 'session.turn' &&
-          e.turnId === 'peer:turn:2' &&
-          e.state === 'completed',
-      ),
+    await peerCollector.wait(
+      (e) =>
+        e.type === 'session.turn' &&
+        e.turnId === 'peer:turn:2' &&
+        e.state === 'completed',
     )
   } finally {
-    handles.forEach((close) => close())
+    closeHandles(handles)
     await f.close()
   }
 })
@@ -5640,7 +5640,7 @@ test('follow-up send_message to a child stalled in retryPending never deadlocks 
     await stWatch.ready
     assert.deepEqual(turnStates(stEvents), ['started', 'failed'])
   } finally {
-    handles.forEach((close) => close())
+    closeHandles(handles)
     await f.close()
   }
 })
@@ -6143,15 +6143,13 @@ test('child initial spawn prompt after step-0 system reminder projects user_mess
       true,
       'a child still running its wakeup turn blocks parent settlement',
     )
-    let parentSettled = false
-    running = settleBrainTurn(f.root, parent, 'p', () => {}, {
-      signal: abort.signal,
-      minStepIndex: -1,
-      pollIntervalMs: 5,
-    }).then((res) => {
-      parentSettled = true
-      return res
-    })
+    running = alive(
+      settleBrainTurn(f.root, parent, 'p', () => {}, {
+        signal: abort.signal,
+        minStepIndex: -1,
+        pollIntervalMs: 5,
+      }),
+    )
 
     await f.deliver(parent, child, 'child final report', true, 'c-report')
     await appendFile(
@@ -6165,7 +6163,6 @@ test('child initial spawn prompt after step-0 system reminder projects user_mess
       f.path(parent),
       encode([message(5, child, 'child final report'), done(6, 'all done')]),
     )
-    await waitUntil(() => parentSettled)
     assert.equal(((await running) as { status: string }).status, 'completed')
 
     // Root session (allowInitialSpawnPrompt = false) treats a step-0 UUID [Message] as a wakeup, not an initial spawn prompt.
@@ -6370,7 +6367,7 @@ test('isWokenActive and captureRuntimeEpoch fence pre-restart artifacts while de
     { step_index: 3, type: 'PLANNER_RESPONSE', status: 'RUNNING' },
   ]
   const wokenNode = new BrainNode(parent, 'p')
-  wokenRows.forEach((row) => wokenNode.ingest(row))
+  ingestAll(wokenNode, wokenRows)
   assert.equal(wokenNode.isWokenWorking(), false)
   assert.equal(wokenNode.isWokenActive(), true)
   await f.put(parent, wokenRows)
@@ -7300,10 +7297,10 @@ test('BackgroundWorkProbe fails closed on corrupt appended JSONL and recovers fr
         done(1, 'idle'),
       ],
       reset: true,
-      mtimeMs: Date.now(),
+      mtimeMs: T0,
     },
-    { rows: [], reset: true, mtimeMs: Date.now() },
-    { rows: replacementRows, reset: true, mtimeMs: Date.now() },
+    { rows: [], reset: true, mtimeMs: T0 },
+    { rows: replacementRows, reset: true, mtimeMs: T0 },
   ]
   const racedProbe = new BackgroundWorkProbe(
     () =>

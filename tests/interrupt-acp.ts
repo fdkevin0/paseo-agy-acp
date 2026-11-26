@@ -12,9 +12,9 @@ import {
   writeFileSync,
   appendFileSync,
 } from 'node:fs'
-import { connect } from 'node:net'
 import { join } from 'node:path'
 import { Readable, Writable } from 'node:stream'
+import { awaitSignalGate } from './helpers.ts'
 
 const nativeId = '33333333-3333-4333-8333-333333333333'
 const home = process.env.HOME!
@@ -23,23 +23,7 @@ const resumeCap = process.env.AGY_RESUME_CAP === '1'
 const noReload = process.env.AGY_NO_RELOAD === '1'
 const failReload = process.env.AGY_FAIL_RELOAD === '1'
 const gateSocket = process.env.AGY_RELOAD_GATE
-const awaitReloadGate = (kind: 'load' | 'resume') =>
-  gateSocket
-    ? new Promise<void>((resolve, reject) => {
-        const socket = connect(gateSocket, () => {
-          socket.write(`${kind}\n`)
-        })
-        socket.once('data', () => {
-          socket.destroy()
-          resolve()
-        })
-        socket.once('end', () => {
-          socket.destroy()
-          resolve()
-        })
-        socket.once('error', reject)
-      })
-    : Promise.resolve()
+const awaitReloadGate = (kind: string) => awaitSignalGate(gateSocket, kind)
 const log = (event: string, data: object = {}) =>
   appendFileSync(
     join(home, 'runtime.jsonl'),
@@ -92,13 +76,12 @@ const update = (update: SessionUpdate) =>
     update,
   })
 const commands = () =>
-  setTimeout(
+  setImmediate(
     () =>
       void update({
         sessionUpdate: 'available_commands_update',
         availableCommands: [],
       }),
-    0,
   )
 connection = agent()
   .onRequest(methods.agent.initialize, async () => ({
@@ -129,7 +112,6 @@ connection = agent()
       sessionUpdate: 'agent_message_chunk',
       content: { type: 'text', text: 'HISTORY_REPLAY' },
     })
-    await new Promise((resolve) => setTimeout(resolve, 40))
     commands()
     return { configOptions }
   })
@@ -210,7 +192,7 @@ connection = agent()
         false,
       )
       log('held-foreground')
-      await new Promise((resolve) => setTimeout(resolve, 150))
+      await awaitReloadGate('held-foreground')
       rows([
         {
           step_index: 2,
@@ -268,14 +250,6 @@ connection = agent()
         rawInput: { CommandLine: 'background work' },
         status: 'in_progress',
       })
-      setTimeout(() => {
-        log('leaked-background')
-        writeFileSync(join(home, 'old-result'), 'OLD_RESULT')
-        void update({
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: 'OLD_RESULT' },
-        })
-      }, 3000)
       await update({
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'WAITING' },

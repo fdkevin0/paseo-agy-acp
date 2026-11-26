@@ -13,13 +13,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { TranscriptReader, StepDedupe } from '../server/brain-io.ts'
 import { BrainTurnObservation } from '../server/brain-observer.ts'
+import { checkpointRow } from './brain-fixtures.ts'
 
 const id = '11111111-1111-4111-8111-111111111111'
-const checkpoint = (step_index: number) => ({
-  step_index,
-  type: 'CHECKPOINT',
-  status: 'DONE',
-})
+const checkpoint = (step_index: number) => checkpointRow(step_index)
 const planner = (step_index: number, content: string) => ({
   step_index,
   type: 'PLANNER_RESPONSE',

@@ -1,28 +1,8 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { TranscriptReader } from '../server/brain-io.ts'
-import {
-  BrainTurnObservation,
-  type BrainRead,
-} from '../server/brain-observer.ts'
-import { sequenceDouble } from './helpers.ts'
-
-type ReadHandler = () => Promise<BrainRead>
-
-class ScriptedTranscriptReader extends TranscriptReader {
-  reads = 0
-  private readonly nextRead: ReadHandler
-
-  constructor(handlers: readonly ReadHandler[]) {
-    super()
-    this.nextRead = sequenceDouble(handlers)
-  }
-
-  override async read(): Promise<BrainRead> {
-    this.reads++
-    return this.nextRead()
-  }
-}
+import { BrainTurnObservation } from '../server/brain-observer.ts'
+import { ScriptedTranscriptReader } from './helpers.ts'
 
 const busy = (message: string) =>
   Object.assign(new Error(message), { code: 'EBUSY' })

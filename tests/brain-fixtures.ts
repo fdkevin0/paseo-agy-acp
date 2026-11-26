@@ -9,6 +9,32 @@ export const child = '22222222-2222-4222-8222-222222222222'
 export const grandchild = '33333333-3333-4333-8333-333333333333'
 export type Row = Record<string, unknown>
 
+export const userRow = (step_index: number, content = 'work'): Row => ({
+  step_index,
+  type: 'USER_INPUT',
+  content,
+})
+
+export const modelRow = (
+  step_index: number,
+  input_tokens: number,
+  content = 'model text',
+): Row => ({
+  step_index,
+  type: 'PLANNER_RESPONSE',
+  status: 'DONE',
+  input_tokens,
+  output_tokens: 1,
+  content,
+})
+
+export const checkpointRow = (step_index: number, extra: Row = {}): Row => ({
+  step_index,
+  type: 'CHECKPOINT',
+  status: 'DONE',
+  ...extra,
+})
+
 export const done = (step_index: number, content = 'finished'): Row => ({
   step_index,
   type: 'PLANNER_RESPONSE',
@@ -64,8 +90,57 @@ export const report = (recipient: string, text: string, start = 1): Row[] => [
   },
   done(start + 2, 'I sent the report.'),
 ]
-export const encode = (rows: Row[]) =>
-  rows.map((row) => JSON.stringify(row)).join('\n') + '\n'
+export const encode = (rows: readonly Row[]) =>
+  rows.map((row) => JSON.stringify(row) + '\n').join('')
+
+function encodeVarint(value: number): Buffer {
+  const bytes: number[] = []
+  let v = BigInt(value)
+  while (v >= 0x80n) {
+    bytes.push(Number(v & 0x7fn) | 0x80)
+    v >>= 7n
+  }
+  bytes.push(Number(v))
+  return Buffer.from(bytes)
+}
+
+export function encodeProtoField(
+  fieldNumber: number,
+  payload: number | Uint8Array,
+): Buffer {
+  if (typeof payload === 'number') {
+    return Buffer.concat([
+      encodeVarint(fieldNumber << 3),
+      encodeVarint(payload),
+    ])
+  }
+  return Buffer.concat([
+    encodeVarint((fieldNumber << 3) | 2),
+    encodeVarint(payload.length),
+    payload,
+  ])
+}
+
+/** Encode a protobuf `gen_metadata` payload containing `context_window_usage` fields. */
+export function encodeGenMetadataContextUsage(fields: {
+  maxTokens?: number
+  estimatedTokens?: number
+}): Buffer {
+  const inner: Buffer[] = []
+  if (fields.estimatedTokens !== undefined)
+    inner.push(encodeProtoField(1, fields.estimatedTokens))
+  if (fields.maxTokens !== undefined)
+    inner.push(encodeProtoField(4, fields.maxTokens))
+  return encodeProtoField(
+    1,
+    encodeProtoField(9, encodeProtoField(10, Buffer.concat(inner))),
+  )
+}
+
+/** Encode a protobuf `gen_metadata` payload with only `max_context_tokens`. */
+export function encodeGenMetadataMaxContext(maxTokens: number): Buffer {
+  return encodeGenMetadataContextUsage({ maxTokens })
+}
 
 /** A `brain` directory holding per-session transcripts, subagent records and inbox files. */
 export async function fixture() {

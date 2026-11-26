@@ -19,6 +19,7 @@ import {
 import { basename, join } from 'node:path'
 import { WritableStream } from 'node:stream/web'
 import { Readable, Writable } from 'node:stream'
+import { MessageChannel } from 'node:worker_threads'
 import recordedWakeup from './fixtures/agy-1.5.12-wakeup.json' with { type: 'json' }
 
 let nativeId = ''
@@ -73,6 +74,7 @@ const configOptions = [
 ]
 const canceled = new Set<string>()
 const cancels = new Map<string, () => void>()
+const earlyCancelGates = new Map<string, () => void>()
 let wokenStepBase = 0
 let holdSeq = 0
 function writeSessionTranscript(
@@ -196,7 +198,7 @@ async function staleEvents(sessionId: string) {
 }
 function sendCommands(sessionId: string) {
   if (process.env.AGY_TEST_NO_COMMANDS) return
-  setTimeout(async () => {
+  setImmediate(async () => {
     if (process.env.AGY_TEST_STALE_EVENTS) await staleEvents(randomUUID())
     await client.sessionUpdate({
       sessionId,
@@ -207,7 +209,7 @@ function sendCommands(sessionId: string) {
         ],
       },
     })
-  }, 0)
+  })
 }
 connection = agent()
   .onRequest(methods.agent.initialize, async ({ params }) => {
@@ -453,6 +455,7 @@ connection = agent()
     async ({ params: { sessionId } }) => {
       if (process.env.AGY_TEST_LOG_LOAD) log('cancel')
       canceled.add(sessionId)
+      earlyCancelGates.get(sessionId)?.()
       cancels.get(sessionId)?.()
     },
   )
@@ -1249,7 +1252,8 @@ connection = agent()
         },
       })
       if (text === 'disconnect') {
-        setInterval(() => {}, 1000)
+        const keepAlive = new MessageChannel()
+        keepAlive.port1.on('message', () => {})
         process.stdout.end()
         await new Promise(() => {})
       }
@@ -1578,8 +1582,15 @@ connection = agent()
         return { stopReason: 'end_turn' as const }
       }
       if (text === 'wait') {
-        if (process.env.AGY_TEST_CANCEL_DELAY)
-          await new Promise((resolve) => setTimeout(resolve, 30))
+        if (
+          process.env.AGY_TEST_CANCEL_BEFORE_REGISTER &&
+          !canceled.has(sessionId)
+        ) {
+          await new Promise<void>((resolve) => {
+            earlyCancelGates.set(sessionId, resolve)
+          })
+          earlyCancelGates.delete(sessionId)
+        }
         await new Promise<void>((resolve) => {
           if (canceled.has(sessionId)) resolve()
           else cancels.set(sessionId, resolve)

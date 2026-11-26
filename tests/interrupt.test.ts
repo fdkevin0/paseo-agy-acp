@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict'
-import { createServer, type Socket } from 'node:net'
 import { test, type TestContext } from 'node:test'
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -18,45 +17,11 @@ import { AgyUsageSource } from '../server/usage.ts'
 import {
   collectProviderEvents,
   createEventCollector,
+  createSignalGate,
   isolatedEnv,
 } from './helpers.ts'
 
-async function createReloadGate(dir: string) {
-  const socketPath = join(dir, 'reload.sock')
-  let resolveEntered!: (kind: 'load' | 'resume') => void
-  const entered = new Promise<'load' | 'resume'>((resolve) => {
-    resolveEntered = resolve
-  })
-  let released = false
-  let conn: Socket | undefined
-  const sockets = new Set<Socket>()
-  const server = createServer((socket) => {
-    conn = socket
-    sockets.add(socket)
-    socket.on('close', () => sockets.delete(socket))
-    let buf = ''
-    socket.on('data', (chunk) => {
-      buf += chunk.toString('utf8')
-      const nl = buf.indexOf('\n')
-      if (nl < 0) return
-      resolveEntered(buf.slice(0, nl).trim() as 'load' | 'resume')
-      if (released) socket.end('go\n')
-    })
-  })
-  await new Promise<void>((resolve) => server.listen(socketPath, resolve))
-  return {
-    socketPath,
-    entered,
-    release() {
-      released = true
-      if (conn && !conn.destroyed) conn.end('go\n')
-    },
-    async close() {
-      for (const socket of sockets) socket.destroy()
-      await new Promise<void>((resolve) => server.close(() => resolve()))
-    },
-  }
-}
+const createReloadGate = (dir: string) => createSignalGate(dir, 'reload.sock')
 
 /** Connect a provider to interrupt-acp.ts and record its events. */
 async function connect(

@@ -1,6 +1,5 @@
 import { test, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, utimesSync } from 'node:fs'
 import { mkdtemp, mkdir, writeFile, rm, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -15,56 +14,14 @@ import { readConversationCompactionWindow } from '../server/conversation-db.ts'
 import { promptUsage } from '../server/mapping.ts'
 import { SessionManager } from '../server/session.ts'
 import { AgyUsageSource } from '../server/usage.ts'
-import { createEventCollector, isolatedEnv } from './helpers.ts'
+import {
+  encodeGenMetadataContextUsage,
+  encodeGenMetadataMaxContext,
+  encodeProtoField,
+} from './brain-fixtures.ts'
+import { createEventCollector, isolatedEnv, writeTimedDb } from './helpers.ts'
 
-function encodeVarint(value: number): Buffer {
-  const bytes: number[] = []
-  let v = BigInt(value)
-  while (v >= 0x80n) {
-    bytes.push(Number(v & 0x7fn) | 0x80)
-    v >>= 7n
-  }
-  bytes.push(Number(v))
-  return Buffer.from(bytes)
-}
-
-function encodeProtoField(
-  fieldNumber: number,
-  payload: number | Uint8Array,
-): Buffer {
-  if (typeof payload === 'number') {
-    return Buffer.concat([
-      encodeVarint(fieldNumber << 3),
-      encodeVarint(payload),
-    ])
-  }
-  return Buffer.concat([
-    encodeVarint((fieldNumber << 3) | 2),
-    encodeVarint(payload.length),
-    payload,
-  ])
-}
-
-function encodeGenMetadataContextUsage(fields: {
-  maxTokens?: number
-  estimatedTokens?: number
-}): Buffer {
-  const inner: Buffer[] = []
-  if (fields.estimatedTokens !== undefined)
-    inner.push(encodeProtoField(1, fields.estimatedTokens))
-  if (fields.maxTokens !== undefined)
-    inner.push(encodeProtoField(4, fields.maxTokens))
-  return encodeProtoField(
-    1,
-    encodeProtoField(9, encodeProtoField(10, Buffer.concat(inner))),
-  )
-}
-
-function encodeGenMetadataMaxContext(maxTokens: number): Buffer {
-  return encodeGenMetadataContextUsage({ maxTokens })
-}
-
-let dbWriteEpochSeconds = Math.floor(Date.now() / 1000) + 1
+let dbWriteEpochSeconds = 1_700_000_000
 
 function writeConversationDb(
   home: string,
@@ -73,23 +30,24 @@ function writeConversationDb(
     gen?: Array<{ idx: number; data: Uint8Array }>
   },
 ) {
-  const convDir = join(home, '.gemini/antigravity-cli/conversations')
-  mkdirSync(convDir, { recursive: true })
-  const dbPath = join(convDir, `${nativeId}.db`)
-  const db = new DatabaseSync(dbPath)
-  try {
-    db.exec(
-      'CREATE TABLE IF NOT EXISTS gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)',
-    )
-    const insGen = db.prepare(
-      'INSERT OR REPLACE INTO gen_metadata (idx, data) VALUES (?, ?)',
-    )
-    ;(entries.gen ?? []).forEach((row) => insGen.run(row.idx, row.data))
-  } finally {
-    db.close()
-  }
-  const tick = ++dbWriteEpochSeconds
-  utimesSync(dbPath, tick, tick)
+  const dbPath = join(
+    home,
+    '.gemini/antigravity-cli/conversations',
+    `${nativeId}.db`,
+  )
+  writeTimedDb(
+    dbPath,
+    (db) => {
+      db.exec(
+        'CREATE TABLE IF NOT EXISTS gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)',
+      )
+      const insGen = db.prepare(
+        'INSERT OR REPLACE INTO gen_metadata (idx, data) VALUES (?, ?)',
+      )
+      ;(entries.gen ?? []).forEach((row) => insGen.run(row.idx, row.data))
+    },
+    ++dbWriteEpochSeconds,
+  )
 }
 
 test('latest usage respects the turn boundary, incomplete rows and cache-only counters', async () => {

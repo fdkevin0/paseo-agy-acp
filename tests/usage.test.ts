@@ -1,7 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  appendFile,
   mkdtemp,
   mkdir,
   writeFile,
@@ -10,7 +9,6 @@ import {
   rm,
   stat,
   symlink,
-  utimes,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -23,7 +21,23 @@ import {
   readLoggedEmail,
   usageWindows,
 } from '../server/usage.ts'
-import { isolatedEnv, waitUntil } from './helpers.ts'
+import { isolatedEnv, waitForPidExit, writeTimedLog } from './helpers.ts'
+
+async function writeTimedNoiseLogs(
+  logDir: string,
+  count: number,
+  startEpoch: number,
+): Promise<void> {
+  await Promise.all(
+    Array.from({ length: count }, (_, i) =>
+      writeTimedLog(
+        join(logDir, `acp-server-${i}.log`),
+        'ACP session started without auth banner\n',
+        startEpoch + i,
+      ),
+    ),
+  )
+}
 
 const groups = ['Gemini Models', 'Claude and GPT models'].map((name) => ({
   name,
@@ -252,58 +266,55 @@ test('email discovery reads bounded tail and startup head chunks and deduplicate
         'y'.repeat(80_000),
     )
     assert.equal(await readLoggedEmail(dir), 'complete@example.test')
-    await writeFile(
-      join(dir, 'cli.log'),
+    const startupLog =
       'x'.repeat(11_000) +
-        '\napplyAuthResult: email=startup@example.test\n' +
-        'y'.repeat(140_000),
-    )
+      '\napplyAuthResult: email=startup@example.test\n' +
+      'y'.repeat(140_000)
+    await writeFile(join(dir, 'cli.log'), startupLog)
     assert.equal(await readLoggedEmail(dir), 'startup@example.test')
-    await appendFile(
+    await writeTimedLog(
       join(dir, 'cli.log'),
-      '\nOAuth: authenticated successfully as relogin@example.test\n',
+      startupLog +
+        '\nOAuth: authenticated successfully as relogin@example.test\n',
+      10,
     )
-    await utimes(join(dir, 'cli.log'), 10, 10)
     assert.equal(await readLoggedEmail(dir), 'relogin@example.test')
-    await writeFile(
+    await writeTimedLog(
       join(dir, 'log/cli-old.log'),
       'applyAuthResult: email=old@example.test, token=omitted\n',
+      5,
     )
-    await utimes(join(dir, 'log/cli-old.log'), 5, 5)
-    await writeFile(
+    await writeTimedLog(
       join(dir, 'log/cli-new.log'),
       'applyAuthResult: email=first@example.test\nOAuth: authenticated successfully as latest@example.test\n',
+      20,
     )
-    await utimes(join(dir, 'log/cli-new.log'), 20, 20)
     assert.equal(await readLoggedEmail(dir), 'latest@example.test')
     await rm(join(dir, 'cli.log'))
     await symlink(join(dir, 'log/cli-new.log'), join(dir, 'cli.log'))
-    await writeFile(join(dir, 'log/cli-new.log'), 'no auth banner here\n')
-    await utimes(join(dir, 'log/cli-new.log'), 25, 25)
+    await writeTimedLog(
+      join(dir, 'log/cli-new.log'),
+      'no auth banner here\n',
+      25,
+    )
     assert.equal(await readLoggedEmail(dir), 'old@example.test')
-    await writeFile(
+    await writeTimedLog(
       join(dir, 'log/acp-server-1234.log'),
       'applyAuthResult: email=acp@example.test, token=omitted\n',
+      30,
     )
-    await utimes(join(dir, 'log/acp-server-1234.log'), 30, 30)
     assert.equal(await readLoggedEmail(dir), 'acp@example.test')
 
     // 10 newer acp-server-*.log files without auth lines must not evict cli.log.
     await rm(join(dir, 'cli.log'))
-    await writeFile(
+    await writeTimedLog(
       join(dir, 'cli.log'),
       'applyAuthResult: email=retained-cli@example.test\n',
+      5,
     )
-    await utimes(join(dir, 'cli.log'), 5, 5)
     await rm(join(dir, 'log'), { recursive: true, force: true })
     await mkdir(join(dir, 'log'))
-    await Promise.all(
-      Array.from({ length: 12 }, async (_, i) => {
-        const logFile = join(dir, `log/acp-server-${i}.log`)
-        await writeFile(logFile, 'ACP session started without auth banner\n')
-        await utimes(logFile, 100 + i, 100 + i)
-      }),
-    )
+    await writeTimedNoiseLogs(join(dir, 'log'), 12, 100)
     await mkdir(join(dir, 'log/cli-ignored-dir.log'))
     assert.equal(await readLoggedEmail(dir), 'retained-cli@example.test')
 
@@ -502,14 +513,7 @@ test('keychain logins without a token file support cold global discovery, accoun
     })
     const hungPid = Number(await readFile(pidFile, 'utf8'))
     assert.ok(Number.isInteger(hungPid) && hungPid > 0)
-    await waitUntil(() => {
-      try {
-        process.kill(hungPid, 0)
-        return false
-      } catch (error) {
-        return (error as NodeJS.ErrnoException).code === 'ESRCH'
-      }
-    })
+    await waitForPidExit(hungPid)
   } finally {
     await rm(home, { recursive: true, force: true })
   }

@@ -18,6 +18,7 @@ import {
   readConversationCompactionWindow,
   readConversationStepError,
 } from '../server/conversation-db.ts'
+import { encodeGenMetadataContextUsage } from './brain-fixtures.ts'
 
 const ID_A = '11111111-1111-4111-8111-111111111111'
 const ID_B = '22222222-2222-4222-8222-222222222222'
@@ -35,30 +36,8 @@ async function createEnv(t: TestContext) {
   return { home, brainRoot, convDir }
 }
 
-function encodeVarint(value: number): number[] {
-  return [
-    (value & 0x7f) | 0x80,
-    ((value >> 7) & 0x7f) | 0x80,
-    (value >> 14) & 0x7f,
-  ]
-}
-
-function encodeLengthDelimited(fieldNumber: number, payload: Uint8Array) {
-  return new Uint8Array([(fieldNumber << 3) | 2, payload.length, ...payload])
-}
-
-function encodeCompactionMetadata(maxTokens: number, estimatedTokens: number) {
-  const inner = new Uint8Array([
-    (1 << 3) | 0,
-    ...encodeVarint(estimatedTokens),
-    (4 << 3) | 0,
-    ...encodeVarint(maxTokens),
-  ])
-  return encodeLengthDelimited(
-    1,
-    encodeLengthDelimited(9, encodeLengthDelimited(10, inner)),
-  )
-}
+const encodeCompactionMetadata = (maxTokens: number, estimatedTokens: number) =>
+  encodeGenMetadataContextUsage({ maxTokens, estimatedTokens })
 
 test('readConversationCompactionWindow returns defensive copies on cache miss and cache hit', async (t) => {
   const { brainRoot, convDir } = await createEnv(t)
