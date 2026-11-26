@@ -1070,3 +1070,114 @@ test('remember() with launch.env undefined preserves baseEnv PATH/HOME and surfa
     await rm(home, { recursive: true, force: true })
   }
 })
+
+test('exit code 2 reports no_quota only for Gemini API key or unsupported-quota responses, not CLI flag errors', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-usage-apikey-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const fixture = join(home, 'usage-error.json')
+  const argsLog = join(home, 'args.json')
+  const script = fileURLToPath(new URL('./mock-usage.ts', import.meta.url))
+  const apiKeyMessage =
+    "/usage failed: not available with a Gemini API key; see https://aistudio.google.com/usage for the key's usage"
+
+  await writeFile(
+    fixture,
+    JSON.stringify({
+      conversation_id: '',
+      status: 'ERROR',
+      response: '',
+      error: apiKeyMessage,
+      duration_seconds: 0,
+      num_turns: 0,
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        thinking_tokens: 0,
+        cache_read_tokens: 0,
+        total_tokens: 0,
+      },
+      finished_reason: 'error',
+    }),
+  )
+
+  const usage = new AgyUsageSource({ env: isolatedEnv(home) })
+  const dir = usage.remember(
+    {
+      command: process.execPath,
+      args: [script, 'acp'],
+      env: isolatedEnv(home, {
+        AGY_USAGE_ARGS: argsLog,
+        AGY_USAGE_FIXTURE: fixture,
+        AGY_USAGE_STDERR: `error: ${apiKeyMessage}\n`,
+        AGY_USAGE_EXIT_CODE: '2',
+      }),
+    },
+    {},
+    home,
+  )
+
+  const apiKeyReport = await usage.fetch({ dataDir: dir })
+  assert.deepEqual(apiKeyReport, {
+    status: 'unavailable',
+    problem: { kind: 'no_quota', detail: apiKeyMessage },
+  })
+
+  usage.remember(
+    {
+      command: process.execPath,
+      args: [script, 'acp'],
+      env: isolatedEnv(home, {
+        AGY_USAGE_ARGS: argsLog,
+        AGY_USAGE_STDERR:
+          'error: /usage failed: no quota summary is available for this account\n',
+        AGY_USAGE_EXIT_CODE: '2',
+      }),
+    },
+    {},
+    home,
+  )
+  const stderrOnlyReport = await usage.fetch({ dataDir: dir })
+  assert.deepEqual(stderrOnlyReport, {
+    status: 'unavailable',
+    problem: {
+      kind: 'no_quota',
+      detail: '/usage failed: no quota summary is available for this account',
+    },
+  })
+
+  usage.remember(
+    {
+      command: process.execPath,
+      args: [script, 'acp'],
+      env: isolatedEnv(home, {
+        AGY_USAGE_ARGS: argsLog,
+        AGY_USAGE_STDERR: 'unknown flag: --gemini-dir\n',
+        AGY_USAGE_EXIT_CODE: '2',
+      }),
+    },
+    {},
+    home,
+  )
+  const flagErrorReport = await usage.fetch({ dataDir: dir })
+  assert.ok(flagErrorReport.status === 'error')
+  assert.match(flagErrorReport.error, /code 2/)
+  assert.match(flagErrorReport.error, /unknown flag: --gemini-dir/)
+
+  usage.remember(
+    {
+      command: process.execPath,
+      args: [script, 'acp'],
+      env: isolatedEnv(home, {
+        AGY_USAGE_ARGS: argsLog,
+        AGY_USAGE_FIXTURE: fixture,
+        AGY_USAGE_STDERR: `error: ${apiKeyMessage}\n`,
+        AGY_USAGE_EXIT_CODE: '1',
+      }),
+    },
+    {},
+    home,
+  )
+  const exitOneReport = await usage.fetch({ dataDir: dir })
+  assert.ok(exitOneReport.status === 'error')
+  assert.match(exitOneReport.error, /code 1/)
+})
