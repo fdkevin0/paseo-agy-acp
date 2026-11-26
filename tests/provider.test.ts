@@ -92,27 +92,27 @@ async function assertRejectsRuntimeVersion(
 
 test('session.open rejects an unsupported ACP initialize version without status preflight', async () => {
   await assertRejectsRuntimeVersion(
-    '1.5.9',
-    /agy 1\.5\.9 is too old; requires >=1\.5\.10/,
+    '1.5.15',
+    /agy 1\.5\.15 is too old; requires >=1\.5\.16/,
   )
 })
 
 test('session.open rejects a minimum-version ACP prerelease', async () => {
   await assertRejectsRuntimeVersion(
-    '1.5.10-rc.1',
-    /agy 1\.5\.10-rc\.1 is too old/,
+    '1.5.16-rc.1',
+    /agy 1\.5\.16-rc\.1 is too old/,
   )
 })
 
 test('session.open rejects ACP initialize without agentInfo version', async () => {
   await assertRejectsRuntimeVersion(
     'missing',
-    /Could not determine agy version; requires >=1\.5\.10/,
+    /Could not determine agy version; requires >=1\.5\.16/,
   )
 })
 
 test('session configure rejects a replacement runtime below the ACP minimum', async () => {
-  const h = await harness({ AGY_TEST_RELAUNCH_VERSION: '1.5.9' })
+  const h = await harness({ AGY_TEST_RELAUNCH_VERSION: '1.5.15' })
   try {
     await h.provider.send({
       type: 'session.open',
@@ -136,7 +136,7 @@ test('session configure rejects a replacement runtime below the ACP minimum', as
     assert.ok(failure.type === 'session.runtime_failed')
     assert.match(
       failure.error.message,
-      /agy 1\.5\.9 is too old; requires >=1\.5\.10/,
+      /agy 1\.5\.15 is too old; requires >=1\.5\.16/,
     )
     await h.wait(
       (event) =>

@@ -94,7 +94,7 @@ function createFakeConnect(
         const result = script?.init
           ? await script.init()
           : {
-              agentInfo: { version: '1.5.12' },
+              agentInfo: { version: '1.5.16' },
               agentCapabilities: {
                 loadSession: true,
                 sessionCapabilities: { list: {} },
@@ -444,9 +444,9 @@ test('unexpected exit or failed startup evicts the dead shared control transport
   const pidLog = join(home, 'pids.log')
   const crashFlag = join(home, 'crash-list')
   const fake = createFakeConnect([
-    { init: async () => ({ agentInfo: { version: '1.5.9' } }) },
-    { init: async () => ({ agentInfo: { version: '1.5.12' } }) },
-    { init: async () => ({ agentInfo: { version: '1.5.12' } }) },
+    { init: async () => ({ agentInfo: { version: '1.5.15' } }) },
+    { init: async () => ({ agentInfo: { version: '1.5.16' } }) },
+    { init: async () => ({ agentInfo: { version: '1.5.16' } }) },
   ])
   const manual = createManualScheduler()
   const runtime = new SharedControlRuntime({
@@ -746,7 +746,7 @@ test('SharedControlRuntime.close shuts down idle, in-flight startup, and ephemer
     const pendingStartup = startupRuntime.run(home, async () => 'never')
     await startupEntered.promise
     const closingStartup = startupRuntime.close()
-    startupGate.resolve({ agentInfo: { version: '1.5.12' } })
+    startupGate.resolve({ agentInfo: { version: '1.5.16' } })
     await closingStartup
     await assert.rejects(pendingStartup, /Provider connection is closed/)
     assert.equal(startupFake.created[0].closeCalled(), 1)
@@ -886,13 +886,13 @@ test('StandbyRuntimePool isolates skipPermissions and session env keys and rejec
     {
       init: async () => {
         baseStarted.resolve()
-        return { agentInfo: { version: '1.5.12' } }
+        return { agentInfo: { version: '1.5.16' } }
       },
     },
     {
       init: async () => {
         envStarted.resolve()
-        return { agentInfo: { version: '1.5.12' } }
+        return { agentInfo: { version: '1.5.16' } }
       },
     },
   ])
@@ -981,9 +981,9 @@ test('StandbyRuntimePool isolates skipPermissions and session env keys and rejec
 test('StandbyRuntimePool evicts dead standby and failed warmup cleanly so take falls back to undefined', async () => {
   const home = await mkdtemp(join(tmpdir(), 'agy-standby-fail-'))
   const fake = createFakeConnect([
-    { init: async () => ({ agentInfo: { version: '1.5.9' } }) },
-    { init: async () => ({ agentInfo: { version: '1.5.12' } }) },
-    { init: async () => ({ agentInfo: { version: '1.5.12' } }) },
+    { init: async () => ({ agentInfo: { version: '1.5.15' } }) },
+    { init: async () => ({ agentInfo: { version: '1.5.16' } }) },
+    { init: async () => ({ agentInfo: { version: '1.5.16' } }) },
   ])
   const manual = createManualScheduler()
   const launch: ProviderLaunch = {
@@ -1035,19 +1035,19 @@ test('StandbyRuntimePool enforces maxSlots LRU eviction and unreffed idle reapin
     {
       init: async () => {
         slot1Started.resolve()
-        return { agentInfo: { version: '1.5.12' } }
+        return { agentInfo: { version: '1.5.16' } }
       },
     },
     {
       init: async () => {
         slot2Started.resolve()
-        return { agentInfo: { version: '1.5.12' } }
+        return { agentInfo: { version: '1.5.16' } }
       },
     },
     {
       init: async () => {
         slot3Started.resolve()
-        return { agentInfo: { version: '1.5.12' } }
+        return { agentInfo: { version: '1.5.16' } }
       },
     },
   ])
@@ -1143,7 +1143,7 @@ test('StandbyRuntimePool.close shuts down idle, recycled, and in-flight-warming 
     const pendingTakeB = pool.take(launch, home, { SLOT: 'B' })
 
     const closing = pool.close()
-    warmGate.resolve({ agentInfo: { version: '1.5.12' } })
+    warmGate.resolve({ agentInfo: { version: '1.5.16' } })
     await closing
 
     assert.equal(await pendingTakeB, undefined)
@@ -1627,7 +1627,7 @@ function createControlledSessionConnect(
       closed: closedBarrier.promise,
       initialize: async () => ({
         protocolVersion: 1,
-        agentInfo: { name: 'Antigravity ACP Server', version: '1.5.12' },
+        agentInfo: { name: 'Antigravity ACP Server', version: '1.5.16' },
         agentCapabilities: {
           loadSession: true,
           sessionCapabilities: { list: {}, resume: {} },
@@ -2139,19 +2139,19 @@ test('StandbyRuntimePool.take misses and closes stale-fingerprint slots and warm
     {
       init: async () => {
         slot1Started.resolve()
-        return { agentInfo: { version: '1.5.12' } }
+        return { agentInfo: { version: '1.5.16' } }
       },
     },
     {
       init: async () => {
         slot2Started.resolve()
-        return { agentInfo: { version: '1.5.12' } }
+        return { agentInfo: { version: '1.5.16' } }
       },
     },
     {
       init: async () => {
         slot3Started.resolve()
-        return { agentInfo: { version: '1.5.12' } }
+        return { agentInfo: { version: '1.5.16' } }
       },
     },
   ])
@@ -2401,7 +2401,7 @@ test('SessionManager.close during standby.take or cold initializeAcp aborts imme
       },
     })
     const closing1 = Promise.all([manager1.close(), pool.close()])
-    warmInitGate.resolve({ agentInfo: { version: '1.5.12' } })
+    warmInitGate.resolve({ agentInfo: { version: '1.5.16' } })
     await closing1
     await assert.rejects(openingFromStandby, /Provider connection is closed/)
     assert.equal(coldStartCalls.length, 0)
@@ -2444,7 +2444,7 @@ test('SharedControlRuntime transparently retries an in-flight startup caller whe
       },
     },
     {
-      init: async () => ({ agentInfo: { version: '1.5.12' } }),
+      init: async () => ({ agentInfo: { version: '1.5.16' } }),
     },
   ])
   let currentFingerprint = 'fp-v1'
@@ -2472,7 +2472,7 @@ test('SharedControlRuntime transparently retries an in-flight startup caller whe
     assert.equal(fake.created[0].closeCalled(), 0)
 
     // Completing slot1 initialize lets caller1 drain slot1, close it, and transparently acquire slot2.
-    init1Gate.resolve({ agentInfo: { version: '1.5.12' } })
+    init1Gate.resolve({ agentInfo: { version: '1.5.16' } })
     const transport1 = await caller1
     assert.equal(transport1, fake.created[1].transport)
     await fake.created[0].closedBarrier.promise

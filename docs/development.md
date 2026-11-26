@@ -14,7 +14,7 @@ Paseo compiles the TypeScript plugin; no separate build output is required. Git/
 
 ## Protocol and identity primer
 
-- **ACP vs. Brain**: Prompts, text and tool notifications, config options and interactive approvals flow over JSON-RPC stdio (`agy acp`). The minimum supported agy version is 1.5.10, which also streams wakeup updates after the prompt RPC. Local Brain files under `<appDataDir>/brain/<nativeId>/.system_generated/` track background work and consumption outside the RPC.
+- **ACP vs. Brain**: Prompts, text and tool notifications, config options and interactive approvals flow over JSON-RPC stdio (`agy acp`). The minimum supported agy version is 1.5.16, which streams wakeup updates, completes `session/load` history replay before replying, and returns `-32002` for missing `session/load` conversations. Local Brain files under `<appDataDir>/brain/<nativeId>/.system_generated/` track background work and consumption outside the RPC.
 - **Session identities**:
   - `sessionId`: Paseo's host-assigned session identifier (for example, `'s'`).
   - `nativeId`: `agy`'s UUIDv4 conversation identifier on disk and over ACP.

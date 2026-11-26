@@ -21,8 +21,9 @@ const STATUS_CACHE_TTL_MS = 60_000
 const statusCache = new Map<string, number>()
 const pendingStatuses = new Map<string, Promise<ProviderStatus>>()
 
-// agy 1.5.10 streams Reactive Wakeup output after session/prompt returns.
-const MIN_AGY_VERSION = '1.5.10'
+// agy 1.5.16+ returns -32002 for missing session/load, keeps turns open across
+// non-daemon background wakeups, and forwards child-session permissions/questions.
+const MIN_AGY_VERSION = '1.5.16'
 const agyVersionPattern =
   /v?(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?/
 const agyVersionOutputPattern = new RegExp(`\\b${agyVersionPattern.source}\\b`)
@@ -365,29 +366,6 @@ async function realDirectory(path: string): Promise<boolean> {
     if (isMissingOrNonDir(error)) return false
     throw error
   }
-}
-
-/** Whether a session has local conversation database or Brain directory artifacts. */
-export async function hasLocalSessionArtifacts(
-  appData: string,
-  sessionId: string,
-): Promise<boolean> {
-  if (!sessionIdPattern.test(sessionId) || !(await realDirectory(appData)))
-    return false
-  for (const [directory, name, kind] of [
-    [join(appData, 'conversations'), `${sessionId}.db`, 'file'],
-    [join(appData, 'brain'), sessionId, 'directory'],
-  ] as const) {
-    if (!(await realDirectory(directory))) continue
-    try {
-      const info = await lstat(join(directory, name))
-      if (kind === 'file' ? info.isFile() : info.isDirectory()) return true
-    } catch (error) {
-      if (isMissingOrNonDir(error)) continue
-      throw error
-    }
-  }
-  return false
 }
 
 /** Delete only the UUID returned by a disposable, never-prompted, now-closed session. */

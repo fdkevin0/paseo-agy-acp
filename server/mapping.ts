@@ -569,7 +569,7 @@ export function configState(response: SessionMetadata): ProviderConfigState {
       : inventoried
         ? knownEfforts.filter((o) => offered.has(o.id))
         : thinkingOptions
-    // Matches agy 1.5.7 acp.(*modelFamily).defaultModel: active thought_level, else 'medium', else first.
+    // Matches agy acp.(*modelFamily).defaultModel: active thought_level, else 'medium', else first.
     const defaultThinkingOptionId =
       efforts.length > 0
         ? m.id === modelId &&
