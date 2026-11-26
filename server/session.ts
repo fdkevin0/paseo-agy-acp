@@ -78,19 +78,6 @@ import {
   type StandbyRuntimePool,
 } from './runtime.ts'
 import { connectAcp, type AcpClient } from './transport.ts'
-
-const childToolCallIdPattern =
-  /^([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}):/i
-
-/** Whether a toolCallId is prefixed with a child/workflow conversation UUID distinct from root. */
-export function isChildToolCallId(
-  toolCallId: string | undefined,
-  rootNativeId: string,
-): boolean {
-  if (!toolCallId || !rootNativeId) return false
-  const match = childToolCallIdPattern.exec(toolCallId)
-  return match !== null && match[1].toLowerCase() !== rootNativeId.toLowerCase()
-}
 import {
   definedProcessEnv,
   formatErrorMessage,
@@ -113,6 +100,19 @@ import {
   type SessionMetadata,
   type StepUsage,
 } from './mapping.ts'
+
+const childToolCallIdPattern =
+  /^([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}):/i
+
+/** Whether a toolCallId is prefixed with a child/workflow conversation UUID distinct from root. */
+export function isChildToolCallId(
+  toolCallId: string | undefined,
+  rootNativeId: string,
+): boolean {
+  if (!toolCallId || !rootNativeId) return false
+  const match = childToolCallIdPattern.exec(toolCallId)
+  return match !== null && match[1].toLowerCase() !== rootNativeId.toLowerCase()
+}
 
 type Open = Extract<ProviderInput, { type: 'session.open' }>
 type Prompt = Extract<ProviderInput, { type: 'session.prompt' }>
