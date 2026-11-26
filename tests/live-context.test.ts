@@ -726,11 +726,21 @@ test(
       { observationPollIntervalMs: 60_000 },
       'recorded-wakeup-delayed-reads',
     )
-    await h.session.drain()
-    await h.attached()
-    await h.read()
     const lastRead = (callId: string) =>
       h.toolCalls().findLast((item) => item.callId === callId)
+    await h.wait(
+      () =>
+        lastRead('call_2')?.status === 'running' &&
+        lastRead('call_3')?.status === 'running',
+    )
+    await h.session.drain()
+    await h.attached()
+    await h.session.transport.rpc.setSessionConfigOption({
+      sessionId: h.session.state.nativeId,
+      configId: 'fixture-write-wakeup-rows',
+      value: 'write',
+    })
+    await h.read()
     assert.equal(lastRead('call_2')?.status, 'completed')
     assert.match(JSON.stringify(lastRead('call_2')?.detail), /alpha/)
     assert.equal(lastRead('call_3')?.status, 'completed')

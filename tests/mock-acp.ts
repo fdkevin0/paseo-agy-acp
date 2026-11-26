@@ -25,6 +25,7 @@ import recordedWakeup from './fixtures/agy-1.5.12-wakeup.json' with { type: 'jso
 let nativeId = ''
 let lastSessionCwd = ''
 let afterPromptResponse: (() => Promise<void>) | undefined
+let writeRecordedWakeupRows: (() => void) | undefined
 let finishRecordedReads: (() => Promise<void>) | undefined
 if (process.env.AGY_TEST_PID_FILE)
   writeFileSync(process.env.AGY_TEST_PID_FILE, String(process.pid))
@@ -429,6 +430,13 @@ connection = agent()
   .onRequest(
     methods.agent.session.setConfigOption,
     async ({ params: { configId, value } }) => {
+      if (configId === 'fixture-write-wakeup-rows') {
+        if (!writeRecordedWakeupRows)
+          throw new Error('Recorded wakeup rows are not waiting')
+        writeRecordedWakeupRows()
+        writeRecordedWakeupRows = undefined
+        return { configOptions }
+      }
       if (configId === 'fixture-release-reads') {
         if (!finishRecordedReads)
           throw new Error('Recorded reads are not waiting')
@@ -573,19 +581,21 @@ connection = agent()
               ])
               return
             }
-            writeSessionTranscript(sessionId, recordedWakeup.wakeup.rows)
             if (text === 'recorded-wakeup-delayed-reads') {
               const readCompleted = (
                 u: (typeof recordedWakeup.wakeup.updates)[number],
               ) =>
                 u.sessionUpdate === 'tool_call_update' &&
                 (u.toolCallId === 'call_2' || u.toolCallId === 'call_3')
+              writeRecordedWakeupRows = () =>
+                writeSessionTranscript(sessionId, recordedWakeup.wakeup.rows)
               finishRecordedReads = () =>
                 sendUpdates(recordedWakeup.wakeup.updates.filter(readCompleted))
               await sendUpdates(
                 recordedWakeup.wakeup.updates.filter((u) => !readCompleted(u)),
               )
             } else {
+              writeSessionTranscript(sessionId, recordedWakeup.wakeup.rows)
               await sendUpdates(recordedWakeup.wakeup.updates)
             }
             const answer = await client.createElicitation({
