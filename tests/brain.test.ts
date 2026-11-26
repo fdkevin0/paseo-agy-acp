@@ -16,14 +16,8 @@ import { join } from 'node:path'
 import {
   advanceForegroundCursor,
   BackgroundWorkProbe,
-  BrainNode,
-  BrainTranscriptProjector,
   captureRuntimeEpoch,
-  countRowMessages,
   hasActiveBackgroundWork,
-  readInboxState,
-  readLastStepIndex,
-  readSubagents,
   settleBrainTurn,
   watchBrain,
   type BrainWatchHandle,
@@ -37,7 +31,18 @@ import {
   writeFileAtomic,
 } from './helpers.ts'
 import recordedWakeup from './fixtures/agy-1.5.12-wakeup.json' with { type: 'json' }
-import { isRestartNotice, TranscriptReader } from '../server/brain-io.ts'
+import {
+  countRowMessages,
+  isRestartNotice,
+  readInboxState,
+  readLastStepIndex,
+  readSubagents,
+  TranscriptReader,
+} from '../server/brain-io.ts'
+import {
+  BrainNode,
+  BrainTranscriptProjector,
+} from '../server/brain-projector.ts'
 import { BrainTurnObservation } from '../server/brain-observer.ts'
 import {
   child,
@@ -7826,4 +7831,117 @@ test('settleBrainTurn resets stall watchdog after a host-sleep clock jump and st
   assert.equal(result.stalled, true)
   assert.match(String(result.error), /idle for 12s without a final response/)
   assert.deepEqual(items.map(errorIdOrType), ['p:step:2:stalled'])
+})
+
+test('daemon run_command completes its tool card on SYSTEM_MESSAGE result and multiline headers cannot match tasks', () => {
+  const projector = new BrainTranscriptProjector(parent)
+  const daemonTaskId = `${parent}/task-daemon`
+  const timerTaskId = `${parent}/task-timer`
+
+  projector.project({
+    step_index: 1,
+    type: 'PLANNER_RESPONSE',
+    tool_calls: [
+      {
+        id: 'daemon-cmd',
+        name: 'run_command',
+        args: { CommandLine: 'serve --port 8080', IsDaemon: true },
+      },
+      {
+        id: 'timer-1',
+        name: 'schedule',
+        args: {
+          DurationSeconds: 60,
+          TimerCondition: 'peer-1',
+          Prompt: 'check',
+        },
+      },
+    ],
+  })
+  projector.project({
+    step_index: 2,
+    type: 'GENERIC',
+    status: 'RUNNING',
+    content: `Tool is running as a background task with task id: ${daemonTaskId}\n`,
+  })
+  projector.project({
+    step_index: 3,
+    type: 'GENERIC',
+    status: 'RUNNING',
+    content: `Tool is running as a background task with task id: ${timerTaskId}\n`,
+  })
+  assert.equal(projector.hasDaemons(), true)
+  assert.equal(projector.hasBackground(), true)
+
+  // Multiline body containing `[Message]\n...sender=peer-1` must not match as a single-line header.
+  const ignored = projector.project({
+    step_index: 4,
+    type: 'SYSTEM_MESSAGE',
+    content:
+      '<SYSTEM_MESSAGE>\n[Message]\ntimestamp=2026-11-26T10:00:00Z sender=peer-1 content=not a header\n</SYSTEM_MESSAGE>',
+  })
+  assert.deepEqual(ignored, [])
+  assert.equal(projector.hasBackground(), true)
+  assert.equal(projector.hasDaemons(), true)
+
+  const finished = projector.project({
+    step_index: 5,
+    type: 'SYSTEM_MESSAGE',
+    content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-26T10:00:05Z sender=${daemonTaskId} priority=MESSAGE_PRIORITY_HIGH content=Task id "${daemonTaskId}" finished with result:\nCommand exited with code 0.\n\nCommand output:\nstopped cleanly\n</SYSTEM_MESSAGE>`,
+  })
+  assert.equal(projector.hasDaemons(), false)
+  assert.equal(projector.hasBackground(), true)
+  assert.equal(finished.length, 1)
+  assert.equal(finished[0].type, 'tool_call')
+  assert.equal(finished[0].callId, 'daemon-cmd')
+  assert.equal(finished[0].status, 'completed')
+  assert.deepEqual(finished[0].detail, {
+    type: 'shell',
+    command: 'serve --port 8080',
+    cwd: undefined,
+    output: 'Command exited with code 0.\n\nCommand output:\nstopped cleanly',
+    exitCode: 0,
+  })
+})
+
+test('readSubagents recovers spawn metadata after a transiently torn invoke_subagent message file', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+  const childId = randomUUID()
+  const subDir = join(f.root, parent, '.system_generated/subagents')
+  await writeFileAtomic(
+    join(subDir, `${childId}.json`),
+    JSON.stringify({
+      conversationId: childId,
+      spawnStepIndex: 0,
+      state: 'SUBAGENT_STATE_ALIVE',
+    }),
+  )
+
+  const msgDir = join(f.root, childId, '.system_generated/messages')
+  await mkdir(msgDir, { recursive: true })
+  await f.deliver(childId, parent, 'later wakeup', false, 'wake-1', {
+    conversationId: parent,
+    stepIndex: 9,
+    callId: 'send-call',
+    name: 'send_message',
+  })
+  await writeFile(join(msgDir, 'init-1.json'), '{')
+
+  const [before] = await readSubagents(f.root, parent)
+  assert.equal(before.conversationId, childId)
+  assert.equal(before.spawnCallId, undefined)
+  assert.equal(before.spawnStepIndex, 0)
+
+  await f.deliver(childId, parent, 'spawn task', true, 'init-1', {
+    conversationId: parent,
+    stepIndex: 4,
+    callId: 'spawn-call-1',
+    name: 'invoke_subagent',
+  })
+
+  const [after] = await readSubagents(f.root, parent)
+  assert.equal(after.conversationId, childId)
+  assert.equal(after.spawnCallId, 'spawn-call-1')
+  assert.equal(after.spawnStepIndex, 4)
 })

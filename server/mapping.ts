@@ -22,9 +22,9 @@ import {
   classifyPlanModeTool,
   cleanToolName,
   isAskQuestionName,
+  normalizeToolCandidate,
   sessionIdPattern,
   setBounded,
-  unwrapToolTitle,
   record,
   str,
   num,
@@ -163,14 +163,12 @@ function nonEmptyRawOutput(rawOutput: unknown): string | undefined {
 }
 
 /** Map native tool arguments and output to Paseo detail cards. */
-const canonicalWriteToolPattern =
-  /^(?:write_file|write_to_file|create_file|fs\/write_text_file|write_text_file)$/i
+const canonicalWriteToolPattern = /^(?:write_file|write_to_file|create_file)$/i
 // Native identities and ACP kinds declare semantics; argument keys do not.
 const nativeToolKinds: Record<string, ToolCall['kind']> = {
   invoke_subagent: 'other',
   send_message: 'other',
   ask_question: 'other',
-  ask_user: 'other',
   update_steps: 'other',
   run_command: 'execute',
   read_file: 'read',
@@ -178,8 +176,6 @@ const nativeToolKinds: Record<string, ToolCall['kind']> = {
   write_file: 'edit',
   write_to_file: 'edit',
   create_file: 'edit',
-  'fs/write_text_file': 'edit',
-  write_text_file: 'edit',
   edit_file: 'edit',
   replace_file_content: 'edit',
   multi_replace_file_content: 'edit',
@@ -233,13 +229,14 @@ export function toolDetail(
       : (extractToolContentText(tool) ?? nonEmptyRawOutput(tool.rawOutput))
   const explicitRawName = str(record(tool).name)
   const rawName = cleanToolName(explicitRawName ?? tool.title ?? '')
-  // Legacy ACP titles may wrap native identities as `Run`/`Running <name>` or append `?`.
-  const legacyName = unwrapToolTitle(
-    rawName.replace(/^Running\s+/i, '').replace(/\?$/, ''),
+  const unwrappedName = normalizeToolCandidate(
+    explicitRawName,
+    tool.title,
   ).toLowerCase()
   const name =
-    explicitRawName === undefined && Object.hasOwn(nativeToolKinds, legacyName)
-      ? legacyName
+    explicitRawName === undefined &&
+    Object.hasOwn(nativeToolKinds, unwrappedName)
+      ? unwrappedName
       : rawName.toLowerCase()
   const kind = Object.hasOwn(nativeToolKinds, name)
     ? nativeToolKinds[name]
@@ -428,12 +425,6 @@ export function toolDetail(
     }
   }
   if (filePath) {
-    if (isCanonicalWrite)
-      return {
-        type: 'write',
-        filePath,
-        content: writeContent,
-      }
     if (kind === 'edit') {
       const chunks = Array.isArray(input.ReplacementChunks)
         ? input.ReplacementChunks.map(record)
@@ -491,7 +482,7 @@ export function toolDetail(
   }
 }
 
-/** agy still advertises the legacy per-effort model inventory. */
+/** Per-effort model inventory advertised by agy alongside configOptions. */
 export const nativeModelsSchema = z.object({
   currentModelId: z.string().optional(),
   availableModels: z.array(
@@ -650,7 +641,6 @@ export function configState(response: SessionMetadata): ProviderConfigState {
       },
     ],
     thinkingOptions: currentThinking,
-    settings: [],
   }
 }
 
@@ -968,15 +958,16 @@ export class Timeline {
       ) {
         return undefined
       }
-      const oldStatus = str((old as { status?: unknown } | undefined)?.status)
-      const incomingStatus = str((update as { status?: unknown }).status)
+      const oldStatus = str(old?.status)
+      const incomingStatus = str(update.status)
       const preserveStatus =
         update.sessionUpdate === 'tool_call_update' &&
         isTerminalToolStatus(oldStatus) &&
         !isTerminalToolStatus(incomingStatus)
+      const oldName = str(record(old).name)
       const oldPlanTool =
         old !== undefined
-          ? classifyPlanModeTool(str(record(old).name), old.title, old.kind)
+          ? classifyPlanModeTool(oldName, old.title, old.kind)
           : undefined
       const nextPlanTool = classifyPlanModeTool(
         str(record(update).name),
@@ -987,7 +978,7 @@ export class Timeline {
       const preservePlanMode =
         update.sessionUpdate === 'tool_call_update' &&
         (oldPlanTool === 'exit_plan_mode' || oldPlanTool === 'switch_mode') &&
-        str(record(old).name) === undefined &&
+        oldName === undefined &&
         (nextPlanTool === 'exit_plan_mode' || nextPlanTool === 'switch_mode') &&
         (update.kind == null ||
           update.kind === 'other' ||
@@ -1029,7 +1020,7 @@ export class Timeline {
         ),
         detail: toolDetail(tool),
       }
-      const rawStatus = str((tool as { status?: unknown }).status)
+      const rawStatus = str(tool.status)
       const isDenied = denied?.has(tool.toolCallId) === true
       const isCanceledFailure =
         tool.status === 'failed' && (isDenied || cancelFailed)

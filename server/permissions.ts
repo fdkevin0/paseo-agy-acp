@@ -6,13 +6,12 @@ import type {
 } from '@getpaseo/plugin/server/provider'
 import {
   classifyPlanModeTool,
-  cleanToolName,
-  detachString,
   isAskQuestionName,
+  normalizeToolCandidate,
   record,
   str,
   text,
-  unwrapToolTitle,
+  truncateDetached,
 } from './common.ts'
 
 /** Validate the permission fields consumed by the bridge before creating pending work. */
@@ -93,10 +92,10 @@ export function permissionKind(
   )
     return 'question'
   const explicitRawName = str(record(request.toolCall).name)
-  const identity =
-    explicitRawName !== undefined
-      ? cleanToolName(explicitRawName)
-      : unwrapToolTitle(request.toolCall.title ?? '')
+  const identity = normalizeToolCandidate(
+    explicitRawName,
+    request.toolCall.title,
+  )
   if (isChooserRequest(request.options) || isAskQuestionName(identity))
     return 'question'
   if (
@@ -151,13 +150,8 @@ export function extractSecurityWarning(request: {
   }
   if (warnings.size === 0) return undefined
   const combined = [...warnings].join('\n')
-  const chars = [...combined]
-  const truncated =
-    chars.length > SECURITY_WARNING_MAX_CHARS
-      ? `${chars.slice(0, SECURITY_WARNING_MAX_CHARS - 1).join('')}…`
-      : combined
   return {
-    description: detachString(truncated),
+    description: truncateDetached(combined, SECURITY_WARNING_MAX_CHARS),
     warnedOptionIds,
   }
 }

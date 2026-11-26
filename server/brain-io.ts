@@ -7,10 +7,11 @@ import {
   type FileHandle,
 } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
-import { join, sep } from 'node:path'
+import { join } from 'node:path'
 import {
-  detachString,
   isAskQuestionName,
+  isContainedIn,
+  isMissing,
   isNativeToolName,
   nonnegative,
   record,
@@ -29,7 +30,7 @@ export type SubagentRecord = {
 
 export const SUBAGENT_ALIVE = 'SUBAGENT_STATE_ALIVE'
 
-export type BrainMessageRecord = {
+type BrainMessageRecord = {
   id: string
   sender: string
   priority?: string
@@ -43,7 +44,7 @@ export type BrainMessageRecord = {
   }
 }
 
-export function messageSignature(sender: string, content = ''): string {
+function messageSignature(sender: string, content = ''): string {
   const firstLine = content.split(/\r?\n/, 1)[0]
   return `${sender}\0${createHash('sha1').update(firstLine).digest('hex')}`
 }
@@ -94,11 +95,6 @@ export class BrainEscapeError extends Error {
     super('Brain artifact escapes its directory')
     this.name = 'BrainEscapeError'
   }
-}
-
-export function isMissing(error: unknown): boolean {
-  const code = (error as NodeJS.ErrnoException | undefined)?.code
-  return code === 'ENOENT' || code === 'ENOTDIR'
 }
 
 function isUnloggedStep(row: Record<string, unknown>): boolean {
@@ -164,6 +160,17 @@ function hasPositiveRetriesRemaining(message: string): boolean {
   return /^Retries remaining: [1-9]\d*$/.test(lastLine)
 }
 
+/** Match observed non-terminal agy retry warning messages (shared by transcript and SQLite readers). */
+export function isRetryWarningMessage(rawMessage: string): boolean {
+  const message = rawMessage.replace(/^Error: /, '')
+  return (
+    RETRY_EXACT_MESSAGES.has(message) ||
+    /^API error \(attempt [1-9]\d*\): [\s\S]+$/.test(message) ||
+    (RETRY_COUNTDOWN_PREFIXES.some((prefix) => message.startsWith(prefix)) &&
+      hasPositiveRetriesRemaining(message))
+  )
+}
+
 // shortcut: Brain has no retry outcome; replace these observed warning forms when upstream supplies one.
 export function isRetryWarning(
   step: Record<string, unknown> | undefined,
@@ -174,13 +181,7 @@ export function isRetryWarning(
     (step.source != null && step.source !== 'SYSTEM')
   )
     return false
-  const message = stepErrorMessage(step).replace(/^Error: /, '')
-  return (
-    RETRY_EXACT_MESSAGES.has(message) ||
-    /^API error \(attempt [1-9]\d*\): [\s\S]+$/.test(message) ||
-    (RETRY_COUNTDOWN_PREFIXES.some((prefix) => message.startsWith(prefix)) &&
-      hasPositiveRetriesRemaining(message))
-  )
+  return isRetryWarningMessage(stepErrorMessage(step))
 }
 
 // Brain has no exhaustion event: allow the normal silent model window after the latest retry warning.
@@ -250,6 +251,15 @@ function collectRowWakeupHeaders<T>(
     }
   }
   return items
+}
+
+/** Extract every `sender=<id>` from line-anchored `[Message]` headers (regardless of priority). */
+export function extractHeaderMessageSenders(text: string): string[] {
+  const senders: string[] = []
+  for (const match of text.matchAll(rowMessageHeaderPattern)) {
+    senders.push(match[1])
+  }
+  return senders
 }
 
 export function extractRowMessageSignatures(
@@ -372,8 +382,7 @@ export async function resolveBrainPath(
   const path = await realpath(
     join(base, nativeId, '.system_generated', subpath),
   )
-  const prefix = base === sep ? sep : base + sep
-  if (!path.startsWith(prefix)) throw new BrainEscapeError()
+  if (!isContainedIn(path, base)) throw new BrainEscapeError()
   return path
 }
 
@@ -391,13 +400,14 @@ export async function readInboxState(
   }
   if (!sessionIdPattern.test(nativeId)) return empty
   let dir: string
+  let entries: string[]
   try {
     dir = await resolveBrainPath(root, nativeId, 'messages')
+    entries = await readdir(dir)
   } catch (error) {
     if (isMissing(error)) return empty
     throw error
   }
-  const entries = await readdir(dir).catch(() => [] as string[])
   const readIds = new Set<string>()
   if (entries.includes('read.json')) {
     try {
@@ -459,13 +469,14 @@ export async function readSubagents(
 ): Promise<SubagentRecord[]> {
   if (!sessionIdPattern.test(nativeId)) return []
   let dir: string
+  let entries: string[]
   try {
     dir = await resolveBrainPath(root, nativeId, 'subagents')
+    entries = await readdir(dir)
   } catch (error) {
     if (isMissing(error)) return []
     throw error
   }
-  const entries = await readdir(dir).catch(() => [] as string[])
   const loaded = await Promise.all(
     entries
       .filter((name) => name.endsWith('.json'))
@@ -498,9 +509,6 @@ export async function readSubagents(
             )?.tool
             if (init) {
               spawn = { callId: init.callId, stepIndex: init.stepIndex }
-              setBounded(spawnCache, spawnKey, spawn, SPAWN_CACHE_LIMIT)
-            } else if (childInbox.messages.length > 0) {
-              spawn = {}
               setBounded(spawnCache, spawnKey, spawn, SPAWN_CACHE_LIMIT)
             }
           }
@@ -537,7 +545,7 @@ export class TranscriptReader {
   private readonly openFile: typeof open
   private identity = ''
   private offset = 0
-  private remainder = ''
+  private remainder = Buffer.alloc(0)
   private snapshotStepIndices?: Set<number>
   private head = Buffer.alloc(0)
   private tail = Buffer.alloc(0)
@@ -549,7 +557,7 @@ export class TranscriptReader {
   private clearCursor(identity = '') {
     this.identity = identity
     this.offset = 0
-    this.remainder = ''
+    this.remainder = Buffer.alloc(0)
     this.snapshotStepIndices = new Set()
     this.head = Buffer.alloc(0)
     this.tail = Buffer.alloc(0)
@@ -617,7 +625,7 @@ export class TranscriptReader {
       if (reset) {
         this.clearCursor(identity)
       }
-      const startedAtZero = this.offset === 0 && this.remainder === ''
+      const startedAtZero = this.offset === 0 && this.remainder.length === 0
       try {
         while (this.offset < stat.size) {
           const buffer = Buffer.alloc(
@@ -630,23 +638,34 @@ export class TranscriptReader {
             this.offset,
           )
           if (!bytesRead) break
+          const chunk = buffer.subarray(0, bytesRead)
           this.offset += bytesRead
-          this.remember(buffer.subarray(0, bytesRead))
-          // Preserve bytes until a complete line is available, including split UTF-8 characters.
-          this.remainder += buffer.subarray(0, bytesRead).toString('latin1')
-          const lines = this.remainder.split('\n')
-          this.remainder = detachString(lines.pop()!)
-          if (this.remainder.length > 8 * 1024 * 1024)
-            throw new Error('Brain JSONL line exceeds 8 MiB')
-          for (const line of lines) {
-            if (line.length > 8 * 1024 * 1024)
+          this.remember(chunk)
+          // Preserve raw bytes until LF so split multi-byte UTF-8 sequences stay intact across chunks.
+          const combined =
+            this.remainder.length > 0
+              ? Buffer.concat([this.remainder, chunk])
+              : chunk
+          let lineStart = 0
+          for (
+            let nl = combined.indexOf(10, lineStart);
+            nl >= 0;
+            nl = combined.indexOf(10, lineStart)
+          ) {
+            const lineBytes = combined.subarray(lineStart, nl)
+            lineStart = nl + 1
+            if (lineBytes.length > 8 * 1024 * 1024)
               throw new Error('Brain JSONL line exceeds 8 MiB')
+            const line = lineBytes.toString('utf8')
             if (!line.trim()) continue
-            const row = record(
-              JSON.parse(Buffer.from(line, 'latin1').toString('utf8')),
-            )
+            const row = record(JSON.parse(line))
             if (!isUnloggedStep(row)) rows.push(row)
           }
+          const trailing = combined.subarray(lineStart)
+          if (trailing.length > 8 * 1024 * 1024)
+            throw new Error('Brain JSONL line exceeds 8 MiB')
+          this.remainder =
+            trailing.length > 0 ? Buffer.from(trailing) : Buffer.alloc(0)
         }
       } catch (error) {
         if (error instanceof SyntaxError) {
@@ -669,8 +688,10 @@ export class TranscriptReader {
       }
       if (this.snapshotStepIndices && rows.length) {
         this.snapshotStepIndices = new Set(this.snapshotStepIndices)
-        for (const row of rows)
-          this.snapshotStepIndices.add(Number(row.step_index))
+        for (const row of rows) {
+          const step = Number(row.step_index)
+          if (Number.isInteger(step)) this.snapshotStepIndices.add(step)
+        }
       }
       // shortcut: observed JSONL has no commit marker; only a nonempty newline-complete snapshot authorizes pruning.
       const snapshotStepIndices =
@@ -828,8 +849,3 @@ export async function readLatestStepUsage(
   }
   return { lastStepIndex }
 }
-
-export {
-  readConversationCompactionWindow,
-  resolveConversationDbStat,
-} from './conversation-db.ts'

@@ -2,6 +2,7 @@ import { toolDisplayName } from './mcp.ts'
 import {
   cleanToolName,
   detachString,
+  isMissing,
   isNativeToolName,
   isAskQuestionName,
   record,
@@ -17,6 +18,7 @@ import {
   SUBAGENT_ALIVE,
   TranscriptReader,
   extractCheckpointPreTokens,
+  extractHeaderMessageSenders,
   extractRowMessageSenders,
   isCompletePlannerResponse,
   isPlanExecuteNotice,
@@ -69,8 +71,6 @@ const systemTaskResultPattern =
   /\bsender=(\S+)[^\n]*\scontent=Task id "([^"]+)" (finished|was canceled|failed) with result:\n([\s\S]*?)(?:\nLog: file:\/\/\S+)?(?=\n(?:\d+\.\s+)?\[Message\]\s+|\s*<\/SYSTEM_MESSAGE>|\s*$)/g
 const hasSystemTaskResult = (text: string) =>
   new RegExp(systemTaskResultPattern.source).test(text)
-const messageHeaderSenderPattern =
-  /(?:^|\n)(?:\d+\.\s+)?\[Message\]\s+(?:timestamp=\S+\s+)?sender=(\S+)/g
 
 /** Logged while still running: the transcript never records this step's own result. */
 const runningStepStatuses = new Set(['RUNNING', 'WAITING'])
@@ -103,8 +103,9 @@ function takePendingForGeneric<
   return pending.splice(matchIndex, 1)[0]
 }
 
-type BackgroundEntry = {
+type TrackedTask = {
   pending: PendingTool
+  isDaemon: boolean
   isCron: boolean
   remainingIterations: number
 }
@@ -122,8 +123,7 @@ export class BrainTranscriptProjector {
     source: NativeToolIdentitySource
   }
   private lastGenericMatched = false
-  private background = new Map<string, BackgroundEntry>()
-  private daemons = new Map<string, number>()
+  private tasks = new Map<string, TrackedTask>()
   private subagentTouches: { childId: string; stepIndex: number }[] = []
   private completedWakeups = new Map<number, string>()
   private initialPromptStep: number
@@ -315,11 +315,13 @@ export class BrainTranscriptProjector {
   }
 
   hasBackground(): boolean {
-    return this.background.size > 0
+    for (const task of this.tasks.values()) if (!task.isDaemon) return true
+    return false
   }
 
   hasDaemons(): boolean {
-    return this.daemons.size > 0
+    for (const task of this.tasks.values()) if (task.isDaemon) return true
+    return false
   }
 
   followsHistoricalQuestion(): boolean {
@@ -362,8 +364,7 @@ export class BrainTranscriptProjector {
   }
 
   private forgetTask(taskId: string) {
-    this.background.delete(taskId)
-    this.daemons.delete(taskId)
+    this.tasks.delete(taskId)
   }
 
   touchedSubagentIds(minStepIndex = -1): ReadonlySet<string> {
@@ -406,10 +407,7 @@ export class BrainTranscriptProjector {
       stepIndex === this.initialPromptStep &&
       row.type === 'SYSTEM_MESSAGE' &&
       !isRestartNotice(row) &&
-      !(
-        this.background.size > 0 &&
-        hasSystemTaskResult(String(row.content ?? ''))
-      )
+      !(this.tasks.size > 0 && hasSystemTaskResult(String(row.content ?? '')))
     ) {
       const initIdx = senders.findIndex((s) => sessionIdPattern.test(s))
       if (initIdx >= 0) {
@@ -494,21 +492,19 @@ export class BrainTranscriptProjector {
       const rawTaskId = text.match(backgroundTaskPattern)?.[1]
       if (rawTaskId) {
         const taskId = detachString(rawTaskId)
+        const isDaemon = pending.args.IsDaemon === true
         const isCron =
           isNativeToolName(pending.name, 'schedule') &&
           typeof pending.args.CronExpression === 'string' &&
           pending.args.CronExpression.trim().length > 0
         const max = Number(pending.args.MaxIterations)
         const maxIterations = Number.isInteger(max) && max > 0 ? max : Infinity
-        if (pending.args.IsDaemon === true) {
-          this.daemons.set(taskId, maxIterations)
-        } else {
-          this.background.set(taskId, {
-            pending,
-            isCron,
-            remainingIterations: isCron ? maxIterations : 1,
-          })
-        }
+        this.tasks.set(taskId, {
+          pending,
+          isDaemon,
+          isCron,
+          remainingIterations: isDaemon || isCron ? maxIterations : 1,
+        })
       }
       return []
     }
@@ -643,8 +639,7 @@ export class BrainTranscriptProjector {
           // Stopped calls never log a result; child transcripts have no USER_INPUT to reset them.
           this.pending = []
           this.retired = []
-          this.background.clear()
-          this.daemons.clear()
+          this.tasks.clear()
           this.subagentTouches.length = 0
           return []
         }
@@ -653,34 +648,28 @@ export class BrainTranscriptProjector {
         for (const match of taskResults) {
           finishedIds.add(match[1])
           finishedIds.add(match[2])
-          this.daemons.delete(match[1])
-          this.daemons.delete(match[2])
         }
-        const senders = [...text.matchAll(messageHeaderSenderPattern)].map(
-          (m) => m[1],
-        )
+        const senders = extractHeaderMessageSenders(text)
         const canceledSchedules: ProviderTimelineItem[] = []
         for (const sender of senders) {
-          const remaining = this.daemons.get(sender)
-          if (remaining !== undefined && !finishedIds.has(sender)) {
-            if (remaining <= 1) this.daemons.delete(sender)
-            else this.daemons.set(sender, remaining - 1)
-          }
-          for (const [taskId, entry] of this.background) {
-            if (
-              !isNativeToolName(entry.pending.name, 'schedule') ||
-              finishedIds.has(taskId)
-            )
-              continue
+          for (const [taskId, entry] of this.tasks) {
+            if (finishedIds.has(taskId)) continue
             if (sender === taskId) {
-              if (entry.remainingIterations <= 1) this.background.delete(taskId)
-              else entry.remainingIterations -= 1
+              if (
+                entry.isDaemon ||
+                isNativeToolName(entry.pending.name, 'schedule')
+              ) {
+                if (entry.remainingIterations <= 1) this.tasks.delete(taskId)
+                else entry.remainingIterations -= 1
+              }
             } else if (
+              !entry.isDaemon &&
               !entry.isCron &&
+              isNativeToolName(entry.pending.name, 'schedule') &&
               (entry.pending.args.TimerCondition === 'any' ||
                 entry.pending.args.TimerCondition === sender)
             ) {
-              this.background.delete(taskId)
+              this.tasks.delete(taskId)
               canceledSchedules.push(
                 ...this.finishOrDefer(entry.pending, null, 'canceled', ''),
               )
@@ -690,10 +679,10 @@ export class BrainTranscriptProjector {
         if (taskResults.length > 0 || canceledSchedules.length > 0) {
           const completed: ProviderTimelineItem[] = [...canceledSchedules]
           for (const [, senderId, quotedId, outcome, output] of taskResults) {
-            const key = this.background.has(quotedId) ? quotedId : senderId
-            const entry = this.background.get(key)
+            const key = this.tasks.has(quotedId) ? quotedId : senderId
+            const entry = this.tasks.get(key)
             if (!entry) continue
-            this.background.delete(key)
+            this.tasks.delete(key)
             const status =
               outcome === 'failed'
                 ? 'failed'
@@ -739,8 +728,7 @@ export class BrainTranscriptProjector {
         this.retired = []
         this.pending = []
         this.lastErrorCallId = undefined
-        this.background.clear()
-        this.daemons.clear()
+        this.tasks.clear()
         this.subagentTouches.length = 0
         return [
           {
@@ -855,10 +843,10 @@ export function activeChildIdsForTurn(
   return [...ids]
 }
 
-export type BrainPromptPhase =
+type BrainPromptPhase =
   'foreground' | 'foreground_active' | 'foreground_idle' | 'woken'
 
-export type BrainNodeOptions = {
+type BrainNodeOptions = {
   mcpServerNames?: readonly string[]
   onQuestionSettled?: (
     questions: readonly NormalizedQuestion[],
@@ -885,12 +873,10 @@ export class BrainNode {
   answeredQuestionStep = -1
   initialReadDone = false
   lastStep?: Record<string, unknown>
-  private retrySince?: number
-  private retryError?: string
-  private retryStep = -1
+  private retry?: { step: number; since: number; error: string }
+  private highestRetryStep = -1
   private mcpServerNames: readonly string[]
-  private terminalError?: string
-  private terminalErrorStep = -1
+  private terminalError?: { step: number; message: string }
   private wakeupStepsBySender = new Map<string, number[]>()
   // Keyed by step index + error message so O_TRUNC replays keep the original deadline while in-place mutations refresh it.
   private retryObservedAt = new Map<
@@ -963,11 +949,9 @@ export class BrainNode {
 
   /** Forget the wakeup phase on a new USER_INPUT or transcript rewrite. */
   resetPhase() {
-    this.retrySince = undefined
-    this.retryError = undefined
-    this.retryStep = -1
+    this.retry = undefined
+    this.highestRetryStep = -1
     this.terminalError = undefined
-    this.terminalErrorStep = -1
     this.promptPhase = 'foreground'
     this.wokeUp = false
     this.questionSettled = false
@@ -1006,6 +990,78 @@ export class BrainNode {
     ])
     this.projector.syncMetadata(inbox, subagents)
     return { inbox, subagents }
+  }
+
+  /** Poll metadata + incremental transcript together, applying reset/prune state transitions uniformly. */
+  async pollTranscript(
+    root: string,
+    options: {
+      retryEmptyReset?: boolean
+      resetInitialReadOnReset?: boolean
+      onReset?: () => void
+      onSnapshot?: (stepIndices: ReadonlySet<number>) => void
+    } = {},
+  ): Promise<{
+    inbox: InboxState
+    subagents: SubagentRecord[]
+    rows: Record<string, unknown>[]
+    reset: boolean
+    missing: boolean
+    snapshotStepIndices?: ReadonlySet<number>
+    mtimeMs?: number
+    observedAt?: number
+  }> {
+    const readTranscript = () =>
+      this.reader
+        .read(root, this.nativeId)
+        .then((res) => ({ ...res, missing: false }))
+        .catch((error) => {
+          if (isMissing(error))
+            return {
+              rows: [] as Record<string, unknown>[],
+              reset: false,
+              snapshotStepIndices: undefined,
+              mtimeMs: undefined,
+              missing: true,
+            }
+          throw error
+        })
+    const [{ inbox, subagents }, firstRead] = await Promise.all([
+      this.pollMetadata(root),
+      readTranscript(),
+    ])
+    // A warm incremental reader (offset > 0) reports { rows: [], reset: true } on either a mid-O_TRUNC
+    // raced write or a corrupt appended JSONL line. Retry once from byte 0 when requested so genuinely
+    // corrupt transcripts throw SyntaxError (fail-closed) and raced rewrites ingest the snapshot.
+    const readResult =
+      options.retryEmptyReset && firstRead.reset && firstRead.rows.length === 0
+        ? { ...(await readTranscript()), reset: true }
+        : firstRead
+    if (readResult.missing) {
+      return {
+        inbox,
+        subagents,
+        ...readResult,
+        observedAt: undefined,
+      }
+    }
+    if (readResult.reset) {
+      this.reset(inbox, subagents)
+      options.onReset?.()
+      if (options.resetInitialReadOnReset) this.initialReadDone = false
+    }
+    if (readResult.snapshotStepIndices) {
+      this.pruneRetrySteps(readResult.snapshotStepIndices)
+      options.onSnapshot?.(readResult.snapshotStepIndices)
+    }
+    const observedAt = this.initialReadDone ? undefined : readResult.mtimeMs
+    if (readResult.rows.length > 0) this.initialReadDone = true
+    return {
+      inbox,
+      subagents,
+      ...readResult,
+      observedAt,
+    }
   }
 
   private isQuestionContinuationInput(row: Record<string, unknown>): boolean {
@@ -1049,19 +1105,21 @@ export class BrainNode {
     }
     if (isRetryWarning(row)) {
       const createdAt = Date.parse(String(row.created_at ?? ''))
-      const step = Number(row.step_index)
-      if (Number.isInteger(step) && step > this.retryStep) {
+      if (Number.isInteger(stepIndex) && stepIndex > this.highestRetryStep) {
         const error = stepErrorMessage(row)
-        let entry = this.retryObservedAt.get(step)
+        let entry = this.retryObservedAt.get(stepIndex)
         if (!entry || entry.error !== error) {
           entry = { error, observedAt: clampedObservedAt }
-          this.retryObservedAt.set(step, entry)
+          this.retryObservedAt.set(stepIndex, entry)
         }
-        this.retrySince = Number.isFinite(createdAt)
-          ? Math.min(createdAt, entry.observedAt)
-          : entry.observedAt
-        this.retryStep = step
-        this.retryError = error
+        this.retry = {
+          step: stepIndex,
+          since: Number.isFinite(createdAt)
+            ? Math.min(createdAt, entry.observedAt)
+            : entry.observedAt,
+          error,
+        }
+        this.highestRetryStep = stepIndex
       }
     } else if (
       row.type === 'ERROR_MESSAGE' ||
@@ -1080,14 +1138,14 @@ export class BrainNode {
         (isCompletePlannerResponse(row) ||
           (Array.isArray(row.tool_calls) && row.tool_calls.length > 0)))
     ) {
-      this.retrySince = undefined
-      this.retryError = undefined
+      this.retry = undefined
       if (row.type === 'ERROR_MESSAGE') {
-        this.terminalError = stepErrorMessage(row)
-        this.terminalErrorStep = Number.isInteger(stepIndex) ? stepIndex : -1
+        this.terminalError = {
+          step: Number.isInteger(stepIndex) ? stepIndex : -1,
+          message: stepErrorMessage(row),
+        }
       } else if (isRestartNotice(row) || row.type === 'PLANNER_RESPONSE') {
         this.terminalError = undefined
-        this.terminalErrorStep = -1
       }
     }
     this.consumedMessages += rowMessages
@@ -1140,7 +1198,7 @@ export class BrainNode {
   }
 
   retryPending(minStepIndex = this.currentTurnFloor()): boolean {
-    return this.retrySince !== undefined && this.retryStep > minStepIndex
+    return this.retry !== undefined && this.retry.step > minStepIndex
   }
 
   failure(
@@ -1148,15 +1206,16 @@ export class BrainNode {
     minStepIndex = this.currentTurnFloor(),
   ): string | undefined {
     if (
-      this.retryPending(minStepIndex) &&
-      Date.now() - this.retrySince! >= timeoutMs
+      this.retry !== undefined &&
+      this.retry.step > minStepIndex &&
+      Date.now() - this.retry.since >= timeoutMs
     )
-      return `${this.retryError} No retry recovery was observed for ${Math.round(timeoutMs / 1000)}s; stopped waiting locally.`
+      return `${this.retry.error} No retry recovery was observed for ${Math.round(timeoutMs / 1000)}s; stopped waiting locally.`
     if (
       this.terminalError !== undefined &&
-      this.terminalErrorStep > minStepIndex
+      this.terminalError.step > minStepIndex
     )
-      return this.terminalError
+      return this.terminalError.message
     return undefined
   }
 

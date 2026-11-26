@@ -11,8 +11,7 @@ import {
   type ProviderEvent,
   type ProviderInput,
 } from '@getpaseo/plugin/server/provider'
-import { readSubagents } from '../server/brain.ts'
-import { TranscriptReader } from '../server/brain-io.ts'
+import { readSubagents, TranscriptReader } from '../server/brain-io.ts'
 import { createProvider } from '../server/provider.ts'
 import { SessionManager } from '../server/session.ts'
 import { AgyUsageSource } from '../server/usage.ts'

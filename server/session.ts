@@ -42,15 +42,18 @@ import {
   captureRuntimeEpoch,
   computeRuntimeEpoch,
   hasActiveBackgroundWork,
-  readInboxState,
-  readSubagents,
-  readTranscriptRows,
-  readLastStepIndex,
   settleBrainTurn,
   type ForegroundAcpSegment,
   type RuntimeEpoch,
 } from './brain.ts'
-import { readLatestStepUsage, type TranscriptReader } from './brain-io.ts'
+import {
+  readInboxState,
+  readLastStepIndex,
+  readLatestStepUsage,
+  readSubagents,
+  readTranscriptRows,
+  type TranscriptReader,
+} from './brain-io.ts'
 import {
   captureConversationStepBaseline,
   readConversationCompactionWindow,
@@ -149,7 +152,6 @@ interface SessionOptions {
   hasActiveBackgroundWork?: typeof hasActiveBackgroundWork
 }
 
-const TIER_CACHE_LIMIT = 100
 const PROMPT_DEDUPE_LIMIT = 1000
 const permissionInputSchema = z.record(z.string(), z.json())
 
@@ -346,12 +348,7 @@ export class SessionManager {
           session.spawnCwd,
         )
         if (session.transport.tier?.name)
-          setBounded(
-            this.options.usage.tiers,
-            dir,
-            session.transport.tier.name,
-            TIER_CACHE_LIMIT,
-          )
+          this.options.usage.rememberTier(dir, session.transport.tier.name)
         await session.drain()
         if (this.closed || session.state.closing || session.state.failed)
           throw (

@@ -11,6 +11,7 @@ import type {
 } from '@getpaseo/plugin/server/provider'
 import {
   formatErrorMessage,
+  isMissing,
   mergeEnv,
   sessionIdPattern,
   setBounded,
@@ -354,16 +355,11 @@ export async function resolveSpawnCwd(
   throw new Error(`Working directory does not exist: ${target}`)
 }
 
-function isMissingOrNonDir(error: unknown): boolean {
-  const code = (error as NodeJS.ErrnoException | undefined)?.code
-  return code === 'ENOENT' || code === 'ENOTDIR'
-}
-
 async function realDirectory(path: string): Promise<boolean> {
   try {
     return (await lstat(path)).isDirectory()
   } catch (error) {
-    if (isMissingOrNonDir(error)) return false
+    if (isMissing(error)) return false
     throw error
   }
 }
@@ -390,7 +386,7 @@ export async function removeSessionArtifacts(
       try {
         stat = await lstat(path)
       } catch (error) {
-        if (isMissingOrNonDir(error)) continue
+        if (isMissing(error)) continue
         throw error
       }
       if (stat.isSymbolicLink())

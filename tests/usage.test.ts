@@ -558,7 +558,7 @@ test('usage discovers account scopes and maps windows, tier and failures through
       'applyAuthResult: email=example@example.test\n',
     )
     assert.equal(usage.remember(launch, {}, home), dir)
-    usage.tiers.set(dir, 'Google AI Ultra')
+    usage.rememberTier(dir, 'Google AI Ultra')
     assert.deepEqual(await usage.discover({ ...scope, provider: 'codex' }), [])
     const [account] = await usage.discover(scope)
     assert.deepEqual(account.input, beforeRemember.input)
@@ -650,7 +650,7 @@ test('usage discovers account scopes and maps windows, tier and failures through
     assert.equal(clamped.windows[3].label, 'Extra · Future allowance')
     assert.equal(clamped.windows[3].shortLabel, 'Extra future')
     const checkTier = async (tier: string, expected: string) => {
-      usage.tiers.set(dir, tier)
+      usage.rememberTier(dir, tier)
       const result = await usage.fetch(account.input)
       assert.ok(result.status === 'available')
       assert.equal(result.planLabel, expected)
@@ -660,7 +660,7 @@ test('usage discovers account scopes and maps windows, tier and failures through
     await checkTier('Google AI Ultra Business', 'Google AI Ultra Business')
     await checkTier('Google AI Future', 'Google AI Future')
     await checkTier('Other Pro', 'Other Pro')
-    usage.tiers.delete(dir)
+    usage.rememberTier(dir, undefined)
     const withoutTier = await usage.fetch(account.input)
     assert.ok(withoutTier.status === 'available')
     assert.equal(withoutTier.planLabel, undefined)
@@ -1180,4 +1180,53 @@ test('exit code 2 reports no_quota only for Gemini API key or unsupported-quota 
   const exitOneReport = await usage.fetch({ dataDir: dir })
   assert.ok(exitOneReport.status === 'error')
   assert.match(exitOneReport.error, /code 1/)
+})
+
+test('readLoggedEmail matches EOF email lines and usageArgs does not consume flag-like values after directory flags', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-usage-reg-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+
+  const dirA = join(home, 'eof-apply')
+  await mkdir(dirA, { recursive: true })
+  await writeFile(
+    join(dirA, 'cli.log'),
+    'applyAuthResult: email=eof@example.test',
+  )
+  assert.equal(await readLoggedEmail(dirA), 'eof@example.test')
+
+  const dirB = join(home, 'eof-oauth')
+  await mkdir(dirB, { recursive: true })
+  await writeFile(
+    join(dirB, 'cli.log'),
+    'OAuth: authenticated successfully as oauth-eof@example.test',
+  )
+  assert.equal(await readLoggedEmail(dirB), 'oauth-eof@example.test')
+
+  const script = fileURLToPath(new URL('./mock-usage.ts', import.meta.url))
+  const fixture = join(home, 'usage.json')
+  const argsLog = join(home, 'args.json')
+  await writeFile(fixture, envelope(groups))
+
+  const usage = new AgyUsageSource({ env: isolatedEnv(home) })
+  const dir = usage.remember(
+    {
+      command: process.execPath,
+      args: [script, '--gemini-dir', '--stdio', 'acp'],
+      env: isolatedEnv(home, {
+        AGY_USAGE_ARGS: argsLog,
+        AGY_USAGE_FIXTURE: fixture,
+      }),
+    },
+    {},
+    home,
+  )
+  const report = await usage.fetch({ dataDir: dir })
+  assert.equal(report.status, 'available')
+  assert.deepEqual(JSON.parse(await readFile(argsLog, 'utf8')), [
+    '--gemini-dir',
+    '-p',
+    '/usage',
+    '--output-format',
+    'json',
+  ])
 })

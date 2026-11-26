@@ -1,8 +1,12 @@
-import { readdir, stat } from 'node:fs/promises'
+import { lstat, readdir, stat } from 'node:fs/promises'
 import { join } from 'node:path'
-import { isNativeToolName, sessionIdPattern, setBounded } from './common.ts'
 import {
   isMissing,
+  isNativeToolName,
+  sessionIdPattern,
+  setBounded,
+} from './common.ts'
+import {
   readInboxState,
   readSubagents,
   readTranscriptRows,
@@ -22,7 +26,7 @@ export type ChildTurnState =
       awaitingTurnWakeup: boolean
     }
 
-export type TaggedWakeupMessage = InboxMessage & {
+type TaggedWakeupMessage = InboxMessage & {
   tool: { conversationId: string; stepIndex: number; name?: string }
 }
 
@@ -42,7 +46,7 @@ type CachedNodeBoundary = {
 
 export type TurnBoundaryCache = Map<string, CachedNodeBoundary>
 
-export type ReWokenTurn =
+type ReWokenTurn =
   /** The child was spawned inside the active parent turn, so nothing earlier needs skipping. */
   | { status: 'spawned-in-turn' }
   /** The parent re-woke the child, but this turn's wakeup rows have not landed in the transcript yet. */
@@ -60,7 +64,7 @@ async function readDirSignature(
     const names = (await readdir(dir)).sort()
     const entries = await Promise.all(
       names.map(async (name) => {
-        const s = await stat(join(dir, name)).catch(() => undefined)
+        const s = await lstat(join(dir, name)).catch(() => undefined)
         return s ? `${name}:${s.size}:${s.mtimeMs}` : `${name}:missing`
       }),
     )
@@ -186,7 +190,10 @@ async function loadNodeBoundary(
   const [inbox, subagents, rows] = await Promise.all([
     readInboxState(root, nodeId),
     readSubagents(root, nodeId),
-    readTranscriptRows(root, nodeId).catch(() => []),
+    readTranscriptRows(root, nodeId).catch((error) => {
+      if (isMissing(error)) return []
+      throw error
+    }),
   ])
   const cacheKey = `${nodeId}:${beforeStep}`
   if (rows.length === 0) {

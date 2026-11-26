@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
 import type { SessionNotification } from '@agentclientprotocol/sdk'
-import { BrainTranscriptProjector } from '../server/brain.ts'
+import { BrainTranscriptProjector } from '../server/brain-projector.ts'
 import { stripToolSummary, Timeline, toolDetail } from '../server/mapping.ts'
 
 type AcpUpdate = SessionNotification['update']
@@ -898,10 +898,10 @@ test('unknown tool details sanitize non-JSON and cyclic values without throwing'
   )
 })
 
-test('legacy ACP Running/Run/? titles map to dedicated cards without overriding explicit names or unknown tools', () => {
+test('ACP Run titles map to dedicated cards while unbacked legacy titles/aliases fall back to unknown', () => {
   assert.deepEqual(
     toolDetail({
-      title: 'Running run_command',
+      title: 'Run run_command',
       rawInput: { CommandLine: 'pwd' },
     }),
     {
@@ -913,7 +913,7 @@ test('legacy ACP Running/Run/? titles map to dedicated cards without overriding 
   )
   assert.deepEqual(
     toolDetail({
-      title: 'Run read_file?',
+      title: 'Run read_file',
       rawInput: { Path: '/repo/a.ts' },
     }),
     {
@@ -926,7 +926,7 @@ test('legacy ACP Running/Run/? titles map to dedicated cards without overriding 
   )
   assert.deepEqual(
     toolDetail({
-      title: 'run default_api:edit_file?',
+      title: 'run default_api:edit_file',
       rawInput: { Path: '/repo/a.ts', Target: 'old', Replacement: 'new' },
     }),
     {
@@ -938,7 +938,7 @@ test('legacy ACP Running/Run/? titles map to dedicated cards without overriding 
   )
   assert.deepEqual(
     toolDetail({
-      title: 'Running default_api:write_file?',
+      title: 'Run default_api:write_file',
       rawInput: { Path: '/repo/a.ts', Content: 'hello' },
     }),
     {
@@ -955,11 +955,11 @@ test('legacy ACP Running/Run/? titles map to dedicated cards without overriding 
     'read',
   )
 
-  // Explicit raw name takes precedence over legacy ACP title normalization.
+  // Explicit raw name takes precedence over Run title unwrapping.
   assert.deepEqual(
     toolDetail({
       name: 'custom_tool',
-      title: 'Running run_command',
+      title: 'Run run_command',
       kind: 'execute',
       rawInput: { CommandLine: 'pwd' },
     }),
@@ -967,7 +967,16 @@ test('legacy ACP Running/Run/? titles map to dedicated cards without overriding 
   )
   assert.deepEqual(
     toolDetail({
-      name: 'Running run_command',
+      name: 'Run run_command',
+      title: 'Run run_command',
+      rawInput: { CommandLine: 'pwd' },
+    }),
+    unknownDetail({ CommandLine: 'pwd' }, null),
+  )
+
+  // Unbacked Running/? wrappers and non-agy write aliases remain unknown.
+  assert.deepEqual(
+    toolDetail({
       title: 'Running run_command',
       rawInput: { CommandLine: 'pwd' },
     }),
@@ -975,31 +984,42 @@ test('legacy ACP Running/Run/? titles map to dedicated cards without overriding 
   )
   assert.deepEqual(
     toolDetail({
-      name: 'Run read_file?',
       title: 'Run read_file?',
       rawInput: { Path: '/repo/a.ts' },
     }),
     unknownDetail({ Path: '/repo/a.ts' }, null),
   )
-
-  // Unknown names remain unknown even with Running/Run/? wrappers.
   assert.deepEqual(
     toolDetail({
-      title: 'Running custom_tool?',
-      rawInput: { CommandLine: 'pwd' },
+      title: 'Running default_api:write_file?',
+      rawInput: { Path: '/repo/a.ts', Content: 'hello' },
     }),
-    unknownDetail({ CommandLine: 'pwd' }, null),
+    unknownDetail({ Path: '/repo/a.ts', Content: 'hello' }, null),
   )
   assert.deepEqual(
     toolDetail({
-      title: 'Run mcp__srv__read_file?',
+      name: 'fs/write_text_file',
+      rawInput: { Path: '/repo/a.ts', Content: 'hello' },
+    }),
+    unknownDetail({ Path: '/repo/a.ts', Content: 'hello' }, null),
+  )
+  assert.deepEqual(
+    toolDetail({
+      name: 'write_text_file',
+      rawInput: { Path: '/repo/a.ts', Content: 'hello' },
+    }),
+    unknownDetail({ Path: '/repo/a.ts', Content: 'hello' }, null),
+  )
+  assert.deepEqual(
+    toolDetail({
+      title: 'Run mcp_srv_read_file',
       rawInput: { Path: '/repo/a.ts' },
     }),
     unknownDetail({ Path: '/repo/a.ts' }, null),
   )
   assert.deepEqual(
     toolDetail({
-      title: 'Running read_file with extra?',
+      title: 'Run read_file with extra',
       rawInput: { Path: '/repo/a.ts' },
     }),
     unknownDetail({ Path: '/repo/a.ts' }, null),

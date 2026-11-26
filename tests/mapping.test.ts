@@ -1067,6 +1067,22 @@ test('exit_plan_mode renders as a Markdown plan card across ACP variants and par
   )
   assert.equal(
     toolDetail({
+      title: 'Run mcp_srv_switch_mode',
+      kind: 'switch_mode',
+      rawInput: { plan: md },
+    }).type,
+    'unknown',
+  )
+  assert.equal(
+    toolDetail({
+      title: 'Run default_api:mcp_srv_switch_mode',
+      kind: 'switch_mode',
+      rawInput: { plan: md },
+    }).type,
+    'unknown',
+  )
+  assert.equal(
+    toolDetail({
       title: 'srv:switch_mode',
       kind: 'switch_mode',
       rawInput: { plan: md },

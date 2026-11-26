@@ -8,10 +8,10 @@ import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import {
   extractStepUsage,
-  readConversationCompactionWindow,
   readLastStepIndex,
   readLatestStepUsage,
 } from '../server/brain-io.ts'
+import { readConversationCompactionWindow } from '../server/conversation-db.ts'
 import { promptUsage } from '../server/mapping.ts'
 import { SessionManager } from '../server/session.ts'
 import { AgyUsageSource } from '../server/usage.ts'
