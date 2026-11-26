@@ -17,6 +17,14 @@ if (process.env.AGY_USAGE_AUTH_HANG) {
 } else if (process.env.AGY_USAGE_FAIL) {
   process.stderr.write('Authentication required')
   process.exit(1)
+} else if (process.env.AGY_USAGE_EXIT_CODE) {
+  if (process.env.AGY_USAGE_FIXTURE) {
+    process.stdout.write(readFileSync(process.env.AGY_USAGE_FIXTURE, 'utf8'))
+  }
+  if (process.env.AGY_USAGE_STDERR) {
+    process.stderr.write(process.env.AGY_USAGE_STDERR)
+  }
+  process.exit(Number(process.env.AGY_USAGE_EXIT_CODE))
 } else {
   process.stdout.write(readFileSync(process.env.AGY_USAGE_FIXTURE!, 'utf8'))
 }

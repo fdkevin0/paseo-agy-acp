@@ -34,3 +34,30 @@ test(
     assert.deepEqual(accounts, [])
   },
 )
+
+test(
+  'live agy usage CLI reports no_quota under GEMINI_API_KEY mode',
+  { timeout: 15_000 },
+  async (t) => {
+    const home = await mkdtemp(join(tmpdir(), 'agy-live-apikey-'))
+    t.after(() => rm(home, { recursive: true, force: true }))
+    const env = isolatedEnv(home, {
+      PATH: process.env.PATH ?? '',
+      GEMINI_API_KEY: 'dummy',
+    })
+    const usage = new AgyUsageSource({ env })
+    const dataDir = usage.remember(
+      {
+        command: 'agy',
+        args: ['--settings', '{"modelProvider":"gemini"}'],
+        env,
+      },
+      {},
+      home,
+    )
+    const report = await usage.fetch({ dataDir })
+    assert.ok(report.status === 'unavailable')
+    assert.equal(report.problem.kind, 'no_quota')
+    assert.match(report.problem.detail, /Gemini API key/i)
+  },
+)

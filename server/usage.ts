@@ -26,7 +26,9 @@ import {
   detachString,
   formatErrorMessage,
   mergeEnv,
+  record,
   setBounded,
+  text,
 } from './common.ts'
 import {
   dataDirectory,
@@ -321,6 +323,53 @@ function usageArgs(args: readonly string[]): string[] {
   return result
 }
 
+const NO_QUOTA_ERROR_PATTERN =
+  /not available with a Gemini API key|no quota summary is available/i
+
+export class UsageCommandError extends Error {
+  readonly code: number | null
+  readonly signal: NodeJS.Signals | null
+  readonly stdout: string
+  readonly stderr: string
+
+  constructor(
+    message: string,
+    details: {
+      code: number | null
+      signal: NodeJS.Signals | null
+      stdout: string
+      stderr: string
+    },
+  ) {
+    super(message)
+    this.name = 'UsageCommandError'
+    this.code = details.code
+    this.signal = details.signal
+    this.stdout = details.stdout
+    this.stderr = details.stderr
+  }
+}
+
+/** Extract a user-facing detail when `agy /usage` exits with code 2 because the account has no quota. */
+export function extractNoQuotaDetail(
+  error: UsageCommandError,
+): string | undefined {
+  if (error.code !== 2 || error.signal !== null) return undefined
+  let detail: string | undefined
+  const trimmedStdout = error.stdout.trim()
+  if (trimmedStdout) {
+    try {
+      const parsed = record(JSON.parse(trimmedStdout))
+      detail = text(parsed.error) ?? text(parsed.response)
+    } catch {
+      /* Fall back to stderr when stdout is not JSON. */
+    }
+  }
+  detail ??= text(error.stderr)?.replace(/^error:\s*/i, '')
+  if (!detail || !NO_QUOTA_ERROR_PATTERN.test(detail)) return undefined
+  return detail
+}
+
 async function runUsageCommand(
   cmd: string,
   args: string[],
@@ -432,10 +481,11 @@ async function runUsageCommand(
         code !== null ? `code ${code}` : `signal ${signal ?? 'unknown'}`
       const detail = stderr.trim()
       finish(
-        new Error(
+        new UsageCommandError(
           detail
             ? `${cmd} exited (${status}): ${detail}`
             : `${cmd} exited (${status})`,
+          { code, signal, stdout, stderr },
         ),
       )
     })
@@ -609,6 +659,12 @@ export class AgyUsageSource {
         windows,
       }
     } catch (error) {
+      if (error instanceof UsageCommandError) {
+        const detail = extractNoQuotaDetail(error)
+        if (detail) {
+          return unavailable({ kind: 'no_quota', detail })
+        }
+      }
       return {
         status: 'error',
         error: formatErrorMessage(error),

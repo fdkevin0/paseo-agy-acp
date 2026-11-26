@@ -196,11 +196,12 @@ Each validated `command.data.groups` bucket becomes a scoped window (non-`SUCCES
 
 Windows are included in the default summary. Usage above 90% has a danger tone; 70–90% has a warning tone; lower known usage is OK and unknown usage uses the default tone.
 
-| Outcome                                             | Usage report                                                      |
-| --------------------------------------------------- | ----------------------------------------------------------------- |
-| Valid quota buckets                                 | `available`, with windows and the observed plan label when known. |
-| No buckets                                          | `unavailable` with `no_quota`.                                    |
-| Command, authentication, timeout or parsing failure | `error` with a diagnostic.                                        |
-| No token file, login line or remembered launch      | Omit the account from discovery.                                  |
-| Non-default account without launch context          | `error` instead of querying the default account.                  |
-| Login store removed but the CLI still answers       | Report the CLI result; the token file is not authoritative.       |
+| Outcome                                                       | Usage report                                                      |
+| ------------------------------------------------------------- | ----------------------------------------------------------------- |
+| Valid quota buckets                                           | `available`, with windows and the observed plan label when known. |
+| No buckets                                                    | `unavailable` with `no_quota`.                                    |
+| Gemini API key / account without quota (`exit code 2`)        | `unavailable` with `no_quota` and the CLI diagnostic.             |
+| Command, CLI flag, authentication, timeout or parsing failure | `error` with a diagnostic.                                        |
+| No token file, login line or remembered launch                | Omit the account from discovery.                                  |
+| Non-default account without launch context                    | `error` instead of querying the default account.                  |
+| Login store removed but the CLI still answers                 | Report the CLI result; the token file is not authoritative.       |
