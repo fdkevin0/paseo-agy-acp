@@ -142,6 +142,42 @@ export function encodeGenMetadataMaxContext(maxTokens: number): Buffer {
   return encodeGenMetadataContextUsage({ maxTokens })
 }
 
+/** Encode a protobuf `CortexStep` `step_payload` for `step_type = 17` (`[24, 3, ...]`). */
+export function encodeStepErrorPayload(fields: {
+  userError?: string
+  shortError?: string
+  fullError?: string
+  errorId?: string
+  retryInfoJson?: string
+  terminalFlag?: boolean
+}): Buffer {
+  const errFields: Buffer[] = []
+  if (fields.userError !== undefined)
+    errFields.push(encodeProtoField(1, Buffer.from(fields.userError, 'utf8')))
+  if (fields.shortError !== undefined)
+    errFields.push(encodeProtoField(2, Buffer.from(fields.shortError, 'utf8')))
+  if (fields.fullError !== undefined)
+    errFields.push(encodeProtoField(3, Buffer.from(fields.fullError, 'utf8')))
+  if (fields.errorId !== undefined)
+    errFields.push(encodeProtoField(6, Buffer.from(fields.errorId, 'utf8')))
+  if (fields.retryInfoJson !== undefined)
+    errFields.push(
+      encodeProtoField(10, Buffer.from(fields.retryInfoJson, 'utf8')),
+    )
+  const stepErrorFields: Buffer[] = [
+    encodeProtoField(3, Buffer.concat(errFields)),
+  ]
+  if (fields.terminalFlag) stepErrorFields.push(encodeProtoField(5, 1))
+  // Include leading step metadata envelope bytes matching real agy 1.5.18 SQLite rows.
+  return Buffer.concat([
+    encodeProtoField(
+      1,
+      Buffer.from('e6b81e75-87d0-4ef7-9d3c-3174267c5a46', 'utf8'),
+    ),
+    encodeProtoField(24, Buffer.concat(stepErrorFields)),
+  ])
+}
+
 /** A `brain` directory holding per-session transcripts, subagent records and inbox files. */
 export async function fixture() {
   const root = await mkdtemp(join(tmpdir(), 'agy-brain-test-'))

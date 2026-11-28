@@ -776,6 +776,8 @@ type QuestionAnswer = {
   callId?: string
 }
 
+const HIDDEN_ERROR_POLL_INTERVAL_MS = 1000
+
 /** Follow background tasks and post-RPC Reactive Wakeup steps in transcript_full.jsonl until the turn settles. */
 export async function settleBrainTurn(
   root: string,
@@ -812,6 +814,7 @@ export async function settleBrainTurn(
     onWakeupState,
     mcpServerNames,
     runtimeEpoch,
+    readHiddenError,
   }: {
     mcpServerNames?: readonly string[]
     observation?: BrainTurnObservation
@@ -820,6 +823,8 @@ export async function settleBrainTurn(
       wakeupUsage?: StepUsage
     }) => void
     runtimeEpoch?: RuntimeEpoch
+    /** Poll for terminal errors persisted outside transcript_full.jsonl (e.g. SQLite step_type=17). */
+    readHiddenError?: () => Promise<string | undefined>
     onSubagents?: (subagents: readonly SubagentRecord[]) => void
     signal?: AbortSignal
     minStepIndex?: number
@@ -1159,6 +1164,27 @@ export async function settleBrainTurn(
   const deferReaderFault = () =>
     stream.hasReaderFault &&
     (isWakeupQuestionDeclined?.() || isWaitingOnQuestion?.())
+  const STALE = Symbol('stale')
+  let lastHiddenErrorCheck: number | undefined
+  const pollHiddenError = async (
+    checkedVersion: number,
+    force = false,
+  ): Promise<string | typeof STALE | undefined> => {
+    if (!readHiddenError) return undefined
+    const now = Date.now()
+    if (
+      !force &&
+      lastHiddenErrorCheck !== undefined &&
+      now >= lastHiddenErrorCheck &&
+      now - lastHiddenErrorCheck < HIDDEN_ERROR_POLL_INTERVAL_MS
+    ) {
+      return undefined
+    }
+    lastHiddenErrorCheck = now
+    const hiddenError = await readHiddenError()
+    if (signal?.aborted || checkedVersion !== foldVersion) return STALE
+    return hiddenError || undefined
+  }
   try {
     await stream.attach(consume)
     if (ownsObservation) stream.start()
@@ -1198,17 +1224,27 @@ export async function settleBrainTurn(
         )
           return { status: 'completed' }
         if (!anchored && !withinGrace()) return { status: 'completed' }
-        if (anchored && Date.now() - lastActivity >= stallTimeoutMs)
-          return stall()
+        if (anchored && Date.now() - lastActivity >= stallTimeoutMs) {
+          const hidden = await pollHiddenError(foldVersion, true)
+          if (hidden === STALE) continue
+          return hidden ? finish('failed', hidden) : stall()
+        }
         await stream.wait(revision, signal)
         continue
       }
       const failure = node.failure(retryTimeoutMs)
-      if (failure)
+      if (failure) {
+        const retryTimedOut = node.retryPending()
+        if (retryTimedOut) {
+          const hidden = await pollHiddenError(foldVersion, true)
+          if (hidden === STALE) continue
+          if (hidden) return finish('failed', hidden)
+        }
         return {
           ...finish('failed', failure),
-          ...(node.retryPending() ? { stalled: true } : {}),
+          ...(retryTimedOut ? { stalled: true } : {}),
         }
+      }
       node.settleAbortedDenial(deniedToolCallIds)
       while (takeQuestionAnswer) {
         const question =
@@ -1285,10 +1321,17 @@ export async function settleBrainTurn(
       const idleLimitMs = node.isWokenWorking()
         ? wokenStallTimeoutMs
         : stallTimeoutMs
-      if (tracking || node.retryPending()) lastActivity = Date.now()
-      else if (Date.now() - lastActivity >= idleLimitMs) {
-        return stall(idleLimitMs)
+      const idleExpired =
+        !tracking &&
+        !node.retryPending() &&
+        Date.now() - lastActivity >= idleLimitMs
+      if (!tracking && (!node.projector.hasPendingQuestion() || idleExpired)) {
+        const hidden = await pollHiddenError(checkedVersion, idleExpired)
+        if (hidden === STALE) continue
+        if (hidden) return finish('failed', hidden)
       }
+      if (tracking || node.retryPending()) lastActivity = Date.now()
+      else if (idleExpired) return stall(idleLimitMs)
       await stream.wait(revision, signal)
     }
   } finally {

@@ -28,20 +28,84 @@ type ReadConversationCompactionWindowOptions = {
   openDb?: (path: string) => DatabaseSync
 }
 
-function readProtoVarint(
-  buf: Uint8Array,
-  start: number,
-): [bigint, number] | undefined {
+type VarintRead =
+  { ok: true; value: bigint; next: number } | { ok: false; truncated: boolean }
+
+function readProtoVarint(buf: Uint8Array, start: number): VarintRead {
   let val = 0n
   let shift = 0n
   let pos = start
   while (pos < buf.length && shift <= 63n) {
     const b = buf[pos++]
     val |= BigInt(b & 0x7f) << shift
-    if ((b & 0x80) === 0) return [val, pos]
+    if ((b & 0x80) === 0) return { ok: true, value: val, next: pos }
     shift += 7n
   }
-  return undefined
+  return { ok: false, truncated: pos === buf.length && shift <= 63n }
+}
+
+type ProtoField =
+  | { field: number; wire: 0; value: bigint }
+  | { field: number; wire: 2; bytes: Uint8Array; truncated: boolean }
+
+const MAX_PROTO_FIELD_NUMBER = 0x1fff_ffffn
+
+/**
+ * Walk top-level protobuf fields in `buf`.
+ * Returns `false` on corrupt/non-protobuf wire data, visitor rejection, or (unless `allowTruncated`) truncated fields.
+ */
+function walkProtoFields(
+  buf: Uint8Array,
+  visit: (field: ProtoField) => boolean | void,
+  allowTruncated = false,
+): boolean {
+  let pos = 0
+  const maxSafe = BigInt(Number.MAX_SAFE_INTEGER)
+  while (pos < buf.length) {
+    const tagRead = readProtoVarint(buf, pos)
+    if (!tagRead.ok) return allowTruncated && tagRead.truncated
+    pos = tagRead.next
+    const rawField = tagRead.value >> 3n
+    const wire = Number(tagRead.value & 7n)
+    if (rawField <= 0n || rawField > MAX_PROTO_FIELD_NUMBER) return false
+    const field = Number(rawField)
+    if (wire === 0) {
+      const valRead = readProtoVarint(buf, pos)
+      if (!valRead.ok) return allowTruncated && valRead.truncated
+      if (visit({ field, wire: 0, value: valRead.value }) === false)
+        return false
+      pos = valRead.next
+    } else if (wire === 1) {
+      pos += 8
+      if (pos > buf.length) return allowTruncated
+    } else if (wire === 2) {
+      const lenRead = readProtoVarint(buf, pos)
+      if (!lenRead.ok) return allowTruncated && lenRead.truncated
+      if (lenRead.value > maxSafe) return false
+      const len = Number(lenRead.value)
+      pos = lenRead.next
+      const end = pos + len
+      const truncated = end > buf.length
+      if (truncated && !allowTruncated) return false
+      if (
+        visit({
+          field,
+          wire: 2,
+          bytes: buf.subarray(pos, truncated ? buf.length : end),
+          truncated,
+        }) === false
+      )
+        return false
+      if (truncated) return true
+      pos = end
+    } else if (wire === 5) {
+      pos += 4
+      if (pos > buf.length) return allowTruncated
+    } else {
+      return false
+    }
+  }
+  return true
 }
 
 function readProtoVarintPath(
@@ -49,56 +113,62 @@ function readProtoVarintPath(
   path: readonly number[],
 ): number | undefined {
   if (path.length === 0) return undefined
-  let pos = 0
   let match: number | undefined
   const maxSafe = BigInt(Number.MAX_SAFE_INTEGER)
-  while (pos < buf.length) {
-    const tagRead = readProtoVarint(buf, pos)
-    if (!tagRead) return undefined
-    const [tag, afterTag] = tagRead
-    pos = afterTag
-    const fieldNumber = Number(tag >> 3n)
-    const wireType = Number(tag & 7n)
-    if (wireType === 0) {
-      const valRead = readProtoVarint(buf, pos)
-      if (!valRead) return undefined
-      const [val, afterVal] = valRead
-      pos = afterVal
-      if (
-        path.length === 1 &&
-        fieldNumber === path[0] &&
-        val > 0n &&
-        val <= maxSafe
-      ) {
-        match = Number(val)
-      }
-    } else if (wireType === 1) {
-      pos += 8
-      if (pos > buf.length) return undefined
-    } else if (wireType === 2) {
-      const lenRead = readProtoVarint(buf, pos)
-      if (!lenRead) return undefined
-      const [rawLen, afterLen] = lenRead
-      if (rawLen < 0n || rawLen > maxSafe) return undefined
-      const len = Number(rawLen)
-      pos = afterLen
-      if (pos + len > buf.length) return undefined
-      if (path.length > 1 && fieldNumber === path[0]) {
-        const nested = readProtoVarintPath(
-          buf.subarray(pos, pos + len),
-          path.slice(1),
-        )
-        if (nested !== undefined) match = nested
-      }
-      pos += len
-    } else if (wireType === 5) {
-      pos += 4
-      if (pos > buf.length) return undefined
-    } else {
-      return undefined
+  const ok = walkProtoFields(buf, (f) => {
+    if (f.field !== path[0]) return
+    if (
+      path.length === 1 &&
+      f.wire === 0 &&
+      f.value > 0n &&
+      f.value <= maxSafe
+    ) {
+      match = Number(f.value)
+    } else if (path.length > 1 && f.wire === 2) {
+      const nested = readProtoVarintPath(f.bytes, path.slice(1))
+      if (nested !== undefined) match = nested
     }
-  }
-  return match
+  })
+  return ok ? match : undefined
+}
+
+/**
+ * Extract `user_error_message` (`[24, 3, 1]`) and `short_error` (`[24, 3, 2]`) from a protobuf
+ * `step_payload` in one pass, tolerating outer-container truncation from `substr(step_payload, 1, 16384)`
+ * because both fields precede large stack traces in `[24, 3, 3]`.
+ */
+function decodeProtoStepError(buf: Uint8Array): {
+  userError?: string
+  shortError?: string
+} {
+  let userError: string | undefined
+  let shortError: string | undefined
+  const ok = walkProtoFields(
+    buf,
+    (top) => {
+      if (top.field !== 24 || top.wire !== 2) return
+      return walkProtoFields(
+        top.bytes,
+        (stepErr) => {
+          if (stepErr.field !== 3 || stepErr.wire !== 2) return
+          return walkProtoFields(
+            stepErr.bytes,
+            (detail) => {
+              if (detail.wire !== 2 || detail.truncated) return
+              if (detail.field === 1)
+                userError = Buffer.from(detail.bytes).toString('utf8')
+              else if (detail.field === 2)
+                shortError = Buffer.from(detail.bytes).toString('utf8')
+            },
+            true,
+          )
+        },
+        true,
+      )
+    },
+    true,
+  )
+  return ok ? { userError, shortError } : {}
 }
 
 async function resolveConversationDbStat(
@@ -365,6 +435,8 @@ function parseStructuredApiError(text: string):
 export function classifyStepError(input: {
   stepType?: number
   payloadText?: string
+  shortError?: string
+  userError?: string
   stopReason?: string
   reachedModel: boolean
 }): HiddenApiError | undefined {
@@ -373,13 +445,26 @@ export function classifyStepError(input: {
   if (!isErrorStep && !isRefusal) return undefined
 
   const text = input.payloadText ?? ''
-  if (isErrorStep && !isRefusal && text && isNonTerminalRetryPayload(text)) {
-    return undefined
+  const shortError = input.shortError
+  if (isErrorStep && !isRefusal) {
+    const retryCandidate = shortError || text
+    if (retryCandidate && isNonTerminalRetryPayload(retryCandidate)) {
+      return undefined
+    }
   }
 
-  const structured = text ? parseStructuredApiError(text) : undefined
+  // Test decoded shortError alongside raw payloadText because protobuf length-varint bytes
+  // immediately preceding shortError can be ASCII `\w` characters that defeat `\b` anchors.
+  const matches = (pattern: RegExp) =>
+    (shortError !== undefined &&
+      shortError !== '' &&
+      pattern.test(shortError)) ||
+    (text !== '' && pattern.test(text))
+  const structured =
+    (shortError ? parseStructuredApiError(shortError) : undefined) ??
+    (text ? parseStructuredApiError(text) : undefined)
 
-  if (text && INVALID_THINKING_SIGNATURE_PATTERN.test(text)) {
+  if (matches(INVALID_THINKING_SIGNATURE_PATTERN)) {
     return {
       kind: 'invalid_thinking_signature',
       message:
@@ -395,14 +480,18 @@ export function classifyStepError(input: {
   }
 
   const isQuota =
-    (text !== '' && QUOTA_EXHAUSTED_PATTERN.test(text)) ||
+    matches(QUOTA_EXHAUSTED_PATTERN) ||
     structured?.statusCode === 429 ||
     structured?.statusName === 'RESOURCE_EXHAUSTED' ||
     structured?.statusName === 'QUOTA_EXHAUSTED' ||
-    (isRefusal && text !== '' && REFUSAL_QUOTA_CUE_PATTERN.test(text))
+    (isRefusal && matches(REFUSAL_QUOTA_CUE_PATTERN))
   if (isQuota) {
-    const resetAtMatch = text.match(QUOTA_RESET_TIMESTAMP_PATTERN)?.[1]
-    const delayRaw = text.match(QUOTA_RESET_DELAY_PATTERN)?.[1]
+    const resetAtMatch =
+      shortError?.match(QUOTA_RESET_TIMESTAMP_PATTERN)?.[1] ??
+      text.match(QUOTA_RESET_TIMESTAMP_PATTERN)?.[1]
+    const delayRaw =
+      shortError?.match(QUOTA_RESET_DELAY_PATTERN)?.[1] ??
+      text.match(QUOTA_RESET_DELAY_PATTERN)?.[1]
     const retryAfterMs =
       delayRaw !== undefined ? parseGoDurationMs(delayRaw) : undefined
     const details: string[] = []
@@ -456,7 +545,10 @@ export function classifyStepError(input: {
         }
   }
 
-  const summary = sanitizePrintable(text)
+  const summary =
+    sanitizePrintable(shortError ?? '') ||
+    sanitizePrintable(input.userError ?? '') ||
+    sanitizePrintable(text)
   return {
     kind: 'api_error',
     message: truncateDetached(
@@ -512,7 +604,7 @@ export async function captureConversationStepBaseline(
   }
 }
 
-/** Fail-closed post-turn check for hidden SQLite `steps` API errors newer than `baseline`. */
+/** Fail-closed check for hidden SQLite `steps` API errors newer than `baseline`. */
 export async function readConversationStepError(
   brainRoot: string,
   nativeId: string,
@@ -565,6 +657,10 @@ export async function readConversationStepError(
           ? latest.type
           : undefined
       // Never feed untrusted user/assistant prose (`step_type !== 17`) into error classifiers.
+      const { shortError, userError } =
+        stepType === 17 && latest?.payload instanceof Uint8Array
+          ? decodeProtoStepError(latest.payload)
+          : {}
       const payloadPart = stepType === 17 ? decodeSqlText(latest?.payload) : ''
       const errDetailsPart = decodeSqlText(latest?.errDetails)
       const payloadText =
@@ -574,6 +670,8 @@ export async function readConversationStepError(
       return classifyStepError({
         stepType,
         payloadText,
+        shortError,
+        userError,
         stopReason,
         reachedModel,
       })

@@ -18,7 +18,10 @@ import {
   readConversationCompactionWindow,
   readConversationStepError,
 } from '../server/conversation-db.ts'
-import { encodeGenMetadataContextUsage } from './brain-fixtures.ts'
+import {
+  encodeGenMetadataContextUsage,
+  encodeStepErrorPayload,
+} from './brain-fixtures.ts'
 
 const ID_A = '11111111-1111-4111-8111-111111111111'
 const ID_B = '22222222-2222-4222-8222-222222222222'
@@ -837,4 +840,198 @@ test('readConversationStepError does not re-attribute stale errors when baseline
     },
   )
   assert.equal(postOpenCalls, 0)
+})
+
+test('readConversationStepError filters protobuf retry rows including >16 KiB truncated payloads and surfaces clean protobuf terminal errors', async (t) => {
+  const { brainRoot, convDir } = await createEnv(t)
+  const dbPath = join(convDir, `${ID_A}.db`)
+  const db = new DatabaseSync(dbPath)
+  t.after(() => db.close())
+  db.exec(
+    'CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, step_payload BLOB)',
+  )
+  const insert = db.prepare(
+    'INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)',
+  )
+
+  // Real protobuf retry row: API error (attempt 1) with leading metadata + UUID errorId.
+  insert.run(
+    1,
+    17,
+    encodeStepErrorPayload({
+      shortError: 'API error (attempt 1): stream reading error: unexpected EOF',
+      errorId: `${ID_A}-1`,
+    }),
+  )
+  assert.equal(
+    await readConversationStepError(brainRoot, ID_A, { maxIdx: 0 }, 'end_turn'),
+    undefined,
+  )
+
+  // Real protobuf retry row: model output error with >16 KiB stack trace truncated by substr(..., 1, 16384).
+  const largeStack = `stack frame\n${'x'.repeat(20_000)}`
+  insert.run(
+    2,
+    17,
+    encodeStepErrorPayload({
+      userError: 'Model produced invalid output.',
+      shortError:
+        'model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again',
+      fullError: largeStack,
+    }),
+  )
+  assert.equal(
+    await readConversationStepError(brainRoot, ID_A, { maxIdx: 1 }, 'end_turn'),
+    undefined,
+  )
+
+  // Real protobuf terminal 404 NOT_FOUND with >16 KiB stack trace.
+  insert.run(
+    3,
+    17,
+    encodeStepErrorPayload({
+      userError: 'Agent execution terminated due to error.',
+      shortError: 'NOT_FOUND (code 404): Requested entity was not found.',
+      fullError: largeStack,
+      terminalFlag: true,
+    }),
+  )
+  const notFound = await readConversationStepError(
+    brainRoot,
+    ID_A,
+    { maxIdx: 2 },
+    'end_turn',
+  )
+  assert.deepEqual(notFound, {
+    kind: 'api_error',
+    statusCode: 404,
+    statusName: 'NOT_FOUND',
+    message: 'NOT_FOUND (404): Requested entity was not found.',
+    reachedModel: false,
+  })
+
+  // Real protobuf terminal 401 UNAUTHENTICATED after planner step.
+  insert.run(4, 15, Buffer.from('planner step'))
+  insert.run(
+    5,
+    17,
+    encodeStepErrorPayload({
+      userError: 'Agent execution terminated due to error.',
+      shortError:
+        'UNAUTHENTICATED (code 401): Request had invalid authentication credentials.',
+      terminalFlag: true,
+    }),
+  )
+  const unauth = await readConversationStepError(
+    brainRoot,
+    ID_A,
+    { maxIdx: 3 },
+    'end_turn',
+  )
+  assert.deepEqual(unauth, {
+    kind: 'api_error',
+    statusCode: 401,
+    statusName: 'UNAUTHENTICATED',
+    message:
+      'UNAUTHENTICATED (401): Request had invalid authentication credentials.',
+    reachedModel: true,
+  })
+
+  // Unstructured terminal protobuf error (e.g. post-retry-exhaustion network EOF) surfaces short_error without binary prefix garbage.
+  insert.run(
+    6,
+    17,
+    encodeStepErrorPayload({
+      userError:
+        'There was a network issue connecting to the server, please try again.',
+      shortError:
+        'agent executor error: generating and executing: request failed: Post "https://example.invalid/stream": EOF',
+      fullError: largeStack,
+      terminalFlag: true,
+    }),
+  )
+  const networkErr = await readConversationStepError(
+    brainRoot,
+    ID_A,
+    { maxIdx: 5 },
+    'end_turn',
+  )
+  assert.deepEqual(networkErr, {
+    kind: 'api_error',
+    message:
+      'agent executor error: generating and executing: request failed: Post "https://example.invalid/stream": EOF',
+    reachedModel: false,
+  })
+
+  // Quota error in protobuf preserves retryDelay from nested field [24, 3, 10].
+  insert.run(
+    7,
+    17,
+    encodeStepErrorPayload({
+      userError: 'Individual quota reached.',
+      shortError: 'RESOURCE_EXHAUSTED (code 429): Individual quota reached.',
+      retryInfoJson:
+        '{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"45s"}',
+      terminalFlag: true,
+    }),
+  )
+  const quotaErr = await readConversationStepError(
+    brainRoot,
+    ID_A,
+    { maxIdx: 6 },
+    'end_turn',
+  )
+  assert.equal(quotaErr?.kind, 'quota_exhausted')
+  assert.equal(quotaErr?.statusCode, 429)
+  assert.equal(quotaErr?.statusName, 'RESOURCE_EXHAUSTED')
+  assert.equal(quotaErr?.retryAfterMs, 45_000)
+
+  // Length-varint byte collision: 55-byte ('7') and 57-byte ('9') short_error strings must still match \b classifiers.
+  insert.run(
+    8,
+    17,
+    encodeStepErrorPayload({
+      shortError: 'messages.0.content.0.thinking.signature: Field required',
+      terminalFlag: true,
+    }),
+  )
+  const sigCollision = await readConversationStepError(
+    brainRoot,
+    ID_A,
+    { maxIdx: 7 },
+    'end_turn',
+  )
+  assert.equal(sigCollision?.kind, 'invalid_thinking_signature')
+
+  insert.run(
+    9,
+    17,
+    encodeStepErrorPayload({
+      shortError: 'RESOURCE_EXHAUSTED: You have exceeded your current quota.',
+      terminalFlag: true,
+    }),
+  )
+  const quotaCollision = await readConversationStepError(
+    brainRoot,
+    ID_A,
+    { maxIdx: 8 },
+    'end_turn',
+  )
+  assert.equal(quotaCollision?.kind, 'quota_exhausted')
+
+  // Corrupt overlong varint trailing a valid protobuf retry message fails closed and does not hide the step as a retry.
+  const corruptVarint = Buffer.concat([
+    encodeStepErrorPayload({
+      shortError: 'API error (attempt 1): temporary 503',
+    }),
+    Buffer.alloc(12, 0x80),
+  ])
+  insert.run(10, 17, corruptVarint)
+  const corruptErr = await readConversationStepError(
+    brainRoot,
+    ID_A,
+    { maxIdx: 9 },
+    'end_turn',
+  )
+  assert.equal(corruptErr?.kind, 'api_error')
 })
