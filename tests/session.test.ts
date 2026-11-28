@@ -24,6 +24,7 @@ import { SessionManager } from '../server/session.ts'
 import { SubagentRegistry } from '../server/subagents.ts'
 import { connectAcp } from '../server/transport.ts'
 import { AgyUsageSource } from '../server/usage.ts'
+import { encodeStepErrorPayload } from './brain-fixtures.ts'
 import {
   collectProviderEvents,
   compactionEvents,
@@ -5601,4 +5602,202 @@ test('activeTurn clears per-turn state when idle without leaking deniedToolCallI
   )?.item
   assert.equal(turn2Tool?.status, 'failed')
   assert.equal(manager.session.state.activeTurn, null)
+})
+
+test('promptSession surfaces hidden SQLite step_type 17 protobuf errors while anchored on transcript_full.jsonl without stalling or false-failing protobuf retries', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'agy-hidden-settle-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const nativeId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+  const appDir = join(home, '.gemini/antigravity-cli')
+  const brainRoot = join(appDir, 'brain')
+  const convDir = join(appDir, 'conversations')
+  await mkdir(convDir, { recursive: true })
+  const dbPath = join(convDir, `${nativeId}.db`)
+  const db = new DatabaseSync(dbPath)
+  t.after(() => db.close())
+  db.exec(
+    'CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL, step_payload BLOB)',
+  )
+  const insertStep = db.prepare(
+    'INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)',
+  )
+
+  const env = isolatedEnv(home)
+  const events: ProviderEvent[] = []
+  let cancelCalls = 0
+  const promptTurns = sequenceDouble<[], Promise<{ stopReason: 'end_turn' }>>([
+    // Turn 1: agy writes USER_INPUT to transcript_full.jsonl and hidden 404 to SQLite only.
+    async () => {
+      await writeBrainTranscript(brainRoot, nativeId, [
+        { step_index: 1, type: 'USER_INPUT', status: 'DONE', content: 'one' },
+      ])
+      insertStep.run(1, 14, Buffer.from('one'))
+      insertStep.run(
+        2,
+        17,
+        encodeStepErrorPayload({
+          userError: 'Agent execution terminated due to error.',
+          shortError: 'NOT_FOUND (code 404): Requested entity was not found.',
+          terminalFlag: true,
+        }),
+      )
+      return { stopReason: 'end_turn' }
+    },
+    // Turn 2: agy writes USER_INPUT + protobuf retry row (>16 KiB) to SQLite first, then recovers with PLANNER_RESPONSE DONE.
+    async () => {
+      await writeBrainTranscript(brainRoot, nativeId, [
+        { step_index: 1, type: 'USER_INPUT', status: 'DONE', content: 'one' },
+        { step_index: 3, type: 'USER_INPUT', status: 'DONE', content: 'two' },
+      ])
+      insertStep.run(3, 14, Buffer.from('two'))
+      insertStep.run(
+        4,
+        17,
+        encodeStepErrorPayload({
+          userError: 'Model produced invalid output.',
+          shortError:
+            'model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again',
+          fullError: `stack\n${'z'.repeat(20_000)}`,
+        }),
+      )
+      return { stopReason: 'end_turn' }
+    },
+  ])
+
+  let turn2Obs!: TrackingObservation
+  let turn2ObsReady!: () => void
+  const turn2ObsCreated = new Promise<void>((resolve) => {
+    turn2ObsReady = resolve
+  })
+  const createObservation = sequenceDouble<
+    ConstructorParameters<typeof TrackingObservation>,
+    TrackingObservation
+  >([
+    (...args) => new TrackingObservation(...args),
+    (...args) => {
+      turn2Obs = new TrackingObservation(...args)
+      turn2ObsReady()
+      return turn2Obs
+    },
+  ])
+  const manager = new SessionManager({
+    launch: { command: 'agy', args: ['acp'], env },
+    usage: new AgyUsageSource({ env }),
+    capabilities: PROVIDER_CAPABILITIES,
+    emit: (event) => events.push(event),
+    commandWaitTimeoutMs: 50,
+    stallTimeoutMs: 120_000,
+    observationPollIntervalMs: 60_000,
+    createObservation,
+    connectAcp: (_l, _cwd, _e, client) => {
+      const closed = new Promise<void>(() => {})
+      const rpc = {
+        closed,
+        initialize: async () => ({
+          protocolVersion: 1,
+          agentInfo: { name: 'Antigravity ACP Server', version: '1.5.18' },
+          agentCapabilities: { loadSession: true },
+        }),
+        newSession: async () => {
+          void client.sessionUpdate({
+            sessionId: nativeId,
+            update: {
+              sessionUpdate: 'available_commands_update',
+              availableCommands: [],
+            },
+          })
+          return { sessionId: nativeId, configOptions: [] }
+        },
+        closeSession: async () => ({}),
+        prompt: () => promptTurns(),
+        cancel: async () => {
+          cancelCalls += 1
+        },
+      } as unknown as ReturnType<typeof connectAcp>['rpc']
+      return {
+        rpc,
+        exited: closed,
+        stopped: Promise.resolve(),
+        close: async () => {},
+        request: async <T>(op: Promise<T>) => op,
+        get closed() {
+          return false
+        },
+        get tier() {
+          return undefined
+        },
+        get models() {
+          return undefined
+        },
+      }
+    },
+  })
+  t.after(() => manager.close())
+
+  await manager.handle({
+    type: 'session.open',
+    requestId: 'open',
+    sessionId: 's',
+    history: 'skip',
+    config: {
+      cwd: home,
+      env: {},
+      mcpServers: {},
+      settings: {},
+      persist: true,
+    },
+  })
+
+  // Turn 1 fails immediately with the hidden 404 (not 120s stall, no cancel).
+  await manager.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId: 'm-hidden-404',
+      delivery: 'auto',
+      input: { type: 'message', content: [{ type: 'text', text: 'one' }] },
+    },
+  })
+  const turn1 = events.findLast(
+    (e): e is Extract<ProviderEvent, { type: 'session.turn' }> =>
+      e.type === 'session.turn' && e.state !== 'started',
+  )
+  assert.equal(turn1?.state, 'failed')
+  assert.equal(
+    turn1?.error?.message,
+    'NOT_FOUND (404): Requested entity was not found.',
+  )
+  assert.equal(cancelCalls, 0)
+
+  // Turn 2 must NOT fail on the protobuf retry row while settling; once PLANNER_RESPONSE DONE lands, it completes.
+  const turn2Promise = manager.handle({
+    type: 'session.prompt',
+    sessionId: 's',
+    prompt: {
+      clientMessageId: 'm-retry-recover',
+      delivery: 'auto',
+      input: { type: 'message', content: [{ type: 'text', text: 'two' }] },
+    },
+  })
+  await turn2ObsCreated
+  // Wait until settleBrainTurn completes its first unsettled iteration (including pollHiddenError on step 4).
+  await turn2Obs.firstWait.promise
+  assert.deepEqual(completedTurnStates(events), ['failed'])
+
+  insertStep.run(5, 15, Buffer.from('recovered answer'))
+  await writeBrainTranscript(brainRoot, nativeId, [
+    { step_index: 1, type: 'USER_INPUT', status: 'DONE', content: 'one' },
+    { step_index: 3, type: 'USER_INPUT', status: 'DONE', content: 'two' },
+    {
+      step_index: 5,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      content: 'recovered answer',
+    },
+  ])
+  await flushObs(turn2Obs)
+  await turn2Promise
+
+  assert.deepEqual(completedTurnStates(events), ['failed', 'completed'])
+  assert.equal(cancelCalls, 0)
 })

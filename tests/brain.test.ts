@@ -7942,3 +7942,140 @@ test('readSubagents recovers spawn metadata after a transiently torn invoke_suba
   assert.equal(after.spawnCallId, 'spawn-call-1')
   assert.equal(after.spawnStepIndex, 4)
 })
+
+test('settleBrainTurn surfaces hidden SQLite errors immediately without stalling across USER_INPUT, GENERIC DONE, and retryPending', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+
+  // 1. Hidden 404 right after USER_INPUT fails immediately without stalled: true.
+  const s1 = randomUUID()
+  await f.put(s1, [{ step_index: 1, type: 'USER_INPUT', content: 'hi' }])
+  const res1 = await settleBrainTurn(f.root, s1, 's1', () => {}, {
+    pollIntervalMs: 5,
+    stallTimeoutMs: 120_000,
+    readHiddenError: async () =>
+      'NOT_FOUND (404): Requested entity was not found.',
+  })
+  assert.equal(res1.status, 'failed')
+  assert.equal(res1.stalled, undefined)
+  assert.equal(res1.error, 'NOT_FOUND (404): Requested entity was not found.')
+
+  // 2. Hidden 401 after GENERIC DONE fails immediately without stalled: true.
+  const s2 = randomUUID()
+  await f.put(s2, [
+    { step_index: 1, type: 'USER_INPUT', content: 'run' },
+    {
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ id: 'c1', name: 'run_command', args: {} }],
+    },
+    { step_index: 3, type: 'GENERIC', status: 'DONE', content: 'ok' },
+  ])
+  const res2 = await settleBrainTurn(f.root, s2, 's2', () => {}, {
+    pollIntervalMs: 5,
+    stallTimeoutMs: 120_000,
+    readHiddenError: async () => 'UNAUTHENTICATED (401): invalid credentials',
+  })
+  assert.equal(res2.status, 'failed')
+  assert.equal(res2.stalled, undefined)
+  assert.equal(res2.error, 'UNAUTHENTICATED (401): invalid credentials')
+
+  // 3. Hidden terminal error arriving while retryPending is active fails immediately instead of waiting retryTimeoutMs.
+  const s3 = randomUUID()
+  await f.put(s3, [
+    { step_index: 1, type: 'USER_INPUT', content: 'retry me' },
+    {
+      step_index: 2,
+      source: 'SYSTEM',
+      type: 'ERROR_MESSAGE',
+      status: 'DONE',
+      error: 'API error (attempt 8): request failed: EOF',
+    },
+  ])
+  const res3 = await settleBrainTurn(f.root, s3, 's3', () => {}, {
+    pollIntervalMs: 5,
+    retryTimeoutMs: 15 * 60_000,
+    readHiddenError: async () =>
+      'agent executor error: generating and executing: request failed: EOF',
+  })
+  assert.equal(res3.status, 'failed')
+  assert.equal(res3.stalled, undefined)
+  assert.equal(
+    res3.error,
+    'agent executor error: generating and executing: request failed: EOF',
+  )
+})
+
+test('settleBrainTurn ignores stale readHiddenError when transcript settles mid-check and still stalls on genuine idle', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+  t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
+
+  // 1. Transcript settles while readHiddenError is in flight: foldVersion invalidates the stale check.
+  const sRace = randomUUID()
+  await f.put(sRace, [{ step_index: 1, type: 'USER_INPUT', content: 'race' }])
+  const obsRace = new BrainTurnObservation(
+    f.root,
+    sRace,
+    'race',
+    -1,
+    { isCurrent: () => true, onUsage: () => {}, onItem: () => {} },
+    60_000,
+  )
+  t.after(() => obsRace.dispose())
+  let releaseHidden!: (value: string | undefined) => void
+  let markEntered!: () => void
+  const hiddenStarted = new Promise<void>((resolve) => {
+    markEntered = resolve
+  })
+  const racePromise = settleBrainTurn(f.root, sRace, 'race', () => {}, {
+    observation: obsRace,
+    stallTimeoutMs: 120_000,
+    readHiddenError: () => {
+      markEntered()
+      return new Promise<string | undefined>((resolve) => {
+        releaseHidden = resolve
+      })
+    },
+  })
+  await hiddenStarted
+  await f.put(sRace, [
+    { step_index: 1, type: 'USER_INPUT', content: 'race' },
+    done(2, 'actually completed'),
+  ])
+  await flushObs(obsRace)
+  releaseHidden('NOT_FOUND (404): stale error')
+  const raceResult = await racePromise
+  assert.equal(raceResult.status, 'completed')
+
+  // 2. Genuine stall with no hidden error still triggers final readHiddenError check and stalls cleanly.
+  const sStall = randomUUID()
+  await f.put(sStall, [{ step_index: 1, type: 'USER_INPUT', content: 'hang' }])
+  const obsStall = new BrainTurnObservation(
+    f.root,
+    sStall,
+    'stall',
+    -1,
+    { isCurrent: () => true, onUsage: () => {}, onItem: () => {} },
+    60_000,
+  )
+  t.after(() => obsStall.dispose())
+  let hiddenCalls = 0
+  const stallPromise = settleBrainTurn(f.root, sStall, 'stall', () => {}, {
+    observation: obsStall,
+    stallTimeoutMs: 500,
+    readHiddenError: async () => {
+      hiddenCalls += 1
+      return undefined
+    },
+  })
+  await flushObs(obsStall)
+  assert.equal(hiddenCalls, 1)
+  t.mock.timers.tick(500)
+  await flushObs(obsStall)
+  const stallResult = await stallPromise
+  assert.equal(stallResult.status, 'failed')
+  assert.equal(stallResult.stalled, true)
+  assert.equal(hiddenCalls, 2)
+})

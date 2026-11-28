@@ -409,6 +409,7 @@ export function wrapConnectAcp(
 export class TrackingObservation extends BrainTurnObservation {
   readonly attached = deferred<void>()
   readonly initialPoll = deferred<void>()
+  readonly firstWait = deferred<void>()
   private isAttached = false
   override async attach(
     consumer: Parameters<BrainTurnObservation['attach']>[0],
@@ -426,6 +427,10 @@ export class TrackingObservation extends BrainTurnObservation {
       )
     }
     return pass
+  }
+  override wait(after: number, signal?: AbortSignal): Promise<void> {
+    this.firstWait.resolve()
+    return super.wait(after, signal)
   }
 }
 

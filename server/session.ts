@@ -2399,13 +2399,15 @@ async function promptSession(
           ? 'failed'
           : 'completed'
     let turnError: string | undefined
-    if (result.stopReason === 'refusal') {
-      const hiddenError = await readConversationStepError(
+    const readHiddenStepError = () =>
+      readConversationStepError(
         session.brainRoot,
         session.state.nativeId,
         stepErrorBaseline,
         result.stopReason,
       )
+    if (result.stopReason === 'refusal') {
+      const hiddenError = await readHiddenStepError()
       turnError = hiddenError?.message ?? 'Request was refused.'
     } else if (status === 'completed') {
       turn.inSettle = true
@@ -2421,6 +2423,7 @@ async function promptSession(
           onSubagents: session.subagents.rememberSubagents,
           minStepIndex,
           runtimeEpoch: session.state.runtimeEpoch,
+          readHiddenError: async () => (await readHiddenStepError())?.message,
           // Pass the live Set by reference so post-RPC wakeup tool_call notifications remain visible while settling.
           acpToolCallIds: turn.toolCallIds,
           drainAcp: session.drain,
@@ -2496,12 +2499,7 @@ async function promptSession(
         !turnAbort.signal.aborted &&
         !session.isUnavailable()
       ) {
-        const hiddenError = await readConversationStepError(
-          session.brainRoot,
-          session.state.nativeId,
-          stepErrorBaseline,
-          result.stopReason,
-        )
+        const hiddenError = await readHiddenStepError()
         if (hiddenError) {
           status = 'failed'
           turnError = hiddenError.message
