@@ -3,7 +3,7 @@ import { sep } from 'node:path'
 
 // Paseo's server bundler forbids importing root files outside client/, server/, or shared/;
 // tests/index.test.ts enforces parity with package.json#version.
-export const PACKAGE_VERSION = '0.2.0'
+export const PACKAGE_VERSION = '0.2.1'
 
 export const sessionIdPattern =
   /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i
